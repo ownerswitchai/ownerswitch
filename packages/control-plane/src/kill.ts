@@ -1,3 +1,5 @@
+import type { RestoreAuthorization } from "./twogo.js";
+
 /**
  * KillSwitch — the global kill state of an OwnerSwitch deployment.
  *
@@ -14,13 +16,6 @@ export interface KillEvent {
   at: number;
 }
 
-/** Produced by a completed 2GO restore ceremony (see feat/2go-restore). */
-export interface RestoreAuthorization {
-  ceremonyId: string;
-  ownerId: string;
-  completedAt: number;
-}
-
 export type AuditEntry =
   | { type: "kill"; event: KillEvent }
   | { type: "restore"; auth: RestoreAuthorization; at: number };
@@ -28,6 +23,7 @@ export type AuditEntry =
 export class KillSwitch {
   private killedState = false;
   private log: AuditEntry[] = [];
+  private consumedCeremonies = new Set<string>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -44,12 +40,20 @@ export class KillSwitch {
   /**
    * Restore requires a completed ceremony. This method trusts its input's
    * SHAPE only — verifying the ceremony itself is the caller's job.
+   * Each ceremony authorizes exactly one restore: replaying an
+   * authorization whose ceremony id was already consumed throws.
    */
   restore(auth: RestoreAuthorization): void {
     if (!this.killedState) throw new Error("not killed — nothing to restore");
     if (!auth.ceremonyId || !auth.ownerId) {
       throw new Error("restore requires a completed 2GO ceremony");
     }
+    if (this.consumedCeremonies.has(auth.ceremonyId)) {
+      throw new Error(
+        `ceremony "${auth.ceremonyId}" already consumed — restore authorizations are single-use`,
+      );
+    }
+    this.consumedCeremonies.add(auth.ceremonyId);
     this.log.push({ type: "restore", auth, at: this.now() });
     this.killedState = false;
   }
