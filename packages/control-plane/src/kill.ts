@@ -14,6 +14,8 @@ export interface KillEvent {
   source: KillSource;
   reason?: string;
   at: number;
+  /** present when the trigger carried no verifiable credential */
+  unauthenticated?: true;
 }
 
 export type AuditEntry =
@@ -28,8 +30,16 @@ export class KillSwitch {
   constructor(private readonly now: () => number = Date.now) {}
 
   /** Idempotent: repeated triggers only add audit entries, never throw. */
-  engage(source: KillSource, reason?: string): void {
-    this.log.push({ type: "kill", event: { source, reason, at: this.now() } });
+  engage(source: KillSource, reason?: string, opts: { unauthenticated?: boolean } = {}): void {
+    this.log.push({
+      type: "kill",
+      event: {
+        source,
+        reason,
+        at: this.now(),
+        ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
+      },
+    });
     this.killedState = true;
   }
 
