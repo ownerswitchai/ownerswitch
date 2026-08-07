@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createOwnerSession,
@@ -25,7 +26,7 @@ describe("verifyDeviceSignature", () => {
     const { credential, body } = signedAt(100_000);
     const ok = verifyDeviceSignature(credential, body, SECRET, {
       now: () => 100_000,
-      seenNonces: new Set(),
+      seenNonces: new Map(),
     });
     expect(ok).toBe(true);
   });
@@ -34,7 +35,7 @@ describe("verifyDeviceSignature", () => {
     const { credential } = signedAt(100_000);
     const ok = verifyDeviceSignature(credential, '{"source":"api"}', SECRET, {
       now: () => 100_000,
-      seenNonces: new Set(),
+      seenNonces: new Map(),
     });
     expect(ok).toBe(false);
   });
@@ -43,7 +44,7 @@ describe("verifyDeviceSignature", () => {
     const { credential, body } = signedAt(100_000);
     const ok = verifyDeviceSignature(credential, body, "other-secret", {
       now: () => 100_000,
-      seenNonces: new Set(),
+      seenNonces: new Map(),
     });
     expect(ok).toBe(false);
   });
@@ -53,7 +54,7 @@ describe("verifyDeviceSignature", () => {
     for (const signature of ["", "zz", "deadbeef", credential.signature.slice(0, -2)]) {
       const ok = verifyDeviceSignature({ ...credential, signature }, body, SECRET, {
         now: () => 100_000,
-        seenNonces: new Set(),
+        seenNonces: new Map(),
       });
       expect(ok).toBe(false);
     }
@@ -64,7 +65,7 @@ describe("verifyDeviceSignature", () => {
       const { credential, body } = signedAt(signedAtMs);
       return verifyDeviceSignature(credential, body, SECRET, {
         now: () => nowMs,
-        seenNonces: new Set(),
+        seenNonces: new Map(),
       });
     };
     expect(verify(100_000, 100_000 + 59_000)).toBe(true); // 59 s old — fine
@@ -73,7 +74,7 @@ describe("verifyDeviceSignature", () => {
   });
 
   it("rejects a replayed nonce", () => {
-    const seenNonces = new Set<string>();
+    const seenNonces = new Map<string, number>();
     const { credential, body } = signedAt(100_000);
     const opts = { now: () => 100_000, seenNonces };
     expect(verifyDeviceSignature(credential, body, SECRET, opts)).toBe(true);
@@ -81,7 +82,7 @@ describe("verifyDeviceSignature", () => {
   });
 
   it("an invalid signature does not burn the nonce", () => {
-    const seenNonces = new Set<string>();
+    const seenNonces = new Map<string, number>();
     const { credential, body } = signedAt(100_000);
     const opts = { now: () => 100_000, seenNonces };
     expect(verifyDeviceSignature({ ...credential, signature: "deadbeef" }, body, SECRET, opts)).toBe(
@@ -91,7 +92,7 @@ describe("verifyDeviceSignature", () => {
   });
 
   it("nonces are scoped per device", () => {
-    const seenNonces = new Set<string>();
+    const seenNonces = new Map<string, number>();
     const opts = { now: () => 100_000, seenNonces };
     const a = signedAt(100_000);
     expect(verifyDeviceSignature(a.credential, a.body, SECRET, opts)).toBe(true);
@@ -99,6 +100,40 @@ describe("verifyDeviceSignature", () => {
     const fields = { deviceId: "btn-2", timestamp: 100_000, nonce: "n-1" };
     const b = { ...fields, signature: signDeviceRequest(fields, a.body, SECRET) };
     expect(verifyDeviceSignature(b, a.body, SECRET, opts)).toBe(true);
+  });
+
+  it("one signed message cannot be re-parsed into a second valid credential", () => {
+    // A hand-rolled signature over a dotted nonce: the payload "btn-1.100000.5.x.{}"
+    // parses two ways. Verification must accept NEITHER parse.
+    const signature = createHmac("sha256", SECRET).update("btn-1.100000.5.x.{}").digest("hex");
+    const dottedNonce = { deviceId: "btn-1", timestamp: 100_000, nonce: "5.x", signature };
+    const shifted = { deviceId: "btn-1", timestamp: 100_000.5, nonce: "x", signature };
+    const opts = { now: () => 100_000, seenNonces: new Map<string, number>() };
+    expect(verifyDeviceSignature(dottedNonce, "{}", SECRET, opts)).toBe(false);
+    expect(verifyDeviceSignature(shifted, "{}", SECRET, opts)).toBe(false);
+  });
+
+  it("signDeviceRequest refuses fields that would make the payload ambiguous", () => {
+    const fields = { deviceId: "btn-1", timestamp: 100_000, nonce: "n-1" };
+    expect(() => signDeviceRequest({ ...fields, deviceId: "btn.1" }, "{}", SECRET)).toThrow(/"\."/);
+    expect(() => signDeviceRequest({ ...fields, nonce: "5.x" }, "{}", SECRET)).toThrow(/"\."/);
+    expect(() => signDeviceRequest({ ...fields, timestamp: 0.5 }, "{}", SECRET)).toThrow(/integer/);
+  });
+
+  it("prunes nonce entries once they fall outside the replay window", () => {
+    const seenNonces = new Map<string, number>();
+    let t = 100_000;
+    const opts = { now: () => t, seenNonces };
+
+    const a = signedAt(t);
+    expect(verifyDeviceSignature(a.credential, a.body, SECRET, opts)).toBe(true);
+    expect(seenNonces.has("btn-1:n-1")).toBe(true);
+
+    t += 61_000; // n-1's timestamp can no longer verify — its entry is dead weight
+    const b = signedAt(t, undefined, "n-2");
+    expect(verifyDeviceSignature(b.credential, b.body, SECRET, opts)).toBe(true);
+    expect(seenNonces.has("btn-1:n-1")).toBe(false); // swept
+    expect(seenNonces.has("btn-1:n-2")).toBe(true);
   });
 });
 

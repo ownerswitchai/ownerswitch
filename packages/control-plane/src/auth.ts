@@ -26,17 +26,26 @@ export interface DeviceVerifyOptions {
   now?: () => number;
   /** accepted clock skew, which is also the replay window; default 60 s */
   maxSkewMs?: number;
-  /** nonce store override (tests, or one store per server); defaults to a module-level set */
-  seenNonces?: Set<string>;
+  /**
+   * Seen-nonce store override (tests, or one store per server); defaults to a
+   * module-level store. Maps nonce key -> the instant it can be forgotten.
+   */
+  seenNonces?: Map<string, number>;
 }
 
 // TODO(persistence): nonces live in process memory, so a restart forgets them.
 // Inside the 60 s window that is a real (if small) replay gap — move to a
 // shared store before this runs as more than one process.
-const defaultSeenNonces = new Set<string>();
+const defaultSeenNonces = new Map<string, number>();
 
 const signedPayload = (c: Pick<DeviceCredential, "deviceId" | "timestamp" | "nonce">, rawBody: string) =>
   `${c.deviceId}.${c.timestamp}.${c.nonce}.${rawBody}`;
+
+// The payload is dot-joined, so deviceId and nonce must not contain "." and
+// the timestamp must be an integer — otherwise one signed string could parse
+// as two different credentials (e.g. nonce "5.x" re-read as timestamp suffix
+// ".5" plus nonce "x"), and a captured signature would burn two nonces.
+const unambiguousField = (value: string): boolean => value !== "" && !value.includes(".");
 
 /** Compute the signature a device must send; also documents the exact format. */
 export function signDeviceRequest(
@@ -44,6 +53,12 @@ export function signDeviceRequest(
   rawBody: string,
   secret: string,
 ): string {
+  if (!unambiguousField(fields.deviceId) || !unambiguousField(fields.nonce)) {
+    throw new Error('deviceId and nonce must be non-empty and contain no "."');
+  }
+  if (!Number.isInteger(fields.timestamp)) {
+    throw new Error("timestamp must be an integer (ms since epoch)");
+  }
   return createHmac("sha256", secret).update(signedPayload(fields, rawBody)).digest("hex");
 }
 
@@ -58,9 +73,14 @@ export function verifyDeviceSignature(
   const seenNonces = opts.seenNonces ?? defaultSeenNonces;
   const { deviceId, timestamp, nonce, signature } = credential;
 
-  if (deviceId === "" || nonce === "" || signature === "" || !Number.isFinite(timestamp)) {
-    return false;
+  // A nonce outside the skew window can never verify again, so its entry is
+  // dead weight — sweep here to keep the store bounded in a long-lived process.
+  for (const [key, staleAfter] of seenNonces) {
+    if (now() > staleAfter) seenNonces.delete(key);
   }
+
+  if (!unambiguousField(deviceId) || !unambiguousField(nonce) || signature === "") return false;
+  if (!Number.isInteger(timestamp)) return false;
   if (Math.abs(now() - timestamp) > maxSkewMs) return false;
 
   const expected = createHmac("sha256", secret).update(signedPayload(credential, rawBody)).digest();
@@ -74,7 +94,7 @@ export function verifyDeviceSignature(
   // attacker cannot invalidate a device's pending request by guessing at it.
   const nonceKey = `${deviceId}:${nonce}`;
   if (seenNonces.has(nonceKey)) return false;
-  seenNonces.add(nonceKey);
+  seenNonces.set(nonceKey, timestamp + maxSkewMs);
   return true;
 }
 
@@ -102,6 +122,10 @@ const sessions = new Map<string, OwnerSession>();
 // whoever can call this function in-process.
 export function createOwnerSession(ownerId: string, opts: SessionOptions = {}): OwnerSession {
   const now = opts.now ?? Date.now;
+  // Abandoned sessions would otherwise accumulate forever; each mint sweeps.
+  for (const [token, existing] of sessions) {
+    if (now() >= existing.expiresAt) sessions.delete(token);
+  }
   const session: OwnerSession = {
     token: randomBytes(32).toString("base64url"),
     ownerId,

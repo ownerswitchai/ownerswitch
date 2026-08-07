@@ -13,7 +13,7 @@ const clock = (start = 0) => {
 const DEVICE_SECRET = "button-secret";
 
 /** Headers for a device-signed request over `body`, signed "now". */
-const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random()}`) => ({
+const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
   "content-type": "application/json",
   "x-device-id": "btn-1",
   "x-device-timestamp": String(at),
@@ -194,6 +194,45 @@ describe("control-plane HTTP API", () => {
     // replaying the exact same signed request from outside loopback -> 401
     const replay = await fetch(`${url}/kill`, { method: "POST", headers, body });
     expect(replay.status).toBe(401);
+  });
+
+  it("non-loopback kill with an owner session works and honors the claimed source", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await startAs(cp, "203.0.113.7");
+    const session = createOwnerSession("adam", { now: c.now });
+
+    const res = await fetch(`${url}/kill`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ source: "app", reason: "owner tapped stop" }),
+    });
+    expect(res.status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    const [entry] = cp.killSwitch.auditLog();
+    expect(entry.type).toBe("kill");
+    if (entry.type === "kill") {
+      expect(entry.event.source).toBe("app");
+      expect(entry.event.unauthenticated).toBeUndefined();
+    }
+  });
+
+  it("the Bearer auth-scheme is case-insensitive (RFC 9110)", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
+    cp.vetoWindows.set("v-1", window);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `bearer ${session.token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(window.vetoedBy).toBe("adam");
   });
 
   it("POST /restore without a session -> 401 generic, even from loopback", async () => {

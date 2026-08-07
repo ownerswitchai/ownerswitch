@@ -92,7 +92,8 @@ function deviceCredentialFrom(req: IncomingMessage): DeviceCredential | null {
 }
 
 function bearerToken(req: IncomingMessage): string | null {
-  const match = /^Bearer (.+)$/.exec(headerValue(req, "authorization") ?? "");
+  // the auth-scheme is case-insensitive (RFC 9110 §11.1); the token is not
+  const match = /^Bearer (.+)$/i.exec(headerValue(req, "authorization") ?? "");
   return match ? match[1] : null;
 }
 
@@ -100,7 +101,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   const now = opts.now ?? Date.now;
   const killSwitch = new KillSwitch(now);
   const vetoWindows = new Map<string, VetoWindow>();
-  const seenNonces = new Set<string>();
+  const seenNonces = new Map<string, number>();
 
   function ownerSessionFrom(req: IncomingMessage): OwnerSession | null {
     const token = bearerToken(req);
