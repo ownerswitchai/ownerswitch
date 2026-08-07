@@ -9,3 +9,6 @@ export type { VetoStatus, VetoOptions } from "./veto.js";
 
 export { RestoreCeremony } from "./twogo.js";
 export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.js";
+
+export { createControlPlane } from "./server.js";
+export type { ControlPlane, ControlPlaneOptions } from "./server.js";
