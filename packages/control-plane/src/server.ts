@@ -1,4 +1,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  isLoopbackAddress,
+  verifyDeviceSignature,
+  verifyOwnerSession,
+  type DeviceCredential,
+  type OwnerSession,
+} from "./auth.js";
 import { KillSwitch, type KillSource } from "./kill.js";
 import type { VetoWindow } from "./veto.js";
 
@@ -9,9 +16,20 @@ import type { VetoWindow } from "./veto.js";
  *
  * Deliberately framework-free: Node's http module only, so the surface stays
  * small enough to audit in one sitting.
+ *
+ * Auth keeps the asymmetry of the switch itself:
+ *  - POST /kill     — a device signature or owner session attributes the kill;
+ *                     with neither, loopback callers may still kill (recorded
+ *                     as an unauthenticated "api" kill). Stopping must never
+ *                     fail because auth was misconfigured.
+ *  - POST /restore  — owner session required. No exceptions, no loopback bypass.
+ *  - POST /veto/:id — owner session required; the session names the vetoer.
+ *  - GET  /status   — open; the gateway polls it and it leaks only kill state.
  */
 export interface ControlPlaneOptions {
   now?: () => number;
+  /** Shared secret the physical button / kill triggers sign requests with. */
+  deviceSecret?: string;
 }
 
 export interface ControlPlane {
@@ -27,13 +45,17 @@ const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voi
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
 
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (raw === "") return {}; // empty body is fine — stopping must never fail on a technicality
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseJsonBody(raw: string): Record<string, unknown> {
+  const trimmed = raw.trim();
+  if (trimmed === "") return {}; // empty body is fine — stopping must never fail on a technicality
   try {
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(trimmed);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new BadJsonError("body must be a JSON object");
     }
@@ -49,10 +71,48 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** 401s stay generic: an unauthenticated caller learns nothing about the domain. */
+function sendUnauthorized(res: ServerResponse): void {
+  sendJson(res, 401, { error: "unauthorized" });
+}
+
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/** All four x-device-* headers, or null when the request doesn't attempt device auth. */
+function deviceCredentialFrom(req: IncomingMessage): DeviceCredential | null {
+  const deviceId = headerValue(req, "x-device-id");
+  const timestamp = headerValue(req, "x-device-timestamp");
+  const nonce = headerValue(req, "x-device-nonce");
+  const signature = headerValue(req, "x-device-signature");
+  if (!deviceId || !timestamp || !nonce || !signature) return null;
+  return { deviceId, timestamp: Number(timestamp), nonce, signature };
+}
+
+function bearerToken(req: IncomingMessage): string | null {
+  const match = /^Bearer (.+)$/.exec(headerValue(req, "authorization") ?? "");
+  return match ? match[1] : null;
+}
+
 export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane {
   const now = opts.now ?? Date.now;
   const killSwitch = new KillSwitch(now);
   const vetoWindows = new Map<string, VetoWindow>();
+  const seenNonces = new Set<string>();
+
+  function ownerSessionFrom(req: IncomingMessage): OwnerSession | null {
+    const token = bearerToken(req);
+    return token === null ? null : verifyOwnerSession(token, { now });
+  }
+
+  function hasValidDeviceSignature(req: IncomingMessage, rawBody: string): boolean {
+    if (opts.deviceSecret === undefined) return false;
+    const credential = deviceCredentialFrom(req);
+    if (credential === null) return false;
+    return verifyDeviceSignature(credential, rawBody, opts.deviceSecret, { now, seenNonces });
+  }
 
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
@@ -68,20 +128,38 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   async function postKill(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // TODO(auth): verify the button HMAC here before trusting source "button".
-    const body = await readJsonBody(req);
-    const source = KILL_SOURCES.includes(body.source as KillSource)
+    // The raw body is read before parsing because the device HMAC covers the
+    // exact bytes on the wire.
+    const raw = await readRawBody(req);
+    const authenticated = hasValidDeviceSignature(req, raw) || ownerSessionFrom(req) !== null;
+
+    if (!authenticated && !isLoopbackAddress(req.socket.remoteAddress)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    const body = parseJsonBody(raw);
+    const claimed = KILL_SOURCES.includes(body.source as KillSource)
       ? (body.source as KillSource)
       : "api";
+    // An unverified source claim is not trusted: unauthenticated loopback
+    // kills are recorded as plain "api" kills, flagged in the audit trail.
+    const source = authenticated ? claimed : "api";
     const reason = typeof body.reason === "string" ? body.reason : undefined;
-    killSwitch.engage(source, reason);
+    killSwitch.engage(source, reason, { unauthenticated: !authenticated });
     sendJson(res, 200, { killed: true });
   }
 
   async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // TODO(auth): verify the owner passkey session and that the 2GO ceremony
-    // actually completed — for now we trust the authorization's shape only.
-    const body = await readJsonBody(req);
+    // Owner session required — no exceptions, no loopback bypass. Restoring is
+    // the expensive direction and stays that way.
+    if (ownerSessionFrom(req) === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    // TODO(2go): also verify the ceremony itself completed — for now we trust
+    // the authorization's shape only.
+    const body = parseJsonBody(await readRawBody(req));
     try {
       killSwitch.restore({
         ceremonyId: String(body.ceremonyId ?? ""),
@@ -90,21 +168,27 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       });
       sendJson(res, 200, { killed: false });
     } catch (err) {
+      // Detailed conflict messages are for authenticated callers only.
       sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
     }
   }
 
   async function postVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
-    // TODO(auth): verify the owner passkey session before accepting a veto.
+    // A veto is a stop, but it names an owner — so it stays authenticated,
+    // and the session (not the body) says who vetoed.
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
     const window = vetoWindows.get(id);
     if (!window) {
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    const body = await readJsonBody(req);
-    const by = typeof body.by === "string" ? body.by : "unknown";
+    parseJsonBody(await readRawBody(req)); // drain and validate; `by` comes from the session
     try {
-      window.veto(by);
+      window.veto(session.ownerId);
       sendJson(res, 200, { status: window.state });
     } catch (err) {
       sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });

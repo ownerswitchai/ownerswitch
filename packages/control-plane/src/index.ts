@@ -12,3 +12,12 @@ export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.
 
 export { createControlPlane } from "./server.js";
 export type { ControlPlane, ControlPlaneOptions } from "./server.js";
+
+export {
+  createOwnerSession,
+  isLoopbackAddress,
+  signDeviceRequest,
+  verifyDeviceSignature,
+  verifyOwnerSession,
+} from "./auth.js";
+export type { DeviceCredential, DeviceVerifyOptions, OwnerSession, SessionOptions } from "./auth.js";
