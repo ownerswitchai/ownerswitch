@@ -1,0 +1,11 @@
+{
+  "name": "@ownerswitchai/sdk",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo stub",
+    "typecheck": "echo stub",
+    "test": "echo stub"
+  }
+}

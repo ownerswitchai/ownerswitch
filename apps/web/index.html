@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OwnerSwitch — the kill switch your agents respect</title>
+<style>
+  :root{
+    --paper:#EFF1F4; --panel:#FFFFFF; --ink:#14171B; --ink-dim:#5B6470;
+    --red:#E02323; --red-deep:#8F0F0F; --yellow:#F5B800; --green:#1E9E4B;
+    --line:#D8DCE1;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+  .wrap{max-width:640px;margin:0 auto;padding:0 20px}
+
+  /* nav — concept 02 mark */
+  nav{display:flex;align-items:center;justify-content:space-between;padding:18px 0}
+  .logo{display:flex;align-items:center;gap:1px;text-decoration:none;color:var(--ink)}
+  .logo span{font-family:var(--mono);font-weight:600;font-size:17px;letter-spacing:-.01em}
+  .nav-tag{font-family:var(--mono);font-size:11px;color:var(--ink-dim);letter-spacing:.12em}
+
+  /* hazard stripe divider — the e-stop world */
+  .hazard{height:8px;background:repeating-linear-gradient(-45deg,var(--yellow) 0 12px,var(--ink) 12px 24px)}
+
+  header{padding:44px 0 10px;text-align:center}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.22em;color:var(--red);text-transform:uppercase;margin-bottom:14px}
+  h1{font-size:clamp(28px,7vw,40px);font-weight:800;letter-spacing:-.03em;line-height:1.12}
+  .sub{color:var(--ink-dim);font-size:16px;line-height:1.55;margin:16px auto 0;max-width:44ch}
+
+  /* the switch — concept 03 */
+  .switch-zone{text-align:center;padding:36px 0 8px}
+  .estop{background:var(--yellow);border:none;border-radius:26px;padding:22px;cursor:pointer;
+         box-shadow:0 10px 0 #C89600, 0 16px 28px rgba(0,0,0,.18);
+         transition:transform .08s ease, box-shadow .08s ease}
+  .estop:active{transform:translateY(7px);box-shadow:0 3px 0 #C89600, 0 6px 12px rgba(0,0,0,.2)}
+  .estop svg{display:block}
+  .hint{font-family:var(--mono);font-size:11px;letter-spacing:.2em;color:var(--ink-dim);margin-top:22px;text-transform:uppercase}
+  .restored{font-family:var(--mono);font-size:12px;color:var(--green);margin-top:10px;min-height:16px;opacity:0;transition:opacity .6s}
+  .restored.show{opacity:1}
+
+  /* tiers */
+  .tiers{display:grid;gap:12px;padding:34px 0 10px}
+  .tier{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;display:flex;gap:14px;align-items:baseline}
+  .tier b{font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--red);white-space:nowrap}
+  .tier p{font-size:14px;line-height:1.5;color:var(--ink-dim)}
+  .tier p strong{color:var(--ink);font-weight:600}
+
+  footer{text-align:center;font-family:var(--mono);font-size:12px;color:var(--ink-dim);padding:28px 0 44px}
+  footer em{color:var(--ink);font-style:normal}
+
+  /* blackout */
+  #blackout{position:fixed;inset:0;background:#000;z-index:50;display:none;
+            align-items:center;justify-content:center;text-align:left}
+  #blackout.on{display:flex}
+  #blackout .term{font-family:var(--mono);font-size:14px;line-height:2;color:#3AE375;padding:0 26px;max-width:520px;width:100%}
+  #blackout .term .dim{color:#2E6B45}
+  #blackout .punch{display:none;text-align:center;padding:0 26px}
+  #blackout .punch h2{color:#fff;font-size:clamp(26px,7vw,38px);font-weight:800;letter-spacing:-.02em;line-height:1.15}
+  #blackout .punch p{color:#8B939E;font-family:var(--mono);font-size:13px;margin-top:14px}
+  #blackout .punch p i{color:var(--red);font-style:normal}
+  #blackout .skip{position:fixed;bottom:22px;left:0;right:0;text-align:center;
+                  font-family:var(--mono);font-size:11px;color:#3A414A;letter-spacing:.15em}
+  body.fade-back{animation:fadeback .9s ease}
+  @keyframes fadeback{from{opacity:0}to{opacity:1}}
+  @media (prefers-reduced-motion: reduce){
+    .estop{transition:none} body.fade-back{animation:none}
+  }
+</style>
+</head>
+<body>
+  <div class="hazard"></div>
+  <div class="wrap">
+    <nav>
+      <a class="logo" href="#">
+        <svg viewBox="0 0 100 100" width="26" height="26" aria-hidden="true">
+          <circle cx="50" cy="56" r="32" fill="none" stroke="#E02323" stroke-width="13" stroke-linecap="round" stroke-dasharray="163 38" stroke-dashoffset="-119" transform="rotate(-90 50 56)"/>
+          <line x1="50" y1="8" x2="50" y2="46" stroke="#E02323" stroke-width="13" stroke-linecap="round"/>
+        </svg>
+        <span>wnerswitch</span>
+      </a>
+      <span class="nav-tag">v0 · demo</span>
+    </nav>
+
+    <header>
+      <div class="eyebrow">Owner-controlled · fail-closed</div>
+      <h1>The kill switch your AI agents can't talk their way around.</h1>
+      <p class="sub">Your agents deploy, move money, touch production. OwnerSwitch is the one control they can't social-engineer: a real stop, held by the real owner.</p>
+    </header>
+
+    <div class="switch-zone">
+      <button class="estop" id="estop" aria-label="Press the kill switch — demo">
+        <svg viewBox="0 0 100 100" width="96" height="96">
+          <circle cx="50" cy="55" r="38" fill="#8F0F0F"/>
+          <circle cx="50" cy="48" r="34" fill="#E02323"/>
+          <ellipse cx="41" cy="37" rx="13" ry="8" fill="#fff" opacity="0.25"/>
+        </svg>
+      </button>
+      <div class="hint">Live demo — press the switch</div>
+      <div class="restored" id="restored">&#9679; restored — owner verified</div>
+    </div>
+
+    <div class="tiers">
+      <div class="tier"><b>INSTANT</b><p><strong>Tripwires and the red button.</strong> Honeytoken touched or switch pressed — tokens revoked, sessions frozen, tools blocked. Seconds, not meetings.</p></div>
+      <div class="tier"><b>VETO</b><p><strong>Risky moves wait for you.</strong> Medium-risk actions hold for a few minutes. One tap on your phone stops them. Silence lets them through.</p></div>
+      <div class="tier"><b>APPROVE</b><p><strong>Critical ops never run alone.</strong> Money, deletion, production keys — default deny until your passkey says yes. No passkey, no action.</p></div>
+    </div>
+  </div>
+
+  <footer><em>ownerswitch.ai</em> — coming 2026</footer>
+  <div class="hazard"></div>
+
+  <div id="blackout" role="dialog" aria-live="polite">
+    <div class="term" id="term"></div>
+    <div class="punch" id="punch">
+      <h2>Everything stopped.<br>0.4 seconds.</h2>
+      <p>Restoring takes the owner. <i>Only the owner.</i></p>
+    </div>
+    <div class="skip">tap to skip</div>
+  </div>
+
+<script>
+(function(){
+  var estop = document.getElementById('estop');
+  var blackout = document.getElementById('blackout');
+  var term = document.getElementById('term');
+  var punch = document.getElementById('punch');
+  var restored = document.getElementById('restored');
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var timers = [], running = false;
+
+  var lines = [
+    '> kill signal received &middot; owner verified',
+    '> revoking agent tokens <span class="dim">....</span> done',
+    '> freezing sessions <span class="dim">.......</span> done',
+    '> blocking tool calls <span class="dim">.....</span> done',
+    '> agents running: <b>0</b>'
+  ];
+
+  function schedule(fn, ms){ timers.push(setTimeout(fn, ms)); }
+  function clearAll(){ timers.forEach(clearTimeout); timers = []; }
+
+  function endSequence(){
+    clearAll(); running = false;
+    blackout.classList.remove('on');
+    term.innerHTML = ''; punch.style.display = 'none'; term.style.display = 'block';
+    document.body.classList.add('fade-back');
+    schedule(function(){ document.body.classList.remove('fade-back'); }, 950);
+    restored.classList.add('show');
+    schedule(function(){ restored.classList.remove('show'); }, 5000);
+  }
+
+  function play(){
+    if (running) return; running = true;
+    blackout.classList.add('on');
+    term.innerHTML = ''; term.style.display = 'block'; punch.style.display = 'none';
+
+    if (reduced){
+      term.innerHTML = lines.join('<br>');
+      schedule(function(){ term.style.display='none'; punch.style.display='block'; }, 1600);
+      schedule(endSequence, 3600);
+      return;
+    }
+    var t = 350;
+    lines.forEach(function(l){
+      schedule(function(){ term.innerHTML += l + '<br>'; }, t);
+      t += 420;
+    });
+    schedule(function(){ term.style.display='none'; punch.style.display='block'; }, t + 500);
+    schedule(endSequence, t + 3300);
+  }
+
+  estop.addEventListener('click', play);
+  blackout.addEventListener('click', function(){ if (running) endSequence(); });
+})();
+</script>
+</body>
+</html>
