@@ -3,19 +3,23 @@
 **The agent asks for the action. OwnerSwitch performs it. The agent never
 sees a credential.**
 
-Today the gateway proves the decision path: a tool call comes in over MCP,
-`evaluate()` answers allow / veto / approve / deny, and an engaged kill
-switch turns everything into deny. But when the answer is yes, the agent
-still executes the action with a credential *it* holds — and the credential
-in the agent's hands is exactly the thing OwnerSwitch exists to eliminate.
-A token handed out survives the moment of the decision: it can be
-exfiltrated, replayed after a kill, or used for a different action than the
-one that was approved.
+Today the decision path is real end to end: the MCP proxy fronts the
+agent, the gateway's `evaluate()` answers allow / veto / approve / deny
+against live kill state, and on yes the proxy *forwards the call to the
+upstream MCP server* — tooling that acts with a credential the agent's
+side holds. The credential on the agent's side of the boundary is exactly
+the thing OwnerSwitch exists to eliminate: a token handed out survives the
+moment of the decision. It can be exfiltrated, replayed after a kill, or
+used for a different action than the one that was approved — which is why
+the kill switch's own docs are careful to say kill stops *new* actions and
+does not revoke credentials already issued downstream.
 
 This package inverts the last step. When the answer is yes, OwnerSwitch
 calls the connector API **itself, with its own credential**, and returns
 the *result* of the action to the agent — never a token. There is nothing
-for the agent to leak, because the agent was never given anything.
+for the agent to leak, because the agent was never given anything. For
+executor-routed actions, the "credentials already issued downstream"
+residue disappears entirely: nothing is issued downstream.
 
 One connector to start: **GitHub PR merge** (`merge_pull_request`). It is a
 single, well-bounded, irreversible-ish action with a clean approve/deny
@@ -38,7 +42,7 @@ executor never reaches back into the gateway's memory.
 | `canonicalArgs` | `string`  | the arguments, canonicalized (below). The executor runs *these bytes* — not a re-supplied copy — so what runs is exactly what was evaluated and approved |
 | `resourceId`    | `string`  | stable id of the object acted on, e.g. `github:pr:ownerswitchai/ownerswitch#7` — audit and future per-resource rules key on this, independent of args shape |
 | `policyVersion` | `string`  | content hash of the policy the verdict came from. `Policy` has no version field today, so the version *is* the hash of its canonical JSON; if the policy changed between decision and execution, the audit trail shows which policy said yes |
-| `killEpoch`     | `number`  | the control plane's kill epoch at mint time (§3). Must still match at execution time |
+| `killEpoch`     | `number`  | `KillSwitch.epoch` at mint time (§3). Must still match at execution time |
 | `expiresAt`     | `number`  | unix ms. Tickets are short-lived (minutes, not hours) — a yes is not a standing grant |
 | `nonce`         | `string`  | unique per ticket; burned on first execution attempt |
 | `singleUse`     | `true`    | always `true` in v0. The field exists so a future batch/recurring grant is an explicit, visible design change — not an accidental default |
@@ -60,10 +64,10 @@ executor caring.
 ## 2. The flow
 
 ```
-agent ──MCP──▶ gateway ── evaluate() ──▶ allow ────────────────────┐
-                              ├────────▶ veto   ── released ──────┤
-                              ├────────▶ approve ── 2GO confirmed ┤
-                              └────────▶ deny ────────────────────┼──▶ refused
+agent ──MCP──▶ proxy ── evaluate() ──▶ allow ──────────────────────┐
+                             ├───────▶ veto   ── released ────────┤
+                             ├───────▶ approve ── 2GO confirmed ──┤
+                             └───────▶ deny ──────────────────────┼──▶ refused
                                                                   │   (result to agent)
                                                      mint ActionTicket
                                                                   │
@@ -77,6 +81,11 @@ agent ──MCP──▶ gateway ── evaluate() ──▶ allow ────�
 agent ◀────────── result: { merged: true, sha } ──────────────────┘
                   (data, never a token)
 ```
+
+Where today the proxy's yes-path is `forward(call)` — hand the call to the
+upstream MCP server and pass its result through — an executor-routed
+operation's yes-path is `executor.run(ticket)`. Same lanes, same refusals,
+different last step.
 
 The agent's MCP call *is* the request; the result of the merge is the
 response. From the agent's point of view `merge_pull_request` is just a
@@ -102,12 +111,26 @@ control plane** — never a cached answer:
 3. `now < ticket.expiresAt`;
 4. the nonce must not already be burned.
 
-**The kill epoch, defined.** The control plane's monotone count of kill
-engagements: every `KillSwitch.engage()` bumps it; restore never resets
-it. It is derivable from the control plane's existing audit log today (the
-number of `kill` entries), so this package invents no new kill state — a
-follow-up control-plane PR exposes it as `epoch` on `GET /status`, and the
-gateway's `ControlPlaneClient` learns to read it. This PR touches neither.
+**The kill epoch is the control plane's, not ours.** `KillSwitch` already
+maintains it: `epochCounter`, bumped on every `engage()`, exposed as
+`KillSwitch.epoch`, persisted across process restarts by the
+`KillStateStore` (and fail-closed at boot if that state can't be trusted).
+Restore never resets it. The control plane already uses it for exactly the
+pattern this design needs: a restore ceremony binds to the epoch in force
+when it started, and a later kill bumps the counter and invalidates every
+ceremony in flight. The `ActionTicket` applies the same rule to actions —
+a ticket binds to the epoch at mint time, and a later kill invalidates
+every ticket in flight. This package invents no kill state of its own.
+
+**The one small follow-up the executor needs:** `GET /status` does not
+expose the epoch yet — it returns `killed`, the attributing kill's
+`reason`/`at`, and the persistence-degradation fields. A small
+control-plane PR adds `epoch` to the `/status` body (and the executor's
+kill-state reader consumes it). One note for that PR: `/status` is
+deliberately unauthenticated and documented as leaking *only kill state* —
+the epoch adds a monotone count of every kill ever engaged, a deliberate
+and worthwhile widening, but one to acknowledge in the endpoint's docs
+rather than slip in.
 
 **Why an epoch and not just `killed === false`:** kill-then-restore. The
 owner kills at 12:00, cleans up, completes 2GO and restores at 12:10. At
@@ -128,22 +151,24 @@ merge is not a retry, it's an incident.
 
 ## 4. How this composes with what already exists
 
-The gateway remains the only authority on yes/no. `evaluate()` does not
-change, the decision vocabulary does not change, veto windows and 2GO do
-not change. This package is purely the *"then what"* for yes — it runs the
-action instead of forwarding the call to a credential the agent holds.
+The gateway's engine remains the only authority on yes/no. `evaluate()`
+does not change, the decision vocabulary does not change, veto windows and
+2GO do not change, and the MCP proxy keeps deciding every call the way it
+does today. This package is purely the *"then what"* for yes — it runs the
+action instead of forwarding the call to tooling that holds a credential
+on the agent's side.
 
 | piece | today | with the executor |
 | --- | --- | --- |
 | `@ownerswitchai/shared` | `Decision`, `ToolCall`, `Policy`, `Verdict` | unchanged |
-| gateway `evaluate()` / `evaluateRemote()` | the decision | unchanged — still the sole authority |
-| control plane | boolean kill state + audit log, `GET /status` | follow-up: expose `epoch` on `/status` (derived from the audit log) |
-| gateway, on yes | reports "allowed"; the agent would act on its own credential | follow-up: mint an `ActionTicket`, call `executor.run()`, relay the result |
+| gateway `evaluate()` / `evaluateRemote()` | the decision, live kill state required | unchanged — still the sole authority |
+| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` without `epoch` | follow-up: add `epoch` to the `/status` body (§3) |
+| mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | follow-up: for executor-routed operations, mint an `ActionTicket` and call `executor.run()` instead; relay the result |
 | **this package** | — | ticket type, refusal core, `ExecutorBackend`, stubbed GitHub merge backend |
 
-The wiring PR (gateway mints tickets and calls the executor) comes after
-this design is agreed. This PR deliberately wires nothing and touches no
-existing package.
+The wiring PR (the proxy minting tickets and calling the executor) comes
+after this design is agreed. This PR deliberately wires nothing and
+touches no existing package.
 
 ## 5. What this does NOT solve
 
@@ -155,6 +180,13 @@ Honesty about the boundary, in the same spirit as the threat model:
   this package never hears about it. The executor closes the gap *for
   actions routed through OwnerSwitch* — routing everything through
   OwnerSwitch is a deployment property, not something this code can force.
+- **Kill stops new executions, not in-flight ones.** The re-check in §3
+  runs immediately before `backend.execute()`; once the connector call is
+  on the wire, a kill cannot recall it. This is the same enforcement
+  boundary the kill switch itself documents — kill guarantees no *new*
+  authorized action crosses the boundary, nothing more. What the executor
+  removes is the other half of that caveat: for actions routed through it,
+  there are no credentials issued downstream to outlive the kill.
 - **OwnerSwitch's credential is now the prize.** The executor holds a
   standing GitHub credential; whoever compromises the executor process
   merges without any ticket. Least privilege (a GitHub App with
