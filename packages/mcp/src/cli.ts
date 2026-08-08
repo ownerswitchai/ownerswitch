@@ -9,6 +9,7 @@
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
+import { createTripwire } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
 import { createVetoClient } from "./veto-client.js";
@@ -17,18 +18,30 @@ async function main(): Promise<void> {
   const config = loadConfig(process.argv.slice(2), process.env);
   const { controlPlaneUrl, device, timeoutMs = 1500 } = config;
 
+  // Always on — scanning is pattern-based (no registry to configure), and the
+  // gateway already holds the device credentials a signed kill needs.
+  const tripwire = createTripwire({
+    controlPlaneUrl,
+    deviceId: device.id,
+    secret: device.secret,
+  });
+
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,
     agentId: config.agentId,
     controlPlane: createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs }),
     vetoClient: createVetoClient({ baseUrl: controlPlaneUrl, device, timeoutMs }),
+    honeytokens: tripwire,
   });
 
   let shuttingDown = false;
   const shutdown = (code: number): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    void proxy.close().finally(() => process.exit(code));
+    void proxy.close().finally(() => {
+      tripwire.stop(); // logs loudly if a tripped kill is still unconfirmed
+      process.exit(code);
+    });
   };
 
   await proxy.connectUpstream(
@@ -50,7 +63,7 @@ async function main(): Promise<void> {
   console.error(
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
-      `control plane: ${controlPlaneUrl}`,
+      `control plane: ${controlPlaneUrl}; honeytoken tripwires: armed`,
   );
 }
 

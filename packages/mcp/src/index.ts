@@ -3,7 +3,7 @@
  * another MCP server and enforces OwnerSwitch policy on every tool call.
  */
 export { createOwnerSwitchProxy, PROXY_NAME, PROXY_VERSION } from "./proxy.js";
-export type { OwnerSwitchProxy, ProxyOptions } from "./proxy.js";
+export type { HoneytokenGuard, OwnerSwitchProxy, ProxyOptions } from "./proxy.js";
 
 export { OwnerSwitchErrorCode, OwnerSwitchRefusal } from "./errors.js";
 export type { OwnerSwitchErrorCodeName, RefusalData } from "./errors.js";

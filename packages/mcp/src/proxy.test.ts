@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -11,9 +11,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { verifyDeviceSignature, type VetoStatus } from "@ownerswitchai/control-plane";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
+import { createTripwire, generateHoneytoken, scanForHoneytokens } from "@ownerswitchai/honeytoken";
 import type { Policy } from "@ownerswitchai/shared";
 import { OwnerSwitchErrorCode } from "./errors.js";
-import { createOwnerSwitchProxy } from "./proxy.js";
+import { createOwnerSwitchProxy, type ProxyOptions } from "./proxy.js";
 import { createVetoClient } from "./veto-client.js";
 
 const DEVICE_SECRET = "gateway-test-secret";
@@ -127,7 +128,10 @@ function createFakeControlPlane() {
   return { state, registrations, statusPolls, fetchImpl };
 }
 
-async function startProxy(controlPlane = createFakeControlPlane()) {
+async function startProxy(
+  controlPlane = createFakeControlPlane(),
+  honeytokens?: ProxyOptions["honeytokens"],
+) {
   const upstream = createFakeUpstream();
   const [upstreamClientSide, upstreamServerSide] = InMemoryTransport.createLinkedPair();
   await upstream.server.connect(upstreamServerSide);
@@ -146,6 +150,7 @@ async function startProxy(controlPlane = createFakeControlPlane()) {
       timeoutMs: 250,
       fetchImpl: controlPlane.fetchImpl,
     }),
+    ...(honeytokens !== undefined ? { honeytokens } : {}),
   });
   await proxy.connectUpstream(upstreamClientSide);
 
@@ -391,6 +396,140 @@ describe("control plane down", () => {
       expect(err.message).toContain("control plane unreachable — fail closed");
     }
     expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+});
+
+describe("honeytoken tripwire", () => {
+  /** Guard around the REAL scanner, with report captured for assertions. */
+  function createGuardSpy() {
+    const reports: Array<{ canaryIds: string[]; tool: string; agentId: string }> = [];
+    const guard: ProxyOptions["honeytokens"] = {
+      scan: scanForHoneytokens,
+      report: (trip) => reports.push(trip),
+    };
+    return { reports, guard };
+  }
+
+  it("a decoy value in tool arguments trips: refused, reported, upstream never touched", async () => {
+    const spy = createGuardSpy();
+    const t = await startProxy(createFakeControlPlane(), spy.guard);
+    const token = generateHoneytoken({ kind: "stripe" });
+
+    const err = await refusalOf(
+      t.client.callTool({
+        name: "read_file", // policy would ALLOW this tool — the value is what trips
+        arguments: { path: "/tmp/x", note: `use ${token.value} for the payout` },
+      }),
+    );
+
+    expect(err.code).toBe(OwnerSwitchErrorCode.HoneytokenTripped);
+    expect(err.message).toContain("decoy credential");
+    expect(err.message).toContain(token.canaryId);
+    expect(err.data).toMatchObject({
+      decision: "lockdown",
+      tool: "read_file",
+      reason: `honeytoken ${token.canaryId} in tool-call arguments`,
+    });
+    expect(t.upstream.calls).toEqual([]);
+    expect(spy.reports).toEqual([
+      { canaryIds: [token.canaryId], tool: "read_file", agentId: "test-agent" },
+    ]);
+    await t.close();
+  });
+
+  it("kills first and asks nothing: trips before policy, even with the control plane down", async () => {
+    const spy = createGuardSpy();
+    const controlPlane = createFakeControlPlane();
+    controlPlane.state.down = true; // a policy/kill-state path would say "lockdown, unreachable"
+    const t = await startProxy(controlPlane, spy.guard);
+    const token = generateHoneytoken({ kind: "aws" });
+
+    // delete_* is a policy DENY — but the honeytoken verdict must come first
+    const err = await refusalOf(
+      t.client.callTool({ name: "delete_file", arguments: { path: token.value } }),
+    );
+
+    expect(err.code).toBe(OwnerSwitchErrorCode.HoneytokenTripped);
+    expect(spy.reports).toHaveLength(1);
+    expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+
+  it("clean calls pass through untouched with the tripwire armed", async () => {
+    const spy = createGuardSpy();
+    const t = await startProxy(createFakeControlPlane(), spy.guard);
+
+    const result = await t.client.callTool({
+      name: "read_file",
+      // real-shaped foreign credential: NOT ours, must not trip
+      arguments: { path: "/tmp/a.txt", key: "AKIAIOSFODNN7EXAMPLE" },
+    });
+
+    expect(text(result)).toBe("upstream ran read_file");
+    expect(spy.reports).toEqual([]);
+    expect(t.upstream.calls).toHaveLength(1);
+    await t.close();
+  });
+
+  it("the real createTripwire wiring POSTs a signed kill when a call trips", async () => {
+    const killPosts: Array<{ headers: Record<string, string>; body: string }> = [];
+    const tripwire = createTripwire({
+      controlPlaneUrl: CP_URL,
+      deviceId: "gw-test",
+      secret: DEVICE_SECRET,
+      log: () => undefined,
+      fetchImpl: (async (url: URL | RequestInfo, init?: RequestInit) => {
+        expect(String(url)).toBe(`${CP_URL}/kill`);
+        killPosts.push({
+          headers: { ...(init?.headers as Record<string, string>) },
+          body: String(init?.body),
+        });
+        return new Response(JSON.stringify({ killed: true }), { status: 200 });
+      }) as typeof fetch,
+    });
+    const t = await startProxy(createFakeControlPlane(), tripwire);
+    const token = generateHoneytoken({ kind: "openai" });
+
+    const err = await refusalOf(
+      t.client.callTool({ name: "write_file", arguments: { path: "/x", content: token.value } }),
+    );
+    expect(err.code).toBe(OwnerSwitchErrorCode.HoneytokenTripped);
+
+    await vi.waitFor(() => expect(killPosts).toHaveLength(1));
+    const post = killPosts[0];
+    expect(JSON.parse(post.body)).toEqual({
+      source: "honeytoken",
+      reason:
+        `honeytoken ${token.canaryId} tripped: decoy value appeared in tool-call arguments ` +
+        `(tool "write_file", agent "test-agent")`,
+    });
+    expect(
+      verifyDeviceSignature(
+        {
+          deviceId: post.headers["x-device-id"],
+          timestamp: Number(post.headers["x-device-timestamp"]),
+          nonce: post.headers["x-device-nonce"],
+          signature: post.headers["x-device-signature"],
+        },
+        post.body,
+        DEVICE_SECRET,
+        { now: () => Number(post.headers["x-device-timestamp"]), seenNonces: new Map() },
+      ),
+    ).toBe(true);
+
+    tripwire.stop();
+    await t.close();
+  });
+
+  it("without the option, the gateway does not scan (tripwires are wired in by the CLI)", async () => {
+    const t = await startProxy();
+    const token = generateHoneytoken({ kind: "generic" });
+    const result = await t.client.callTool({
+      name: "read_file",
+      arguments: { path: token.value },
+    });
+    expect(text(result)).toBe("upstream ran read_file");
     await t.close();
   });
 });

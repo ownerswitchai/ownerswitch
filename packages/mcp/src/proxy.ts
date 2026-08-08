@@ -14,6 +14,7 @@ import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import {
   approvalRequired,
   controlPlaneUnavailable,
+  honeytokenTripped,
   lockdown,
   ownerVetoed,
   policyDenied,
@@ -42,6 +43,19 @@ export const PROXY_VERSION = "0.0.1";
  *    (the gateway client's contract), and any veto-lane failure refuses the
  *    call rather than letting it through.
  */
+/**
+ * Honeytoken tripwire, structurally the shape @ownerswitchai/honeytoken's
+ * createTripwire returns. scan() must be synchronous and cheap (it runs on
+ * every call); report() must retry internally and never throw — the refusal
+ * must not depend on the kill POST landing first.
+ */
+export interface HoneytokenGuard {
+  /** matches of decoy values in the given text; [] when clean */
+  scan(text: string): ReadonlyArray<{ canaryId: string }>;
+  /** fire-and-forget kill report for a decoy seen in a tool call */
+  report(trip: { canaryIds: string[]; tool: string; agentId: string }): void;
+}
+
 export interface ProxyOptions {
   policy: Policy;
   /** /status lookup used by evaluateRemote — fail-closed by construction */
@@ -50,6 +64,11 @@ export interface ProxyOptions {
   vetoClient: VetoClient;
   /** names this gateway's agent in tool calls and audit */
   agentId?: string;
+  /**
+   * Decoy-credential tripwire, checked on every call BEFORE kill state and
+   * policy: a tripped honeytoken kills first and asks nothing.
+   */
+  honeytokens?: HoneytokenGuard;
 }
 
 export interface OwnerSwitchProxy {
@@ -102,6 +121,20 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
     const call: ToolCall = { agentId, tool: req.params.name, args: req.params.arguments };
+
+    // Honeytokens outrank everything. A decoy value in the arguments is
+    // evidence of credential theft in progress, so this runs BEFORE the
+    // kill-state lookup and the policy — no veto window, no approval lane,
+    // no appeal, and no dependency on the control plane being reachable.
+    // The kill report retries in the background; the call fails right now.
+    if (options.honeytokens !== undefined) {
+      const matches = options.honeytokens.scan(JSON.stringify(call.args ?? {}));
+      if (matches.length > 0) {
+        const canaryIds = matches.map((m) => m.canaryId);
+        options.honeytokens.report({ canaryIds, tool: call.tool, agentId });
+        throw honeytokenTripped(call.tool, canaryIds);
+      }
+    }
 
     // evaluateRemote fetches live kill state per call and never throws; the
     // wrapper records the state it saw so a lockdown (kill engaged, or the

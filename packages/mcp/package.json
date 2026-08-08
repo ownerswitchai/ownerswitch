@@ -12,6 +12,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@ownerswitchai/control-plane": "workspace:*",
     "@ownerswitchai/gateway": "workspace:*",
+    "@ownerswitchai/honeytoken": "workspace:*",
     "@ownerswitchai/shared": "workspace:*"
   },
   "scripts": {

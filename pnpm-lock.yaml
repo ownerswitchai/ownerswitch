@@ -39,6 +39,12 @@ importers:
         specifier: workspace:*
         version: link:../shared
 
+  packages/honeytoken:
+    dependencies:
+      '@ownerswitchai/control-plane':
+        specifier: workspace:*
+        version: link:../control-plane
+
   packages/mcp:
     dependencies:
       '@modelcontextprotocol/sdk':
@@ -50,6 +56,9 @@ importers:
       '@ownerswitchai/gateway':
         specifier: workspace:*
         version: link:../gateway
+      '@ownerswitchai/honeytoken':
+        specifier: workspace:*
+        version: link:../honeytoken
       '@ownerswitchai/shared':
         specifier: workspace:*
         version: link:../shared
