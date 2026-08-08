@@ -5,7 +5,7 @@ export { KillSwitch, KILL_SOURCES } from "./kill.js";
 export type { KillSource, KillEvent, AuditEntry, KillSwitchOptions } from "./kill.js";
 
 export { KillStateFileStore } from "./kill-state.js";
-export type { KillStateStore, KillStateLoad, PersistedKillState } from "./kill-state.js";
+export type { KillStateStore, KillStateLoad, PersistedKillState, SaveResult } from "./kill-state.js";
 
 export { VetoWindow } from "./veto.js";
 export type { VetoStatus, VetoOptions } from "./veto.js";

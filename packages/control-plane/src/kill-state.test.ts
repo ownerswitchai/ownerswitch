@@ -29,7 +29,7 @@ describe("KillStateFileStore", () => {
 
   it("round-trips killed and not-killed state", () => {
     const store = new KillStateFileStore(tempPath());
-    store.save(killedState);
+    expect(store.save(killedState)).toEqual({ durable: true }); // every fsync succeeded
     expect(store.load()).toEqual({ outcome: "loaded", state: killedState });
 
     store.save({ version: 1, killed: false, epoch: 4 });
@@ -82,14 +82,24 @@ describe("KillStateFileStore", () => {
     if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/symlink|not a regular file/);
   });
 
-  it("degrade() makes stale state unable to pass for healthy: next load fails closed", () => {
+  it("degrade() quarantines stale state and reports success: next load fails closed", () => {
     const path = tempPath();
     const store = new KillStateFileStore(path);
     store.save({ version: 1, killed: false, epoch: 2 }); // stale not-killed state on disk
-    store.degrade(); // called after a failed save of a NEWER state
+    expect(store.degrade()).toBe(true); // called after a failed save of a NEWER state
     const loaded = store.load();
     expect(loaded.outcome).toBe("corrupt"); // never "loaded { killed: false }", never "absent"
     expect(existsSync(store.markerPath)).toBe(true);
+  });
+
+  it("degrade() reports FAILURE when the stale state cannot be removed", () => {
+    // a non-empty directory at the state path cannot be unlinked — the stale
+    // "state" stays put, and degrade() must say so instead of pretending
+    const dirAsFile = mkdtempSync(join(tmpdir(), "ownerswitch-killstate-"));
+    writeFileSync(join(dirAsFile, "occupied"), "", "utf8");
+    const store = new KillStateFileStore(dirAsFile);
+    expect(store.degrade()).toBe(false);
+    expect(existsSync(dirAsFile)).toBe(true); // and indeed it is still there
   });
 
   it("unparseable content loads as corrupt, with the why", () => {
@@ -111,6 +121,7 @@ describe("KillStateFileStore", () => {
       '{"version":2,"killed":true,"epoch":1,"lastKill":{"source":"button","at":1}}',
       '{"version":1,"killed":"yes","epoch":1}',
       '{"version":1,"killed":true,"epoch":-1,"lastKill":{"source":"button","at":1}}',
+      '{"version":1,"killed":false,"epoch":9007199254740993}', // beyond Number.isSafeInteger
       '{"version":1,"killed":true,"epoch":1}', // killed without the attributing event
       '{"version":1,"killed":false,"epoch":1,"lastKill":{"source":"button","at":1}}',
       '{"version":1,"killed":true,"epoch":1,"lastKill":{"source":"meteor","at":1}}',

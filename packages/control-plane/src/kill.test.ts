@@ -2,26 +2,36 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { KillStateFileStore, type KillStateLoad, type KillStateStore, type PersistedKillState } from "./kill-state.js";
+import {
+  KillStateFileStore,
+  type KillStateLoad,
+  type KillStateStore,
+  type PersistedKillState,
+  type SaveResult,
+} from "./kill-state.js";
 import { KillSwitch } from "./kill.js";
 
 const auth = { ceremonyId: "c1", ownerId: "adam", completedAt: 2000 };
 
-/** In-memory store: records every save, serves whatever load is scripted. */
+/** In-memory store: records every save, serves whatever load/outcomes are scripted. */
 class FakeStore implements KillStateStore {
   saved: PersistedKillState[] = [];
   loadResult: KillStateLoad = { outcome: "absent" };
   failSaves = false;
+  saveResult: SaveResult = { durable: true };
+  degradeResult = true;
   degradeCalls = 0;
   load(): KillStateLoad {
     return this.loadResult;
   }
-  save(state: PersistedKillState): void {
+  save(state: PersistedKillState): SaveResult {
     if (this.failSaves) throw new Error("disk full");
     this.saved.push(state);
+    return this.saveResult;
   }
-  degrade(): void {
+  degrade(): boolean {
     this.degradeCalls += 1;
+    return this.degradeResult;
   }
 }
 
@@ -147,11 +157,60 @@ describe("KillSwitch", () => {
       expect(store.degradeCalls).toBe(1); // and the stale on-disk state was quarantined
       expect(errors).toHaveBeenCalled();
 
+      // the quarantine succeeded (degrade returned true), so the plane is
+      // degraded but not unhealthy: a restart fails closed, not open
+      expect(k.quarantineFailed).toBe(false);
+
       // the next persist that succeeds clears the degradation
       store.failSaves = false;
       k.engage("api");
       expect(k.persistenceDegraded).toBe(false);
       expect(store.saved.at(-1)?.killed).toBe(true);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a failed QUARANTINE marks the switch unhealthy until a persist succeeds", () => {
+    const store = new FakeStore();
+    store.failSaves = true;
+    store.degradeResult = false; // the stale state cannot be neutralised either
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const k = new KillSwitch(() => 1000, { store });
+      k.engage("button");
+      expect(k.killed).toBe(true); // the in-memory kill always lands
+      expect(k.persistenceDegraded).toBe(true);
+      expect(k.quarantineFailed).toBe(true); // a restart may boot from stale state
+
+      // owner intervention repairs the store; the next successful persist IS
+      // the repair — correct state on disk means no stale state to fear
+      store.failSaves = false;
+      k.engage("api");
+      expect(k.quarantineFailed).toBe(false);
+      expect(k.persistenceDegraded).toBe(false);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a save that published but did not fsync reports degraded persistence, not silence", () => {
+    const store = new FakeStore();
+    store.saveResult = { durable: false, detail: "directory fsync unavailable" };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const k = new KillSwitch(() => 1000, { store });
+      k.engage("button");
+      expect(k.killed).toBe(true);
+      expect(store.saved.at(-1)?.killed).toBe(true); // the state WAS published...
+      expect(k.persistenceDegraded).toBe(true); // ...but durability is not claimed
+      expect(k.quarantineFailed).toBe(false); // published state is correct — no stale hazard
+      expect(errors).toHaveBeenCalled();
+
+      // a fully durable save clears it
+      store.saveResult = { durable: true };
+      k.engage("api");
+      expect(k.persistenceDegraded).toBe(false);
     } finally {
       errors.mockRestore();
     }

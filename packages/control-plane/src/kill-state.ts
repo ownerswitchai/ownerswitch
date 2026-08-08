@@ -50,16 +50,29 @@ export type KillStateLoad =
   | { outcome: "loaded"; state: PersistedKillState }
   | { outcome: "corrupt"; detail: string };
 
+/**
+ * A save that returned (did not throw) has PUBLISHED the new state — readers
+ * see it. It is DURABLE only when every fsync succeeded too; durable: false
+ * means a power cut could still resurface the previous state, and the caller
+ * must surface that as degraded persistence, not silence.
+ */
+export type SaveResult = { durable: true } | { durable: false; detail: string };
+
 export interface KillStateStore {
   load(): KillStateLoad;
-  /** Must be atomic: a reader sees the previous state or this one, never a torn write. */
-  save(state: PersistedKillState): void;
   /**
-   * Called after a FAILED save. Best-effort and non-throwing: make any stale
-   * on-disk state unable to pass for healthy, so a later load() fails closed
-   * instead of reporting a not-killed state that save() failed to update.
+   * Must be atomic: a reader sees the previous state or this one, never a
+   * torn write. Throws when the state could not be published at all.
    */
-  degrade(): void;
+  save(state: PersistedKillState): SaveResult;
+  /**
+   * Called after a FAILED save. Never throws; returns true only when stale
+   * on-disk state can no longer pass for healthy — i.e. a later load() is
+   * guaranteed to fail closed rather than report a state save() failed to
+   * replace. A false return means the caller must treat the store, and the
+   * process's own restart, as unsafe.
+   */
+  degrade(): boolean;
 }
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -83,7 +96,7 @@ function asPersistedKillState(value: unknown): PersistedKillState | null {
   if (Object.keys(rest).length > 0) return null;
   if (version !== 1) return null;
   if (typeof killed !== "boolean") return null;
-  if (typeof epoch !== "number" || !Number.isInteger(epoch) || epoch < 0) return null;
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return null;
   if (killed !== (lastKill !== undefined)) return null;
   if (lastKill === undefined) return { version, killed, epoch };
   if (typeof lastKill !== "object" || lastKill === null || Array.isArray(lastKill)) return null;
@@ -174,18 +187,19 @@ export class KillStateFileStore implements KillStateStore {
     return { outcome: "loaded", state };
   }
 
-  save(state: PersistedKillState): void {
+  save(state: PersistedKillState): SaveResult {
     mkdirSync(dirname(this.filePath), { recursive: true });
     // Marker before state: a save that dies half-way can only err toward
     // "initialised but missing", which boots killed — never toward fresh.
-    this.ensureMarker();
+    const markerDurable = this.ensureMarker();
     const tmp = `${this.filePath}.${randomBytes(8).toString("hex")}.tmp`;
     let fd: number | undefined;
     try {
       fd = openSync(tmp, CREATE_FLAGS, 0o600);
       writeSync(fd, `${JSON.stringify(state, null, 2)}\n`);
       // rename orders visibility; only fsync orders durability. The file
-      // first, then (after the rename) the directory entry.
+      // first, then (after the rename) the directory entry — the transition
+      // counts as durable only once every one of these fsyncs succeeded.
       fsyncSync(fd);
       closeSync(fd);
       fd = undefined;
@@ -205,31 +219,47 @@ export class KillStateFileStore implements KillStateStore {
       }
       throw err;
     }
-    this.fsyncDir();
+    const dirDurable = this.fsyncDir();
+    return markerDurable && dirDurable
+      ? { durable: true }
+      : {
+          durable: false,
+          detail:
+            `the directory entry for ${this.filePath} could not be fsynced — ` +
+            `the new state is visible but a power cut may resurface the previous one`,
+        };
   }
 
-  degrade(): void {
-    // Per the KillStateStore contract: best-effort, never throws. Making the
-    // marker exist and the state file not exist turns any stale on-disk
-    // claim into "initialised but missing" — which boots killed.
+  degrade(): boolean {
+    // Per the KillStateStore contract: never throws, reports honestly.
+    // Making the marker exist and the state file not exist turns any stale
+    // on-disk claim into "initialised but missing" — which boots killed.
+    let markerOk: boolean;
     try {
       this.ensureMarker();
+      markerOk = true;
     } catch {
-      /* the disk is already failing; nothing more to do */
+      markerOk = existsSync(this.markerPath); // pre-existing marker still counts
     }
+    let stateGone: boolean;
     try {
       unlinkSync(this.filePath);
-    } catch {
-      /* ENOENT or a failing disk — either way, best effort */
+      stateGone = true;
+    } catch (err) {
+      // ENOENT is success (nothing stale to quarantine); anything else is
+      // only success if the stale file is verifiably no longer there.
+      stateGone = errCode(err) === "ENOENT" ? true : !existsSync(this.filePath);
     }
+    return markerOk && stateGone;
   }
 
-  private ensureMarker(): void {
+  /** Returns true when the marker durably exists (created+fsynced now, or already there). */
+  private ensureMarker(): boolean {
     let fd: number;
     try {
       fd = openSync(this.markerPath, CREATE_FLAGS, 0o600);
     } catch (err) {
-      if (errCode(err) === "EEXIST") return; // already initialised
+      if (errCode(err) === "EEXIST") return true; // already initialised (and synced when created)
       throw err;
     }
     try {
@@ -241,24 +271,29 @@ export class KillStateFileStore implements KillStateStore {
     } finally {
       closeSync(fd);
     }
-    this.fsyncDir();
+    return this.fsyncDir();
   }
 
-  private fsyncDir(): void {
-    // fsync of the parent directory is what makes the rename itself durable.
-    // Platforms that cannot open or fsync a directory get one loud log line
-    // instead of a false promise.
+  /**
+   * fsync of the parent directory is what makes a rename (or marker
+   * creation) durable. Returns false — and logs once — where the platform
+   * cannot do it: the caller must report that as degraded persistence, never
+   * accept it silently.
+   */
+  private fsyncDir(): boolean {
     let fd: number;
     try {
       fd = openSync(dirname(this.filePath), constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
     } catch (err) {
       this.warnDirFsyncOnce(err);
-      return;
+      return false;
     }
     try {
       fsyncSync(fd);
+      return true;
     } catch (err) {
       this.warnDirFsyncOnce(err);
+      return false;
     } finally {
       closeSync(fd);
     }

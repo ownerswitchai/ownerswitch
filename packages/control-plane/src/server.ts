@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ToolCall } from "@ownerswitchai/shared";
 import {
   isLoopbackAddress,
@@ -36,17 +37,19 @@ import { VetoWindow } from "./veto.js";
  *                     clocks untouched — a retry or second tab cannot
  *                     invalidate the id the owner holds, and a stolen
  *                     same-owner session cannot reset the cooldown.
- *  - DELETE /restore/ceremony/:id — owner session required; explicitly
- *                     cancels the owner's pending ceremony. The only way to
- *                     abandon one early — and cancelling only ever makes
- *                     restore harder, never easier.
+ *                     There is deliberately NO cancel verb: a pending
+ *                     ceremony ends only by TTL expiry, consumption, or a
+ *                     new kill epoch. A cancel would hand the same bearer
+ *                     token a repeatable way to destroy the owner's pending
+ *                     ceremony — the exact lockout idempotency closes.
  *  - GET  /restore/ceremony/:id — owner session required; the ceremony's
  *                     state, cooldown remaining, and expiry.
  *  - POST /restore  — owner session required plus a live server-side ceremony
  *                     (GO 2/2): owned by this owner, past its cooldown, inside
  *                     its TTL, bound to the current kill epoch, consumed
- *                     atomically. No exceptions, no loopback bypass, no
- *                     shape-only path.
+ *                     atomically (single-spend holds for this one process and
+ *                     event loop — where all ceremony state lives). No
+ *                     exceptions, no loopback bypass, no shape-only path.
  *  - POST /veto     — device signature required; a gateway registers a window
  *                     for a call it is holding. Registration puts text in
  *                     front of the owner and grows server state, so unlike
@@ -62,17 +65,97 @@ export interface ControlPlaneOptions {
   deviceSecret?: string;
   /**
    * Where the kill switch persists killed state, its reason and the kill
-   * epoch across process restarts. Defaults to DEFAULT_KILL_STATE_FILE in the
-   * process working directory — an explicit, visible location, never a temp
-   * dir the OS may clean between boots. Pass null for a deliberately
-   * ephemeral control plane (unit tests, throwaway demos): a restart then
-   * forgets the kill, so only opt out where that is the point.
+   * epoch across process restarts.
+   *
+   * In production (the default), this is REQUIRED and checked at boot: it
+   * must be an explicit absolute path outside the working directory, in a
+   * directory owned by the process user with no group/world write access.
+   * Anything else refuses to start — whoever can write this directory holds
+   * an administrative capability over kill state.
+   *
+   * With dev: true, it defaults to DEFAULT_KILL_STATE_FILE in the working
+   * directory, and null runs a deliberately ephemeral control plane (unit
+   * tests, throwaway demos): a restart then forgets the kill, so only opt
+   * out where that is the point.
    */
   killStateFile?: string | null;
+  /**
+   * Development mode: skips the kill-state path safety checks (with a loud
+   * one-line warning) and enables the conveniences above. Never set this for
+   * a control plane that real agents depend on.
+   */
+  dev?: boolean;
 }
 
-/** Default kill-state location, resolved against the working directory. */
+/** Default kill-state location IN DEV MODE, resolved against the working directory. */
 export const DEFAULT_KILL_STATE_FILE = "ownerswitch-kill-state.json";
+
+/**
+ * Production boot guard for the kill-state path. Every refusal says exactly
+ * what is wrong and what the operator must do — a control plane that starts
+ * with a tamperable state file is worse than one that refuses to start.
+ */
+function guardKillStatePath(file: string | null | undefined): string {
+  const refuse = (what: string, fix: string): never => {
+    const msg = `[ownerswitch] refusing to start: ${what}. ${fix} (Pass dev: true only for a development instance.)`;
+    console.error(msg);
+    throw new Error(msg);
+  };
+  if (file === undefined) {
+    return refuse(
+      "no killStateFile configured",
+      "Set killStateFile to an explicit absolute path in a protected directory, e.g. /var/lib/ownerswitch/kill-state.json.",
+    );
+  }
+  if (file === null) {
+    return refuse(
+      "killStateFile: null (ephemeral) is a development convenience",
+      "An ephemeral control plane forgets kills on restart. Set an absolute killStateFile.",
+    );
+  }
+  if (!isAbsolute(file)) {
+    return refuse(
+      `killStateFile "${file}" is a relative path`,
+      "Set an explicit absolute path — a relative path silently points at a different store whenever the working directory changes.",
+    );
+  }
+  const resolved = resolve(file);
+  const rel = relative(process.cwd(), resolved);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    return refuse(
+      `killStateFile "${resolved}" resolves inside the working directory ${process.cwd()}`,
+      "The working directory is not a protected location. Put the state file in a dedicated directory such as /var/lib/ownerswitch/.",
+    );
+  }
+  const dir = dirname(resolved);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let stats;
+  try {
+    stats = statSync(dir);
+  } catch (err) {
+    return refuse(
+      `the kill-state directory ${dir} cannot be inspected (${err instanceof Error ? err.message : String(err)})`,
+      `Create it first, owned by uid ${uid ?? "<process uid>"} with mode 0700: mkdir -p ${dir} && chmod 700 ${dir}.`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    return refuse(`${dir} is not a directory`, "Point killStateFile at a file inside a real, protected directory.");
+  }
+  if ((stats.mode & 0o022) !== 0) {
+    return refuse(
+      `the kill-state directory ${dir} is group- or world-writable (mode ${(stats.mode & 0o777).toString(8)})`,
+      `Anyone who can write this directory can tamper with kill state. Run: chmod 700 ${dir}.`,
+    );
+  }
+  // POSIX-only check: without getuid (Windows) ownership cannot be compared.
+  if (uid !== undefined && stats.uid !== uid) {
+    return refuse(
+      `the kill-state directory ${dir} is owned by uid ${stats.uid}, but the control plane runs as uid ${uid}`,
+      `The directory must belong to the user that runs the control plane. Run: chown ${uid} ${dir}.`,
+    );
+  }
+  return resolved;
+}
 
 export interface ControlPlane {
   /** Plug into http.createServer(handler). */
@@ -154,11 +237,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // constructor — before this function returns a handler, so before any
   // request can be answered. A process restart resumes the kill state it
   // went down with (`kill -9` is not a restore), and a state file that
-  // exists but cannot be read boots the plane killed.
-  const killStateFile =
-    opts.killStateFile === null
-      ? undefined
-      : (opts.killStateFile ?? resolve(process.cwd(), DEFAULT_KILL_STATE_FILE));
+  // exists but cannot be read boots the plane killed. In production the
+  // path is guarded first: a state file an attacker can write is not
+  // persistence, so a bad location refuses to start.
+  let killStateFile: string | undefined;
+  if (opts.dev === true) {
+    console.error(
+      "[ownerswitch] DEV MODE: kill-state path safety checks are disabled — never point production agents at this control plane.",
+    );
+    killStateFile =
+      opts.killStateFile === null
+        ? undefined
+        : (opts.killStateFile ?? resolve(process.cwd(), DEFAULT_KILL_STATE_FILE));
+  } else {
+    killStateFile = guardKillStatePath(opts.killStateFile);
+  }
   const killSwitch = new KillSwitch(
     now,
     killStateFile === undefined ? {} : { store: new KillStateFileStore(killStateFile) },
@@ -184,10 +277,20 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
   // Degraded durability is worth a field only when true: the in-memory state
   // in this response is in force either way, but a restart may not preserve
-  // it. Absence of the field means persistence is healthy (or deliberately
-  // ephemeral).
-  const degradedFields = () =>
-    killSwitch.persistenceDegraded ? { persistenceDegraded: true as const } : {};
+  // it. Absence of the fields means persistence is healthy (or deliberately
+  // ephemeral). `unhealthy` is the harder condition: a failed persist whose
+  // stale on-disk state could ALSO not be quarantined — a restart may boot
+  // from that stale state, so the plane is not fit for service until an
+  // owner repairs the store.
+  const degradedFields = () => ({
+    ...(killSwitch.persistenceDegraded ? { persistenceDegraded: true as const } : {}),
+    ...(killSwitch.quarantineFailed
+      ? {
+          unhealthy:
+            "stale kill state could not be quarantined — durable state is untrustworthy; owner intervention required",
+        }
+      : {}),
+  });
 
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
@@ -261,8 +364,10 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // its clocks untouched. A double-click, a browser retry or a second tab
     // must not invalidate the id the owner is holding — and a stolen
     // same-owner session must not be able to reset the cooldown forever by
-    // hammering this route. Abandoning a pending ceremony is an explicit,
-    // separate act: DELETE /restore/ceremony/:id, then start anew.
+    // hammering this route. There is deliberately no way to abandon a
+    // pending ceremony early: it ends by TTL expiry, consumption, or a new
+    // kill epoch — any owner-session cancel verb would reopen the same
+    // stolen-session lockout this idempotency closes.
     for (const [existingId, record] of ceremonies) {
       if (record.ceremony.ownerId === session.ownerId) {
         sendJson(res, 200, {
@@ -326,27 +431,6 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     });
   }
 
-  function deleteCeremony(req: IncomingMessage, res: ServerResponse, id: string): void {
-    // The explicit cancel: the ONLY way to abandon a pending ceremony, since
-    // GO 1/2 is idempotent and never replaces one implicitly. Cancelling
-    // deletes server state, so it can only make restore harder — the next
-    // GO 1/2 starts a fresh ceremony with a fresh cooldown. Kill state is
-    // untouched.
-    const session = ownerSessionFrom(req);
-    if (session === null) {
-      sendUnauthorized(res);
-      return;
-    }
-    const record = ceremonies.get(id);
-    // Same absence semantics as GET: another owner's ceremony reads as absent.
-    if (record === undefined || record.ceremony.ownerId !== session.ownerId) {
-      sendJson(res, 404, { error: `no ceremony "${id}"` });
-      return;
-    }
-    ceremonies.delete(id);
-    sendJson(res, 200, { cancelled: true });
-  }
-
   async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // GO 2/2. Owner session required — no exceptions, no loopback bypass.
     // Restoring is the expensive direction and stays that way.
@@ -358,10 +442,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const body = parseJsonBody(await readRawBody(req));
     const ceremonyId = typeof body.ceremonyId === "string" ? body.ceremonyId : "";
     const record = ceremonies.get(ceremonyId);
-    // Every rejection is the same generic 409: which check failed (wrong
-    // owner, wrong epoch, timing, replay) is not information a caller
-    // holding a stolen session gets to enumerate.
+    // Every rejection is the same generic 409 — a uniform response SHAPE, so
+    // the body never says which check failed (wrong owner, wrong epoch,
+    // timing, replay). It is NOT a constant-time or side-channel-free
+    // guarantee: evaluation order, timing and transport metadata still
+    // differ between causes.
     const rejected = () => sendJson(res, 409, { error: "restore rejected" });
+    // A failed quarantine means stale kill state may survive on disk and a
+    // restart may boot from it. Until an owner repairs the store, the plane
+    // must not become ready: restores stay denied, because flipping the
+    // in-memory switch is the only working stop left.
+    if (killSwitch.quarantineFailed) return rejected();
     if (record === undefined) return rejected();
     if (record.ceremony.ownerId !== session.ownerId) return rejected();
     if (record.epoch !== killSwitch.epoch) return rejected();
@@ -369,7 +460,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     try {
       // confirm() is the atomic consume: it only succeeds in "ready" (past
       // the cooldown, inside the TTL) and transitions to "completed" before
-      // returning, so a concurrent second spend of the same ceremony throws.
+      // returning, so a concurrent second spend throws. Single-spend holds
+      // for one process and one event loop — where all ceremony state lives.
       killSwitch.restore(record.ceremony.confirm());
     } catch {
       return rejected();
@@ -459,9 +551,6 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
     if (method === "GET" && ceremonyMatch) {
       return getCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
-    }
-    if (method === "DELETE" && ceremonyMatch) {
-      return deleteCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
     }
     if (method === "POST" && path === "/restore") return postRestore(req, res);
     if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);

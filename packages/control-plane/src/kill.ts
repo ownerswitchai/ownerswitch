@@ -55,6 +55,7 @@ export class KillSwitch {
   private readonly store?: KillStateStore;
   private lastKillEvent?: KillEvent;
   private degradedSince?: { at: number; reason: string };
+  private quarantineFailedState = false;
 
   constructor(
     private readonly now: () => number = Date.now,
@@ -118,13 +119,25 @@ export class KillSwitch {
   }
 
   /**
-   * True while the most recent attempt to persist a transition failed: the
-   * in-memory state is authoritative and in force, but a restart may not
-   * come back with it (the store has been degraded so a restart fails
-   * CLOSED, never open). Cleared by the next successful persist.
+   * True while the most recent transition is not known durable: the save
+   * threw, or it published but an fsync failed. The in-memory state is
+   * authoritative and in force, but a restart may not come back with it.
+   * Cleared by the next fully durable persist.
    */
   get persistenceDegraded(): boolean {
     return this.degradedSince !== undefined;
+  }
+
+  /**
+   * True when a persist failed AND the store could not quarantine the stale
+   * on-disk state it failed to replace — a restart may boot from that stale
+   * state. The control plane must not present itself as fit for service
+   * while this holds (the HTTP layer reports it unhealthy and keeps denying
+   * restores). Cleared when a later persist writes correct state (that IS
+   * the repair) or a later quarantine succeeds.
+   */
+  get quarantineFailed(): boolean {
+    return this.quarantineFailedState;
   }
 
   /**
@@ -166,16 +179,21 @@ export class KillSwitch {
   /**
    * Persistence must never block a transition — above all not a kill: if the
    * disk is the thing that's broken, the switch still flips in memory. But a
-   * failed persist is never swallowed either: durability is recorded as
-   * DEGRADED (surfaced by the HTTP layer on /kill and /status), the failure
-   * is logged loudly, and the store is degraded — best-effort — so that a
-   * later restart fails CLOSED instead of resurrecting the stale on-disk
-   * state this save failed to replace.
+   * failed persist is never swallowed either:
+   *  - save threw → durability DEGRADED (surfaced on /kill and /status) and
+   *    the store is asked to quarantine the stale state it failed to replace
+   *  - the quarantine itself fails → the process is UNHEALTHY: a restart may
+   *    boot from stale state, so the HTTP layer keeps denying restores until
+   *    an owner repairs the store
+   *  - save published but an fsync failed → DEGRADED too: a transition is
+   *    durable only after every fsync succeeds, and a directory-fsync
+   *    failure must surface, not pass in silence
    */
   private persist(): void {
     if (this.store === undefined) return;
+    let result;
     try {
-      this.store.save({
+      result = this.store.save({
         version: 1,
         killed: this.killedState,
         epoch: this.epochCounter,
@@ -183,19 +201,47 @@ export class KillSwitch {
           ? { lastKill: this.lastKillEvent }
           : {}),
       });
-      this.degradedSince = undefined; // durable again as of this write
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       this.degradedSince = { at: this.now(), reason };
       console.error(
         `[ownerswitch] FAILED to persist kill state (${reason}) — the in-memory state stands ` +
-          `and durability is now reported DEGRADED; the on-disk store is being degraded so a ` +
-          `restart boots killed rather than resurrecting stale state.`,
+          `and durability is now reported DEGRADED; quarantining the stale on-disk state.`,
       );
+      let quarantined = false;
       try {
-        this.store.degrade();
+        quarantined = this.store.degrade();
       } catch {
-        /* the contract says degrade() never throws; belt over braces */
+        quarantined = false; // the contract says degrade() never throws; belt over braces
+      }
+      if (quarantined) {
+        // stale state is neutralised: a restart fails closed, not open
+        this.quarantineFailedState = false;
+      } else if (!this.quarantineFailedState) {
+        this.quarantineFailedState = true;
+        console.error(
+          `[ownerswitch] QUARANTINE FAILED: stale kill state could not be neutralised and may ` +
+            `survive a restart. The control plane is UNHEALTHY pending owner intervention — ` +
+            `restores are denied until a persist succeeds.`,
+        );
+      }
+      return;
+    }
+    if (result.durable) {
+      // fully durable: the on-disk state is correct AND survives power loss —
+      // both the degradation and any earlier quarantine failure are repaired
+      this.degradedSince = undefined;
+      this.quarantineFailedState = false;
+    } else {
+      const first = this.degradedSince === undefined;
+      this.degradedSince = { at: this.now(), reason: result.detail };
+      // the published state is CORRECT, so any stale-state hazard is gone
+      this.quarantineFailedState = false;
+      if (first) {
+        console.error(
+          `[ownerswitch] kill state was published but is NOT yet durable (${result.detail}) — ` +
+            `persistence is reported DEGRADED.`,
+        );
       }
     }
   }

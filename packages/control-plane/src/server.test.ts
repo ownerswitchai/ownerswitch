@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,12 +39,22 @@ const bearer = (token: string) => ({
 });
 
 /**
- * A control plane with persistence explicitly OFF: each test gets fresh kill
- * state and leaves no file behind. The restart tests below are the ones that
- * exercise persistence, and they construct their own with a real state file.
+ * A control plane with persistence explicitly OFF (dev mode): each test gets
+ * fresh kill state and leaves no file behind. The restart tests below are the
+ * ones that exercise persistence, and they construct their own with a real
+ * state file — in production mode, so the boot-time path guard runs too. The
+ * one-line DEV MODE warning is silenced here so it doesn't drown test output;
+ * a dedicated test asserts it fires.
  */
-const ephemeral = (opts: Omit<ControlPlaneOptions, "killStateFile"> = {}) =>
-  createControlPlane({ ...opts, killStateFile: null });
+const ephemeral = (opts: Omit<ControlPlaneOptions, "killStateFile" | "dev"> = {}) => {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    return createControlPlane({ ...opts, dev: true, killStateFile: null });
+  } finally {
+    console.error = original;
+  }
+};
 
 /** A kill-state path inside a fresh private temp dir. */
 const tempStateFile = () => join(mkdtempSync(join(tmpdir(), "ownerswitch-test-")), "kill-state.json");
@@ -402,7 +412,7 @@ describe("control-plane HTTP API", () => {
     expect((await postRestore(url, owner.token, id)).status).toBe(200);
   });
 
-  it("a valid-but-foreign id and a random nonexistent id reject byte-identically", async () => {
+  it("a valid-but-foreign id and a random nonexistent id reject with an identical response shape", async () => {
     const c = clock();
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
@@ -416,8 +426,10 @@ describe("control-plane HTTP API", () => {
     const foreign = await postRestore(url, other.token, real);
     const missing = await postRestore(url, other.token, `cer_${randomUUID()}`);
 
-    // "no such id", "wrong owner" and "expired" must be one indistinguishable
-    // answer: same status, same headers, byte-identical body
+    // "no such id", "wrong owner" and "expired" must share one response
+    // SHAPE: same status, same content-type, byte-identical body. This pins
+    // the shape only — timing and evaluation order are NOT normalised, so it
+    // is not a constant-time guarantee.
     expect(foreign.status).toBe(409);
     expect(missing.status).toBe(409);
     const [foreignBody, missingBody] = [await foreign.text(), await missing.text()];
@@ -652,17 +664,89 @@ describe("control-plane HTTP API", () => {
     expect(cp.killSwitch.epoch).toBe(0);
   });
 
+  /** Expect createControlPlane to refuse to start, with the reason in the error. */
+  const expectRefusal = (opts: ControlPlaneOptions, match: RegExp) => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(() => createControlPlane(opts)).toThrow(match);
+      expect(errors).toHaveBeenCalled(); // the refusal is also logged, with the fix
+    } finally {
+      errors.mockRestore();
+    }
+  };
+
+  it("production refuses to start without a killStateFile", () => {
+    expectRefusal({ now: clock().now }, /no killStateFile configured/);
+  });
+
+  it("production refuses killStateFile: null — ephemeral is dev-only", () => {
+    expectRefusal({ now: clock().now, killStateFile: null }, /ephemeral/);
+  });
+
+  it("production refuses a relative killStateFile", () => {
+    expectRefusal({ now: clock().now, killStateFile: "state/kill.json" }, /relative path/);
+  });
+
+  it("production refuses a killStateFile inside the working directory", () => {
+    expectRefusal(
+      { now: clock().now, killStateFile: join(process.cwd(), "state", "kill.json") },
+      /inside the working directory/,
+    );
+  });
+
+  it("production refuses a state directory that does not exist, and says how to create it", () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "ownerswitch-test-")), "missing", "kill.json");
+    expectRefusal({ now: clock().now, killStateFile: missing }, /cannot be inspected.*mkdir -p/s);
+  });
+
+  it("production refuses a group- or world-writable state directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-test-"));
+    chmodSync(dir, 0o770); // group-writable
+    expectRefusal({ now: clock().now, killStateFile: join(dir, "kill.json") }, /group- or world-writable/);
+    chmodSync(dir, 0o777); // world-writable
+    expectRefusal({ now: clock().now, killStateFile: join(dir, "kill.json") }, /group- or world-writable/);
+  });
+
+  it("production refuses a state directory owned by another user", () => {
+    let path: string;
+    if (process.getuid?.() === 0) {
+      // running as root: hand the directory to another uid
+      const dir = mkdtempSync(join(tmpdir(), "ownerswitch-test-"));
+      chownSync(dir, 12345, 12345);
+      path = join(dir, "kill.json");
+    } else {
+      // not root: "/" exists, is not writable by us, and is owned by root
+      path = "/ownerswitch-kill-state.json";
+    }
+    expectRefusal({ now: clock().now, killStateFile: path }, /owned by uid/);
+  });
+
+  it("dev: true skips the path checks, with a loud one-line warning", () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cp = createControlPlane({ now: clock().now, dev: true, killStateFile: null });
+      expect(cp.killSwitch.killed).toBe(false); // ephemeral dev plane boots armed
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("DEV MODE"));
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
   it("failed persistence is admitted on the wire: /kill and /status report degraded durability", async () => {
     const c = clock(500);
     // A DIRECTORY where the state file should be: loading fails closed
-    // (not a regular file) and every save fails (rename onto a directory) —
-    // a deterministic, real-filesystem persistence failure.
+    // (not a regular file), every save fails (rename onto a directory), and
+    // the quarantine fails too (a directory cannot be unlinked) — a
+    // deterministic, real-filesystem persistence failure. dev: true because
+    // the path guard would (rightly) refuse a state file inside the
+    // world-writable os tmpdir.
     const stateDir = mkdtempSync(join(tmpdir(), "ownerswitch-test-"));
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const cp = createControlPlane({ now: c.now, killStateFile: stateDir });
+      const cp = createControlPlane({ now: c.now, killStateFile: stateDir, dev: true });
       expect(cp.killSwitch.killed).toBe(true); // fail-closed boot...
       expect(cp.killSwitch.persistenceDegraded).toBe(true); // ...whose own persist already failed
+      expect(cp.killSwitch.quarantineFailed).toBe(true); // ...and whose stale state is stuck in place
 
       const url = await start(cp);
       const kill = await fetch(`${url}/kill`, {
@@ -671,13 +755,60 @@ describe("control-plane HTTP API", () => {
         body: JSON.stringify({ reason: "manual stop" }),
       });
       // the kill is in force, but the response does not claim durability it lacks
-      expect(await kill.json()).toEqual({ killed: true, persistenceDegraded: true });
+      expect(await kill.json()).toEqual({
+        killed: true,
+        persistenceDegraded: true,
+        unhealthy: expect.stringContaining("owner intervention"),
+      });
       expect(await (await fetch(`${url}/status`)).json()).toEqual({
         killed: true,
         reason: "manual stop",
         at: 500,
         persistenceDegraded: true,
+        unhealthy: expect.stringContaining("owner intervention"),
       });
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a failed quarantine keeps the plane out of service: restores are denied until the store is repaired", async () => {
+    const c = clock();
+    const stateFile = tempStateFile();
+    const cp = createControlPlane({ now: c.now, killStateFile: stateFile }); // production mode, first boot
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    // sabotage the store before the first transition: a NON-EMPTY directory
+    // at the state path makes save fail (rename) AND quarantine fail (unlink)
+    mkdirSync(stateFile);
+    writeFileSync(join(stateFile, "occupied"), "", "utf8");
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await fetch(`${url}/kill`, { method: "POST" });
+      expect(cp.killSwitch.killed).toBe(true); // the kill itself always lands
+      expect(cp.killSwitch.quarantineFailed).toBe(true);
+
+      // a full, patient 2GO ceremony still cannot restore while the stale
+      // store is unquarantined — flipping the in-memory switch is the only
+      // working stop left, so the plane keeps denying
+      const id = await startCeremony(url, session.token);
+      c.advance(30_000);
+      const denied = await postRestore(url, session.token, id);
+      expect(denied.status).toBe(409);
+      expect(await denied.json()).toEqual({ error: "restore rejected" }); // same generic shape
+      expect(cp.killSwitch.killed).toBe(true);
+
+      // owner intervention: repair the store, then a successful persist (the
+      // next kill) clears the condition and restore works again
+      rmSync(stateFile, { recursive: true });
+      await fetch(`${url}/kill`, { method: "POST" }); // persists cleanly -> healthy
+      expect(cp.killSwitch.quarantineFailed).toBe(false);
+      const fresh = await startCeremony(url, session.token);
+      c.advance(30_000);
+      expect((await postRestore(url, session.token, fresh)).status).toBe(200);
+      expect(cp.killSwitch.killed).toBe(false);
     } finally {
       errors.mockRestore();
     }
@@ -727,47 +858,26 @@ describe("control-plane HTTP API", () => {
     expect(cp.killSwitch.killed).toBe(false);
   });
 
-  it("DELETE /restore/ceremony/:id is the explicit cancel: the id dies, and GO 1/2 then mints fresh", async () => {
+  it("there is NO cancel verb: DELETE /restore/ceremony/:id is not a route, and the ceremony survives it", async () => {
     const c = clock();
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const owner = createOwnerSession("adam", { now: c.now });
-    const other = createOwnerSession("eve", { now: c.now });
 
     cp.killSwitch.engage("api");
     const id = await startCeremony(url, owner.token);
 
-    // no session -> 401; a foreign owner sees absence and cancels nothing
-    expect((await fetch(`${url}/restore/ceremony/${id}`, { method: "DELETE" })).status).toBe(401);
-    const foreign = await fetch(`${url}/restore/ceremony/${id}`, {
-      method: "DELETE",
-      headers: bearer(other.token),
-    });
-    expect(foreign.status).toBe(404);
-    expect(
-      (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(owner.token) })).status,
-    ).toBe(200); // still alive
-
-    // the owner cancels: the id is gone from every surface and never spends
-    const cancel = await fetch(`${url}/restore/ceremony/${id}`, {
+    // a cancel would hand the same bearer token a repeatable way to destroy
+    // the owner's pending ceremony — the lockout idempotent GO 1/2 closed
+    const attempt = await fetch(`${url}/restore/ceremony/${id}`, {
       method: "DELETE",
       headers: bearer(owner.token),
     });
-    expect(cancel.status).toBe(200);
-    expect(await cancel.json()).toEqual({ cancelled: true });
-    expect(
-      (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(owner.token) })).status,
-    ).toBe(404);
-    c.advance(30_000);
-    expect((await postRestore(url, owner.token, id)).status).toBe(409);
-    expect(cp.killSwitch.killed).toBe(true);
+    expect(attempt.status).toBe(404); // not a route
 
-    // only after the explicit cancel does GO 1/2 mint a NEW ceremony — with a
-    // fresh cooldown of its own
-    const fresh = await startCeremony(url, owner.token);
-    expect(fresh).not.toBe(id);
+    // the pending ceremony is untouched and still spends
     c.advance(30_000);
-    expect((await postRestore(url, owner.token, fresh)).status).toBe(200);
+    expect((await postRestore(url, owner.token, id)).status).toBe(200);
     expect(cp.killSwitch.killed).toBe(false);
   });
 

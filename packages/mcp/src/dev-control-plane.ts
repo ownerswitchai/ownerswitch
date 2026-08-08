@@ -23,7 +23,10 @@ const deviceSecret = process.env.OWNERSWITCH_DEVICE_SECRET ?? "dev-device-secret
 const killStateFile =
   process.env.OWNERSWITCH_KILL_STATE_FILE ?? resolve(process.cwd(), DEFAULT_KILL_STATE_FILE);
 
-const controlPlane = createControlPlane({ deviceSecret, killStateFile });
+// dev: true — this is the quickstart instance; the kill-state path safety
+// checks that production enforces (absolute path, protected directory) are
+// deliberately off here, and createControlPlane says so loudly at boot.
+const controlPlane = createControlPlane({ deviceSecret, killStateFile, dev: true });
 const owner = createOwnerSession("owner-dev");
 
 createServer(controlPlane.handler).listen(port, "127.0.0.1", () => {
