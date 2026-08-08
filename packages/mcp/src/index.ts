@@ -9,7 +9,15 @@ export { OwnerSwitchErrorCode, OwnerSwitchRefusal } from "./errors.js";
 export type { OwnerSwitchErrorCodeName, RefusalData } from "./errors.js";
 
 export { ConfigError, loadConfig, parseConfig } from "./config.js";
-export type { OwnerSwitchMcpConfig, UpstreamConfig } from "./config.js";
+export type { ExecutorRouteConfig, OwnerSwitchMcpConfig, UpstreamConfig } from "./config.js";
+
+export {
+  DEFAULT_TICKET_TTL_MS,
+  deriveResourceId,
+  mintActionTicket,
+  policyVersionOf,
+} from "./executor-route.js";
+export type { ExecutorWiring, MintContext } from "./executor-route.js";
 
 export { createVetoClient, VetoClientError } from "./veto-client.js";
 export type { DeviceIdentity, VetoClient, VetoClientOptions } from "./veto-client.js";

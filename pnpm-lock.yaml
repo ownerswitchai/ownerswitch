@@ -33,7 +33,11 @@ importers:
         specifier: workspace:*
         version: link:../shared
 
-  packages/executor: {}
+  packages/executor:
+    dependencies:
+      '@ownerswitchai/gateway':
+        specifier: workspace:*
+        version: link:../gateway
 
   packages/gateway:
     dependencies:
@@ -55,6 +59,9 @@ importers:
       '@ownerswitchai/control-plane':
         specifier: workspace:*
         version: link:../control-plane
+      '@ownerswitchai/executor':
+        specifier: workspace:*
+        version: link:../executor
       '@ownerswitchai/gateway':
         specifier: workspace:*
         version: link:../gateway

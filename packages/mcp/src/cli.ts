@@ -8,6 +8,12 @@
  */
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  Executor,
+  GitHubMergePrExecutor,
+  liveKillStateFromControlPlane,
+  type ActionTicket,
+} from "@ownerswitchai/executor";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
 import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
@@ -60,13 +66,34 @@ async function runGateway(argv: string[]): Promise<void> {
   const { controlPlaneUrl, device, timeoutMs = 1500 } = config;
 
   const tripwire = armTripwire(controlPlaneUrl, device);
+  const controlPlane = createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs });
+
+  // Executor routing, when configured: routed tools are performed by the
+  // executor with OwnerSwitch's own credential, never forwarded upstream.
+  // The executor re-checks live kill state through the SAME fail-closed
+  // control-plane client the decision path uses. One Executor instance for
+  // the gateway's lifetime — its nonce store is what makes tickets
+  // single-use. The GitHub backend has no HTTP client yet (deliberately
+  // stubbed): a routed call that clears every check still fails at the
+  // backend with a clear "not implemented" until the live client lands.
+  const routes = config.executorRoutes;
+  const executor =
+    routes !== undefined && Object.keys(routes).length > 0
+      ? (() => {
+          const runner = new Executor(new GitHubMergePrExecutor(), {
+            fetchLiveKillState: liveKillStateFromControlPlane(controlPlane),
+          });
+          return { routes, run: (ticket: ActionTicket) => runner.run(ticket) };
+        })()
+      : undefined;
 
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,
     agentId: config.agentId,
-    controlPlane: createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs }),
+    controlPlane,
     vetoClient: createVetoClient({ baseUrl: controlPlaneUrl, device, timeoutMs }),
     ...(tripwire !== undefined ? { honeytokens: tripwire } : {}),
+    ...(executor !== undefined ? { executor } : {}),
   });
 
   let shuttingDown = false;
@@ -106,7 +133,8 @@ async function runGateway(argv: string[]): Promise<void> {
   console.error(
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
-      `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}`,
+      `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}; ` +
+      `executor routes: ${executor !== undefined ? Object.keys(executor.routes).join(", ") : "none (all yes-decisions forward upstream)"}`,
   );
 }
 

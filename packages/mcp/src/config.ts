@@ -17,6 +17,14 @@ export interface UpstreamConfig {
   cwd?: string;
 }
 
+/** Where an executor-routed MCP tool lands: which backend, which action. */
+export interface ExecutorRouteConfig {
+  /** e.g. "github" */
+  connector: string;
+  /** e.g. "merge_pull_request" */
+  operation: string;
+}
+
 export interface OwnerSwitchMcpConfig {
   controlPlaneUrl: string;
   device: DeviceIdentity;
@@ -26,6 +34,15 @@ export interface OwnerSwitchMcpConfig {
   agentId?: string;
   /** timeout for each control-plane HTTP call in ms; default 1500 */
   timeoutMs?: number;
+  /**
+   * MCP tool name → executor (connector, operation), e.g.
+   * `"github.merge_pr": { "connector": "github", "operation": "merge_pull_request" }`.
+   * A yes-decision on a routed tool mints an ActionTicket and the executor
+   * performs the action with OwnerSwitch's own credential — the call is
+   * never forwarded upstream, and the agent receives the result, never a
+   * token. Tools not listed here forward exactly as before.
+   */
+  executorRoutes?: Record<string, ExecutorRouteConfig>;
 }
 
 /** Configuration problems are startup errors: message only, no stack noise. */
@@ -109,6 +126,21 @@ function parseUpstream(v: unknown, path: string): UpstreamConfig {
   };
 }
 
+function parseExecutorRoutes(v: unknown, path: string): Record<string, ExecutorRouteConfig> {
+  if (!isRecord(v)) return fail(`${path} must be an object mapping tool names to routes`);
+  const routes: Record<string, ExecutorRouteConfig> = {};
+  for (const [tool, route] of Object.entries(v)) {
+    if (tool === "") return fail(`${path} keys must be non-empty tool names`);
+    const routePath = `${path}["${tool}"]`;
+    if (!isRecord(route)) return fail(`${routePath} must be an object with connector and operation`);
+    routes[tool] = {
+      connector: requireString(route.connector, `${routePath}.connector`),
+      operation: requireString(route.operation, `${routePath}.operation`),
+    };
+  }
+  return routes;
+}
+
 /** Validate an already-parsed config object (the JSON file's contents). */
 export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
   if (!isRecord(v)) return fail("config must be a JSON object");
@@ -133,6 +165,9 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
     policy: parsePolicy(v.policy, "policy"),
     ...(v.agentId !== undefined ? { agentId: requireString(v.agentId, "agentId") } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(v.executorRoutes !== undefined
+      ? { executorRoutes: parseExecutorRoutes(v.executorRoutes, "executorRoutes") }
+      : {}),
   };
 }
 
@@ -165,6 +200,11 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
     ...(env.OWNERSWITCH_AGENT_ID !== undefined ? { agentId: env.OWNERSWITCH_AGENT_ID } : {}),
     ...(env.OWNERSWITCH_TIMEOUT_MS !== undefined
       ? { timeoutMs: Number(env.OWNERSWITCH_TIMEOUT_MS) }
+      : {}),
+    ...(env.OWNERSWITCH_EXECUTOR_ROUTES !== undefined
+      ? {
+          executorRoutes: parseJson(env.OWNERSWITCH_EXECUTOR_ROUTES, "OWNERSWITCH_EXECUTOR_ROUTES"),
+        }
       : {}),
   };
 }

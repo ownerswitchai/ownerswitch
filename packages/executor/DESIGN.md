@@ -128,9 +128,13 @@ acknowledged in the endpoint's own docs and in
 `packages/mcp/THREAT-MODEL.md` as the deliberate widening it is. The
 gateway's kill-state client (`packages/gateway/src/client.ts`) reads it and
 fails the whole lookup closed if `epoch` is missing or unparseable, rather
-than defaulting it to `0`. The executor's own kill-state reader (its
-injected `fetchLiveKillState`) is still unwired — that lands with the proxy
-wiring in §4.
+than defaulting it to `0`. The executor's own kill-state reader is wired to
+that same client: `liveKillStateFromControlPlane`
+(`packages/executor/src/live-kill-state.ts`) backs the injected
+`fetchLiveKillState`, so the re-check before execution reads `killed` and
+`epoch` off `/status` under the same fail-closed contract as every other
+lookup — including refusing a "not killed" answer that carries no epoch,
+which could not support the ticket-epoch check.
 
 **Why an epoch and not just `killed === false`:** kill-then-restore. The
 owner kills at 12:00, cleans up, completes 2GO and restores at 12:10. At
@@ -158,17 +162,20 @@ does today. This package is purely the *"then what"* for yes — it runs the
 action instead of forwarding the call to tooling that holds a credential
 on the agent's side.
 
-| piece | today | with the executor |
+| piece | before | now |
 | --- | --- | --- |
 | `@ownerswitchai/shared` | `Decision`, `ToolCall`, `Policy`, `Verdict` | unchanged |
 | gateway `evaluate()` / `evaluateRemote()` | the decision, live kill state required | unchanged — still the sole authority |
-| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` now returns `epoch` too (§3) | unchanged |
-| mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | follow-up: for executor-routed operations, mint an `ActionTicket` and call `executor.run()` instead; relay the result |
-| **this package** | — | ticket type, refusal core, `ExecutorBackend`, stubbed GitHub merge backend |
+| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` returns `epoch` too (§3) | unchanged |
+| mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | **wired**: for operations declared in the gateway config's `executorRoutes` (MCP tool name → connector/operation), a yes — allow, or veto after release — mints an `ActionTicket` (`packages/mcp/src/executor-route.ts`) and calls `executor.run()`; the result is relayed to the agent. Every unrouted tool keeps forwarding exactly as before |
+| **this package** | — | ticket type, refusal core, `ExecutorBackend`, `liveKillStateFromControlPlane` (§3), GitHub merge backend with the HTTP call still stubbed |
 
-The wiring PR (the proxy minting tickets and calling the executor) comes
-after this design is agreed. This PR deliberately wires nothing and
-touches no existing package.
+The wiring is deliberately thin: the proxy's decision path did not change —
+same lanes, same refusals, same honeytoken scan immediately before anything
+crosses the boundary. Routing only replaces the *last step* of yes. The
+ticket binds to the kill epoch the decision itself observed (the same
+`/status` answer `evaluateRemote` fetched for the call), and the executor
+re-checks live state through the same fail-closed client before running.
 
 ## 5. What this does NOT solve
 
@@ -206,14 +213,26 @@ Honesty about the boundary, in the same spirit as the threat model:
   instances behind a balancer could each burn the same nonce once. A
   shared store is part of productionizing, not of this proof.
 
-## 6. In this PR / not in this PR
+## 6. Wired / still stubbed
 
-**In:** this document; `ActionTicket`; the pure refusal core (kill /
-epoch / expiry / nonce); `ExecutorBackend` with `execute(ticket)`;
-`GitHubMergePrExecutor` with the HTTP call stubbed behind an injectable
-client; one test proving a ticket from a stale kill epoch is refused
-before the backend is ever called.
+**Wired:** this document; `ActionTicket`; the pure refusal core (kill /
+epoch / expiry / nonce); `ExecutorBackend` with `execute(ticket)`; the
+control-plane `/status` epoch field and its fail-closed client;
+`liveKillStateFromControlPlane` backing the executor's live re-check (§3);
+the proxy wiring — config-declared `executorRoutes`, ticket minting on yes,
+`executor.run()` instead of `forward()` for routed operations, result
+relayed to the agent (`packages/mcp/src/executor-route.ts`, `proxy.ts`,
+`config.ts`); end-to-end tests over a fake backend proving the central
+claim — kill between mint and execution refuses before the backend is ever
+called (engaged, and kill-then-restore epoch mismatch), expired ticket
+refused, replayed nonce refused, unreachable control plane refused, and a
+happy path where the backend runs exactly once and the agent receives the
+result, never a token.
 
-**Not in:** any live GitHub call; gateway wiring; control-plane `/status`
-epoch field; ticket signing; a persistent nonce store; any connector
-beyond `merge_pull_request`.
+**Still stubbed / not yet:** the live GitHub call —
+`GitHubMergePrExecutor`'s HTTP call stays behind its injectable
+`GitHubMergeClient`, and the CLI wires the backend with no client, so a
+routed call that clears every check fails with an explicit "not
+implemented" (`ExecutionFailed`, `-32057`) rather than silently
+forwarding. Also not yet: ticket signing; a persistent/shared nonce store;
+any connector beyond `merge_pull_request`.

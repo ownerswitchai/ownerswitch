@@ -6,6 +6,7 @@ export { canonicalizeArgs } from "./ticket.js";
 export type { ActionTicket } from "./ticket.js";
 
 export { Executor, refuseTicket } from "./executor.js";
+export { liveKillStateFromControlPlane } from "./live-kill-state.js";
 export type {
   ExecutionOutcome,
   ExecutionResult,

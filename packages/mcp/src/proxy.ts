@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -9,18 +9,27 @@ import {
   ToolListChangedNotificationSchema,
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { ActionTicket, ExecutionOutcome } from "@ownerswitchai/executor";
 import { evaluateRemote, type ControlPlaneClient, type KillState } from "@ownerswitchai/gateway";
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import {
   approvalRequired,
   controlPlaneUnavailable,
+  executionFailed,
   honeytokenTripped,
   lockdown,
   ownerVetoed,
   policyDenied,
+  ticketRefused,
   vetoHeld,
   vetoPending,
 } from "./errors.js";
+import {
+  DEFAULT_TICKET_TTL_MS,
+  mintActionTicket,
+  policyVersionOf,
+  type ExecutorWiring,
+} from "./executor-route.js";
 import { VetoClientError, type VetoClient } from "./veto-client.js";
 
 export const PROXY_NAME = "ownerswitch-mcp";
@@ -34,8 +43,11 @@ export const PROXY_VERSION = "0.0.1";
  *    RUN is decided per call. Hiding tools would only push failures from a
  *    clear refusal at call time to a confusing absence at plan time.
  *  - tools/call goes through evaluateRemote() first: live kill-state lookup
- *    from the control plane, then the policy. Only "allow" forwards; the
- *    upstream result passes through untouched.
+ *    from the control plane, then the policy. Only a yes acts; for a
+ *    forwarded call the upstream result passes through untouched, and for an
+ *    executor-routed one (ProxyOptions.executor) the yes mints an
+ *    ActionTicket and the executor performs the action itself — the agent
+ *    receives the result, never a token.
  *  - every refusal is a protocol error with a distinct code and a message
  *    written for the agent to relay — an agent behind this proxy must never
  *    be left guessing whether its action ran.
@@ -79,6 +91,16 @@ export interface ProxyOptions {
    * kill primitive — it only raises an alert.
    */
   honeytokens?: HoneytokenGuard;
+  /**
+   * Executor routing (DESIGN.md §2, §4). For tools listed in its routes, a
+   * yes-decision — allow, or veto after release — mints an ActionTicket and
+   * hands it to the executor instead of forwarding the call upstream:
+   * OwnerSwitch performs the action with its own credential and the agent
+   * receives the result, never a token. The decision vocabulary does not
+   * change and evaluate() stays the sole authority — this only replaces
+   * forward() as the "then what" for yes on routed tools.
+   */
+  executor?: ExecutorWiring;
 }
 
 export interface OwnerSwitchProxy {
@@ -114,6 +136,13 @@ const detail = (err: unknown): string =>
 
 export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy {
   const agentId = options.agentId ?? PROXY_NAME;
+  const executor = options.executor;
+  const ticketTtlMs = executor?.ticketTtlMs ?? DEFAULT_TICKET_TTL_MS;
+  const mintNow = executor?.now ?? Date.now;
+  const mintNonce = executor?.mintNonce ?? randomUUID;
+  // pinned once: every ticket names the policy that was in force when this
+  // gateway started judging calls with it
+  const policyVersion = policyVersionOf(options.policy);
   const upstream = new Client({ name: `${PROXY_NAME} (upstream side)`, version: PROXY_VERSION });
   const server = new Server(
     { name: PROXY_NAME, version: PROXY_VERSION },
@@ -152,7 +181,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
 
     switch (verdict.decision) {
       case "allow":
-        return forwardOrKill(call);
+        return forwardOrKill(call, observedKill?.epoch);
       case "deny":
         alertIfDecoy(call, "policy denied");
         throw policyDenied(call.tool, verdict);
@@ -160,7 +189,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         alertIfDecoy(call, "held for owner approval");
         throw approvalRequired(call.tool, verdict);
       case "veto":
-        return vetoLane(call, verdict);
+        return vetoLane(call, verdict, observedKill?.epoch);
     }
   });
 
@@ -171,15 +200,26 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
   }
 
   /**
-   * The ONLY path that forwards. Scans immediately before forwarding: a decoy
-   * about to cross the boundary is exfiltration in progress — report the kill
-   * and refuse. Never forwards before scanning.
+   * The ONLY path where a yes-decision becomes an action. Scans immediately
+   * before the call crosses the boundary — forwarded upstream or executed by
+   * the executor alike: a decoy about to cross is exfiltration in progress —
+   * report the kill and refuse. Never acts before scanning.
+   *
+   * `mintEpoch` is the kill epoch the control plane reported to THIS call's
+   * evaluation; an executor-routed yes binds its ticket to it (DESIGN.md §3).
    */
-  async function forwardOrKill(call: ToolCall): Promise<CallToolResult> {
+  async function forwardOrKill(
+    call: ToolCall,
+    mintEpoch: number | undefined,
+  ): Promise<CallToolResult> {
     const canaryIds = decoyIds(call);
     if (canaryIds.length > 0) {
       options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
       throw honeytokenTripped(call.tool, canaryIds);
+    }
+    const route = executor?.routes[call.tool];
+    if (executor !== undefined && route !== undefined) {
+      return runRouted(call, executor, route, mintEpoch);
     }
     // the client validated the result against CallToolResultSchema; the SDK's
     // return type is a union over every possible schema, so narrow it here
@@ -188,6 +228,62 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       CallToolResultSchema,
     );
     return result as CallToolResult;
+  }
+
+  /**
+   * The executor lane: mint the ActionTicket and let the executor perform
+   * the action with OwnerSwitch's own credential. The upstream server is
+   * never involved; the agent receives the result — data, never a token.
+   */
+  async function runRouted(
+    call: ToolCall,
+    wiring: ExecutorWiring,
+    route: { connector: string; operation: string },
+    mintEpoch: number | undefined,
+  ): Promise<CallToolResult> {
+    // The real control-plane client always carries an epoch on a live "not
+    // killed" answer (or fails the lookup closed). No epoch means no way to
+    // bind the ticket to the world that approved it — fail closed.
+    if (mintEpoch === undefined) {
+      throw controlPlaneUnavailable(
+        call.tool,
+        "live kill state carried no epoch — cannot mint an action ticket, fail closed",
+      );
+    }
+    let ticket: ActionTicket;
+    try {
+      ticket = mintActionTicket(call, route, {
+        policyVersion,
+        killEpoch: mintEpoch,
+        now: mintNow(),
+        ttlMs: ticketTtlMs,
+        nonce: mintNonce(),
+      });
+    } catch (err) {
+      throw ticketRefused(
+        call.tool,
+        "mint-failed",
+        `cannot mint an action ticket for ${route.connector}.${route.operation}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let outcome: ExecutionOutcome;
+    try {
+      outcome = await wiring.run(ticket);
+    } catch (err) {
+      // the nonce burned before the backend call — honestly ambiguous
+      throw executionFailed(call.tool, err instanceof Error ? err.message : String(err));
+    }
+    if (outcome.status === "refused") {
+      const { refusal } = outcome;
+      // a kill seen at execution time is the same lockdown the agent would
+      // have hit at decision time — same code, same account of the world
+      if (refusal.code === "kill-engaged") throw lockdown(call.tool, refusal.reason);
+      throw ticketRefused(call.tool, refusal.code, refusal.reason);
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(outcome.result) }],
+    };
   }
 
   /** A decoy in a call that will NOT forward: flag it, never kill. */
@@ -204,7 +300,11 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    * window state. Silence-plus-confirmed-delivery releases the window on the
    * control plane; a retry then (and only then) forwards the call.
    */
-  async function vetoLane(call: ToolCall, verdict: Verdict): Promise<CallToolResult> {
+  async function vetoLane(
+    call: ToolCall,
+    verdict: Verdict,
+    mintEpoch: number | undefined,
+  ): Promise<CallToolResult> {
     const key = callKey(call);
     for (;;) {
       const tracked = windows.get(key);
@@ -241,10 +341,13 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           throw vetoHeld(call.tool, id);
         case "released":
           // silence let it run; a released window authorizes exactly one run.
-          // Scan here, right before forwarding — a decoy released to cross the
-          // boundary kills, exactly as an allowed call would.
+          // Scan here, right before acting — a decoy released to cross the
+          // boundary kills, exactly as an allowed call would. mintEpoch is
+          // the epoch THIS attempt's evaluation observed, not the epoch when
+          // the window opened: the released retry re-evaluated against live
+          // kill state moments ago, and the ticket binds to that world.
           windows.delete(key);
-          return forwardOrKill(call);
+          return forwardOrKill(call, mintEpoch);
       }
     }
   }

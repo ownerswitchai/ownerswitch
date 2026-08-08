@@ -94,6 +94,61 @@ describe("loadConfig", () => {
     expect(() => loadConfig(["--verbose"], {})).toThrowError(/unknown argument/);
   });
 
+  it("loads executor routes: tool name → (connector, operation)", () => {
+    const config = load({
+      ...VALID,
+      executorRoutes: {
+        "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+      },
+    });
+    expect(config.executorRoutes).toEqual({
+      "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+    });
+    // and absent means absent — no implicit routing
+    expect(load(VALID).executorRoutes).toBeUndefined();
+  });
+
+  it("rejects malformed executor routes, naming the offending entry", () => {
+    expect(() => load({ ...VALID, executorRoutes: [] })).toThrowError(/executorRoutes/);
+    expect(() =>
+      load({ ...VALID, executorRoutes: { "github.merge_pr": "github" } }),
+    ).toThrowError(/executorRoutes\["github\.merge_pr"\]/);
+    expect(() =>
+      load({ ...VALID, executorRoutes: { "github.merge_pr": { connector: "github" } } }),
+    ).toThrowError(/executorRoutes\["github\.merge_pr"\]\.operation/);
+    expect(() =>
+      load({
+        ...VALID,
+        executorRoutes: { "github.merge_pr": { connector: "", operation: "merge_pull_request" } },
+      }),
+    ).toThrowError(/executorRoutes\["github\.merge_pr"\]\.connector/);
+    expect(() =>
+      load({ ...VALID, executorRoutes: { "": { connector: "github", operation: "merge" } } }),
+    ).toThrowError(/non-empty tool names/);
+  });
+
+  it("accepts executor routes from OWNERSWITCH_EXECUTOR_ROUTES (JSON)", () => {
+    const config = loadConfig(
+      [],
+      {
+        OWNERSWITCH_CONTROL_PLANE_URL: "http://127.0.0.1:4600",
+        OWNERSWITCH_DEVICE_ID: "gw-env",
+        OWNERSWITCH_DEVICE_SECRET: "s3cret",
+        OWNERSWITCH_UPSTREAM_COMMAND: "npx",
+        OWNERSWITCH_POLICY: JSON.stringify(VALID.policy),
+        OWNERSWITCH_EXECUTOR_ROUTES: JSON.stringify({
+          "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+        }),
+      },
+      () => {
+        throw new Error("no file should be read");
+      },
+    );
+    expect(config.executorRoutes).toEqual({
+      "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+    });
+  });
+
   it("explains what to do when no config is given at all", () => {
     expect(() => loadConfig([], {})).toThrowError(/--config|OWNERSWITCH/);
   });

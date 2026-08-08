@@ -20,18 +20,24 @@ export const OwnerSwitchErrorCode = {
   Lockdown: -32054,
   /** a decoy credential surfaced in a tool call — the kill is already firing */
   HoneytokenTripped: -32055,
+  /** the executor refused an already-approved action ticket at execution time */
+  TicketRefused: -32056,
+  /** the executor's connector call failed after the single-use ticket was consumed */
+  ExecutionFailed: -32057,
 } as const;
 
 export type OwnerSwitchErrorCodeName = keyof typeof OwnerSwitchErrorCode;
 
 /** Machine-readable refusal detail, carried in the error's `data`. */
 export interface RefusalData {
-  decision: "deny" | "approve" | "veto" | "lockdown";
+  decision: "deny" | "approve" | "veto" | "lockdown" | "refused" | "failed";
   tool: string;
   reason: string;
   ruleId?: string | null;
   vetoWindowId?: string;
   vetoStatus?: string;
+  /** the executor's refusal code, e.g. "epoch-mismatch" (TicketRefused only) */
+  refusalCode?: string;
 }
 
 /**
@@ -153,6 +159,45 @@ export function honeytokenTripped(tool: string, canaryIds: string[]): OwnerSwitc
       `call will be denied until the owner restores OwnerSwitch. Do not retry with different ` +
       `arguments; tell the user what happened.`,
     { decision: "lockdown", tool, reason: `honeytoken ${ids} in tool-call arguments` },
+  );
+}
+
+/**
+ * The executor refused an already-approved ticket at execution time —
+ * expired, replayed, or minted before a kill that has since happened. The
+ * decision that produced the ticket was a yes; the world changed between
+ * yes and run. The approval is void: a retry goes through the whole
+ * decision path again from the start.
+ */
+export function ticketRefused(
+  tool: string,
+  refusalCode: string,
+  reason: string,
+): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.TicketRefused,
+    `OwnerSwitch refused to execute "${tool}": ${reason}. The action did NOT run, and the ` +
+      `approval this call carried is void. Calling the tool again starts a fresh owner ` +
+      `decision — do not assume it will be approved; tell the user what happened.`,
+    { decision: "refused", tool, reason, refusalCode },
+  );
+}
+
+/**
+ * The connector call failed AFTER the single-use ticket was consumed. Unlike
+ * every refusal above, this is the one genuinely ambiguous outcome: the
+ * nonce burns before the call (at-most-once, DESIGN.md §3), so the action
+ * may or may not have completed on the backend. Deliberately explicit about
+ * that — the one wrong takeaway would be "retry until it works".
+ */
+export function executionFailed(tool: string, detail: string): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.ExecutionFailed,
+    `OwnerSwitch accepted "${tool}" but the backend call failed: ${detail}. The single-use ` +
+      `ticket was consumed, and the action MAY OR MAY NOT have completed — check the ` +
+      `resource directly before doing anything else. Retrying starts a fresh owner ` +
+      `decision and could run the action twice; tell the user.`,
+    { decision: "failed", tool, reason: detail },
   );
 }
 

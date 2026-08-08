@@ -305,11 +305,12 @@ One JSON file (`--config <file>`, or `OWNERSWITCH_MCP_CONFIG=<file>`):
 | `policy.defaultDecision` | yes | decision when no rule matches — ship `"approve"` so unknown tools need the owner |
 | `agentId` | no | name attached to calls in windows/audit (default `ownerswitch-mcp`) |
 | `timeoutMs` | no | per control-plane call, default 1500 — on timeout the gateway fails closed |
+| `executorRoutes` | no | MCP tool name → `{ connector, operation }`, e.g. `"github.merge_pr": { "connector": "github", "operation": "merge_pull_request" }`. A yes on a routed tool mints an ActionTicket and the executor performs the action with OwnerSwitch's own credential — never forwarded upstream, and the agent gets the result, never a token (see `packages/executor/DESIGN.md`). Unlisted tools forward exactly as before |
 
 No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`,
 `OWNERSWITCH_DEVICE_ID`, `OWNERSWITCH_DEVICE_SECRET`, `OWNERSWITCH_UPSTREAM_COMMAND`,
 `OWNERSWITCH_UPSTREAM_ARGS` (JSON array), `OWNERSWITCH_POLICY` (JSON),
-`OWNERSWITCH_AGENT_ID`, `OWNERSWITCH_TIMEOUT_MS`.
+`OWNERSWITCH_AGENT_ID`, `OWNERSWITCH_TIMEOUT_MS`, `OWNERSWITCH_EXECUTOR_ROUTES` (JSON).
 
 ## What the agent sees (error codes)
 
@@ -320,9 +321,12 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 | `-32052` `VetoPending` | held in an open veto window | yes, in a few minutes |
 | `-32053` `OwnerVetoed` | the owner stopped this exact action | no |
 | `-32054` `Lockdown` | kill switch engaged, or control plane unreachable | once restored |
+| `-32055` `HoneytokenTripped` | a decoy credential surfaced in the call — the kill is already firing | no |
+| `-32056` `TicketRefused` | an executor-routed action was approved, but refused at execution time (expired, replayed, or a kill happened since the approval) — it did NOT run | a retry starts a fresh owner decision |
+| `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed — the action MAY OR MAY NOT have completed | check the resource first; a retry could duplicate the action |
 
 Each error's `data` carries the machine-readable detail:
-`{ decision, tool, reason, ruleId, vetoWindowId?, vetoStatus? }`.
+`{ decision, tool, reason, ruleId, vetoWindowId?, vetoStatus?, refusalCode? }`.
 
 ## How the veto lane behaves
 
