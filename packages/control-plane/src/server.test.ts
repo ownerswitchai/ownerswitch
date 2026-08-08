@@ -391,6 +391,97 @@ describe("control-plane HTTP API", () => {
     expect((await res.json()).error).toMatch(/released/);
   });
 
+  it("POST /veto with a valid device signature registers a window the owner can veto", async () => {
+    const c = clock(100_000);
+    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const body = JSON.stringify({
+      call: { agentId: "mcp-proxy", tool: "write_file", args: { path: "/tmp/x" } },
+    });
+    const res = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(201);
+    const { id, status } = (await res.json()) as { id: string; status: string };
+    expect(id).toMatch(/^veto_/);
+    expect(status).toBe("pending");
+
+    const window = cp.vetoWindows.get(id);
+    expect(window?.call).toEqual({
+      agentId: "mcp-proxy",
+      tool: "write_file",
+      args: { path: "/tmp/x" },
+    });
+
+    // the registered window is live on the owner surface: readable and vetoable
+    expect(await (await fetch(`${url}/veto/${id}`)).json()).toEqual({ status: "pending" });
+    const session = createOwnerSession("adam", { now: c.now });
+    const veto = await fetch(`${url}/veto/${id}`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(await veto.json()).toEqual({ status: "vetoed" });
+    expect(window?.vetoedBy).toBe("adam");
+  });
+
+  it("POST /veto without a valid signature -> 401, even from loopback, nothing registered", async () => {
+    const c = clock(100_000);
+    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
+    const bare = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    expect(bare.status).toBe(401);
+    expect(await bare.json()).toEqual({ error: "unauthorized" });
+
+    const forged = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: { ...deviceHeaders(body, c.now()), "x-device-signature": "deadbeef" },
+      body,
+    });
+    expect(forged.status).toBe(401);
+    expect(cp.vetoWindows.size).toBe(0);
+  });
+
+  it("POST /veto with no device secret configured -> 401 (registration has no open mode)", async () => {
+    const c = clock(100_000);
+    const cp = createControlPlane({ now: c.now }); // deviceSecret absent
+    const url = await start(cp);
+
+    const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
+    const res = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(401);
+    expect(cp.vetoWindows.size).toBe(0);
+  });
+
+  it("POST /veto with a malformed call -> 400", async () => {
+    const c = clock(100_000);
+    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    for (const bad of [{}, { call: "write_file" }, { call: { tool: "write_file" } }]) {
+      const body = JSON.stringify(bad);
+      const res = await fetch(`${url}/veto`, {
+        method: "POST",
+        headers: deviceHeaders(body, c.now()),
+        body,
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(cp.vetoWindows.size).toBe(0);
+  });
+
   it("unknown route -> 404", async () => {
     const url = await start(createControlPlane({ now: clock().now }));
 
