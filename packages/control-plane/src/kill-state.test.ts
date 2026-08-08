@@ -10,8 +10,32 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { KillStateFileStore, type PersistedKillState } from "./kill-state.js";
+import { describe, expect, it, vi } from "vitest";
+import { KillStateFileStore, MAX_KILL_STATE_FILE_BYTES, type PersistedKillState } from "./kill-state.js";
+
+/**
+ * Arms a one-shot short write for the NEXT writeSync(fd, buffer, ...) call
+ * kill-state.ts's own import makes (mocked at module resolution, not by
+ * mutating the frozen node:fs namespace object, which vi.spyOn cannot do for
+ * a native builtin's exports). Every other call, and every other test in
+ * this file, goes through the real implementation unchanged: the mock
+ * delegates to `importOriginal()` unless armed.
+ */
+let armShortWriteOnce = false;
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    writeSync: (fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null) => {
+      if (!armShortWriteOnce) return actual.writeSync(fd, buffer, offset, length, position);
+      armShortWriteOnce = false; // one-shot: only the first call after arming is short
+      const requested = length ?? buffer.length;
+      const short = Math.max(1, Math.floor(requested / 2));
+      return actual.writeSync(fd, buffer, offset, short, position);
+    },
+  };
+});
 
 const tempPath = () => join(mkdtempSync(join(tmpdir(), "ownerswitch-killstate-")), "kill.json");
 
@@ -140,5 +164,53 @@ describe("KillStateFileStore", () => {
     const loaded = new KillStateFileStore(dirAsFile).load();
     expect(loaded.outcome).toBe("corrupt");
     if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/not a regular file/);
+  });
+
+  it("loads a file right up to MAX_KILL_STATE_FILE_BYTES — the cap is a ceiling, not an off-by-one", () => {
+    const path = tempPath();
+    const state: PersistedKillState = { version: 1, killed: false, epoch: 0 };
+    const json = JSON.stringify(state);
+    // JSON.parse ignores trailing whitespace, so padding lets the file land
+    // at exactly the cap while still being state the store actually wrote.
+    const padded = json + " ".repeat(MAX_KILL_STATE_FILE_BYTES - Buffer.byteLength(json, "utf8"));
+    expect(Buffer.byteLength(padded, "utf8")).toBe(MAX_KILL_STATE_FILE_BYTES);
+    writeFileSync(path, padded, "utf8");
+    expect(new KillStateFileStore(path).load()).toEqual({ outcome: "loaded", state });
+  });
+
+  it("rejects a file over MAX_KILL_STATE_FILE_BYTES without trusting a pre-read fstat size", () => {
+    const path = tempPath();
+    writeFileSync(path, "x".repeat(MAX_KILL_STATE_FILE_BYTES + 1), "utf8");
+    const loaded = new KillStateFileStore(path).load();
+    expect(loaded.outcome).toBe("corrupt");
+    if (loaded.outcome === "corrupt") {
+      expect(loaded.detail).toMatch(new RegExp(`over the ${MAX_KILL_STATE_FILE_BYTES}-byte kill-state limit`));
+    }
+  });
+
+  it("rejects a file many times over the cap — enforcement isn't tied to the exact +1 boundary", () => {
+    const path = tempPath();
+    writeFileSync(path, "x".repeat(MAX_KILL_STATE_FILE_BYTES * 4), "utf8");
+    const loaded = new KillStateFileStore(path).load();
+    expect(loaded.outcome).toBe("corrupt");
+    if (loaded.outcome === "corrupt") {
+      expect(loaded.detail).toMatch(new RegExp(`over the ${MAX_KILL_STATE_FILE_BYTES}-byte kill-state limit`));
+    }
+  });
+
+  it("survives a short writeSync() — the whole buffer lands, not a truncated prefix", () => {
+    const path = tempPath();
+    const store = new KillStateFileStore(path);
+    store.save({ version: 1, killed: false, epoch: 0 }); // establish the marker first
+
+    armShortWriteOnce = true; // the next writeSync() call — save()'s main write — returns short
+    const result = store.save(killedState);
+
+    // The published file is COMPLETE — not the truncated first chunk a naive
+    // single-call write would have fsynced and rename-published as if it had
+    // succeeded, which would boot killed forever after on a corrupt parse.
+    expect(result).toEqual({ durable: true });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(killedState);
+    expect(store.load()).toEqual({ outcome: "loaded", state: killedState });
   });
 });
