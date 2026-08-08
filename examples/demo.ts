@@ -29,7 +29,9 @@ const calls: ToolCall[] = [
 ];
 
 function startServer(): Promise<{ baseUrl: string; close: () => void }> {
-  const controlPlane = createControlPlane();
+  // Dev + ephemeral on purpose: the demo must reset fully on every run. A
+  // real deployment omits dev and must configure a protected killStateFile.
+  const controlPlane = createControlPlane({ dev: true, killStateFile: null });
   const server = createServer(controlPlane.handler);
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
