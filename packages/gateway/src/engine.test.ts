@@ -21,30 +21,49 @@ describe("evaluate", () => {
   });
 
   it("money movement requires approval", () => {
-    expect(evaluate({ agentId: "a1", tool: "stripe.payout" }, policy).decision).toBe("approve");
+    expect(evaluate({ agentId: "a1", tool: "stripe.payout" }, policy, { killed: false }).decision).toBe("approve");
   });
 
   it("merges go through the veto window", () => {
-    expect(evaluate({ agentId: "a1", tool: "github.merge_pr" }, policy).decision).toBe("veto");
+    expect(evaluate({ agentId: "a1", tool: "github.merge_pr" }, policy, { killed: false }).decision).toBe("veto");
   });
 
   it("args pattern escalates destructive bash", () => {
-    const v = evaluate({ agentId: "a1", tool: "bash", args: { cmd: "rm -rf /prod" } }, policy);
+    const v = evaluate({ agentId: "a1", tool: "bash", args: { cmd: "rm -rf /prod" } }, policy, { killed: false });
     expect(v.decision).toBe("approve");
     expect(v.ruleId).toBe("r3");
   });
 
   it("plain bash only needs the veto window", () => {
-    expect(evaluate({ agentId: "a1", tool: "bash", args: { cmd: "ls" } }, policy).decision).toBe("veto");
+    expect(evaluate({ agentId: "a1", tool: "bash", args: { cmd: "ls" } }, policy, { killed: false }).decision).toBe("veto");
   });
 
   it("reads are allowed instantly", () => {
-    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy).decision).toBe("allow");
+    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false }).decision).toBe("allow");
   });
 
   it("unknown tools hit the fail-closed default", () => {
-    const v = evaluate({ agentId: "a1", tool: "totally.new.tool" }, policy);
+    const v = evaluate({ agentId: "a1", tool: "totally.new.tool" }, policy, { killed: false });
     expect(v.decision).toBe("approve");
     expect(v.ruleId).toBeNull();
+  });
+});
+
+describe("kill state is required", () => {
+  it("a bare { killed: true } denies even an allowed tool", () => {
+    const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true });
+    expect(v.decision).toBe("deny");
+    expect(v.ruleId).toBeNull();
+  });
+
+  it("evaluate() cannot be called without stating kill state", () => {
+    // Function.length counts parameters before the first default — 3 proves
+    // no parameter regained a default value.
+    expect(evaluate.length).toBe(3);
+    const omitted = () =>
+      // @ts-expect-error kill state is required; omitting it must not compile
+      evaluate({ agentId: "a1", tool: "search.web" }, policy);
+    // Untyped (JS) callers crash instead of silently getting permission.
+    expect(omitted).toThrow(TypeError);
   });
 });

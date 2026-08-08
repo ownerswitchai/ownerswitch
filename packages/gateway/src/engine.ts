@@ -16,11 +16,19 @@ const globToRegex = (glob: string) =>
  *   1. kill switch (deny everything)
  *   2. first matching policy rule
  *   3. fail-closed default
+ *
+ * `kill` is required and deliberately has no default. A default of
+ * `{ killed: false }` would grant silent permission to any caller that
+ * forgot to look up live kill state — fail-open at exactly the moment the
+ * kill switch matters most. In a fail-closed system, an omitted kill state
+ * must be a compile error, not an allow. Callers with a live source should
+ * fetch it (see evaluateRemote); a caller with none must write
+ * `{ killed: false }` itself, making that assumption visible at the call site.
  */
 export function evaluate(
   call: ToolCall,
   policy: Policy,
-  kill: KillState = { killed: false },
+  kill: KillState,
 ): Verdict {
   if (kill.killed) {
     return {
