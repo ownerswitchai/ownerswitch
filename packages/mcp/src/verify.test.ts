@@ -1,8 +1,9 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { verifyDeviceSignature } from "@ownerswitchai/control-plane";
 import type { Policy } from "@ownerswitchai/shared";
 import type { OwnerSwitchMcpConfig } from "./config.js";
-import { formatVerifyReport, resolveOwnerToken, runVerify, verifyMain } from "./verify.js";
+import { formatVerifyReport, readHiddenLine, resolveOwnerToken, runVerify, verifyMain } from "./verify.js";
 
 const DEVICE = { id: "gw-1", secret: "s3cret" };
 const OWNER_TOKEN = "owner-token-abc";
@@ -28,15 +29,13 @@ function baseConfig(policy: Policy = POLICY, device = DEVICE): OwnerSwitchMcpCon
 /**
  * In-memory control plane faithful to the merged ceremony-based API
  * (control-plane/src/server.ts): /kill needs a valid device signature,
- * /restore/ceremony and /restore need the bearer token, /restore rejects
- * everything but a minted, current ceremony id with the uniform 409, and the
- * veto lane needs a device signature to register and the bearer to tap.
+ * /restore needs the bearer token and rejects everything but a minted,
+ * current ceremony id with the uniform 409, and the veto lane needs a
+ * device signature to register and the bearer to tap.
  */
-function createFakeControlPlane(opts: { ceremonyCooldownMs?: number; restoreBroken?: boolean } = {}) {
+function createFakeControlPlane() {
   let killed = false;
-  let mintedCeremony: string | undefined;
   const killCalls: unknown[] = [];
-  const restoreCalls: unknown[] = [];
   const windows = new Map<string, { status: string }>();
 
   const json = (body: unknown, status = 200) =>
@@ -73,41 +72,11 @@ function createFakeControlPlane(opts: { ceremonyCooldownMs?: number; restoreBrok
       return json({ killed: true });
     }
 
-    if (method === "POST" && url.pathname === "/restore/ceremony") {
-      if (!validOwner(init)) return json({ error: "unauthorized" }, 401);
-      if (!killed) return json({ error: "not killed — nothing to restore" }, 409);
-      mintedCeremony = "cer_test_1";
-      const cooldown = opts.ceremonyCooldownMs ?? 0;
-      return json(
-        {
-          id: mintedCeremony,
-          state: cooldown > 0 ? "go1" : "ready",
-          cooldownRemainingMs: cooldown,
-          expiresAt: Date.now() + 300_000,
-        },
-        201,
-      );
-    }
-
-    const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(url.pathname);
-    if (method === "GET" && ceremonyMatch) {
-      if (!validOwner(init)) return json({ error: "unauthorized" }, 401);
-      if (ceremonyMatch[1] !== mintedCeremony) return json({ error: "no ceremony" }, 404);
-      // after the cooldown wait, the ceremony reads ready
-      return json({ state: "ready", cooldownRemainingMs: 0, expiresAt: Date.now() + 300_000 });
-    }
-
     if (method === "POST" && url.pathname === "/restore") {
       if (!validOwner(init)) return json({ error: "unauthorized" }, 401);
-      const ceremonyId = (JSON.parse(rawBody) as { ceremonyId?: unknown }).ceremonyId;
-      if (opts.restoreBroken === true) return json({ error: "restore rejected" }, 409);
-      if (typeof ceremonyId !== "string" || ceremonyId !== mintedCeremony || !killed) {
-        return json({ error: "restore rejected" }, 409);
-      }
-      mintedCeremony = undefined; // single-use
-      restoreCalls.push(ceremonyId);
-      killed = false;
-      return json({ killed: false });
+      // No ceremony is ever actually minted in these tests — every restore
+      // attempt is the harmless probe, which always gets the uniform 409.
+      return json({ error: "restore rejected" }, 409);
     }
 
     if (method === "POST" && url.pathname === "/veto") {
@@ -138,7 +107,6 @@ function createFakeControlPlane(opts: { ceremonyCooldownMs?: number; restoreBrok
   return {
     fetchImpl,
     killCalls,
-    restoreCalls,
     windows,
     get killed() {
       return killed;
@@ -146,14 +114,12 @@ function createFakeControlPlane(opts: { ceremonyCooldownMs?: number; restoreBrok
   };
 }
 
-const silentDeps = { log: () => {} };
-
-describe("runVerify — default mode (no kill switch)", () => {
+describe("runVerify", () => {
   it("requires an owner token before making any control-plane call, and points at env/prompt (not a flag)", async () => {
     const fetchImpl: typeof fetch = async () => {
       throw new Error("must not be called");
     };
-    const outcome = await runVerify(baseConfig(), undefined, {}, { fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(), undefined, { fetchImpl });
     expect(outcome.ok).toBe(false);
     expect(outcome.steps).toHaveLength(1);
     expect(outcome.steps[0]).toMatchObject({ name: "owner token", ok: false });
@@ -165,7 +131,7 @@ describe("runVerify — default mode (no kill switch)", () => {
     const fetchImpl: typeof fetch = async () => {
       throw new Error("ECONNREFUSED");
     };
-    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, {}, { fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, { fetchImpl });
     expect(outcome.ok).toBe(false);
     expect(outcome.steps[0].name).toBe("control plane");
   });
@@ -177,7 +143,7 @@ describe("runVerify — default mode (no kill switch)", () => {
       if (url.pathname === "/status") return new Response(JSON.stringify({ killed: true }), { status: 200 });
       return cp.fetchImpl(input, init);
     };
-    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, {}, { fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, { fetchImpl });
     expect(outcome.ok).toBe(false);
     expect(outcome.steps[0].detail).toContain("lockdown");
     expect(outcome.steps[0].detail).toContain("/restore/ceremony");
@@ -185,7 +151,7 @@ describe("runVerify — default mode (no kill switch)", () => {
 
   it("rejects an invalid owner token via the harmless /restore probe — no kill, no window, nothing mutated", async () => {
     const cp = createFakeControlPlane();
-    const outcome = await runVerify(baseConfig(), "wrong-token", {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(), "wrong-token", { fetchImpl: cp.fetchImpl });
     expect(outcome.ok).toBe(false);
     expect(outcome.steps[0]).toMatchObject({ name: "owner token", ok: false });
     expect(cp.killCalls).toHaveLength(0);
@@ -195,30 +161,40 @@ describe("runVerify — default mode (no kill switch)", () => {
 
   it("passes end to end WITHOUT ever calling POST /kill, ending with a terminally-vetoed demo window", async () => {
     const cp = createFakeControlPlane();
-    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(), OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
 
-    expect(outcome.steps.map((s) => s.name)).toEqual([
-      "owner token",
-      "allow call",
-      "default decision",
-      "veto lane",
-    ]);
+    expect(outcome.steps.map((s) => s.name)).toEqual(["owner token", "allow call", "default decision", "veto lane"]);
     expect(outcome.steps.every((s) => s.ok)).toBe(true);
     expect(outcome.ok).toBe(true);
 
-    expect(cp.killCalls).toHaveLength(0); // the whole point of default mode
+    expect(cp.killCalls).toHaveLength(0); // verify never touches the kill switch, period
     expect(cp.killed).toBe(false);
     expect([...cp.windows.values()].map((w) => w.status)).toEqual(["vetoed"]);
   });
 
-  it("honestly skips the allow-call phase when the policy has no allow rule", async () => {
+  it('fails the allow-call check — not a silent pass — when the policy has no allow rule, naming why', async () => {
     const cp = createFakeControlPlane();
     const policy: Policy = { rules: [{ id: "w", tool: "write_file", decision: "veto" }], defaultDecision: "deny" };
-    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
     const allowStep = outcome.steps.find((s) => s.name === "allow call");
-    expect(allowStep?.skipped).toBe(true);
-    expect(allowStep?.ok).toBe(true); // skipped, not failed
-    expect(outcome.ok).toBe(true);
+    expect(allowStep?.ok).toBe(false);
+    expect(allowStep?.detail).toMatch(/cannot prove "allow"/);
+    expect(allowStep?.detail).toMatch(/no rule with decision "allow"/);
+    expect(outcome.ok).toBe(false); // the whole run fails — nothing is folded into a PASS
+  });
+
+  it('fails the default-decision check — not a silent pass — when every tool matches an explicit rule, naming why', async () => {
+    const cp = createFakeControlPlane();
+    const policy: Policy = {
+      rules: [{ id: "catch-all", tool: "*", decision: "allow" }],
+      defaultDecision: "deny",
+    };
+    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
+    const defaultStep = outcome.steps.find((s) => s.name === "default decision");
+    expect(defaultStep?.ok).toBe(false);
+    expect(defaultStep?.detail).toMatch(/cannot prove the fail-closed default/);
+    expect(defaultStep?.detail).toMatch(/catch-all/);
+    expect(outcome.ok).toBe(false);
   });
 
   it('flags a defaultDecision of "allow" as not fail-closed instead of passing silently', async () => {
@@ -227,20 +203,20 @@ describe("runVerify — default mode (no kill switch)", () => {
       rules: [{ id: "reads", tool: "read_*", decision: "allow" }],
       defaultDecision: "allow",
     };
-    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
     const defaultStep = outcome.steps.find((s) => s.name === "default decision");
     expect(defaultStep?.ok).toBe(false);
     expect(defaultStep?.detail).toMatch(/NOT fail-closed/);
     expect(outcome.ok).toBe(false);
   });
 
-  it("still proves the veto lane mechanics when the policy has no veto rule, and says so", async () => {
+  it("still proves the veto lane mechanics when the policy has no veto rule, and says so (this lane always does real work)", async () => {
     const cp = createFakeControlPlane();
     const policy: Policy = {
       rules: [{ id: "reads", tool: "read_*", decision: "allow" }],
       defaultDecision: "approve",
     };
-    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(baseConfig(policy), OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
     const lane = outcome.steps.find((s) => s.name === "veto lane");
     expect(lane?.ok).toBe(true);
     expect(lane?.detail).toMatch(/lane mechanics/);
@@ -250,95 +226,11 @@ describe("runVerify — default mode (no kill switch)", () => {
   it("fails the veto lane with a device-credentials message when registration is rejected", async () => {
     const cp = createFakeControlPlane();
     const badDeviceConfig = baseConfig(POLICY, { id: "gw-1", secret: "the-wrong-secret" });
-    const outcome = await runVerify(badDeviceConfig, OWNER_TOKEN, {}, { fetchImpl: cp.fetchImpl, ...silentDeps });
+    const outcome = await runVerify(badDeviceConfig, OWNER_TOKEN, { fetchImpl: cp.fetchImpl });
     const lane = outcome.steps.find((s) => s.name === "veto lane");
     expect(lane?.ok).toBe(false);
     expect(lane?.detail).toMatch(/device credentials|device\.id/);
     expect(outcome.ok).toBe(false);
-    expect(cp.killed).toBe(false);
-  });
-});
-
-describe("runVerify — --include-kill-test (real ceremony)", () => {
-  it("engages the kill, restores through the full ceremony, and confirms the final state — leaving SIGINT listeners as it found them", async () => {
-    const cp = createFakeControlPlane();
-    const sigintBefore = process.listenerCount("SIGINT");
-    const outcome = await runVerify(
-      baseConfig(),
-      OWNER_TOKEN,
-      { includeKillTest: true },
-      { fetchImpl: cp.fetchImpl, ...silentDeps },
-    );
-
-    expect(outcome.steps.map((s) => s.name)).toEqual([
-      "owner token",
-      "allow call",
-      "default decision",
-      "veto lane",
-      "kill switch",
-      "restore ceremony",
-      "final state",
-    ]);
-    expect(outcome.steps.every((s) => s.ok)).toBe(true);
-    expect(outcome.ok).toBe(true);
-
-    expect(cp.killCalls).toHaveLength(1);
-    expect(cp.restoreCalls).toEqual(["cer_test_1"]);
-    expect(cp.killed).toBe(false); // restored to the starting state
-    expect(process.listenerCount("SIGINT")).toBe(sigintBefore);
-  });
-
-  it("waits out a non-zero ceremony cooldown before GO 2/2", async () => {
-    const cp = createFakeControlPlane({ ceremonyCooldownMs: 120 });
-    const sleeps: number[] = [];
-    const sleep = async (ms: number): Promise<void> => {
-      sleeps.push(ms);
-    };
-    const outcome = await runVerify(
-      baseConfig(),
-      OWNER_TOKEN,
-      { includeKillTest: true },
-      { fetchImpl: cp.fetchImpl, sleep, ...silentDeps },
-    );
-    expect(outcome.ok).toBe(true);
-    expect(sleeps.some((ms) => ms >= 120)).toBe(true);
-    expect(cp.killed).toBe(false);
-  });
-
-  it("reports the exact recovery commands, and does not lie about the state, when restore is rejected after a real kill", async () => {
-    const cp = createFakeControlPlane({ restoreBroken: true });
-    const outcome = await runVerify(
-      baseConfig(),
-      OWNER_TOKEN,
-      { includeKillTest: true },
-      { fetchImpl: cp.fetchImpl, ...silentDeps },
-    );
-    expect(outcome.ok).toBe(false);
-    expect(outcome.steps.find((s) => s.name === "restore ceremony")?.ok).toBe(false);
-    const finalStep = outcome.steps.find((s) => s.name === "final state");
-    expect(finalStep?.ok).toBe(false);
-    expect(finalStep?.detail).toContain("STILL KILLED");
-    expect(finalStep?.detail).toContain("/restore/ceremony");
-    expect(cp.killed).toBe(true);
-  });
-
-  it("does not attempt any restore, and reports state unchanged, if engaging the kill switch fails", async () => {
-    const cp = createFakeControlPlane();
-    const fetchImpl: typeof fetch = async (input, init) => {
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      if (url.pathname === "/kill") throw new Error("ECONNRESET");
-      return cp.fetchImpl(input, init);
-    };
-    const outcome = await runVerify(
-      baseConfig(),
-      OWNER_TOKEN,
-      { includeKillTest: true },
-      { fetchImpl, ...silentDeps },
-    );
-    expect(outcome.ok).toBe(false);
-    expect(outcome.steps.at(-1)).toMatchObject({ name: "kill switch", ok: false });
-    expect(outcome.steps.at(-1)?.detail).toContain("system state unchanged");
-    expect(outcome.steps.find((s) => s.name === "restore ceremony")).toBeUndefined();
     expect(cp.killed).toBe(false);
   });
 });
@@ -353,16 +245,16 @@ describe("formatVerifyReport", () => {
     expect(report).toContain("PASS");
   });
 
-  it("renders skipped steps distinctly and a FAIL summary on failure", () => {
+  it("renders a failed 'cannot prove' step as an ordinary ✘ failure — not a soft/skip icon — and a FAIL summary", () => {
     const report = formatVerifyReport({
       ok: false,
       steps: [
-        { name: "allow call", ok: true, skipped: true, detail: "skipped — no allow rule" },
-        { name: "final state", ok: false, detail: "still engaged" },
+        { name: "allow call", ok: false, detail: 'cannot prove "allow" — no allow rule' },
+        { name: "veto lane", ok: true, detail: "window vetoed" },
       ],
     });
-    expect(report).toContain("… allow call — skipped — no allow rule");
-    expect(report).toContain("✘ final state — still engaged");
+    expect(report).toContain('✘ allow call — cannot prove "allow" — no allow rule');
+    expect(report).not.toContain("…");
     expect(report).toContain("FAIL");
   });
 });
@@ -382,6 +274,104 @@ describe("resolveOwnerToken", () => {
       "typed-tok",
     );
     await expect(resolveOwnerToken({}, async () => undefined)).resolves.toBeUndefined();
+  });
+});
+
+/** A fake TTY-like stdin: emits raw "keystrokes" as 'data' events, tracks raw-mode toggles. */
+function fakeTtyInput() {
+  const emitter = new EventEmitter();
+  const rawModeCalls: boolean[] = [];
+  let resumed = 0;
+  let paused = 0;
+  const input = Object.assign(emitter, {
+    isTTY: true as const,
+    isRaw: false,
+    setRawMode: (mode: boolean) => {
+      rawModeCalls.push(mode);
+      input.isRaw = mode;
+    },
+    setEncoding: () => {},
+    resume: () => {
+      resumed++;
+    },
+    pause: () => {
+      paused++;
+    },
+  });
+  return {
+    input,
+    type: (text: string) => emitter.emit("data", text),
+    rawModeCalls,
+    get resumed() {
+      return resumed;
+    },
+    get paused() {
+      return paused;
+    },
+  };
+}
+
+function fakeOutput() {
+  const written: string[] = [];
+  return { output: { write: (chunk: string) => void written.push(chunk) }, written };
+}
+
+describe("readHiddenLine", () => {
+  it("writes the prompt but NEVER echoes typed characters, and returns the typed line on Enter", async () => {
+    const tty = fakeTtyInput();
+    const out = fakeOutput();
+    const resultPromise = readHiddenLine("Owner token: ", tty.input, out.output);
+    tty.type("s3cr3t-token");
+    tty.type("\n");
+    await expect(resultPromise).resolves.toBe("s3cr3t-token");
+
+    // Only the prompt itself and the final newline ever reached output —
+    // the secret characters do not appear anywhere in what was written.
+    expect(out.written).toEqual(["Owner token: ", "\n"]);
+    expect(out.written.join("")).not.toContain("s3cr3t-token");
+    expect(tty.rawModeCalls).toEqual([true, false]); // enabled, then restored
+  });
+
+  it("supports backspace without ever echoing a character", async () => {
+    const tty = fakeTtyInput();
+    const out = fakeOutput();
+    const resultPromise = readHiddenLine("token: ", tty.input, out.output);
+    tty.type("abcX");
+    tty.type("\x7f"); // DEL — erase the stray "X"
+    tty.type("d");
+    tty.type("\r");
+    await expect(resultPromise).resolves.toBe("abcd");
+    expect(out.written.join("")).toBe("token: \n");
+  });
+
+  it("returns undefined for an empty line", async () => {
+    const tty = fakeTtyInput();
+    const out = fakeOutput();
+    const resultPromise = readHiddenLine("token: ", tty.input, out.output);
+    tty.type("\n");
+    await expect(resultPromise).resolves.toBeUndefined();
+  });
+
+  it("restores raw mode and exits on Ctrl-C, without ever echoing what was typed so far", async () => {
+    const tty = fakeTtyInput();
+    const out = fakeOutput();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((_code?: number) => {
+      throw new Error("__exit__");
+    }) as never);
+    try {
+      // The mock throws instead of terminating the process, so the promise
+      // readHiddenLine returned is never resolved (real process.exit never
+      // returns either) — only the synchronous throw from the Ctrl-C
+      // handler itself is under test here, not the promise's settlement.
+      void readHiddenLine("token: ", tty.input, out.output).catch(() => undefined);
+      tty.type("partial-sec");
+      expect(() => tty.type("\x03")).toThrow("__exit__");
+      expect(exitSpy).toHaveBeenCalledWith(130);
+      expect(out.written.join("")).not.toContain("partial-sec");
+      expect(tty.rawModeCalls).toEqual([true, false]);
+    } finally {
+      exitSpy.mockRestore();
+    }
   });
 });
 

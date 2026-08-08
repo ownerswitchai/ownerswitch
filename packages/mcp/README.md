@@ -266,33 +266,31 @@ global kill switch**:
 
 The owner token is **required** (it plays the owner's veto tap) and comes
 from `OWNERSWITCH_OWNER_TOKEN` or an interactive prompt — never a CLI flag,
-which would leak it into shell history and process listings. It is
-validated up front by a harmless probe (`POST /restore` with a ceremony id
-the server can never have minted: the uniform `409` proves the token is
-accepted, `401` proves it isn't, and neither mutates anything).
+which would leak it into shell history and process listings. Typing it at
+the prompt never echoes to the terminal (raw-mode input, nothing written
+back but the prompt itself and a trailing newline), so it never lands in
+scrollback or a screen recording either. It is validated up front by a
+harmless probe (`POST /restore` with a ceremony id the server can never
+have minted: the uniform `409` proves the token is accepted, `401` proves
+it isn't, and neither mutates anything).
 
-#### `--include-kill-test`
+If a lane genuinely can't be exercised — e.g. the policy has no `"allow"`
+rule to build a demonstration call from, or every tool name matches an
+explicit rule so the fail-closed default can never fire — that is a
+**failure** for that check, naming exactly what's missing. `verify` proves
+three specific things; if it can't prove one, the run fails, full stop —
+nothing is silently skipped into an overall `PASS`.
 
-"A killed plane denies everything" is worth proving once — but engaging the
-real kill switch is not a casual preflight step: kill state persists across
-restarts, and the only way back is the full 2GO ceremony. So it is **off by
-default** and opt-in:
-
-```bash
-npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json --include-kill-test
-```
-
-With the flag, verify engages the real kill switch, confirms `/status`
-reports killed and that the previously-allowed call now evaluates to a
-refusal, then restores through the **real ceremony**: `POST
-/restore/ceremony` (GO 1/2), wait out the server's ~30 s cooldown, `POST
-/restore` with the minted ceremony id (GO 2/2). The whole sequence runs
-inside a try/finally with a Ctrl-C handler: **every** exit path — success,
-error, interrupt — ends by querying `GET /status`, and if the plane is
-still killed, verify prints the exact `curl` sequence to recover (ceremony
-start → cooldown → restore) rather than pretending the system is back to
-normal. Exits 0 only if every step passed, including the final
-`killed:false` confirmation.
+`verify` deliberately does not engage the real kill switch. A live
+kill/restore cycle from a CLI preflight has real edges — an ambiguous
+`/kill` response on a network blip, a lost connection mid-ceremony, a
+Ctrl-C at the wrong moment — that a DX check has no business improvising
+answers to, and kill state persisting across restarts makes getting it
+wrong expensive. That coverage already exists at the layer that owns it —
+`control-plane/src/integration.test.ts` (kill → 2GO → restore, end to end)
+and the ceremony's own HTTP-level tests in `control-plane/src/server.test.ts`
+— so `verify` stays a fast, low-side-effect preflight instead of repeating
+it.
 
 ## Configuration
 
