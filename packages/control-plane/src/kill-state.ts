@@ -87,8 +87,21 @@ const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoExcept
  */
 export const MAX_KILL_STATE_FILE_BYTES = 64 * 1024;
 
-// O_NOFOLLOW is POSIX; on a platform without it the flag degrades to 0 and
-// the fstat regular-file check below is the remaining guard.
+// O_NOFOLLOW is POSIX; there is no portable way to detect its absence ahead
+// of time, so on a platform without it the flag silently degrades to 0 and
+// open() FOLLOWS a symlink at the state path like normal. The fstat
+// regular-file check in load() below does NOT recover any of that
+// protection: by the time you have an fd, the kernel has already resolved
+// any symlink to reach it, so fstat(fd) reports the FOLLOWED target's type —
+// a symlink to a regular file is indistinguishable, from fstat's point of
+// view, from a real regular file sitting directly at that path. Plainly
+// stated: on a platform lacking O_NOFOLLOW, load() provides NO symlink
+// protection at all — it will happily follow a symlink planted at the state
+// path and read whatever it points to. This is the same gap
+// packages/honeytoken/src/registry.ts's readRegistryFile has (this comment
+// made the identical incorrect claim — that fstat guards against symlinks
+// when O_NOFOLLOW is unavailable — before the honeytoken round corrected the
+// same wrong comment there and flagged this one as out of scope).
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 // New files: never reuse an existing name, never follow a symlink planted at
 // it, and 0600 — the kill state is nobody else's to read or replace.
