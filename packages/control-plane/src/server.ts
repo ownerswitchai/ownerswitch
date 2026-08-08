@@ -1,4 +1,6 @@
+import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { ToolCall } from "@ownerswitchai/shared";
 import {
   isLoopbackAddress,
   verifyDeviceSignature,
@@ -7,7 +9,7 @@ import {
   type OwnerSession,
 } from "./auth.js";
 import { KillSwitch, type KillSource } from "./kill.js";
-import type { VetoWindow } from "./veto.js";
+import { VetoWindow } from "./veto.js";
 
 /**
  * HTTP layer of the control plane. One process, one KillSwitch, one map of
@@ -23,6 +25,12 @@ import type { VetoWindow } from "./veto.js";
  *                     as an unauthenticated "api" kill). Stopping must never
  *                     fail because auth was misconfigured.
  *  - POST /restore  — owner session required. No exceptions, no loopback bypass.
+ *  - POST /veto     — device signature required; a gateway registers a window
+ *                     for a call it is holding. Registration puts text in
+ *                     front of the owner and grows server state, so unlike
+ *                     /kill there is no loopback fallback: a gateway that
+ *                     cannot register must fail its call closed, not get an
+ *                     open door here.
  *  - POST /veto/:id — owner session required; the session names the vetoer.
  *  - GET  /status   — open; the gateway polls it and it leaks only kill state.
  */
@@ -196,6 +204,37 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
   }
 
+  /** The registered call, or null when the body doesn't describe one. */
+  function toolCallFrom(value: unknown): ToolCall | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const { agentId, tool, args } = value as Record<string, unknown>;
+    if (typeof agentId !== "string" || agentId === "") return null;
+    if (typeof tool !== "string" || tool === "") return null;
+    if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
+      return null;
+    }
+    return { agentId, tool, args: args as Record<string, unknown> | undefined };
+  }
+
+  async function postRegisterVeto(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Strictly device-authenticated: whoever registers decides what the owner
+    // gets asked about. Unauthenticated callers must not reach the owner.
+    const raw = await readRawBody(req);
+    if (!hasValidDeviceSignature(req, raw)) {
+      sendUnauthorized(res);
+      return;
+    }
+    const call = toolCallFrom(parseJsonBody(raw).call);
+    if (call === null) {
+      sendJson(res, 400, { error: "call must be an object with string agentId and tool" });
+      return;
+    }
+    const id = `veto_${randomBytes(6).toString("hex")}`;
+    const window = new VetoWindow(call, { now });
+    vetoWindows.set(id, window);
+    sendJson(res, 201, { id, status: window.state });
+  }
+
   function getVeto(res: ServerResponse, id: string): void {
     const window = vetoWindows.get(id);
     if (!window) {
@@ -222,6 +261,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/restore") return postRestore(req, res);
+    if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);
     if (vetoMatch) {
       const id = decodeURIComponent(vetoMatch[1]);
       if (method === "POST") return postVeto(req, res, id);
