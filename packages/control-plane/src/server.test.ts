@@ -249,7 +249,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /alert records a flagged event and does NOT kill (the DoS fix)", async () => {
     const c = clock(7_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     const body = JSON.stringify({ source: "honeytoken", reason: "read of /decoys/.env.backup" });
@@ -275,7 +275,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("non-loopback /alert without credentials -> 401, nothing recorded", async () => {
-    const cp = createControlPlane({ now: clock().now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: clock().now, deviceSecret: DEVICE_SECRET });
     const url = await startAs(cp, "203.0.113.9");
 
     const res = await fetch(`${url}/alert`, {
@@ -288,7 +288,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("loopback /alert without credentials records an unauthenticated 'api' alert", async () => {
-    const cp = createControlPlane({ now: clock().now });
+    const cp = ephemeral({ now: clock().now });
     const url = await start(cp);
 
     const res = await fetch(`${url}/alert`, {

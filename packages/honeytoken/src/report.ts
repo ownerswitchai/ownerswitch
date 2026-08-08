@@ -4,34 +4,30 @@ import { signDeviceRequest } from "@ownerswitchai/control-plane";
 /**
  * The trip reporter: deliver a tripped honeytoken to the control plane.
  *
- * Two tiers, because a decoy FILE being read is not the same event as a decoy
- * VALUE crossing the gateway:
+ * Two tiers, on TWO INDEPENDENT LANES:
  *
- *  - "kill"  → POST /kill.  A decoy value in an outbound tool call has no
- *    innocent explanation; it engages the switch.
- *  - "alert" → POST /alert. A decoy file was touched (read, indexed, backed
- *    up, grepped). Suspicious and worth flagging, but reads have innocent
- *    causes and an attacker can deliberately induce one — so this records a
- *    flagged event and does NOT kill. See watch.ts for why this is the
- *    default for file tripwires.
+ *  - "kill"  → POST /kill.  A decoy value about to be forwarded across the
+ *    gateway has no innocent explanation; it engages the switch.
+ *  - "alert" → POST /alert. A decoy file was touched, or a decoy value showed
+ *    up in a call policy already refused. Suspicious, worth flagging, but not
+ *    a lockdown.
  *
- * Delivery discipline is the button daemon's, for both tiers — evidence in
- * hand must reach the control plane:
+ * The lanes never share a queue. An earlier design put both on one strict
+ * FIFO whose head retries forever — so an undeliverable alert (404, 500, a
+ * hung socket, a version mismatch) could sit at the head and starve a genuine
+ * kill queued behind it. Here the kill lane drains on its own; an alert that
+ * never succeeds cannot delay a kill by a single millisecond.
  *
- *  - a trip that reached us must reach the control plane: a failed POST is
- *    retried (200/400/800 ms, then every 2 s) and every attempt is logged
- *    loudly — an unconfirmed report is never a silent one
- *  - trips queue: each distinct trip gets its own confirmed POST, so the
- *    audit log names every token that was touched
- *  - identical trips collapse while unconfirmed — an agent replaying the
- *    same poisoned call in a loop must not grow the queue without bound
- *  - signed fresh every attempt: nonces are single-use on the server and the
- *    timestamp must sit inside the clock-skew window, so a retry cannot
- *    reuse an earlier attempt's signature
- *  - flush() before shutdown blocks until the queue drains or a bounded
+ * Within each lane the delivery discipline is the button daemon's — evidence
+ * in hand must reach the control plane:
+ *
+ *  - a failed POST retries (200/400/800 ms, then every 2 s), logged loudly;
+ *  - identical trips collapse while unconfirmed, so a replaying agent can't
+ *    grow a lane without bound;
+ *  - each attempt is signed fresh (single-use nonce, fresh timestamp);
+ *  - flush() before shutdown blocks until both lanes drain or a bounded
  *    number of retries per trip is exhausted, so a tripped-but-unconfirmed
- *    report is not lost when the process exits (see the button daemon's
- *    "an unconfirmed kill is an emergency" for the same stance).
+ *    report is not lost when the process exits.
  */
 
 const BACKOFF_MS = [200, 400, 800] as const;
@@ -45,7 +41,7 @@ export type TripTier = "alert" | "kill";
 export interface Trip {
   /** "kill" engages the switch (POST /kill); "alert" only flags it (POST /alert). */
   tier: TripTier;
-  /** Canary ids of the touched token(s); empty when the file held no known core. */
+  /** Canary ids of the touched token(s); empty when none were identified. */
   canaryIds: string[];
   /** How it tripped, for the audit trail: "read of /decoys/.env.backup (atime advanced)". */
   how: string;
@@ -55,9 +51,7 @@ export interface DeliveryConfirmation {
   tier: TripTier;
   /** Attempts in this trip's sequence that finally landed (1 = first try). */
   attempts: number;
-  /** HTTP status of the confirming response. */
   status: number;
-  /** Response body, if it parsed as JSON. */
   body?: unknown;
   /** Reporter-clock time the confirmation arrived (ms since epoch). */
   at: number;
@@ -66,28 +60,24 @@ export interface DeliveryConfirmation {
 export interface TripReporterOptions {
   controlPlaneUrl: string;
   deviceId: string;
-  /** Shared secret provisioned on the control plane (`deviceSecret`). */
+  /** Shared secret provisioned on the control plane (`deviceSecret`) for signing. */
   secret: string;
   /** Called once each trip's report lands. */
   onDelivered?: (trip: Trip, confirmation: DeliveryConfirmation) => void;
   now?: () => number;
-  /** Injectable for tests. */
   fetchImpl?: typeof fetch;
-  /** One line per event, loud by default (console.error). */
   log?: (line: string) => void;
 }
 
 export interface TripReporter {
-  /** Queue a trip and return immediately; delivery retries in the background. */
+  /** Queue a trip on its tier's lane and return immediately; delivery retries in the background. */
   report(trip: Trip): void;
-  /**
-   * Block until every queued trip is confirmed, or each has exhausted
-   * `maxAttempts` tries. Call before shutting the process down so an
-   * unconfirmed trip is not lost. Resolves with what could not be delivered.
-   */
+  /** Block until both lanes drain, or each queued trip exhausts `maxAttempts`. */
   flush(opts?: { maxAttempts?: number }): Promise<{ delivered: boolean; pending: number }>;
-  /** Trips queued but not yet confirmed by the control plane. */
+  /** Trips queued but not yet confirmed, across both lanes. */
   pending(): number;
+  /** Pending count on one lane. */
+  pendingOn(tier: TripTier): number;
   /** Hard teardown: cancel retries now. Prefer flush() when a trip may be pending. */
   stop(): void;
 }
@@ -98,7 +88,7 @@ export function tripReason(trip: Trip): string {
   return `honeytoken ${ids} tripped: ${trip.how}`;
 }
 
-/** Back-compat alias — the kill reason a trip sends. */
+/** Back-compat alias. */
 export const killReason = tripReason;
 
 interface AttemptOutcome {
@@ -118,35 +108,13 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
   };
 
   let active = true;
-  let cancelWait: (() => void) | null = null;
-  /** Attempts allowed per trip. Infinity in the background; flush() lowers it. */
-  let retryBudget = Number.POSITIVE_INFINITY;
-  let drainPromise: Promise<void> | null = null;
-  const queue: Trip[] = [];
-
-  const wait = (ms: number): Promise<void> =>
-    new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        cancelWait = null;
-        resolve();
-      }, ms);
-      cancelWait = () => {
-        clearTimeout(timer);
-        cancelWait = null;
-        resolve();
-      };
-    });
 
   async function attempt(trip: Trip, n: number): Promise<AttemptOutcome> {
     const url = endpoint[trip.tier];
     const timestamp = now();
     const nonce = randomBytes(16).toString("hex");
     const body = JSON.stringify({ source: "honeytoken", reason: tripReason(trip) });
-    const signature = signDeviceRequest(
-      { deviceId: opts.deviceId, timestamp, nonce },
-      body,
-      opts.secret,
-    );
+    const signature = signDeviceRequest({ deviceId: opts.deviceId, timestamp, nonce }, body, opts.secret);
     log(`[honeytoken] → POST ${url} (${trip.tier}, attempt ${n}, device ${opts.deviceId})`);
     try {
       const res = await fetchImpl(url, {
@@ -170,99 +138,144 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
     }
   }
 
-  async function drain(): Promise<void> {
-    while (active && queue.length > 0) {
-      const trip = queue[0];
-      let landed = false;
-      for (let n = 1; active && n <= retryBudget; n += 1) {
-        const outcome = await attempt(trip, n);
-        if (!active) return;
-        if (outcome.ok) {
-          queue.shift();
-          landed = true;
-          const verb = trip.tier === "kill" ? "KILL CONFIRMED" : "ALERT RECORDED";
-          log(`[honeytoken] ■ ${verb} (${outcome.detail}, attempt ${n}) — ${tripReason(trip)}`);
-          opts.onDelivered?.(trip, {
-            tier: trip.tier,
-            attempts: n,
-            status: outcome.status,
-            body: outcome.body,
-            at: now(),
-          });
-          break;
-        }
-        if (n >= retryBudget) {
-          // Bounded flush gave up on this trip. Leave it queued (pending()
-          // still counts it) and stop draining so we don't spin on queue[0].
-          log(
-            `[honeytoken] ✗ giving up after ${n} attempt(s) — trip UNCONFIRMED (${outcome.detail}); ${tripReason(trip)}`,
-          );
-          break;
-        }
-        const delayMs = n <= BACKOFF_MS.length ? BACKOFF_MS[n - 1] : STEADY_RETRY_MS;
-        log(
-          `[honeytoken] ✗ NOT LANDED — attempt ${n} failed (${outcome.detail}); retrying in ${delayMs}ms, not giving up`,
-        );
-        await wait(delayMs);
+  /** One independent delivery lane per tier — no lane can block another. */
+  class Lane {
+    private readonly queue: Trip[] = [];
+    private retryBudget = Number.POSITIVE_INFINITY;
+    private drainPromise: Promise<void> | null = null;
+    private cancelWait: (() => void) | null = null;
+
+    constructor(private readonly tier: TripTier) {}
+
+    get size(): number {
+      return this.queue.length;
+    }
+
+    private wait(ms: number): Promise<void> {
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          this.cancelWait = null;
+          resolve();
+        }, ms);
+        this.cancelWait = () => {
+          clearTimeout(timer);
+          this.cancelWait = null;
+          resolve();
+        };
+      });
+    }
+
+    enqueue(trip: Trip): void {
+      const reason = tripReason(trip);
+      if (this.queue.some((q) => tripReason(q) === reason)) {
+        log(`[honeytoken] duplicate ${this.tier} trip already queued, report in flight — ${reason}`);
+        return;
       }
-      // A bounded budget that didn't land must not loop forever on the head.
-      if (!landed && retryBudget !== Number.POSITIVE_INFINITY) break;
+      this.queue.push(trip);
+      log(`[honeytoken] ⚡ TRIP (${this.tier}) — ${reason}`);
+      this.ensureDraining();
+    }
+
+    private ensureDraining(): void {
+      if (this.drainPromise === null) {
+        this.drainPromise = this.drain().finally(() => {
+          this.drainPromise = null;
+        });
+      }
+    }
+
+    private async drain(): Promise<void> {
+      while (active && this.queue.length > 0) {
+        const trip = this.queue[0];
+        let landed = false;
+        for (let n = 1; active && n <= this.retryBudget; n += 1) {
+          const outcome = await attempt(trip, n);
+          if (!active) return;
+          if (outcome.ok) {
+            this.queue.shift();
+            landed = true;
+            const verb = trip.tier === "kill" ? "KILL CONFIRMED" : "ALERT RECORDED";
+            log(`[honeytoken] ■ ${verb} (${outcome.detail}, attempt ${n}) — ${tripReason(trip)}`);
+            opts.onDelivered?.(trip, {
+              tier: trip.tier,
+              attempts: n,
+              status: outcome.status,
+              body: outcome.body,
+              at: now(),
+            });
+            break;
+          }
+          if (n >= this.retryBudget) {
+            log(
+              `[honeytoken] ✗ giving up after ${n} attempt(s) — ${this.tier} trip UNCONFIRMED (${outcome.detail}); ${tripReason(trip)}`,
+            );
+            break;
+          }
+          const delayMs = n <= BACKOFF_MS.length ? BACKOFF_MS[n - 1] : STEADY_RETRY_MS;
+          log(
+            `[honeytoken] ✗ NOT LANDED — ${this.tier} attempt ${n} failed (${outcome.detail}); retrying in ${delayMs}ms, not giving up`,
+          );
+          await this.wait(delayMs);
+        }
+        if (!landed && this.retryBudget !== Number.POSITIVE_INFINITY) break;
+      }
+    }
+
+    async flush(maxAttempts: number): Promise<void> {
+      this.retryBudget = Math.max(1, Math.floor(maxAttempts));
+      this.cancelWait?.(); // wake an in-progress backoff so it retries now under the bounded budget
+      this.ensureDraining();
+      await this.drainPromise;
+      this.retryBudget = Number.POSITIVE_INFINITY;
+    }
+
+    stop(): void {
+      this.cancelWait?.();
     }
   }
 
-  function ensureDraining(): void {
-    if (drainPromise === null) {
-      drainPromise = drain().finally(() => {
-        drainPromise = null;
-      });
-    }
-  }
+  const lanes: Record<TripTier, Lane> = { kill: new Lane("kill"), alert: new Lane("alert") };
 
   return {
     report(trip: Trip): void {
-      const reason = tripReason(trip);
       if (!active) {
-        // Stopped reporters must not swallow evidence silently.
-        log(`[honeytoken] ⚠ reporter is stopped — trip NOT delivered: ${reason}`);
+        log(`[honeytoken] ⚠ reporter is stopped — trip NOT delivered: ${tripReason(trip)}`);
         return;
       }
-      if (queue.some((queued) => queued.tier === trip.tier && tripReason(queued) === reason)) {
-        log(`[honeytoken] duplicate trip already queued, report in flight — ${reason}`);
-        return;
-      }
-      queue.push(trip);
-      log(`[honeytoken] ⚡ TRIP (${trip.tier}) — ${reason}`);
-      ensureDraining();
+      lanes[trip.tier].enqueue(trip);
     },
 
     async flush(flushOpts: { maxAttempts?: number } = {}): Promise<{ delivered: boolean; pending: number }> {
-      if (!active) return { delivered: queue.length === 0, pending: queue.length };
+      if (!active) return { delivered: this.pending() === 0, pending: this.pending() };
       const maxAttempts = flushOpts.maxAttempts ?? DEFAULT_FLUSH_ATTEMPTS;
-      retryBudget = Math.max(1, Math.floor(maxAttempts));
-      cancelWait?.(); // wake any in-progress backoff so it retries now under the bounded budget
-      ensureDraining();
-      await drainPromise;
-      const delivered = queue.length === 0;
-      if (!delivered) {
+      // Drain both lanes concurrently — flushing must not serialize them either.
+      await Promise.all([lanes.kill.flush(maxAttempts), lanes.alert.flush(maxAttempts)]);
+      const pending = this.pending();
+      if (pending > 0) {
         log(
-          `[honeytoken] ⚠ flush: ${queue.length} trip(s) still UNCONFIRMED after ${retryBudget} attempt(s) each — evidence may be lost on exit`,
+          `[honeytoken] ⚠ flush: ${pending} trip(s) still UNCONFIRMED after ${maxAttempts} attempt(s) each — evidence may be lost on exit`,
         );
       }
-      retryBudget = Number.POSITIVE_INFINITY;
-      return { delivered, pending: queue.length };
+      return { delivered: pending === 0, pending };
     },
 
     pending(): number {
-      return queue.length;
+      return lanes.kill.size + lanes.alert.size;
+    },
+
+    pendingOn(tier: TripTier): number {
+      return lanes[tier].size;
     },
 
     stop(): void {
       if (!active) return;
       active = false;
-      cancelWait?.();
-      if (queue.length > 0) {
+      lanes.kill.stop();
+      lanes.alert.stop();
+      const pending = lanes.kill.size + lanes.alert.size;
+      if (pending > 0) {
         log(
-          `[honeytoken] ⚠ stopped with ${queue.length} trip(s) UNCONFIRMED — the control plane may not have recorded them`,
+          `[honeytoken] ⚠ stopped with ${pending} trip(s) UNCONFIRMED — the control plane may not have recorded them`,
         );
       }
     },

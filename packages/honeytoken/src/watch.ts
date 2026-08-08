@@ -10,7 +10,7 @@ import {
   type Stats,
 } from "node:fs";
 import { join } from "node:path";
-import { scanForHoneytokens } from "./scan.js";
+import type { HoneytokenRegistry } from "./registry.js";
 
 /**
  * File tripwires: any touch of a planted decoy file fires onTrip.
@@ -67,12 +67,12 @@ export interface WatchHoneytokenFilesOptions {
   paths: string[];
   onTrip: (trip: FileTrip) => void;
   /**
-   * Per-deployment canary key, used only to LABEL a trip with the canary ids
-   * found in the file at arm time. Detection does not depend on it — a touch
-   * trips whether or not the ids are recovered — so it is optional; without
-   * it, FileTrip.canaryIds is empty.
+   * The deployment's honeytoken registry, used only to LABEL a trip with the
+   * canary ids found in the file at arm time. Detection does not depend on it
+   * — a touch trips whether or not the ids are recovered — so it is optional;
+   * without it, FileTrip.canaryIds is empty.
    */
-  secret?: string;
+  registry?: HoneytokenRegistry;
   /** atime/mtime sampling cadence; default 500 ms. */
   pollMs?: number;
   now?: () => number;
@@ -146,7 +146,7 @@ export function watchHoneytokenFiles(opts: WatchHoneytokenFilesOptions): Honeyto
     // than no tripwire, so any of these throws aborts watchHoneytokenFiles.
     const content = readFileSync(path, "utf8"); // our own read — before priming
     const canaryIds =
-      opts.secret === undefined ? [] : scanForHoneytokens(content, opts.secret).map((m) => m.canaryId);
+      opts.registry === undefined ? [] : opts.registry.match(content).map((m) => m.canaryId);
     const before = statSync(path);
     if (!before.isFile()) throw new Error(`${path} is not a regular file — cannot arm a tripwire on it`);
     // Prime atime below mtime so relatime mounts record the NEXT read (ours

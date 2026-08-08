@@ -1,36 +1,32 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { generateHoneytoken, type Honeytoken } from "./generate.js";
+import { HoneytokenRegistry, type RegistryIdentity } from "./registry.js";
 
 /**
  * Plant decoy credential files: a fake `.env.backup` and a fake
  * `credentials.json` — the two shapes a credential sweep greps for first.
- * Every "secret" in them is a honeytoken; nothing else in the files is real
- * either. Each file gets its own tokens, so a trip's canary id also says
- * WHICH file was touched.
+ * Every "secret" in them is a honeytoken; nothing else is real either.
  *
- * The canary-id → file/key mapping is returned to the caller and belongs
- * somewhere the decoys are not (the CLI prints it; --manifest can save it).
- * A mapping stored next to the bait is a shopping list of what to avoid.
+ * Planting also builds a deployment-scoped registry of the planted values.
+ * The gateway and file watcher recognise a token by membership in this
+ * registry, so it must be provisioned with the deployment's dedicated canary
+ * key and id — the same ones the gateway loads. The caller serializes the
+ * registry to a file kept OUTSIDE the planted directory (a registry sitting
+ * next to the bait is a map of exactly what to avoid).
  */
 
 export const DECOY_FILENAMES = [".env.backup", "credentials.json"] as const;
 
-export interface PlantOptions {
+export interface PlantOptions extends RegistryIdentity {
   dir: string;
-  /**
-   * Per-deployment canary key the planted tokens are minted with. The gateway
-   * and file watcher only trip on tokens minted with the SAME key, so this
-   * must match theirs — reuse the device secret. Required.
-   */
-  secret: string;
   /** Replace existing files of the same names. Off by default: never destroy a real backup. */
   force?: boolean;
 }
 
 export interface PlantedToken {
   token: Honeytoken;
-  /** Absolute-or-as-given path of the file the token sits in. */
+  /** Path of the file the token sits in. */
   file: string;
   /** The env var or JSON path the value sits under. */
   key: string;
@@ -40,14 +36,20 @@ export interface PlantResult {
   /** Paths written, in DECOY_FILENAMES order. */
   files: string[];
   planted: PlantedToken[];
+  /** Every planted value, registered for this deployment — serialize and give to the gateway. */
+  registry: HoneytokenRegistry;
 }
 
 export function plantHoneytokens(opts: PlantOptions): PlantResult {
+  // Constructing the registry validates the canary key + deployment id up
+  // front, so a misconfigured plant fails before it writes any bait.
+  const registry = new HoneytokenRegistry(opts.canaryKey, opts.deploymentId);
+
   mkdirSync(opts.dir, { recursive: true });
 
   // Check every target before writing any: a real file with one of these
-  // names is exactly what this package must never destroy, and a partial
-  // plant (one file written, then a refusal) would leave confusing bait.
+  // names is exactly what this must never destroy, and a partial plant would
+  // leave confusing bait.
   for (const name of DECOY_FILENAMES) {
     const path = join(opts.dir, name);
     if (!opts.force && existsSync(path)) {
@@ -57,8 +59,9 @@ export function plantHoneytokens(opts: PlantOptions): PlantResult {
 
   const planted: PlantedToken[] = [];
   const mint = (kind: Honeytoken["kind"], file: string, key: string): string => {
-    const token = generateHoneytoken({ kind, label: `${file} ${key}`, secret: opts.secret });
+    const token = generateHoneytoken({ kind, label: `${file} ${key}` });
     planted.push({ token, file, key });
+    registry.add(token);
     return token.value;
   };
 
@@ -90,5 +93,5 @@ export function plantHoneytokens(opts: PlantOptions): PlantResult {
   writeFileSync(envPath, envContent);
   writeFileSync(credsPath, credsContent);
 
-  return { files: [envPath, credsPath], planted };
+  return { files: [envPath, credsPath], planted, registry };
 }

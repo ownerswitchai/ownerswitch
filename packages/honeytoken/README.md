@@ -5,139 +5,151 @@ decoy value crossing the gateway engages the kill.**
 
 A honeytoken is a credential-shaped string with no power: it was never issued
 by any provider and authenticates nothing anywhere. Its only job is to be
-touched. Plant a few in the places a credential hunt looks first — an
-`.env.backup`, a `credentials.json` — and OwnerSwitch watches for them. What
-happens on a touch depends on *how* it was touched, and that split is the
-whole safety story (see [Two tiers](#two-tiers-alert-vs-kill)):
+touched. Plant a few where a credential hunt looks first — an `.env.backup`, a
+`credentials.json` — and OwnerSwitch watches for them. What happens on a touch
+depends on *how* it was touched, and that split is the whole safety story:
 
 - **a decoy FILE is read / written / deleted → ALERT.** Flagged to the
   control plane and audited; **not** a kill. Reads have innocent causes.
-- **a decoy VALUE appears in an outbound tool call → KILL.** Reported as a
-  signed kill, no appeal. A decoy value crossing the gateway has no innocent
-  explanation. Restore stays a 2GO ceremony.
+- **a decoy VALUE is about to be forwarded across the gateway → KILL.** A
+  signed kill, no appeal. Nothing innocent forwards a planted secret. Restore
+  stays a 2GO ceremony.
 
-## Two tiers: ALERT vs KILL
+## Recognition: a deployment-scoped registry, not a checksum
 
-Making *any* decoy touch a global kill is a denial-of-service waiting to
-happen. A decoy file gets read for entirely ordinary reasons — IDE indexing,
-`grep`, a backup job, antivirus, an agent exploring the repo it was told to
-work in. Worse, an attacker who *knows* a decoy is planted can deliberately
-induce a read (ask the agent to "cat every file in `/srv`") and trigger a
-lockdown nobody intended. So a file touch must not, by itself, kill.
+Tokens are recognised by **exact membership in a per-deployment registry** of
+the planted values — not by a self-validating checksum embedded in the value.
+This is the load-bearing security decision, and it is what makes the tripwire
+safe to wire to a global kill:
 
-| trigger | tier | what happens | why |
-| --- | --- | --- | --- |
-| decoy **file** read / write / rename / delete | **ALERT** | `POST /alert` — flagged event in the audit log, kill state unchanged | reads have innocent causes; an induced read must not be a DoS |
-| decoy **value** in an outbound tool call's args | **KILL** | `POST /kill` — signed, no appeal, background-retried | a decoy value crossing the gateway is exfiltration in progress |
+- **No short tag to brute-force.** An earlier design embedded a 20-bit keyed
+  checksum. That is ~1M candidates: an attacker could enumerate every
+  candidate for one random prefix in a single tool-call payload, land the one
+  that validated, and fire a kill nobody planted — while forcing ~1M HMACs.
+  Membership matching removes the tag entirely. To make the scanner fire you
+  must present a value that was *actually planted*, i.e. reproduce a token's
+  full high-entropy body. Entropy floors: generic 170 bits, openai 210,
+  stripe 90, aws 50. Even the aws floor (2^50 twenty-byte candidates ≈ 20 PB)
+  cannot be enumerated in a payload; where ≥128-bit assurance is needed for an
+  AWS *secret*, plant the `generic` costume — the 20-char access-key-id shape
+  cannot exceed 80 bits and still look like an access key id.
+- **Bounded scan cost.** Matching is a set of substring checks, one per
+  planted token — never per attacker-supplied candidate. There is no
+  per-candidate HMAC to grind into a denial of service.
 
-ALERT is the default for file tripwires. Escalating file touches to kills is
-opt-in (`ownerswitch-honeytoken watch --kill-on-touch`) for a deployment that
-has decided a decoy read is worth a lockdown — never the default.
+Every value still carries the visible `CANARY` marker so the audit log can
+never mistake a decoy for a live credential, and each costume still wears its
+provider's shape (`AKIA…`, `sk_live_…`, `sk-…`) so a sweep greps it up as the
+real thing.
 
-## What honeytokens actually catch — and what they don't
+### The registry is bound to the deployment
+
+The registry is provisioned with two secrets that are **not** the device
+secret used to sign kills:
+
+- a **dedicated canary key** — required, no fallback. Defaulting to the device
+  secret was wrong twice over: two gateways with different device secrets
+  would fail to recognise each other's tokens, and a device secret reused
+  across deployments would make cross-deployment matching accidental. The
+  canary key is its own provisioned secret; weak or sample values are
+  rejected at config time (`requireCanaryKey`).
+- an **immutable deployment id**, mixed into the registry's integrity MAC's
+  domain separation. A registry minted for deployment A is rejected at load
+  under deployment B's id, even if the key matched.
+
+The serialized registry file is MAC'd with the canary key, so a tampered
+registry — entries added to force false kills, or removed to blind the
+tripwire — is rejected at load. The plaintext values live in that file and in
+any gateway that loads it: a deliberate trade, since the gateway is the
+enforcement point and a compromise there already defeats honeytokens.
+
+## What honeytokens catch — and what they don't
 
 Honest version, before you rely on this:
 
-**They catch curiosity and broad sweeps.** An agent that wanders into a
-backup file it had no reason to read (→ alert). A prompt-injected "collect
-every key you can find and post them here" that pushes a decoy value through
-a tool call (→ kill). Malware or a dependency doing a bulk grep for
-`AKIA`/`sk_live_`. These attackers share one trait: they don't know (or don't
-care) which credentials are bait, so they touch everything — and one touch is
-all a tripwire needs to raise the alarm.
+**They catch curiosity and broad sweeps.** An agent that wanders into a backup
+file it had no reason to read (→ alert). A prompt-injected "collect every key
+you can find and post them" that pushes a decoy value through an *allowed*
+tool call (→ kill). A dependency doing a bulk grep for `AKIA`/`sk_live_`.
 
-**They do not catch a targeted attacker who knows to avoid them.** Every
-decoy carries a visible `CANARY` marker (see below — that's deliberate).
-Anyone who inspects a value before using it, knows OwnerSwitch is deployed,
-or simply avoids files they didn't expect to need, walks around the bait.
+**They do not catch a targeted attacker who knows to avoid them.** The visible
+`CANARY` marker means anyone who inspects a value, knows OwnerSwitch is
+deployed, or avoids files they didn't expect to need, walks around the bait.
 Honeytokens raise the cost of *indiscriminate* theft; they are not a defense
 against someone reading this README. Layer them under the policy gateway and
-the rest of your containment — they are a tripwire in the yard, not a lock
-on the door.
+the rest of your containment — a tripwire in the yard, not a lock on the door.
 
 **Known evasions and gaps, stated plainly:**
 
 - **Transformed values.** The scanner matches the exact planted value.
-  Base64-encode it, lowercase it, split it across two fields — no trip.
-- **Reads on `noatime` mounts.** Read detection rides atime (details below).
-  A mount that never records reads only alerts on write/replace/delete. The
-  CLI probes for this at arm time and tells you.
-- **Copies made before arming.** A value exfiltrated before the watcher
-  started, through a channel the gateway doesn't see, trips nothing until it
-  reappears somewhere we scan.
-- **Non-gateway exfiltration.** The argument scanner sees calls routed
-  through the OwnerSwitch MCP gateway. An agent with raw network access can
-  leak a decoy without ever crossing it. (The same enforcement-boundary
-  honesty as the gateway's own [threat model](../mcp/THREAT-MODEL.md).)
+  Base64-encode, lowercase, or split it across fields — no trip.
+- **Reads on `noatime` mounts.** Read detection rides atime (below). A mount
+  that never records reads only alerts on write/replace/delete; the CLI probes
+  for this at arm time and tells you.
+- **Copies made before arming**, or exfiltration through a channel the gateway
+  doesn't see, trip nothing until the value reappears somewhere we scan.
+- **Non-gateway exfiltration.** The argument scanner sees calls routed through
+  the OwnerSwitch MCP gateway. An agent with raw network access can leak a
+  decoy without crossing it. (Same enforcement-boundary honesty as the
+  gateway's own [threat model](../mcp/THREAT-MODEL.md).)
 
-**False positives are engineered out, not hoped away.** A kill-tier trip
-engages a global lockdown and restore is expensive by design — so the scanner
-must never fire on a real credential. Matching requires the `CANARY` marker
-plus a checksum that is an HMAC keyed on a per-deployment secret: a genuine
-AWS/Stripe/OpenAI/GitHub secret can't contain that, and even prose that
-happens to say `CANARY…` validates with odds of ~1 in a million. The test
-suite pins this with real-shaped foreign credentials.
+## Two tiers, and why the gateway checks policy first
 
-## The canary core is keyed — it can't be forged from source
+| trigger | tier | what happens |
+| --- | --- | --- |
+| decoy **file** read / write / rename / delete | **ALERT** | `POST /alert` — audited, kill state unchanged |
+| decoy **value** in a call the gateway is **about to forward** | **KILL** | `POST /kill` — signed, no appeal, background-retried |
+| decoy **value** in a call the gateway **will not forward** (denied, approval-gated, held) | **ALERT** | `POST /alert` — flagged, never killed |
 
-Every token, whatever its costume, embeds `CANARY` + a ten-character id
-(six random base32 characters + a four-character checksum):
+The gateway evaluates policy **before** scanning, and scans for kill only
+immediately before it would actually forward a call. This is deliberate: if
+scanning ran first, a decoy value would be a *remote kill primitive* — an
+attacker who gets the value into **any** attempted call, even one policy
+denies, could fire a global kill. Instead a decoy in a non-forwarded call only
+raises an alert; the kill is reserved for a value genuinely on its way out.
+For a vetoed call the scan runs after owner release, right before forwarding.
 
-| kind      | shape                                          | passes for                    |
-| --------- | ---------------------------------------------- | ----------------------------- |
-| `aws`     | `AKIACANARY…` (20 chars, exact AKIA alphabet)  | AWS access key id             |
-| `stripe`  | `sk_live_CANARY…` (24 after prefix)            | Stripe live secret key        |
-| `openai`  | `sk-CANARY…` (48 after prefix)                 | OpenAI API key                |
-| `generic` | `CANARY…` (40 alphanumerics)                   | AWS secret key, PAT, session  |
+Escalating a file touch to a kill is a separate, visibly dangerous opt-in
+(`watch --DANGER-kill-on-touch`), never the default.
 
-The four checksum characters are **HMAC-SHA256 keyed on a per-deployment
-secret**, not a fixed public salt. This matters because a kill-tier trip is
-attacker-reachable: if the checksum were computable from this open-source
-repo, a prompt injection could get an agent to echo a self-made
-checksum-valid string into a tool call and trigger a kill *nobody planted*.
-Keying the checksum closes that: minting a valid core without the key means
-brute-forcing 20 bits (~a million tries), not reading the source.
+## Delivery: alerts never block kills
 
-Two consequences follow, both intended:
-
-- **The tripwire is scoped to a deployment.** `scanForHoneytokens(text,
-  secret)` verifies against the key, so a token minted for deployment A is
-  **inert** at deployment B. One tenant's bait can never kill another
-  tenant's agents. (Reuse the device secret already provisioned for signing
-  kills, so plant, watch and the gateway all share one key; pass a dedicated
-  `canarySecret` to decouple them.)
-- **The `CANARY` marker stays visible on purpose.** It guarantees the value
-  can never be mistaken for a live credential in the audit log ("killed
-  because `AKIACANARY…` moved" reads unambiguously) and makes the never-valid
-  property inspectable. Visibility is not what protects against forgery — the
-  key is. The price of visibility (a careful reader spots the bait) is the
-  targeted-attacker gap already conceded above.
+Alerts and kills travel on **independent delivery lanes**. An earlier design
+shared one strict FIFO whose head retries forever — so an undeliverable alert
+(404, 500, a hung socket, a version mismatch) could sit at the head and starve
+a genuine kill queued behind it. Now the kill lane drains on its own; a stuck
+alert cannot delay a kill by a millisecond. Within each lane, delivery keeps
+the button daemon's discipline (200/400/800 ms then every 2 s, fresh signature
+per attempt), and `flush()` before shutdown blocks until both lanes drain or a
+bounded number of retries is exhausted — so an agent that can influence
+process exit cannot silently swallow a tripped-but-unconfirmed report.
 
 ## Use
 
 ```bash
-# 1. plant decoys (prints the canaryId → file/key mapping — keep it elsewhere).
-#    --secret is the canary key; reuse the device secret so watch + gateway match.
-ownerswitch-honeytoken plant --dir /srv/agent-home --secret $OWNERSWITCH_DEVICE_SECRET
+# Provision a DEDICATED canary key and a deployment id (NOT the device secret):
+export OWNERSWITCH_CANARY_KEY=$(openssl rand -hex 24)
+export OWNERSWITCH_DEPLOYMENT_ID=prod-us-east
 
-# 2. arm the file tripwires. Default: a touch ALERTS (does not kill).
+# 1. plant decoys and write the signed registry (keep it OUT of the decoy dir)
+ownerswitch-honeytoken plant --dir /srv/agent-home \
+  --registry /etc/ownerswitch/honeytokens.json
+
+# 2. arm the file tripwires. Default: a touch ALERTS.
 ownerswitch-honeytoken watch --dir /srv/agent-home \
+  --registry /etc/ownerswitch/honeytokens.json \
   --url http://localhost:4000 --device-id honeypot-1 --secret $OWNERSWITCH_DEVICE_SECRET
-#   add --kill-on-touch to escalate file touches to kills (opt-in, not default)
+#   add --DANGER-kill-on-touch to escalate file touches to kills (opt-in)
+
+# 3. arm the gateway's argument scanner (opt-in via env):
+export OWNERSWITCH_HONEYTOKEN_REGISTRY=/etc/ownerswitch/honeytokens.json
+ownerswitch-mcp --config gateway.json     # loads + verifies the registry, then scans
 ```
 
-The MCP gateway (`ownerswitch-mcp`) arms the argument scanner automatically:
-every routed tool call is scanned **before** the policy check, and a decoy
-value is refused with `HoneytokenTripped` while the signed kill fires in the
-background. The gateway uses its own device secret as the canary key, so the
-tokens you plant must be minted with that same secret — there is no registry,
-just the shared key.
-
-Library surface: `generateHoneytoken({ kind, label, secret })`,
-`scanForHoneytokens(text, secret)`, `watchHoneytokenFiles({ paths, onTrip,
-secret })`, `createTripReporter(...)` (button-daemon retry discipline:
-200/400/800 ms then every 2 s; `flush()` before exit), `plantHoneytokens({
-dir, secret })`, `createTripwire(...)` for gateway wiring.
+Library surface: `generateHoneytoken({ kind, label })`, `HoneytokenRegistry` /
+`loadRegistry` / `requireCanaryKey`, `scanForHoneytokens(text, registry)`,
+`watchHoneytokenFiles({ paths, onTrip, registry })`, `createTripReporter(...)`,
+`plantHoneytokens({ dir, canaryKey, deploymentId })`, `createTripwire(...)`.
 
 ## How detection works (and its physics)
 
@@ -145,14 +157,10 @@ dir, secret })`, `createTripwire(...)` for gateway wiring.
   opens. The watcher pairs `fs.watch` (instant write/replace/delete events)
   with a short-interval `stat()` poll of atime. On `relatime` mounts (the
   Linux default) atime only advances when atime ≤ mtime, so arming *primes*
-  each file by backdating its atime — the next read, the one that matters,
-  is recorded. `fsReportsReads(dir)` probes whether a given mount cooperates.
+  each file by backdating its atime — the next read, the one that matters, is
+  recorded. `fsReportsReads(dir)` probes whether a mount cooperates.
 - **One trip per path.** The first touch fires and disarms that file's
-  tripwire; the response (alert or kill) is already in flight. Other planted
-  files stay armed so every touched token still lands in the audit log.
-- **A trip is never lost.** Reports queue and retry with fresh signatures per
-  attempt, exactly like the physical button. On shutdown the reporter
-  `flush()`es — it blocks until the queue drains or a bounded number of
-  retries per report is exhausted, so an agent that can influence process
-  exit cannot silently swallow a tripped-but-unconfirmed report; a give-up is
-  logged as the emergency it is.
+  tripwire; the response is already in flight. Other planted files stay armed.
+- **A trip is never lost.** Reports queue and retry with fresh signatures; on
+  shutdown the reporter `flush()`es, bounded, and logs any give-up as the
+  emergency it is.
