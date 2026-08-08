@@ -85,6 +85,8 @@ function createFakeControlPlane() {
   const state = {
     killed: false as boolean,
     reason: undefined as string | undefined,
+    /** mirrors the real control plane's monotone kill epoch */
+    epoch: 0,
     /** every fetch rejects, as if the process were gone */
     down: false,
     /** only veto registration fails */
@@ -107,7 +109,11 @@ function createFakeControlPlane() {
     const method = init?.method ?? "GET";
 
     if (method === "GET" && url.pathname === "/status") {
-      return json(state.killed ? { killed: true, reason: state.reason } : { killed: false });
+      return json(
+        state.killed
+          ? { killed: true, reason: state.reason, epoch: state.epoch }
+          : { killed: false, epoch: state.epoch },
+      );
     }
     if (method === "POST" && url.pathname === "/veto") {
       if (state.registrationDown) throw new Error("ECONNREFUSED");

@@ -122,15 +122,15 @@ ceremony in flight. The `ActionTicket` applies the same rule to actions —
 a ticket binds to the epoch at mint time, and a later kill invalidates
 every ticket in flight. This package invents no kill state of its own.
 
-**The one small follow-up the executor needs:** `GET /status` does not
-expose the epoch yet — it returns `killed`, the attributing kill's
-`reason`/`at`, and the persistence-degradation fields. A small
-control-plane PR adds `epoch` to the `/status` body (and the executor's
-kill-state reader consumes it). One note for that PR: `/status` is
-deliberately unauthenticated and documented as leaking *only kill state* —
-the epoch adds a monotone count of every kill ever engaged, a deliberate
-and worthwhile widening, but one to acknowledge in the endpoint's docs
-rather than slip in.
+**Done:** `GET /status` now exposes `epoch` alongside `killed`, the
+attributing kill's `reason`/`at`, and the persistence-degradation fields —
+acknowledged in the endpoint's own docs and in
+`packages/mcp/THREAT-MODEL.md` as the deliberate widening it is. The
+gateway's kill-state client (`packages/gateway/src/client.ts`) reads it and
+fails the whole lookup closed if `epoch` is missing or unparseable, rather
+than defaulting it to `0`. The executor's own kill-state reader (its
+injected `fetchLiveKillState`) is still unwired — that lands with the proxy
+wiring in §4.
 
 **Why an epoch and not just `killed === false`:** kill-then-restore. The
 owner kills at 12:00, cleans up, completes 2GO and restores at 12:10. At
@@ -162,7 +162,7 @@ on the agent's side.
 | --- | --- | --- |
 | `@ownerswitchai/shared` | `Decision`, `ToolCall`, `Policy`, `Verdict` | unchanged |
 | gateway `evaluate()` / `evaluateRemote()` | the decision, live kill state required | unchanged — still the sole authority |
-| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` without `epoch` | follow-up: add `epoch` to the `/status` body (§3) |
+| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` now returns `epoch` too (§3) | unchanged |
 | mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | follow-up: for executor-routed operations, mint an `ActionTicket` and call `executor.run()` instead; relay the result |
 | **this package** | — | ticket type, refusal core, `ExecutorBackend`, stubbed GitHub merge backend |
 

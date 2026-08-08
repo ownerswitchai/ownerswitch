@@ -350,6 +350,28 @@ What limits the blast radius today — real code, caveats included:
   Hardening beyond this (external anchoring, a shared store, singleton
   enforcement, log bounding) is future work, tracked with the audit-log
   hardening above.
+- **`GET /status` is unauthenticated by design, and now discloses one more
+  bit.** The route has always leaked `killed` to any caller who can reach
+  the control plane — that is the point, since gateways and (per
+  `packages/executor/DESIGN.md`) executors must be able to poll it without
+  a session. It now also returns `epoch`, a monotone count of every kill
+  this deployment has EVER had. That is a real, if narrow, widening: an
+  outside observer who can merely reach `/status` learns how many times
+  this system has been stopped over its lifetime — nothing about when, why,
+  or by whom (reason/at require reading the killed branch of the same open
+  response, already true before this change; source and full attribution
+  still require an owner session). It is worth accepting because `killed`
+  alone cannot support the one job `epoch` exists for: telling a stale
+  approval from a current one. A restore flips `killed` back to `false`, so
+  a client that only checked `killed` would treat a pre-kill approval as
+  fresh the moment the owner restores — exactly the gap a kill-then-restore
+  cycle is supposed to close. `epoch` never resets, so an approval minted
+  before a kill (an `ActionTicket`'s `killEpoch`, in the executor design)
+  stays dead forever, even across a restore. Same fail-closed contract
+  applies to readers: a client that cannot read or parse `epoch` must not
+  default it to `0` — that would make every ticket minted before this
+  deployment's first-ever kill look permanently current, silently
+  defeating the check it exists to support.
 - **Short TTLs everywhere.** Owner sessions: 15 min. Ceremonies: 5 min.
   Downstream connector tokens, in the broker model: minutes. A stolen
   artifact is a window, not a standing capability.

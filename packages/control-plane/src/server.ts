@@ -57,7 +57,11 @@ import { VetoWindow } from "./veto.js";
  *                     cannot register must fail its call closed, not get an
  *                     open door here.
  *  - POST /veto/:id — owner session required; the session names the vetoer.
- *  - GET  /status   — open; the gateway polls it and it leaks only kill state.
+ *  - GET  /status   — open; the gateway polls it. Body carries `killed` and
+ *                     the kill `epoch` (a monotone count of every kill this
+ *                     deployment has ever had) — the deliberate, documented
+ *                     widening of what this open route leaks; see getStatus()
+ *                     below and packages/mcp/THREAT-MODEL.md.
  */
 export interface ControlPlaneOptions {
   now?: () => number;
@@ -292,9 +296,25 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       : {}),
   });
 
+  /**
+   * `epoch` is included unconditionally, killed or not: a client needs the
+   * CURRENT epoch to tell a stale approval from a fresh one, and that
+   * question matters most exactly when killed is false (kill-then-restore
+   * flips killed back to false; epoch is what keeps a pre-kill approval
+   * dead). Disclosure note (also in packages/mcp/THREAT-MODEL.md): this
+   * route is deliberately unauthenticated, so exposing epoch lets ANY
+   * caller learn a monotone count of how many times this deployment has
+   * ever been killed — not when, not why, not by whom (those still require
+   * an owner session). That is a real, if small, widening of what an open
+   * endpoint discloses. It is worth it because `killed` alone cannot do
+   * this job: a client holding an approval (e.g. an executor's
+   * ActionTicket, packages/executor/DESIGN.md §3) must be able to detect
+   * that its approval predates a kill even after the system has since been
+   * restored, and only a value that never resets can do that.
+   */
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
-      sendJson(res, 200, { killed: false, ...degradedFields() });
+      sendJson(res, 200, { killed: false, epoch: killSwitch.epoch, ...degradedFields() });
       return;
     }
     // lastKill is tracked directly — this route is polled by every gateway
@@ -304,6 +324,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       killed: true,
       reason: lastKill?.reason,
       at: lastKill?.at,
+      epoch: killSwitch.epoch,
       ...degradedFields(),
     });
   }
