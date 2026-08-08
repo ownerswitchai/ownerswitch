@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { resolve } from "node:path";
 import type { ToolCall } from "@ownerswitchai/shared";
 import {
   isLoopbackAddress,
@@ -8,7 +9,8 @@ import {
   type DeviceCredential,
   type OwnerSession,
 } from "./auth.js";
-import { KillSwitch, type KillSource } from "./kill.js";
+import { KillStateFileStore } from "./kill-state.js";
+import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow } from "./veto.js";
 
@@ -27,7 +29,9 @@ import { VetoWindow } from "./veto.js";
  *                     fail because auth was misconfigured.
  *  - POST /restore/ceremony     — owner session required; starts 2GO (GO 1/2)
  *                     while the system is killed. The ceremony binds to the
- *                     owner, the kill epoch in force, and its start time.
+ *                     owner, the kill epoch in force, and its start time. An
+ *                     owner holds at most ONE live ceremony per kill epoch —
+ *                     a repeat GO 1/2 replaces their pending one.
  *  - GET  /restore/ceremony/:id — owner session required; the ceremony's
  *                     state and how long until its cooldown ends.
  *  - POST /restore  — owner session required plus a live server-side ceremony
@@ -48,7 +52,19 @@ export interface ControlPlaneOptions {
   now?: () => number;
   /** Shared secret the physical button / kill triggers sign requests with. */
   deviceSecret?: string;
+  /**
+   * Where the kill switch persists killed state, its reason and the kill
+   * epoch across process restarts. Defaults to DEFAULT_KILL_STATE_FILE in the
+   * process working directory — an explicit, visible location, never a temp
+   * dir the OS may clean between boots. Pass null for a deliberately
+   * ephemeral control plane (unit tests, throwaway demos): a restart then
+   * forgets the kill, so only opt out where that is the point.
+   */
+  killStateFile?: string | null;
 }
+
+/** Default kill-state location, resolved against the working directory. */
+export const DEFAULT_KILL_STATE_FILE = "ownerswitch-kill-state.json";
 
 export interface ControlPlane {
   /** Plug into http.createServer(handler). */
@@ -58,14 +74,16 @@ export interface ControlPlane {
   vetoWindows: Map<string, VetoWindow>;
 }
 
-const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voice", "api"];
-
 /**
- * Ceiling on live restore ceremonies held in memory. A real owner needs one
- * (plus a few fumbles); the cap exists so a hostile holder of an owner
- * session cannot mint ceremonies until the process falls over.
+ * Hard ceiling on ceremony RECORDS held in memory — a memory backstop, not a
+ * rate limit and never the primary bound. Before it is consulted, every dead
+ * record (TTL-expired, consumed, superseded kill epoch) is purged and each
+ * owner is limited to one live ceremony per kill epoch, so the map's size is
+ * the number of DISTINCT owners with a pending ceremony: normal use is 1–2.
+ * The ceiling only stops a flood of hostile owner sessions from growing the
+ * map without bound, which is why it sits far above any legitimate count.
  */
-export const MAX_LIVE_CEREMONIES = 64;
+export const MAX_CEREMONY_RECORDS = 256;
 
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
@@ -124,7 +142,19 @@ function bearerToken(req: IncomingMessage): string | null {
 
 export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane {
   const now = opts.now ?? Date.now;
-  const killSwitch = new KillSwitch(now);
+  // Persisted kill state loads synchronously inside the KillSwitch
+  // constructor — before this function returns a handler, so before any
+  // request can be answered. A process restart resumes the kill state it
+  // went down with (`kill -9` is not a restore), and a state file that
+  // exists but cannot be read boots the plane killed.
+  const killStateFile =
+    opts.killStateFile === null
+      ? undefined
+      : (opts.killStateFile ?? resolve(process.cwd(), DEFAULT_KILL_STATE_FILE));
+  const killSwitch = new KillSwitch(
+    now,
+    killStateFile === undefined ? {} : { store: new KillStateFileStore(killStateFile) },
+  );
   const vetoWindows = new Map<string, VetoWindow>();
   const seenNonces = new Map<string, number>();
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
@@ -192,16 +222,32 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 409, { error: "not killed — nothing to restore" });
       return;
     }
-    // Dead ceremonies (past their TTL, whatever their state) are unspendable;
-    // sweep here to keep the map bounded in a long-lived process.
+    // Dead records first, BEFORE any capacity decision: a ceremony that is
+    // past its TTL, already consumed, or bound to a superseded kill epoch is
+    // unspendable by every path in this file, so it must never hold a slot
+    // against the one ceremony that matters. (An earlier version purged only
+    // TTL expiry, which let corpses block new ceremonies for minutes — a
+    // lockout of restore, the exact operation this system exists to protect.)
     for (const [staleId, record] of ceremonies) {
-      if (now() >= record.ceremony.expiresAt) ceremonies.delete(staleId);
+      const dead =
+        now() >= record.ceremony.expiresAt ||
+        record.ceremony.state === "completed" ||
+        record.epoch !== killSwitch.epoch;
+      if (dead) ceremonies.delete(staleId);
     }
-    // The sweep bounds normal traffic; the cap bounds an owner session gone
-    // hostile. Full means NEW ceremonies are refused — a live ceremony is
-    // never evicted to make room, and fullness can only ever deny a restore
-    // path, never open one.
-    if (ceremonies.size >= MAX_LIVE_CEREMONIES) {
+    // One live ceremony per owner per kill epoch: a repeat GO 1/2 replaces
+    // the owner's own pending ceremony — the superseded id stops working the
+    // moment the new one is minted — so a single owner session, however
+    // hostile, occupies exactly one slot.
+    for (const [supersededId, record] of ceremonies) {
+      if (record.ceremony.ownerId === session.ownerId) ceremonies.delete(supersededId);
+    }
+    // Secondary backstop only — with the purge and the per-owner limit above,
+    // size counts distinct owners, so reaching this ceiling means a flood of
+    // hostile sessions, not normal use. Full fails closed: new ceremonies are
+    // refused, a live ceremony is never evicted to make room, and fullness
+    // can only ever deny a restore path, never open one.
+    if (ceremonies.size >= MAX_CEREMONY_RECORDS) {
       sendJson(res, 409, { error: "ceremony rejected" });
       return;
     }

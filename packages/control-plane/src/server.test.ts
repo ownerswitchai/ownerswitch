@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
-import { createControlPlane, MAX_LIVE_CEREMONIES, type ControlPlane } from "./server.js";
+import {
+  createControlPlane,
+  MAX_CEREMONY_RECORDS,
+  type ControlPlane,
+  type ControlPlaneOptions,
+} from "./server.js";
 import { VetoWindow } from "./veto.js";
 
 const clock = (start = 0) => {
@@ -29,6 +37,17 @@ const bearer = (token: string) => ({
   "content-type": "application/json",
   authorization: `Bearer ${token}`,
 });
+
+/**
+ * A control plane with persistence explicitly OFF: each test gets fresh kill
+ * state and leaves no file behind. The restart tests below are the ones that
+ * exercise persistence, and they construct their own with a real state file.
+ */
+const ephemeral = (opts: Omit<ControlPlaneOptions, "killStateFile"> = {}) =>
+  createControlPlane({ ...opts, killStateFile: null });
+
+/** A kill-state path inside a fresh private temp dir. */
+const tempStateFile = () => join(mkdtempSync(join(tmpdir(), "ownerswitch-test-")), "kill-state.json");
 
 describe("control-plane HTTP API", () => {
   let server: Server | undefined;
@@ -69,7 +88,7 @@ describe("control-plane HTTP API", () => {
 
   it("GET /status before and after kill", async () => {
     const c = clock(1_000);
-    const url = await start(createControlPlane({ now: c.now }));
+    const url = await start(ephemeral({ now: c.now }));
 
     let res = await fetch(`${url}/status`);
     expect(res.status).toBe(200);
@@ -90,7 +109,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("POST /kill with an empty body still engages (default source 'api')", async () => {
-    const cp = createControlPlane({ now: clock().now });
+    const cp = ephemeral({ now: clock().now });
     const url = await start(cp);
 
     const res = await fetch(`${url}/kill`, { method: "POST" });
@@ -104,7 +123,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /kill with a valid device signature records the claimed source", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     const body = JSON.stringify({ source: "button", reason: "red button pressed" });
@@ -124,7 +143,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("loopback kill without credentials works, but is audited as unauthenticated 'api'", async () => {
-    const cp = createControlPlane({ now: clock().now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: clock().now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     // claims to be the button, but cannot prove it
@@ -147,7 +166,7 @@ describe("control-plane HTTP API", () => {
 
   it("loopback kill with an INVALID signature still kills — stopping never fails on bad auth", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     const body = JSON.stringify({ source: "button" });
@@ -167,7 +186,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("non-loopback kill without credentials -> 401, generic body, not killed", async () => {
-    const cp = createControlPlane({ now: clock().now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: clock().now, deviceSecret: DEVICE_SECRET });
     const url = await startAs(cp, "203.0.113.7");
 
     const res = await fetch(`${url}/kill`, {
@@ -182,7 +201,7 @@ describe("control-plane HTTP API", () => {
 
   it("non-loopback kill WITH a valid device signature works", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await startAs(cp, "203.0.113.7");
 
     const body = JSON.stringify({ source: "button" });
@@ -198,7 +217,7 @@ describe("control-plane HTTP API", () => {
 
   it("non-loopback kill with an owner session works and honors the claimed source", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await startAs(cp, "203.0.113.7");
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -220,7 +239,7 @@ describe("control-plane HTTP API", () => {
 
   it("the Bearer auth-scheme is case-insensitive (RFC 9110)", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
@@ -255,7 +274,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /restore/ceremony without a session -> 401 generic, even from loopback", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     cp.killSwitch.engage("api");
@@ -266,7 +285,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /restore/ceremony while not killed -> 409", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -280,7 +299,7 @@ describe("control-plane HTTP API", () => {
 
   it("GET /restore/ceremony/:id tracks go1 -> ready and counts the cooldown down", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -302,7 +321,7 @@ describe("control-plane HTTP API", () => {
 
   it("GET /restore/ceremony/:id needs a session; unknown and foreign ids read as absent", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const owner = createOwnerSession("adam", { now: c.now });
     const other = createOwnerSession("eve", { now: c.now });
@@ -321,7 +340,7 @@ describe("control-plane HTTP API", () => {
 
   it("GO 2/2 before the cooldown -> 409 and still killed; after the cooldown -> restores", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -342,7 +361,7 @@ describe("control-plane HTTP API", () => {
 
   it("the same ceremony twice -> second attempt rejected, system stays killed", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -364,7 +383,7 @@ describe("control-plane HTTP API", () => {
 
   it("a ceremony from a different owner -> 409, system stays killed", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const owner = createOwnerSession("adam", { now: c.now });
     const other = createOwnerSession("eve", { now: c.now });
@@ -384,7 +403,7 @@ describe("control-plane HTTP API", () => {
 
   it("a valid-but-foreign id and a random nonexistent id reject byte-identically", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const owner = createOwnerSession("adam", { now: c.now });
     const other = createOwnerSession("eve", { now: c.now });
@@ -409,7 +428,7 @@ describe("control-plane HTTP API", () => {
 
   it("a second kill invalidates a ceremony in flight (kill epoch)", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -435,7 +454,7 @@ describe("control-plane HTTP API", () => {
 
   it("an expired ceremony -> 409, system stays killed", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -454,7 +473,7 @@ describe("control-plane HTTP API", () => {
 
   it("two concurrent /restore calls with one ceremony -> exactly one succeeds", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -472,7 +491,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /restore without a session -> 401 generic, even from loopback", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -492,7 +511,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /restore with an expired session -> 401", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     cp.killSwitch.engage("api");
@@ -506,7 +525,7 @@ describe("control-plane HTTP API", () => {
 
   it("an authorization-shaped body without server-side ceremony state -> 409", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -522,9 +541,10 @@ describe("control-plane HTTP API", () => {
     expect(cp.killSwitch.killed).toBe(true);
   });
 
-  it("a control-plane restart mid-ceremony fails closed: the ceremony does not survive", async () => {
+  it("a restart mid-ceremony fails closed: the kill survives, the ceremony does not", async () => {
     const c = clock();
-    const before = createControlPlane({ now: c.now });
+    const stateFile = tempStateFile();
+    const before = createControlPlane({ now: c.now, killStateFile: stateFile });
     const url = await start(before);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -532,67 +552,203 @@ describe("control-plane HTTP API", () => {
     const id = await startCeremony(url, session.token);
     c.advance(30_000); // ready — and then the process dies
     server?.close();
+    server = undefined;
 
-    const after = createControlPlane({ now: c.now }); // fresh process, fresh state
+    // NOTHING re-engages here: the persisted state alone keeps the new
+    // process killed. (An earlier version of this test called engage() on the
+    // new process, which hid a restart that booted not-killed.)
+    const after = createControlPlane({ now: c.now, killStateFile: stateFile });
+    expect(after.killSwitch.killed).toBe(true);
     const url2 = await start(after);
-    after.killSwitch.engage("button"); // the kill is re-asserted on the new process
 
     const res = await postRestore(url2, session.token, id);
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(409); // the ceremony did not survive — start over
     expect(await res.json()).toEqual({ error: "restore rejected" });
     expect(after.killSwitch.killed).toBe(true);
   });
 
-  it("the ceremonies map is capped: full -> generic 409, and no live ceremony is evicted", async () => {
+  it("a restart WITHOUT re-engaging comes back killed, with the same epoch and reason", async () => {
+    const c = clock(1_000);
+    const stateFile = tempStateFile();
+    const before = createControlPlane({ now: c.now, killStateFile: stateFile });
+    before.killSwitch.engage("button", "red button pressed");
+    const epoch = before.killSwitch.epoch;
+
+    // a brand-new process over the same state file — nobody calls engage()
+    const after = createControlPlane({ now: c.now, killStateFile: stateFile });
+    expect(after.killSwitch.killed).toBe(true);
+    expect(after.killSwitch.epoch).toBe(epoch);
+
+    // the attribution survives too: /status still answers what killed us, when
+    const url = await start(after);
+    expect(await (await fetch(`${url}/status`)).json()).toEqual({
+      killed: true,
+      reason: "red button pressed",
+      at: 1_000,
+    });
+  });
+
+  it("a corrupt kill-state file boots FAIL-CLOSED: killed, and loudly", async () => {
+    const stateFile = tempStateFile();
+    writeFileSync(stateFile, "{definitely not json", "utf8");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cp = createControlPlane({ now: clock().now, killStateFile: stateFile });
+      expect(cp.killSwitch.killed).toBe(true);
+      expect(errors).toHaveBeenCalled(); // the why is logged, not swallowed
+      const [entry] = cp.killSwitch.auditLog();
+      expect(entry.type).toBe("kill");
+      if (entry.type === "kill") expect(entry.event.reason).toMatch(/failed closed/);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a restart after a legitimate 2GO restore comes back NOT killed", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const stateFile = tempStateFile();
+    const before = createControlPlane({ now: c.now, killStateFile: stateFile });
+    const url = await start(before);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    before.killSwitch.engage("button");
+    const id = await startCeremony(url, session.token);
+    c.advance(30_000);
+    expect((await postRestore(url, session.token, id)).status).toBe(200);
+    server?.close();
+    server = undefined;
+
+    const after = createControlPlane({ now: c.now, killStateFile: stateFile });
+    expect(after.killSwitch.killed).toBe(false);
+    expect(after.killSwitch.epoch).toBe(before.killSwitch.epoch); // the epoch survives the restore
+    const url2 = await start(after);
+    expect(await (await fetch(`${url2}/status`)).json()).toEqual({ killed: false });
+  });
+
+  /** GO 1/2 for `count` DISTINCT owners; returns their sessions and ceremony ids. */
+  const fillCeremonies = async (url: string, now: () => number, count: number) => {
+    const sessions = [];
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const s = createOwnerSession(`owner-${i}`, { now });
+      sessions.push(s);
+      ids.push(await startCeremony(url, s.token));
+    }
+    return { sessions, ids };
+  };
+
+  it("one live ceremony per owner: a repeat GO 1/2 replaces it, and the older id stops working", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
     cp.killSwitch.engage("api");
-    const ids: string[] = [];
-    for (let i = 0; i < MAX_LIVE_CEREMONIES; i++) {
-      ids.push(await startCeremony(url, session.token));
-    }
+    const first = await startCeremony(url, session.token);
+    const second = await startCeremony(url, session.token);
+    expect(second).not.toBe(first);
 
-    // full: minting fails closed with a generic 409 and changes nothing else
+    // the replaced ceremony is gone from every surface...
+    const read = await fetch(`${url}/restore/ceremony/${first}`, { headers: bearer(session.token) });
+    expect(read.status).toBe(404);
+    c.advance(30_000);
+    const spendOld = await postRestore(url, session.token, first);
+    expect(spendOld.status).toBe(409);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // ...and the replacement is the owner's one live ceremony, spendable normally
+    expect((await postRestore(url, session.token, second)).status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("a consumed ceremony plus a fresh kill cannot lock out restore", { timeout: 20_000 }, async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const adam = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    await fillCeremonies(url, c.now, MAX_CEREMONY_RECORDS - 1); // other owners hold every slot but one
+    const id = await startCeremony(url, adam.token); // adam takes the last one — the map is at its ceiling
+    c.advance(30_000);
+    expect((await postRestore(url, adam.token, id)).status).toBe(200); // an ordinary restore...
+    cp.killSwitch.engage("honeytoken", "fresh incident"); // ...followed by a NEW kill
+
+    // every record in the map is now dead (superseded epoch; adam's also
+    // consumed) — and a new ceremony must still start, because dead records
+    // are purged before any capacity decision
+    const res = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(adam.token),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("a map full of superseded-epoch ceremonies does not block one under the current epoch", { timeout: 20_000 }, async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    cp.killSwitch.engage("api"); // epoch 1
+    await fillCeremonies(url, c.now, MAX_CEREMONY_RECORDS); // ceiling reached, all bound to epoch 1
+    cp.killSwitch.engage("api", "killed again"); // epoch 2 — every record above is now dead
+
+    const adam = createOwnerSession("adam", { now: c.now });
+    const id = await startCeremony(url, adam.token); // asserts 201: the corpses were purged first
+    c.advance(30_000);
+    expect((await postRestore(url, adam.token, id)).status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("the record ceiling is a pure backstop: full of LIVE ceremonies -> 409, none evicted", { timeout: 20_000 }, async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    cp.killSwitch.engage("api");
+    const { sessions, ids } = await fillCeremonies(url, c.now, MAX_CEREMONY_RECORDS);
+
+    // every record is live and current-epoch, so nothing is purgeable: a NEW
+    // owner is refused with the generic 409 and nothing else changes
     const overflow = await fetch(`${url}/restore/ceremony`, {
       method: "POST",
-      headers: bearer(session.token),
+      headers: bearer(createOwnerSession("one-too-many", { now: c.now }).token),
     });
     expect(overflow.status).toBe(409);
     expect(await overflow.json()).toEqual({ error: "ceremony rejected" });
     expect(cp.killSwitch.killed).toBe(true);
 
-    // no eviction to make room: the very first ceremony is still spendable
+    // an owner already holding a slot still can restart their OWN ceremony at
+    // the ceiling — replacement frees their slot before the ceiling is checked
+    const replaced = await startCeremony(url, sessions[5].token);
+    expect(replaced).not.toBe(ids[5]);
+
+    // and no other live ceremony was evicted: the very first is still spendable
     c.advance(30_000);
-    expect((await postRestore(url, session.token, ids[0])).status).toBe(200);
+    expect((await postRestore(url, sessions[0].token, ids[0])).status).toBe(200);
     expect(cp.killSwitch.killed).toBe(false);
   });
 
-  it("expired ceremonies are swept before the cap rejects: a map full of dead ones frees itself", async () => {
+  it("TTL-expired ceremonies are purged before the ceiling rejects: a map full of dead ones frees itself", { timeout: 20_000 }, async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
-    const session = createOwnerSession("adam", { now: c.now });
 
     cp.killSwitch.engage("api");
-    for (let i = 0; i < MAX_LIVE_CEREMONIES; i++) {
-      await startCeremony(url, session.token);
-    }
-    c.advance(5 * 60_000); // every ceremony's TTL elapses; the owner session (15 min) lives on
+    await fillCeremonies(url, c.now, MAX_CEREMONY_RECORDS);
+    c.advance(5 * 60_000); // every ceremony's TTL elapses; owner sessions (15 min) live on
 
-    // the sweep runs before the cap check, so a fresh ceremony fits again
+    // the purge runs before the ceiling check, so a fresh ceremony fits again
     const res = await fetch(`${url}/restore/ceremony`, {
       method: "POST",
-      headers: bearer(session.token),
+      headers: bearer(createOwnerSession("late-owner", { now: c.now }).token),
     });
     expect(res.status).toBe(201);
   });
 
   it("POST /veto/:id without a session -> 401, window untouched", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
@@ -614,7 +770,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto/:id with a session vetoes; the session names the vetoer", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
@@ -636,7 +792,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto/:id on a released window -> 409 (authenticated)", async () => {
     const c = clock();
-    const cp = createControlPlane({ now: c.now });
+    const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
     const window = new VetoWindow(
@@ -662,7 +818,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto with a valid device signature registers a window the owner can veto", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     const body = JSON.stringify({
@@ -698,7 +854,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto without a valid signature -> 401, even from loopback, nothing registered", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
@@ -721,7 +877,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto with no device secret configured -> 401 (registration has no open mode)", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now }); // deviceSecret absent
+    const cp = ephemeral({ now: c.now }); // deviceSecret absent
     const url = await start(cp);
 
     const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
@@ -736,7 +892,7 @@ describe("control-plane HTTP API", () => {
 
   it("POST /veto with a malformed call -> 400", async () => {
     const c = clock(100_000);
-    const cp = createControlPlane({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
     const url = await start(cp);
 
     for (const bad of [{}, { call: "write_file" }, { call: { tool: "write_file" } }]) {
@@ -752,7 +908,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("unknown route -> 404", async () => {
-    const url = await start(createControlPlane({ now: clock().now }));
+    const url = await start(ephemeral({ now: clock().now }));
 
     expect((await fetch(`${url}/nope`)).status).toBe(404);
     expect((await fetch(`${url}/status`, { method: "POST" })).status).toBe(404);
@@ -760,7 +916,7 @@ describe("control-plane HTTP API", () => {
   });
 
   it("malformed JSON -> 400, and the process survives", async () => {
-    const cp = createControlPlane({ now: clock().now });
+    const cp = ephemeral({ now: clock().now });
     const url = await start(cp);
 
     const res = await fetch(`${url}/kill`, {

@@ -18,7 +18,9 @@ const DEVICE_ID = "big-red-button";
 const DEVICE_SECRET = "demo-device-secret";
 
 async function main(): Promise<void> {
-  const controlPlane = createControlPlane({ deviceSecret: DEVICE_SECRET });
+  // Ephemeral on purpose: the demo must reset fully on every run. A real
+  // deployment keeps the default, which persists kill state across restarts.
+  const controlPlane = createControlPlane({ deviceSecret: DEVICE_SECRET, killStateFile: null });
   const server = createServer(controlPlane.handler);
   const baseUrl = await new Promise<string>((resolve) => {
     server.listen(0, "127.0.0.1", () => {

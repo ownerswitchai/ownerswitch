@@ -234,6 +234,48 @@ What limits the blast radius today — real code, caveats included:
   neither survives nor spans multi-instance / HA deployments, so a shared
   ceremony store is required before running more than one control-plane
   instance.
+- **Ceremony capacity cannot be weaponized against restore.** Each owner
+  holds at most ONE live ceremony per kill epoch — a repeat GO 1/2
+  replaces their own pending one, so a hostile owner session occupies
+  exactly one slot, ever. Before any capacity decision, dead records
+  (TTL-expired, consumed, superseded kill epoch) are purged. The
+  remaining global ceiling (`MAX_CEREMONY_RECORDS`) is a memory backstop
+  against a flood of distinct hostile sessions, set far above legitimate
+  use, and it fails closed: full refuses NEW ceremonies with the generic
+  409 and never evicts a live one. An earlier design capped raw map size
+  with only TTL sweeping, which let consumed or superseded records block
+  new ceremonies for minutes — a denial of the recovery operation itself;
+  the purge-before-cap ordering is the fix and is pinned by tests.
+- **Kill state survives restarts — and fails closed.** The kill switch
+  persists `{killed, epoch, last kill event}` to a JSON file on every
+  transition, written atomically (temp file + rename in the same
+  directory, so a reader sees the old state or the new, never a torn
+  one), and loads it synchronously at construction — before the HTTP
+  handler exists, so before any request can be answered
+  (`packages/control-plane/src/kill-state.ts`). Restarting the process is
+  therefore not a restore: `kill -9` comes back killed, with the same
+  epoch and the same attributed reason. A state file that exists but
+  cannot be read or parsed boots the plane KILLED with a loud log — kill
+  state in doubt stops the fleet, never frees it. The path is
+  configurable (`killStateFile`; `OWNERSWITCH_KILL_STATE_FILE` for the
+  dev server) and defaults to an explicit file in the working directory,
+  never a temp dir the OS may clean. Why a file: v0 is one process on one
+  host, and the state is a boolean, a counter and one event — a
+  `cat`-auditable JSON file needs no daemon. The limits of that choice,
+  stated plainly: (1) it is single-instance — like ceremony state, it
+  neither coordinates nor spans HA deployments; (2) it trusts the local
+  disk — an attacker who can DELETE the file and restart the process
+  boots it fresh and not-killed, because a first boot and a deleted file
+  are indistinguishable without an external anchor, so the file (and the
+  host) must be protected by OS permissions like the process itself;
+  (3) there is no fsync, so a power cut in the instant after a transition
+  can lose that newest transition — losing a restore fails closed, losing
+  a kill falls back to the state before it; (4) a persist failure (disk
+  full, read-only fs) is logged loudly but never blocks the transition —
+  stopping must not fail because the disk did — at the cost that a crash
+  before the next successful persist restarts into the last state that
+  did write. Hardening beyond this (fsync, external anchoring, a shared
+  store) is future work, tracked with the audit-log hardening above.
 - **Short TTLs everywhere.** Owner sessions: 15 min. Ceremonies: 5 min.
   Downstream connector tokens, in the broker model: minutes. A stolen
   artifact is a window, not a standing capability.
