@@ -7,7 +7,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "demo": "tsx examples/demo.ts",
-    "demo:button": "tsx examples/button-demo.ts"
+    "demo:button": "tsx examples/button-demo.ts",
+    "bench:kill-latency": "tsx examples/kill-latency-benchmark.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

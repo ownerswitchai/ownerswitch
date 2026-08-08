@@ -96,6 +96,7 @@
       <p class="sub">Your agents deploy, move money, touch production. Every call that routes through OwnerSwitch is checked against live policy and kill state, fail-closed, held by the real owner.</p>
       <p class="tagline">One press to stop. Two GOs to start.</p>
       <p class="threat-link">We wrote down what this can't stop — <a href="https://github.com/ownerswitchai/ownerswitch/blob/main/packages/mcp/THREAT-MODEL.md" target="_blank" rel="noopener">read the threat model on GitHub</a>.</p>
+      <p class="threat-link">Kill signal to the gateway's next policy check, measured locally: ~1 millisecond — <a href="https://github.com/ownerswitchai/ownerswitch/blob/main/examples/kill-latency-benchmark.ts" target="_blank" rel="noopener">see the benchmark</a>.</p>
     </header>
 
     <div class="switch-zone">
@@ -123,7 +124,7 @@
   <div id="blackout" role="dialog" aria-live="polite">
     <div class="term" id="term"></div>
     <div class="punch" id="punch">
-      <h2>Every routed call, stopped.<br>0.4 seconds.</h2>
+      <h2>Every routed call, stopped.<br>~1 millisecond.</h2>
       <p>Restoring takes the owner. <i>Only the owner.</i></p>
     </div>
     <div class="skip">tap to skip</div>
