@@ -10,11 +10,13 @@ import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotoc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
 import { ConfigError, loadConfig } from "./config.js";
+import { doctorMain } from "./doctor.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
 import { createVetoClient } from "./veto-client.js";
+import { verifyMain } from "./verify.js";
 
-async function main(): Promise<void> {
-  const config = loadConfig(process.argv.slice(2), process.env);
+async function runGateway(argv: string[]): Promise<void> {
+  const config = loadConfig(argv, process.env);
   const { controlPlaneUrl, device, timeoutMs = 1500 } = config;
 
   const proxy = createOwnerSwitchProxy({
@@ -52,6 +54,17 @@ async function main(): Promise<void> {
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
       `control plane: ${controlPlaneUrl}`,
   );
+}
+
+async function main(): Promise<void> {
+  const [sub, ...rest] = process.argv.slice(2);
+  if (sub === "doctor") {
+    process.exit(await doctorMain(rest, process.env));
+  } else if (sub === "verify") {
+    process.exit(await verifyMain(rest, process.env));
+  } else {
+    await runGateway(process.argv.slice(2));
+  }
 }
 
 main().catch((err: unknown) => {
