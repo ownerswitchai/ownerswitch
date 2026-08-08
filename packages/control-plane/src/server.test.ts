@@ -264,6 +264,66 @@ describe("control-plane HTTP API", () => {
     }
   });
 
+  it("POST /alert records a flagged event and does NOT kill (the DoS fix)", async () => {
+    const c = clock(7_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const body = JSON.stringify({ source: "honeytoken", reason: "read of /decoys/.env.backup" });
+    const res = await fetch(`${url}/alert`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ alerted: true, killed: false });
+
+    // status stays not-killed — a decoy read alerts, it does not lock down
+    expect(cp.killSwitch.killed).toBe(false);
+    expect((await (await fetch(`${url}/status`)).json())).toEqual({ killed: false });
+
+    const [entry] = cp.killSwitch.auditLog();
+    expect(entry.type).toBe("alert");
+    if (entry.type === "alert") {
+      expect(entry.event.source).toBe("honeytoken");
+      expect(entry.event.reason).toBe("read of /decoys/.env.backup");
+      expect(entry.event.unauthenticated).toBeUndefined();
+    }
+  });
+
+  it("non-loopback /alert without credentials -> 401, nothing recorded", async () => {
+    const cp = ephemeral({ now: clock().now, deviceSecret: DEVICE_SECRET });
+    const url = await startAs(cp, "203.0.113.9");
+
+    const res = await fetch(`${url}/alert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "honeytoken", reason: "x" }),
+    });
+    expect(res.status).toBe(401);
+    expect(cp.killSwitch.auditLog()).toHaveLength(0);
+  });
+
+  it("loopback /alert without credentials records an unauthenticated 'api' alert", async () => {
+    const cp = ephemeral({ now: clock().now });
+    const url = await start(cp);
+
+    const res = await fetch(`${url}/alert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "honeytoken", reason: "loopback read" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ alerted: true, killed: false });
+
+    const [entry] = cp.killSwitch.auditLog();
+    expect(entry.type).toBe("alert");
+    if (entry.type === "alert") {
+      expect(entry.event.source).toBe("api"); // unverified source claim not trusted
+      expect(entry.event.unauthenticated).toBe(true);
+    }
+  });
+
   it("the Bearer auth-scheme is case-insensitive (RFC 9110)", async () => {
     const c = clock();
     const cp = ephemeral({ now: c.now });

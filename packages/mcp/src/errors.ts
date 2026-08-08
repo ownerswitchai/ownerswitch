@@ -18,6 +18,8 @@ export const OwnerSwitchErrorCode = {
   OwnerVetoed: -32053,
   /** kill switch engaged or control plane unreachable — everything is denied */
   Lockdown: -32054,
+  /** a decoy credential surfaced in a tool call — the kill is already firing */
+  HoneytokenTripped: -32055,
 } as const;
 
 export type OwnerSwitchErrorCodeName = keyof typeof OwnerSwitchErrorCode;
@@ -131,6 +133,26 @@ export function lockdown(tool: string, reason: string | undefined): OwnerSwitchR
     `OwnerSwitch denied "${tool}": ${why}. Every tool call is denied until the owner ` +
       `restores OwnerSwitch — do not retry other tools; tell the user why.`,
     { decision: "lockdown", tool, reason: why },
+  );
+}
+
+/**
+ * A honeytoken surfaced in the call's arguments. Unlike every other refusal,
+ * this one is not a decision an owner might revisit — it is a tripwire, and
+ * by the time the agent reads this message the kill is already being
+ * reported. Deliberately blunt: the one wrong takeaway would be "retry with
+ * different arguments".
+ */
+export function honeytokenTripped(tool: string, canaryIds: string[]): OwnerSwitchRefusal {
+  const ids = canaryIds.join("+") || "(id unknown)";
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.HoneytokenTripped,
+    `OwnerSwitch tripped a honeytoken in the arguments of "${tool}" (canary ${ids}): that ` +
+      `value is a decoy credential planted as a tripwire, and touching it engages the kill ` +
+      `switch. The call did NOT run and the kill is being reported now — every further tool ` +
+      `call will be denied until the owner restores OwnerSwitch. Do not retry with different ` +
+      `arguments; tell the user what happened.`,
+    { decision: "lockdown", tool, reason: `honeytoken ${ids} in tool-call arguments` },
   );
 }
 

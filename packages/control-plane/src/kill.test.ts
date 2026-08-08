@@ -82,6 +82,33 @@ describe("KillSwitch", () => {
     expect(k.auditLog()).toHaveLength(2);
   });
 
+  it("alert() records a flagged event WITHOUT engaging the switch", () => {
+    const k = new KillSwitch(() => 42);
+    k.alert("honeytoken", "read of /decoys/.env.backup");
+    expect(k.killed).toBe(false); // the whole point of the DoS fix
+    const log = k.auditLog();
+    expect(log).toHaveLength(1);
+    expect(log[0]).toEqual({
+      type: "alert",
+      event: { source: "honeytoken", reason: "read of /decoys/.env.backup", at: 42 },
+    });
+  });
+
+  it("alerts and kills share one timeline, in order", () => {
+    const k = new KillSwitch(() => 7);
+    k.alert("honeytoken", "decoy file read");
+    k.engage("honeytoken", "decoy value in tool call");
+    expect(k.killed).toBe(true);
+    expect(k.auditLog().map((e) => e.type)).toEqual(["alert", "kill"]);
+  });
+
+  it("alert() flags the unauthenticated case like engage() does", () => {
+    const k = new KillSwitch(() => 1);
+    k.alert("api", "loopback", { unauthenticated: true });
+    const [entry] = k.auditLog();
+    expect(entry.type === "alert" && entry.event.unauthenticated).toBe(true);
+  });
+
   it("every transition persists: engage saves killed+epoch+event, restore saves not-killed", () => {
     const store = new FakeStore();
     const k = new KillSwitch(() => 1000, { store });

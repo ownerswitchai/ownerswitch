@@ -14,6 +14,7 @@ import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import {
   approvalRequired,
   controlPlaneUnavailable,
+  honeytokenTripped,
   lockdown,
   ownerVetoed,
   policyDenied,
@@ -42,6 +43,27 @@ export const PROXY_VERSION = "0.0.1";
  *    (the gateway client's contract), and any veto-lane failure refuses the
  *    call rather than letting it through.
  */
+/**
+ * Honeytoken tripwire, structurally the shape @ownerswitchai/honeytoken's
+ * createTripwire returns. scan() must be synchronous and cheap (it runs on
+ * every forwardable call); the report methods must retry internally and never
+ * throw — a refusal must not depend on the POST landing first.
+ *
+ * Two report methods because the tier depends on whether the call FORWARDS:
+ *  - reportKill: a decoy is about to cross the boundary (allow, or veto after
+ *    release). Exfiltration in progress → engage the switch.
+ *  - reportAlert: a decoy appeared in a call that will NOT forward (denied,
+ *    approval-gated, or held). Nothing crosses the boundary → flag only.
+ */
+export interface HoneytokenGuard {
+  /** matches of decoy values in the given text; [] when clean */
+  scan(text: string): ReadonlyArray<{ canaryId: string }>;
+  /** fire-and-forget kill report for a decoy about to be forwarded */
+  reportKill(trip: { canaryIds: string[]; tool: string; agentId: string }): void;
+  /** fire-and-forget alert for a decoy in a call that will not be forwarded */
+  reportAlert(trip: { canaryIds: string[]; tool: string; agentId: string; note?: string }): void;
+}
+
 export interface ProxyOptions {
   policy: Policy;
   /** /status lookup used by evaluateRemote — fail-closed by construction */
@@ -50,6 +72,13 @@ export interface ProxyOptions {
   vetoClient: VetoClient;
   /** names this gateway's agent in tool calls and audit */
   agentId?: string;
+  /**
+   * Decoy-credential tripwire. Policy and kill state are evaluated FIRST; the
+   * kill-scan runs only immediately before a call would be forwarded, so a
+   * decoy dropped into a call policy would deny cannot be used as a remote
+   * kill primitive — it only raises an alert.
+   */
+  honeytokens?: HoneytokenGuard;
 }
 
 export interface OwnerSwitchProxy {
@@ -103,6 +132,13 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
     const call: ToolCall = { agentId, tool: req.params.name, args: req.params.arguments };
 
+    // Policy and kill state are evaluated FIRST — deliberately BEFORE any
+    // honeytoken scan. Scanning before policy would make a decoy value a
+    // remote kill primitive: an attacker who gets the value into ANY attempted
+    // call, even one policy denies, could fire a global kill. Here the
+    // kill-scan runs only where the call would actually be forwarded (see
+    // forwardOrKill); a decoy in a non-forwarded call raises an alert instead.
+    //
     // evaluateRemote fetches live kill state per call and never throws; the
     // wrapper records the state it saw so a lockdown (kill engaged, or the
     // client's fail-closed "unreachable reads as killed") is reported as
@@ -116,17 +152,35 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
 
     switch (verdict.decision) {
       case "allow":
-        return forward(call);
+        return forwardOrKill(call);
       case "deny":
+        alertIfDecoy(call, "policy denied");
         throw policyDenied(call.tool, verdict);
       case "approve":
+        alertIfDecoy(call, "held for owner approval");
         throw approvalRequired(call.tool, verdict);
       case "veto":
         return vetoLane(call, verdict);
     }
   });
 
-  async function forward(call: ToolCall): Promise<CallToolResult> {
+  /** Decoy values in call arguments, by canary id — [] when clean or no guard. */
+  function decoyIds(call: ToolCall): string[] {
+    if (options.honeytokens === undefined) return [];
+    return options.honeytokens.scan(JSON.stringify(call.args ?? {})).map((m) => m.canaryId);
+  }
+
+  /**
+   * The ONLY path that forwards. Scans immediately before forwarding: a decoy
+   * about to cross the boundary is exfiltration in progress — report the kill
+   * and refuse. Never forwards before scanning.
+   */
+  async function forwardOrKill(call: ToolCall): Promise<CallToolResult> {
+    const canaryIds = decoyIds(call);
+    if (canaryIds.length > 0) {
+      options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
+      throw honeytokenTripped(call.tool, canaryIds);
+    }
     // the client validated the result against CallToolResultSchema; the SDK's
     // return type is a union over every possible schema, so narrow it here
     const result = await upstream.callTool(
@@ -134,6 +188,14 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       CallToolResultSchema,
     );
     return result as CallToolResult;
+  }
+
+  /** A decoy in a call that will NOT forward: flag it, never kill. */
+  function alertIfDecoy(call: ToolCall, note: string): void {
+    const canaryIds = decoyIds(call);
+    if (canaryIds.length > 0) {
+      options.honeytokens?.reportAlert({ canaryIds, tool: call.tool, agentId, note });
+    }
   }
 
   /**
@@ -150,6 +212,9 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         const registration = options.vetoClient.register(call).then((r) => r.id);
         windows.set(key, registration);
         const id = await settle(key, registration, call);
+        // The call is HELD, not forwarded — a decoy in it flags, never kills.
+        // Only on first open, so a held call alerts once, not on every poll.
+        alertIfDecoy(call, "held for owner review");
         throw vetoPending(call.tool, verdict, id, true);
       }
       const id = await settle(key, tracked, call);
@@ -175,9 +240,11 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           // fail closed on unconfirmed delivery: now an approval, still held
           throw vetoHeld(call.tool, id);
         case "released":
-          // silence let it run; a released window authorizes exactly one run
+          // silence let it run; a released window authorizes exactly one run.
+          // Scan here, right before forwarding — a decoy released to cross the
+          // boundary kills, exactly as an allowed call would.
           windows.delete(key);
-          return forward(call);
+          return forwardOrKill(call);
       }
     }
   }
