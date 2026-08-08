@@ -202,10 +202,13 @@ And the big red button:
 curl -X POST http://127.0.0.1:4600/kill -d '{"reason":"owner pressed stop"}'
 ```
 
-Now *everything* — even reads — comes back `-32054` until you restart the
-dev control plane. Stop the control plane entirely and it's the same story:
-**no control plane, no tool calls.** Fail closed is not a mode; it's the
-default.
+Now *everything* — even reads — comes back `-32054`. Restarting the control
+plane does NOT undo it: kill state persists to a file
+(`ownerswitch-kill-state.json` by default) and a restart comes back killed —
+only the 2GO restore ceremony clears it. To hard-reset a dev instance
+instead, stop it and delete the kill-state file. Stop the control plane
+entirely and it's the same story: **no control plane, no tool calls.** Fail
+closed is not a mode; it's the default.
 
 ## Preflight: `doctor` and `verify`
 
