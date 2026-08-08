@@ -29,7 +29,7 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -77,6 +77,15 @@ export interface KillStateStore {
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
+
+/**
+ * Hard ceiling on the kill-state file's byte size — see load() below. The
+ * state is a boolean, a small integer epoch, and at most one KillEvent
+ * (source, an optional free-text reason, a timestamp); 64 KiB is orders of
+ * magnitude more than a legitimate file needs while still bounding memory
+ * against a corrupted or hostile-sized file on disk.
+ */
+export const MAX_KILL_STATE_FILE_BYTES = 64 * 1024;
 
 // O_NOFOLLOW is POSIX; on a platform without it the flag degrades to 0 and
 // the fstat regular-file check below is the remaining guard.
@@ -160,7 +169,28 @@ export class KillStateFileStore implements KillStateStore {
       if (!fstatSync(fd).isFile()) {
         return { outcome: "corrupt", detail: `${this.filePath} is not a regular file` };
       }
-      raw = readFileSync(fd, "utf8");
+      // Read directly off the descriptor in a bounded loop, into a buffer
+      // sized exactly MAX_KILL_STATE_FILE_BYTES + 1, rejecting the instant
+      // that extra byte is observed — rather than trusting an fstat size
+      // checked before the read, which a concurrent writer could race (grow
+      // the file between the stat and the read, or mid-read).
+      const limit = MAX_KILL_STATE_FILE_BYTES;
+      const buffer = Buffer.alloc(limit + 1);
+      let total = 0;
+      for (;;) {
+        const bytesRead = readSync(fd, buffer, total, buffer.length - total, null);
+        if (bytesRead === 0) break; // EOF, within bounds
+        total += bytesRead;
+        if (total > limit) {
+          return {
+            outcome: "corrupt",
+            detail:
+              `${this.filePath} is at least ${total} bytes, over the ${limit}-byte kill-state ` +
+              `limit — refusing to read it into memory`,
+          };
+        }
+      }
+      raw = buffer.toString("utf8", 0, total);
     } catch (err) {
       return { outcome: "corrupt", detail: `cannot read ${this.filePath}: ${message(err)}` };
     } finally {
@@ -193,10 +223,21 @@ export class KillStateFileStore implements KillStateStore {
     // "initialised but missing", which boots killed — never toward fresh.
     const markerDurable = this.ensureMarker();
     const tmp = `${this.filePath}.${randomBytes(8).toString("hex")}.tmp`;
+    const data = Buffer.from(`${JSON.stringify(state, null, 2)}\n`, "utf8");
     let fd: number | undefined;
     try {
       fd = openSync(tmp, CREATE_FLAGS, 0o600);
-      writeSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+      // A single writeSync() is not guaranteed to write the whole buffer —
+      // POSIX write() may return short even for a regular local file, with
+      // no error raised. An unchecked short write here would still get
+      // fsynced and rename-published as a truncated file: KillStateFileStore
+      // would report success while the JSON on disk is corrupt, and that
+      // corruption only surfaces on the NEXT boot — as "cannot parse" —
+      // which boots killed. Loop until every byte has actually landed.
+      let written = 0;
+      while (written < data.length) {
+        written += writeSync(fd, data, written, data.length - written);
+      }
       // rename orders visibility; only fsync orders durability. The file
       // first, then (after the rename) the directory entry — the transition
       // counts as durable only once every one of these fsyncs succeeded.
