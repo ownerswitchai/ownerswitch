@@ -27,6 +27,8 @@ importers:
         specifier: workspace:*
         version: link:../shared
 
+  packages/executor: {}
+
   packages/gateway:
     dependencies:
       '@ownerswitchai/shared':
