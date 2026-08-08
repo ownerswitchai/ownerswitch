@@ -241,3 +241,124 @@ describe("button daemon", () => {
     expect(h.calls).toHaveLength(1);
   });
 });
+
+describe("attemptKill timeout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+    });
+    vi.setSystemTime(new Date("2026-08-07T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A fetch that hangs forever unless the caller's AbortSignal fires. */
+  function hangingFetch(calls: { signal: AbortSignal | undefined }[]) {
+    return (async (_url: URL | RequestInfo, init?: RequestInit) => {
+      calls.push({ signal: init?.signal ?? undefined });
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as typeof fetch;
+  }
+
+  it("a hung POST /kill aborts on the per-attempt timeout instead of stalling silently, and counts as an ordinary failed attempt", async () => {
+    const calls: { signal: AbortSignal | undefined }[] = [];
+    const logs: string[] = [];
+    const kills: KillConfirmation[] = [];
+    let fire: (() => void) | null = null;
+
+    const daemon = createButtonDaemon({
+      controlPlaneUrl: "http://127.0.0.1:4999",
+      deviceId: "btn-test",
+      secret: SECRET,
+      timeoutMs: 1_000,
+      onPress: (listener) => {
+        fire = listener;
+        return () => {
+          fire = null;
+        };
+      },
+      fetchImpl: hangingFetch(calls),
+      log: (line) => logs.push(line),
+      onKill: (confirmation) => kills.push(confirmation),
+    });
+    daemon.start();
+
+    const press = (): void => {
+      if (fire === null) throw new Error("no press listener registered");
+      fire();
+    };
+    press();
+    await settle();
+    expect(calls).toHaveLength(1); // attempt 1 in flight, hung
+    expect(calls[0].signal?.aborted).toBe(false);
+
+    // not yet timed out — nothing has failed or landed
+    await vi.advanceTimersByTimeAsync(999);
+    expect(logs.filter((l) => l.includes("KILL NOT LANDED"))).toHaveLength(0);
+    expect(kills).toHaveLength(0);
+
+    // the 1000ms per-attempt timeout fires: the fetch aborts, which is
+    // reported as an ordinary failed attempt — loud, not a silent stall
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls[0].signal?.aborted).toBe(true);
+    expect(logs.filter((l) => l.includes("KILL NOT LANDED"))).toHaveLength(1);
+    expect(logs.some((l) => l.includes("aborted"))).toBe(true);
+    expect(kills).toHaveLength(0);
+  });
+
+  it("the retry schedule still holds after an abort — the next attempt fires on the normal backoff, not after another full timeout", async () => {
+    const calls: { signal: AbortSignal | undefined }[] = [];
+    let fire: (() => void) | null = null;
+
+    const daemon = createButtonDaemon({
+      controlPlaneUrl: "http://127.0.0.1:4999",
+      deviceId: "btn-test",
+      secret: SECRET,
+      timeoutMs: 1_000,
+      onPress: (listener) => {
+        fire = listener;
+        return () => {
+          fire = null;
+        };
+      },
+      fetchImpl: hangingFetch(calls),
+      log: () => {},
+    });
+    daemon.start();
+
+    const press = (): void => {
+      if (fire === null) throw new Error("no press listener registered");
+      fire();
+    };
+    press();
+    await settle();
+    expect(calls).toHaveLength(1);
+
+    // attempt 1 times out at t=1000
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls).toHaveLength(1);
+
+    // schedule after a failed attempt 1 is the normal 200ms backoff — not
+    // another 1000ms wait for a second timeout
+    await vi.advanceTimersByTimeAsync(199);
+    expect(calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls).toHaveLength(2); // t=1200
+
+    // attempt 2 also hangs and times out at t=2200; attempt 3 follows the
+    // 400ms backoff from there, at t=2600 — the schedule never resets or
+    // stalls because of the abort
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(399);
+    expect(calls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls).toHaveLength(3); // t=2600
+  });
+});
