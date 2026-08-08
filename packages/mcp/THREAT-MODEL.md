@@ -218,14 +218,138 @@ What limits the blast radius today — real code, caveats included:
   restore. Caveat: the seen-nonce store is process memory; a restart
   reopens a ≤60 s replay window (flagged in code — shared store before
   multi-process).
-- **Single-use restore authorizations.** Restore demands a completed 2GO
-  ceremony; each `ceremonyId` is consumed on first use and replay throws
-  (`packages/control-plane/src/kill.ts`). Ceremonies expire after 5 min
-  with a mandatory 30 s cooldown between GO 1 and GO 2 — a stolen
-  authorization is stale in minutes and dead after one spend. Caveat: the
-  server currently verifies the authorization's *shape*, not the ceremony
-  itself (TODO(2go) in `server.ts`); until that wiring lands, this
-  guarantee leans on the owner-session requirement in front of it.
+- **Server-side, single-use restore ceremonies.** Restore demands a live
+  2GO ceremony that the control plane itself started and tracks
+  (`packages/control-plane/src/server.ts`). `POST /restore` verifies the
+  ceremony exists in server state, belongs to the session's owner, has
+  passed its mandatory 30 s cooldown, is inside its 5 min TTL, and is
+  bound to the kill epoch still in force — then consumes it atomically.
+  Single-spend atomicity holds for one process and one event loop — the
+  only place ceremony state lives — not across instances. Every other
+  outcome is the same generic 409: a uniform response SHAPE, deliberately
+  unrevealing about which check failed, but NOT a constant-time or
+  side-channel-free guarantee — timing, evaluation order and transport
+  metadata still differ between causes. Every kill increments the epoch,
+  so a second kill
+  invalidates ceremonies already in flight. There is no shape-only path:
+  an authorization-shaped body without live server state restores
+  nothing, and ceremony state is process-local, so a control-plane
+  restart loses ceremonies *closed* — they must be restarted, never
+  resurrected. The same locality is a deployment limit: ceremony state
+  neither survives nor spans multi-instance / HA deployments, so a shared
+  ceremony store is required before running more than one control-plane
+  instance.
+- **Ceremony capacity cannot be weaponized against restore.** Each owner
+  holds at most ONE live ceremony per kill epoch, and GO 1/2 is
+  IDEMPOTENT: while an owner has a live ceremony under the current
+  epoch, a repeat call returns that same ceremony with its clocks
+  untouched — so a double-click, a browser retry or a second tab cannot
+  invalidate the id the owner is holding, and a stolen same-owner
+  session cannot reset the cooldown by hammering GO 1. There is
+  deliberately NO cancel verb: a pending ceremony ends only by TTL
+  expiry, consumption, or a new kill epoch. Any owner-session cancel
+  would hand the same bearer token a repeatable way to destroy the
+  owner's pending ceremony — the exact lockout idempotency closes — so
+  ceremonies are left to expire on their own. Before any capacity
+  decision, dead records (TTL-expired, consumed, superseded kill epoch)
+  are purged. The remaining global ceiling (`MAX_CEREMONY_RECORDS`) is a
+  memory backstop against a flood of distinct hostile sessions, set far
+  above legitimate use, and it fails closed: full refuses NEW ceremonies
+  with the generic 409 and never evicts a live one (an owner with a
+  pending ceremony still gets it back via the idempotent path). An
+  earlier design capped raw map size with only TTL sweeping, which let
+  consumed or superseded records block new ceremonies for minutes — a
+  denial of the recovery operation itself; the purge-before-cap ordering
+  is the fix and is pinned by tests. Limit, stated plainly: the ceiling
+  is per-IDENTITY, so it is still exhaustible by an attacker who can
+  present many DISTINCT valid owner identities — the capacity math
+  assumes an authoritative owner registry bounding who counts as an
+  owner. Today session minting is in-process and single-owner (flagged
+  in `auth.ts`); until a real registry (passkey enrollment) lands, that
+  assumption is enforced by deployment, not by this code.
+- **Kill state survives restarts — and fails closed.** The kill switch
+  persists `{killed, epoch, last kill event}` to a JSON file on every
+  transition and loads it synchronously at construction — before the
+  HTTP handler exists, so before any request can be answered
+  (`packages/control-plane/src/kill-state.ts`). Restarting the process is
+  therefore not a restore: `kill -9` comes back killed, with the same
+  epoch and the same attributed reason. The mechanics, and what each is
+  for: writes go to a random-named temp file opened
+  `O_CREAT|O_EXCL|O_NOFOLLOW` with mode 0600 and are published by rename
+  in the same directory (atomic visibility — a reader sees the old state
+  or the new, never a torn one); the temp file is fsynced before the
+  rename and the parent directory after it. Durability is claimed
+  narrowly: a transition is durable only after EVERY fsync has
+  succeeded, and a directory-fsync failure surfaces as degraded
+  persistence on `GET /status` (plus a log line) — it is never accepted
+  in silence, because the rename is then visible but a power cut may
+  resurface the previous state. Reads open with `O_NOFOLLOW` and fstat
+  the descriptor, so a symlink or any non-regular file at the state path
+  is refused. A state file that exists but cannot be read or parsed
+  boots the plane KILLED with a loud log. A sibling initialisation
+  marker (`<state-file>.initialized`) is written when the store first
+  persists and never removed: once it exists, a MISSING state file also
+  boots KILLED — deleting the state file is not a restore. Only a store
+  with neither file is a genuine first boot. A persist failure (disk
+  full, read-only fs) never blocks the transition — stopping must not
+  fail because the disk did — but it is never swallowed either:
+  durability is reported DEGRADED on `GET /status` and in the `/kill`
+  response, and the store is asked to quarantine the stale state it
+  failed to replace (marker in, stale state file out) so a later restart
+  boots killed rather than resurrecting the not-killed state the failed
+  save could not replace. If that quarantine itself fails, the plane
+  does not pretend otherwise: it reports itself UNHEALTHY on
+  `GET /status` and keeps denying restores until an owner repairs the
+  store — flipping the in-memory switch is the only working stop left,
+  and it will not be given away while stale state may survive a restart.
+  Why a file: v0 is one process on one host, and the state is a boolean,
+  a counter and one event — a `cat`-auditable JSON file needs no daemon.
+  The limits of that choice, stated plainly:
+  1. **Whoever can write the state directory holds an administrative
+     stop-and-restore capability over kill state.** They can corrupt or
+     delete the state file (forcing fail-closed boots — an
+     administrative stop), and a deleter who removes BOTH the state file
+     and the marker manufactures a "first boot" (indistinguishable
+     without an external anchor). No Node-level hardening changes this;
+     it is the deployment boundary, and it is stated as a REQUIREMENT:
+     the state directory must be writable only by the control plane's
+     user, on a path the agent cannot reach. Production boots enforce
+     what is checkable: `createControlPlane` refuses to start unless
+     `killStateFile` is an explicit absolute path outside the working
+     directory, in an existing directory owned by the process uid with
+     no group/world write access — each refusal logs what is wrong and
+     what the operator must do. `dev: true` (the dev server, demos and
+     tests) skips these checks with a loud warning; the cwd-relative dev
+     default is a convenience, and starting from a different working
+     directory silently addresses a different (empty) store — two more
+     reasons it is not for production.
+  2. **The store is single-instance, and nothing enforces singleton
+     operation yet.** There is no lock file and no lease: two control
+     planes pointed at one state file will interleave last-writer-wins,
+     and — like ceremony state — nothing here coordinates or spans HA
+     deployments. Run exactly one instance per state file; a shared
+     store with real coordination is required before anything else.
+  3. **Crash points can leave the previous state published.** In-memory
+     transitions flip before the file write begins, so a crash between
+     the flip and the rename leaves the PREVIOUS state on disk; a power
+     cut between the rename and the directory fsync can do the same even
+     though the new state was briefly visible. Losing a restore this way
+     fails closed; losing a kill falls back to the state before it —
+     which is why kill triggers should be re-assertable (the button can
+     be pressed again) and why durability degradation is surfaced
+     rather than assumed away.
+  4. **The in-memory audit log is unbounded, and kills are deliberately
+     cheap.** Every kill appends to the process-local log forever, does
+     a synchronous state-file write, and bumps the epoch — invalidating
+     every ceremony in flight. A loopback kill flood therefore grows
+     memory, hammers the disk, and can keep invalidating an owner's
+     pending restore ceremony indefinitely. That is the accepted price
+     of "stopping never fails on auth": bounding the log, batching
+     writes or rate-limiting kills are hardening work, not shipped, and
+     none of them may ever make a kill fail.
+  Hardening beyond this (external anchoring, a shared store, singleton
+  enforcement, log bounding) is future work, tracked with the audit-log
+  hardening above.
 - **Short TTLs everywhere.** Owner sessions: 15 min. Ceremonies: 5 min.
   Downstream connector tokens, in the broker model: minutes. A stolen
   artifact is a window, not a standing capability.

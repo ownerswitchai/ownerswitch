@@ -32,15 +32,32 @@ credential broker, sandboxed egress, OS-level enforcement — honestly
 ranked in **[THREAT-MODEL.md](./THREAT-MODEL.md)**. The quickstart alone
 is policy and audit, not a cage.
 
-## The 5-minute quickstart
+## The quickstart
 
-Goal: your first *blocked* tool call in under 5 minutes.
+Goal: your first *blocked* tool call, with the connection and the policy
+both verified *before* you ever prompt an agent.
 
-**[0:00] Install** (node 22+, pnpm 9)
+**Honest timing.** We clocked a first, unassisted run of this quickstart
+with a stopwatch at **~20 minutes**, not 5. Almost all of it was two
+infrastructure surprises — the `claude` CLI wasn't installed, and the
+documented launch command didn't work when an MCP client (as opposed to a
+human) ran it — plus six minutes of an agent debugging its own connection
+because nothing told anyone to check first. This revision fixes all three:
+the CLI install is now an explicit step, the launch command below is the
+one that actually works under an MCP client, and `doctor` / `verify` (see
+the next section) catch what's broken *before* you spend an agent's quota
+finding out. We haven't re-timed a from-scratch run to put a new number
+here — 5 minutes is the target these tools exist to get you back to, not a
+claim we're making about this walkthrough.
+
+**[0:00] Install** (node 22+, pnpm 9, and an MCP client)
 
 ```bash
 git clone https://github.com/ownerswitchai/ownerswitch && cd ownerswitch
 pnpm install
+
+# an MCP client — for Claude Code:
+npm install -g @anthropic-ai/claude-code
 ```
 
 **[1:30] Start the dev control plane** (terminal 1 — leave it running)
@@ -50,7 +67,8 @@ pnpm --filter @ownerswitchai/mcp dev:control-plane
 ```
 
 It prints the device secret and an **owner token** — that token is your
-"one tap from the owner" for the rest of the quickstart.
+"one tap from the owner" for the rest of the quickstart, and what you'll
+pass to `verify` below.
 
 **[2:00] Write one config file** — `~/ownerswitch.mcp.json`. This example
 guards the official filesystem MCP server: reads run, writes get a veto
@@ -81,10 +99,21 @@ window, renames never run, anything unknown needs the owner (fail closed).
 mkdir -p /tmp/ownerswitch-demo
 ```
 
-**[2:30] Point your MCP client at the gateway.** For Claude Code:
+**[2:30] Preflight, before touching any MCP client:**
 
 ```bash
-claude mcp add ownerswitch -- pnpm -C /ABS/PATH/ownerswitch/packages/mcp exec tsx src/cli.ts --config ~/ownerswitch.mcp.json
+cd packages/mcp
+npx tsx src/cli.ts doctor --config ~/ownerswitch.mcp.json
+```
+
+Every line should be `✔`. If one isn't, its line says exactly what to fix
+— fix it here, not by asking an agent to guess.
+
+**[3:00] Point your MCP client at the gateway.** For Claude Code, from
+`packages/mcp` (same directory as the `doctor` run above):
+
+```bash
+claude mcp add ownerswitch -- npx tsx src/cli.ts --config ~/ownerswitch.mcp.json
 ```
 
 Any other MCP client, same shape:
@@ -93,15 +122,62 @@ Any other MCP client, same shape:
 {
   "mcpServers": {
     "ownerswitch": {
-      "command": "pnpm",
-      "args": ["-C", "/ABS/PATH/ownerswitch/packages/mcp", "exec", "tsx",
-               "src/cli.ts", "--config", "/ABS/PATH/ownerswitch.mcp.json"]
+      "command": "npx",
+      "args": ["tsx", "src/cli.ts", "--config", "/ABS/PATH/ownerswitch.mcp.json"],
+      "cwd": "/ABS/PATH/ownerswitch/packages/mcp"
     }
   }
 }
 ```
 
-**[3:00] See the first blocked call.** Ask the agent:
+> **Don't use `pnpm -C <path> exec tsx ...` to launch this.** It's the
+> command you'd reach for by analogy with the rest of this repo, it runs
+> fine when *you* type it by hand, and it still fails under an MCP client —
+> we hit exactly this. Reproducing it end to end (`claude mcp add` with the
+> `pnpm exec` form, then `claude mcp list`) reliably reproduced the failure:
+> `Failed to connect — connection timed out`, the same failure family as
+> `-32000: Connection closed`. Inspecting the process tree while it hung
+> showed why: `pnpm -C <path> exec <cmd>` doesn't run your command directly.
+> On a machine where `pnpm` is a version-manager shim (common — e.g. Corepack
+> or a pnpm-version-manager install), invoking it re-execs the pinned pnpm
+> binary, which then spawns `tsx`, which then spawns your code — four
+> Node.js processes deep before `cli.ts` ever runs, versus `npx tsx`'s more
+> direct path. An MCP client's startup timeout doesn't leave much room for
+> that. It gets worse: when the client gave up and tore down the connection
+> attempt, that `pnpm → pnpm → tsx → node` chain was still alive —
+> **orphaned** — minutes later. Killing the one process pnpm handed back to
+> the client never reached the leaf process actually speaking MCP. `npx tsx`
+> has one fewer layer of indirection and, in every run we tested, connected
+> and shut down cleanly.
+
+**[3:30] Verify the connection — before you prompt the agent:**
+
+```bash
+claude mcp list
+```
+
+Confirm `ownerswitch` shows `✔ Connected`. If it doesn't, don't hand the
+problem to the agent — that's the six minutes we lost. Re-run `doctor`
+instead; if `doctor` is all green but the client still won't connect, the
+client itself (not this gateway) is the thing to debug.
+
+**[4:00] Verify enforcement — also before you prompt the agent:**
+
+```bash
+npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json
+```
+
+It prompts for the owner token from terminal 1 — paste it there (or
+`export OWNERSWITCH_OWNER_TOKEN=...` first and `unset` it after; it is
+deliberately **not** a CLI flag, which would leak it into shell history and
+`ps` output). This proves the policy is actually being enforced — allow
+passes, an unmatched tool hits the fail-closed default, and the veto lane
+runs end to end: a real window is registered, your owner token vetoes it,
+and it stays vetoed — without spending an agent's turn finding out, and
+without touching the kill switch. See the next section for what it checks
+and what to do if it fails.
+
+**[4:30] See the first blocked call.** Ask the agent:
 
 > create a file /tmp/ownerswitch-demo/hello.txt containing "hi"
 
@@ -113,7 +189,7 @@ veto writes. The call has NOT run. A veto window (id "veto_ab12cd34ef56") is now
 open — the owner has a few minutes to stop it. …
 ```
 
-**[4:00] Be the owner.** Terminal 1 printed the exact commands, e.g.:
+**[5:00] Be the owner.** Terminal 1 printed the exact commands, e.g.:
 
 ```bash
 # one tap: stop it
@@ -130,10 +206,91 @@ And the big red button:
 curl -X POST http://127.0.0.1:4600/kill -d '{"reason":"owner pressed stop"}'
 ```
 
-Now *everything* — even reads — comes back `-32054` until you restart the
-dev control plane. Stop the control plane entirely and it's the same story:
-**no control plane, no tool calls.** Fail closed is not a mode; it's the
-default.
+Now *everything* — even reads — comes back `-32054`. Restarting the control
+plane does NOT undo it: kill state persists to a file
+(`ownerswitch-kill-state.json` by default) and a restart comes back killed —
+only the 2GO restore ceremony clears it. To hard-reset a dev instance
+instead, stop it and delete the kill-state file. Stop the control plane
+entirely and it's the same story: **no control plane, no tool calls.** Fail
+closed is not a mode; it's the default.
+
+## Preflight: `doctor` and `verify`
+
+Two commands exist so a broken setup gets caught by you, in seconds, instead
+of by an agent burning its quota on it. Both take the same `--config <file>`
+(or `OWNERSWITCH_MCP_CONFIG`) as the gateway itself.
+
+### `ownerswitch-mcp doctor`
+
+```bash
+npx tsx src/cli.ts doctor --config ~/ownerswitch.mcp.json
+```
+
+Five one-line checks, printed as `✔` (pass), `⚠` (action required), or `✘`
+(failed) — every non-`✔` line names what to do about it:
+
+| check | what it does |
+| --- | --- |
+| node version | `process.version` is 22 or newer |
+| config | the file parses and every field validates (same loader the gateway uses) |
+| control plane | `GET /status` responds within `timeoutMs` — and if it responds `killed:true`, that is a `⚠`, **not** a pass: the plane is reachable but every call will be refused (`-32054`) until an owner runs the 2GO restore ceremony, and the fix line says exactly that |
+| device credentials | a signed, deliberately-malformed `POST /veto` gets `400` (signature accepted) rather than `401` (rejected) — this proves `device.id`/`device.secret` are right *without* opening a real veto window |
+| upstream command | launches your `upstream.command` exactly as the gateway will and completes a **real MCP initialize handshake**, then shuts it down through the SDK's close path (stdin end → wait for the child to exit, escalating only if it lingers) — a binary that starts but crashes on boot, or was never an MCP server, fails here instead of surfacing later as the client's opaque connection timeout |
+
+A failing check skips whatever depends on it (a bad config skips
+control-plane/device/upstream; an unreachable control plane skips the
+device-credentials check) rather than printing a confusing cascade. Exits 0
+only when every line is `✔` — a `⚠` exits 1 too, because you must not
+connect an agent over it.
+
+### `ownerswitch-mcp verify`
+
+```bash
+npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json
+```
+
+Proves the policy is actually enforced, against the real control plane, by
+exercising the same decision path the gateway uses at runtime — without
+forwarding anything to the real upstream tool, and **without touching the
+global kill switch**:
+
+1. a call matching your policy's first `allow` rule → **allowed**
+2. a call matching no rule → hits `defaultDecision`, and **fails loudly** if
+   that default is itself `"allow"` (that's not fail-closed, and `verify`
+   won't pass a policy that can't back up the claim)
+3. the **veto lane, end to end**: registers a real window (device-signed,
+   exactly as the gateway would for a held call), vetoes it with your owner
+   token — the owner's one tap — and confirms it reads back `vetoed` and
+   stays that way. The only residue is that one terminally-vetoed demo
+   window in the control plane's in-memory map.
+
+The owner token is **required** (it plays the owner's veto tap) and comes
+from `OWNERSWITCH_OWNER_TOKEN` or an interactive prompt — never a CLI flag,
+which would leak it into shell history and process listings. Typing it at
+the prompt never echoes to the terminal (raw-mode input, nothing written
+back but the prompt itself and a trailing newline), so it never lands in
+scrollback or a screen recording either. It is validated up front by a
+harmless probe (`POST /restore` with a ceremony id the server can never
+have minted: the uniform `409` proves the token is accepted, `401` proves
+it isn't, and neither mutates anything).
+
+If a lane genuinely can't be exercised — e.g. the policy has no `"allow"`
+rule to build a demonstration call from, or every tool name matches an
+explicit rule so the fail-closed default can never fire — that is a
+**failure** for that check, naming exactly what's missing. `verify` proves
+three specific things; if it can't prove one, the run fails, full stop —
+nothing is silently skipped into an overall `PASS`.
+
+`verify` deliberately does not engage the real kill switch. A live
+kill/restore cycle from a CLI preflight has real edges — an ambiguous
+`/kill` response on a network blip, a lost connection mid-ceremony, a
+Ctrl-C at the wrong moment — that a DX check has no business improvising
+answers to, and kill state persisting across restarts makes getting it
+wrong expensive. That coverage already exists at the layer that owns it —
+`control-plane/src/integration.test.ts` (kill → 2GO → restore, end to end)
+and the ceremony's own HTTP-level tests in `control-plane/src/server.test.ts`
+— so `verify` stays a fast, low-side-effect preflight instead of repeating
+it.
 
 ## Configuration
 
