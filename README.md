@@ -36,6 +36,18 @@ expires.
 **The mitigation:** short TTLs. The shorter the token lifetime, the
 smaller the window between KILL and everything downstream going dark.
 
+## Enforcement boundary
+
+The gateway enforces policy on calls that **route through it**: checked
+against live kill state, fail-closed on doubt. It does not confine an
+agent that also has direct file, shell, or network access — for that
+agent a denial removes permission, not capability, and a repeated user
+request can be read as authorization to use a non-routed path (we have
+watched it happen). Containment comes from what you deploy around the
+gateway — credential broker, sandboxed egress, OS-level enforcement —
+ranked honestly in the [threat model](packages/mcp/THREAT-MODEL.md).
+Don't read the quickstart as a containment promise.
+
 ## Layout
 
 ```
@@ -43,6 +55,7 @@ apps/web              — ownerswitch.ai landing (static)
 packages/shared       — policy model types
 packages/gateway      — the decision engine (start here)
 packages/sdk          — agent-side client (stub)
+packages/mcp          — MCP gateway (docs first: THREAT-MODEL.md)
 packages/button       — physical kill button daemon (V0: keyboard-mode USB buttons)
 packages/control-plane— policies, kill state, audit (stub)
 ```
