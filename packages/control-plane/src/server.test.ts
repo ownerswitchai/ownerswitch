@@ -102,7 +102,7 @@ describe("control-plane HTTP API", () => {
 
     let res = await fetch(`${url}/status`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: false });
+    expect(await res.json()).toEqual({ killed: false, epoch: 0 });
 
     await fetch(`${url}/kill`, {
       method: "POST",
@@ -115,7 +115,24 @@ describe("control-plane HTTP API", () => {
       killed: true,
       reason: "red button pressed",
       at: 1_000,
+      epoch: 1,
     });
+  });
+
+  it("GET /status exposes the epoch so a client can tell a stale approval from a current one", async () => {
+    const cp = ephemeral({ now: clock().now });
+    const url = await start(cp);
+
+    expect((await (await fetch(`${url}/status`)).json()).epoch).toBe(0);
+
+    await fetch(`${url}/kill`, { method: "POST" });
+    expect((await (await fetch(`${url}/status`)).json()).epoch).toBe(1);
+
+    // a second kill (still killed) bumps the epoch again — it counts every
+    // engagement, not just "is currently killed"
+    await fetch(`${url}/kill`, { method: "POST" });
+    expect((await (await fetch(`${url}/status`)).json()).epoch).toBe(2);
+    expect(cp.killSwitch.epoch).toBe(2);
   });
 
   it("POST /kill with an empty body still engages (default source 'api')", async () => {
@@ -598,6 +615,7 @@ describe("control-plane HTTP API", () => {
       killed: true,
       reason: "red button pressed",
       at: 1_000,
+      epoch,
     });
   });
 
@@ -635,7 +653,10 @@ describe("control-plane HTTP API", () => {
     expect(after.killSwitch.killed).toBe(false);
     expect(after.killSwitch.epoch).toBe(before.killSwitch.epoch); // the epoch survives the restore
     const url2 = await start(after);
-    expect(await (await fetch(`${url2}/status`)).json()).toEqual({ killed: false });
+    expect(await (await fetch(`${url2}/status`)).json()).toEqual({
+      killed: false,
+      epoch: after.killSwitch.epoch,
+    });
   });
 
   it("deleting the state file of an initialised store boots FAIL-CLOSED, not fresh", async () => {
@@ -764,6 +785,7 @@ describe("control-plane HTTP API", () => {
         killed: true,
         reason: "manual stop",
         at: 500,
+        epoch: cp.killSwitch.epoch,
         persistenceDegraded: true,
         unhealthy: expect.stringContaining("owner intervention"),
       });

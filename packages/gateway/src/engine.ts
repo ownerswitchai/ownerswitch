@@ -14,6 +14,18 @@ import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 export interface KillState {
   killed: boolean;
   reason?: string;
+  /**
+   * The control plane's kill epoch — a monotone count of every kill this
+   * deployment has ever had; a restore never resets it. `evaluate()` itself
+   * does not consult it: `killed` is enough to decide a policy call. It
+   * rides along on `KillState` so a live-fetched answer also carries what a
+   * future ticket-epoch check (packages/executor/DESIGN.md §3) needs,
+   * without a second round trip. Optional here because hand-built
+   * `KillState` values (tests, callers with no epoch source) stay valid;
+   * `createControlPlaneClient`'s fetched answers always populate it (see
+   * client.ts) or fail the whole lookup closed.
+   */
+  epoch?: number;
 }
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
