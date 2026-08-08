@@ -280,7 +280,7 @@ describe("control-plane HTTP API", () => {
 
     // status stays not-killed — a decoy read alerts, it does not lock down
     expect(cp.killSwitch.killed).toBe(false);
-    expect((await (await fetch(`${url}/status`)).json())).toEqual({ killed: false });
+    expect((await (await fetch(`${url}/status`)).json())).toEqual({ killed: false, epoch: 0 });
 
     const [entry] = cp.killSwitch.auditLog();
     expect(entry.type).toBe("alert");
