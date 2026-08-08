@@ -54,6 +54,16 @@ export class RestoreCeremony {
     return this.status;
   }
 
+  /** ms until GO 2/2 unlocks; 0 once the cooldown has passed. */
+  cooldownRemainingMs(): number {
+    return Math.max(0, this.startedAt + this.cooldownMs - this.now());
+  }
+
+  /** The instant the ceremony's TTL elapses, regardless of state. */
+  get expiresAt(): number {
+    return this.startedAt + this.ttlMs;
+  }
+
   /** GO 2/2 — only valid in "ready"; too early or too late both fail. */
   confirm(): RestoreAuthorization {
     this.tick();
