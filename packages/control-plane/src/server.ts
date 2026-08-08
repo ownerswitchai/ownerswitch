@@ -24,6 +24,9 @@ import { VetoWindow } from "./veto.js";
  *                     with neither, loopback callers may still kill (recorded
  *                     as an unauthenticated "api" kill). Stopping must never
  *                     fail because auth was misconfigured.
+ *  - POST /alert    — a flagged event that does NOT change kill state (a
+ *                     honeytoken FILE was touched). Same auth shape as /kill;
+ *                     recorded in the audit log, never a lockdown.
  *  - POST /restore  — owner session required. No exceptions, no loopback bypass.
  *  - POST /veto     — device signature required; a gateway registers a window
  *                     for a call it is holding. Registration puts text in
@@ -159,6 +162,28 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 200, { killed: true });
   }
 
+  async function postAlert(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Same auth shape as /kill — an alert is attributed the same way — but it
+    // only records a flagged event; it never engages the switch, so it can
+    // never be a one-touch denial of service.
+    const raw = await readRawBody(req);
+    const authenticated = hasValidDeviceSignature(req, raw) || ownerSessionFrom(req) !== null;
+
+    if (!authenticated && !isLoopbackAddress(req.socket.remoteAddress)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    const body = parseJsonBody(raw);
+    const claimed = KILL_SOURCES.includes(body.source as KillSource)
+      ? (body.source as KillSource)
+      : "api";
+    const source = authenticated ? claimed : "api";
+    const reason = typeof body.reason === "string" ? body.reason : undefined;
+    killSwitch.alert(source, reason, { unauthenticated: !authenticated });
+    sendJson(res, 200, { alerted: true, killed: killSwitch.killed });
+  }
+
   async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Owner session required — no exceptions, no loopback bypass. Restoring is
     // the expensive direction and stays that way.
@@ -260,6 +285,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "POST" && path === "/kill") return postKill(req, res);
+    if (method === "POST" && path === "/alert") return postAlert(req, res);
     if (method === "POST" && path === "/restore") return postRestore(req, res);
     if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);
     if (vetoMatch) {

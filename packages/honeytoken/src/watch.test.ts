@@ -24,6 +24,7 @@ import { fsReportsReads, watchHoneytokenFiles, type FileTrip } from "./watch.js"
  * a noatime mount. The simulated-read test covers the mechanism everywhere.
  */
 const POLL_MS = 25;
+const SECRET = "watch-test-canary-secret";
 
 const readsVisible = fsReportsReads(tmpdir());
 
@@ -34,6 +35,7 @@ let close: (() => void) | null;
 const arm = (paths: string[]): void => {
   ({ close } = watchHoneytokenFiles({
     paths,
+    secret: SECRET,
     onTrip: (trip) => trips.push(trip),
     pollMs: POLL_MS,
     log: () => undefined,
@@ -63,7 +65,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it.skipIf(!readsVisible)("a planted token trips on read", async () => {
-    const { files, planted } = plantHoneytokens({ dir });
+    const { files, planted } = plantHoneytokens({ dir, secret: SECRET });
     const envPath = files[0];
     arm([envPath]);
 
@@ -84,7 +86,7 @@ describe("watchHoneytokenFiles", () => {
   it("an atime advance alone trips as a read — the poller needs no fs event help", async () => {
     // Simulated read via utimes: deterministic even on noatime mounts, and
     // proves detection is stat-based rather than riding fs.watch semantics.
-    const token = generateHoneytoken({ kind: "openai" });
+    const token = generateHoneytoken({ kind: "openai", secret: SECRET });
     const path = join(dir, ".env.backup");
     writeFileSync(path, `OPENAI_API_KEY=${token.value}\n`);
     arm([path]);
@@ -98,7 +100,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it("a write trips", async () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
     arm([files[0]]);
 
     appendFileSync(files[0], "PGPASSWORD=hunter2\n");
@@ -109,7 +111,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it("deleting the decoy trips", async () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
     arm([files[1]]);
 
     rmSync(files[1]);
@@ -119,7 +121,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it("replacing the decoy with another file trips as a rename", async () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
     const impostor = join(dir, "impostor");
     writeFileSync(impostor, "clean\n");
     arm([files[0]]);
@@ -131,7 +133,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it("one trip per path — the first touch disarms that tripwire", async () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
     arm([files[0]]);
 
     appendFileSync(files[0], "X=1\n");
@@ -144,7 +146,7 @@ describe("watchHoneytokenFiles", () => {
   });
 
   it("paths trip independently, and close() disarms everything", async () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
     arm(files);
 
     appendFileSync(files[0], "X=1\n");

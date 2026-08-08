@@ -38,8 +38,14 @@ async function main(): Promise<void> {
   const shutdown = (code: number): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    void proxy.close().finally(() => {
-      tripwire.stop(); // logs loudly if a tripped kill is still unconfirmed
+    void proxy.close().finally(async () => {
+      // Flush first: a tripped-but-unconfirmed kill must not be lost on exit.
+      // Bounded, so a down control plane can't block shutdown forever.
+      const { delivered, pending } = await tripwire.flush();
+      tripwire.stop();
+      if (!delivered) {
+        console.error(`[ownerswitch-mcp] exiting with ${pending} honeytoken kill report(s) UNCONFIRMED`);
+      }
       process.exit(code);
     });
   };

@@ -2,15 +2,18 @@ import { describe, expect, it } from "vitest";
 import { generateHoneytoken } from "./generate.js";
 import { scanForHoneytokens } from "./scan.js";
 
+const SECRET = "deployment-canary-secret";
+const OTHER_SECRET = "another-deployment-secret";
+
 describe("scanForHoneytokens", () => {
   it("a decoy value inside tool-call arguments trips the scanner", () => {
-    const token = generateHoneytoken({ kind: "stripe" });
+    const token = generateHoneytoken({ kind: "stripe", secret: SECRET });
     const args = JSON.stringify({
       tool: "stripe.create_payout",
       args: { api_key: token.value, amount_cents: 125_000 },
     });
 
-    const matches = scanForHoneytokens(args);
+    const matches = scanForHoneytokens(args, SECRET);
 
     expect(matches).toHaveLength(1);
     expect(matches[0].canaryId).toBe(token.canaryId);
@@ -20,11 +23,11 @@ describe("scanForHoneytokens", () => {
   });
 
   it("reports each distinct token once, in order of first appearance", () => {
-    const aws = generateHoneytoken({ kind: "aws" });
-    const openai = generateHoneytoken({ kind: "openai" });
+    const aws = generateHoneytoken({ kind: "aws", secret: SECRET });
+    const openai = generateHoneytoken({ kind: "openai", secret: SECRET });
     const text = `${aws.value} then ${openai.value} and ${aws.value} again`;
 
-    const matches = scanForHoneytokens(text);
+    const matches = scanForHoneytokens(text, SECRET);
 
     expect(matches.map((m) => m.canaryId)).toEqual([aws.canaryId, openai.canaryId]);
     expect(matches.map((m) => m.kindHint)).toEqual(["aws", "openai"]);
@@ -43,25 +46,36 @@ describe("scanForHoneytokens", () => {
       `postgres://svc:${"p".repeat(24)}@db.internal:5432/prod`,
     ];
     for (const credential of foreignCredentials) {
-      expect(scanForHoneytokens(credential)).toEqual([]);
+      expect(scanForHoneytokens(credential, SECRET)).toEqual([]);
     }
   });
 
-  it("the CANARY marker alone is not enough — the checksum must validate", () => {
+  it("the CANARY marker alone is not enough — the keyed checksum must validate", () => {
     // prose that happens to contain CANARY + ten base32-alphabet characters
-    expect(scanForHoneytokens("the CANARYTOKENSDEMO project pages")).toEqual([]);
-    expect(scanForHoneytokens("CANARY22222222AA and CANARYABCDEFGHJK in prose")).toEqual([]);
+    expect(scanForHoneytokens("the CANARYTOKENSDEMO project pages", SECRET)).toEqual([]);
+    expect(scanForHoneytokens("CANARY22222222AA and CANARYABCDEFGHJK in prose", SECRET)).toEqual([]);
 
     // a real token whose final checksum character was corrupted
-    const token = generateHoneytoken({ kind: "aws" });
+    const token = generateHoneytoken({ kind: "aws", secret: SECRET });
     const corrupted = token.value.slice(0, -1) + (token.value.endsWith("A") ? "B" : "A");
-    expect(scanForHoneytokens(corrupted)).toEqual([]);
+    expect(scanForHoneytokens(corrupted, SECRET)).toEqual([]);
+  });
+
+  it("a canary from another deployment does not trip — the key scopes the tripwire", () => {
+    const foreign = generateHoneytoken({ kind: "generic", secret: OTHER_SECRET });
+    expect(scanForHoneytokens(foreign.value, SECRET)).toEqual([]);
+    expect(scanForHoneytokens(foreign.value, OTHER_SECRET)).toHaveLength(1);
   });
 
   it("clean text scans clean", () => {
-    expect(scanForHoneytokens("")).toEqual([]);
-    expect(scanForHoneytokens(JSON.stringify({ path: "/tmp/notes.md", content: "hello" }))).toEqual(
-      [],
-    );
+    expect(scanForHoneytokens("", SECRET)).toEqual([]);
+    expect(
+      scanForHoneytokens(JSON.stringify({ path: "/tmp/notes.md", content: "hello" }), SECRET),
+    ).toEqual([]);
+  });
+
+  it("a missing key is a loud error, never a silent never-match", () => {
+    const token = generateHoneytoken({ kind: "aws", secret: SECRET });
+    expect(() => scanForHoneytokens(token.value, "")).toThrow(/canary secret is required/);
   });
 });

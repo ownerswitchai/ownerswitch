@@ -18,6 +18,12 @@ export const DECOY_FILENAMES = [".env.backup", "credentials.json"] as const;
 
 export interface PlantOptions {
   dir: string;
+  /**
+   * Per-deployment canary key the planted tokens are minted with. The gateway
+   * and file watcher only trip on tokens minted with the SAME key, so this
+   * must match theirs — reuse the device secret. Required.
+   */
+  secret: string;
   /** Replace existing files of the same names. Off by default: never destroy a real backup. */
   force?: boolean;
 }
@@ -51,7 +57,7 @@ export function plantHoneytokens(opts: PlantOptions): PlantResult {
 
   const planted: PlantedToken[] = [];
   const mint = (kind: Honeytoken["kind"], file: string, key: string): string => {
-    const token = generateHoneytoken({ kind, label: `${file} ${key}` });
+    const token = generateHoneytoken({ kind, label: `${file} ${key}`, secret: opts.secret });
     planted.push({ token, file, key });
     return token.value;
   };

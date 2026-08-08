@@ -405,7 +405,7 @@ describe("honeytoken tripwire", () => {
   function createGuardSpy() {
     const reports: Array<{ canaryIds: string[]; tool: string; agentId: string }> = [];
     const guard: ProxyOptions["honeytokens"] = {
-      scan: scanForHoneytokens,
+      scan: (text) => scanForHoneytokens(text, DEVICE_SECRET),
       report: (trip) => reports.push(trip),
     };
     return { reports, guard };
@@ -414,7 +414,7 @@ describe("honeytoken tripwire", () => {
   it("a decoy value in tool arguments trips: refused, reported, upstream never touched", async () => {
     const spy = createGuardSpy();
     const t = await startProxy(createFakeControlPlane(), spy.guard);
-    const token = generateHoneytoken({ kind: "stripe" });
+    const token = generateHoneytoken({ kind: "stripe", secret: DEVICE_SECRET });
 
     const err = await refusalOf(
       t.client.callTool({
@@ -443,7 +443,7 @@ describe("honeytoken tripwire", () => {
     const controlPlane = createFakeControlPlane();
     controlPlane.state.down = true; // a policy/kill-state path would say "lockdown, unreachable"
     const t = await startProxy(controlPlane, spy.guard);
-    const token = generateHoneytoken({ kind: "aws" });
+    const token = generateHoneytoken({ kind: "aws", secret: DEVICE_SECRET });
 
     // delete_* is a policy DENY — but the honeytoken verdict must come first
     const err = await refusalOf(
@@ -489,7 +489,7 @@ describe("honeytoken tripwire", () => {
       }) as typeof fetch,
     });
     const t = await startProxy(createFakeControlPlane(), tripwire);
-    const token = generateHoneytoken({ kind: "openai" });
+    const token = generateHoneytoken({ kind: "openai", secret: DEVICE_SECRET });
 
     const err = await refusalOf(
       t.client.callTool({ name: "write_file", arguments: { path: "/x", content: token.value } }),
@@ -524,7 +524,7 @@ describe("honeytoken tripwire", () => {
 
   it("without the option, the gateway does not scan (tripwires are wired in by the CLI)", async () => {
     const t = await startProxy();
-    const token = generateHoneytoken({ kind: "generic" });
+    const token = generateHoneytoken({ kind: "generic", secret: DEVICE_SECRET });
     const result = await t.client.callTool({
       name: "read_file",
       arguments: { path: token.value },

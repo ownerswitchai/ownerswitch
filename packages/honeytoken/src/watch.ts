@@ -15,6 +15,17 @@ import { scanForHoneytokens } from "./scan.js";
 /**
  * File tripwires: any touch of a planted decoy file fires onTrip.
  *
+ * TIER — a file touch is an ALERT, not a KILL, and callers should keep it
+ * that way by default. A decoy file being read has innocent explanations:
+ * IDE indexing, grep, a backup job, antivirus, ordinary agent repo
+ * exploration. Worse, an attacker who knows a decoy is planted can
+ * deliberately induce a read to force a global kill — turning the tripwire
+ * into a denial-of-service. So the watcher only DETECTS and REPORTS touches;
+ * the wiring (see the CLI) sends them to the control plane as flagged alerts
+ * (POST /alert), not kills. The KILL tier is reserved for a decoy VALUE
+ * crossing the gateway (see tripwire.ts / scan.ts), which has no innocent
+ * explanation. Escalating file touches to kills is opt-in, never the default.
+ *
  * How touches are actually detected — stated honestly, because fs.watch alone
  * cannot see reads:
  *
@@ -55,6 +66,13 @@ export interface WatchHoneytokenFilesOptions {
   /** Planted decoy FILES (not directories). Arming a missing path throws. */
   paths: string[];
   onTrip: (trip: FileTrip) => void;
+  /**
+   * Per-deployment canary key, used only to LABEL a trip with the canary ids
+   * found in the file at arm time. Detection does not depend on it — a touch
+   * trips whether or not the ids are recovered — so it is optional; without
+   * it, FileTrip.canaryIds is empty.
+   */
+  secret?: string;
   /** atime/mtime sampling cadence; default 500 ms. */
   pollMs?: number;
   now?: () => number;
@@ -127,7 +145,8 @@ export function watchHoneytokenFiles(opts: WatchHoneytokenFilesOptions): Honeyto
     // Arming must fail loudly: a tripwire that silently didn't arm is worse
     // than no tripwire, so any of these throws aborts watchHoneytokenFiles.
     const content = readFileSync(path, "utf8"); // our own read — before priming
-    const canaryIds = scanForHoneytokens(content).map((m) => m.canaryId);
+    const canaryIds =
+      opts.secret === undefined ? [] : scanForHoneytokens(content, opts.secret).map((m) => m.canaryId);
     const before = statSync(path);
     if (!before.isFile()) throw new Error(`${path} is not a regular file — cannot arm a tripwire on it`);
     // Prime atime below mtime so relatime mounts record the NEXT read (ours

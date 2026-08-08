@@ -26,9 +26,24 @@ export interface KillEvent {
   unauthenticated?: true;
 }
 
+/**
+ * A flagged event that did NOT change kill state — e.g. a honeytoken FILE was
+ * touched (read/backup/index), which is suspicious but has innocent
+ * explanations, so it alerts instead of killing. Same shape as a KillEvent so
+ * the audit trail reads uniformly.
+ */
+export interface AlertEvent {
+  source: KillSource;
+  reason?: string;
+  at: number;
+  /** present when the trigger carried no verifiable credential */
+  unauthenticated?: true;
+}
+
 export type AuditEntry =
   | { type: "kill"; event: KillEvent }
-  | { type: "restore"; auth: RestoreAuthorization; at: number };
+  | { type: "restore"; auth: RestoreAuthorization; at: number }
+  | { type: "alert"; event: AlertEvent };
 
 export class KillSwitch {
   private killedState = false;
@@ -49,6 +64,24 @@ export class KillSwitch {
       },
     });
     this.killedState = true;
+  }
+
+  /**
+   * Record a flagged event WITHOUT engaging the kill switch. This is the
+   * honeytoken file-touch tier: logged and auditable, but not a lockdown — a
+   * decoy read has innocent explanations (indexing, backup, grep) and must
+   * not be a one-touch denial-of-service. Idempotent and append-only.
+   */
+  alert(source: KillSource, reason?: string, opts: { unauthenticated?: boolean } = {}): void {
+    this.log.push({
+      type: "alert",
+      event: {
+        source,
+        reason,
+        at: this.now(),
+        ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
+      },
+    });
   }
 
   get killed(): boolean {

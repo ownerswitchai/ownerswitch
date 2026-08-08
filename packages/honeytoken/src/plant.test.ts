@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { plantHoneytokens } from "./plant.js";
 import { scanForHoneytokens } from "./scan.js";
 
+const SECRET = "plant-test-canary-secret";
+
 let dir: string;
 
 describe("plantHoneytokens", () => {
@@ -17,7 +19,7 @@ describe("plantHoneytokens", () => {
   });
 
   it("writes .env.backup and credentials.json full of scannable decoys", () => {
-    const { files, planted } = plantHoneytokens({ dir });
+    const { files, planted } = plantHoneytokens({ dir, secret: SECRET });
 
     expect(files).toEqual([join(dir, ".env.backup"), join(dir, "credentials.json")]);
     expect(planted).toHaveLength(8);
@@ -32,14 +34,14 @@ describe("plantHoneytokens", () => {
         expect(p.token.label).toContain(p.key);
       }
       // …and the scanner recovers exactly that file's canary ids
-      expect(scanForHoneytokens(content).map((m) => m.canaryId)).toEqual(
+      expect(scanForHoneytokens(content, SECRET).map((m) => m.canaryId)).toEqual(
         expected.map((p) => p.token.canaryId),
       );
     }
   });
 
   it("the env file parses like an env file and the json file like json", () => {
-    const { files } = plantHoneytokens({ dir });
+    const { files } = plantHoneytokens({ dir, secret: SECRET });
 
     const envLines = readFileSync(files[0], "utf8").split("\n").filter((l) => l !== "");
     for (const line of envLines) {
@@ -62,7 +64,7 @@ describe("plantHoneytokens", () => {
   it("refuses to overwrite an existing file — and writes NOTHING when it refuses", () => {
     writeFileSync(join(dir, "credentials.json"), '{"real":"backup"}');
 
-    expect(() => plantHoneytokens({ dir })).toThrow(/refusing to overwrite/);
+    expect(() => plantHoneytokens({ dir, secret: SECRET })).toThrow(/refusing to overwrite/);
 
     // the pre-existing file is intact and no partial plant happened
     expect(readFileSync(join(dir, "credentials.json"), "utf8")).toBe('{"real":"backup"}');
@@ -73,15 +75,15 @@ describe("plantHoneytokens", () => {
     writeFileSync(join(dir, ".env.backup"), "OLD=1\n");
     writeFileSync(join(dir, "credentials.json"), "{}");
 
-    const { files } = plantHoneytokens({ dir, force: true });
+    const { files } = plantHoneytokens({ dir, secret: SECRET, force: true });
 
-    expect(scanForHoneytokens(readFileSync(files[0], "utf8")).length).toBeGreaterThan(0);
-    expect(scanForHoneytokens(readFileSync(files[1], "utf8")).length).toBeGreaterThan(0);
+    expect(scanForHoneytokens(readFileSync(files[0], "utf8"), SECRET).length).toBeGreaterThan(0);
+    expect(scanForHoneytokens(readFileSync(files[1], "utf8"), SECRET).length).toBeGreaterThan(0);
   });
 
   it("creates the directory if it does not exist", () => {
     const nested = join(dir, "deeper", "still");
-    const { files } = plantHoneytokens({ dir: nested });
+    const { files } = plantHoneytokens({ dir: nested, secret: SECRET });
     expect(existsSync(files[0])).toBe(true);
   });
 });
