@@ -164,14 +164,18 @@ client itself (not this gateway) is the thing to debug.
 **[4:00] Verify enforcement — also before you prompt the agent:**
 
 ```bash
-npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json --owner-token <owner token from terminal 1>
+npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json
 ```
 
-This proves the policy is actually being enforced — allow passes, an
-unmatched tool hits the fail-closed default, and (engaging the real kill
-switch, then releasing it again) a previously-allowed call is refused under
-lockdown — without spending an agent's turn finding out. See the next
-section for what it checks and what to do if it fails.
+It prompts for the owner token from terminal 1 — paste it there (or
+`export OWNERSWITCH_OWNER_TOKEN=...` first and `unset` it after; it is
+deliberately **not** a CLI flag, which would leak it into shell history and
+`ps` output). This proves the policy is actually being enforced — allow
+passes, an unmatched tool hits the fail-closed default, and the veto lane
+runs end to end: a real window is registered, your owner token vetoes it,
+and it stays vetoed — without spending an agent's turn finding out, and
+without touching the kill switch. See the next section for what it checks
+and what to do if it fails.
 
 **[4:30] See the first blocked call.** Ask the agent:
 
@@ -222,49 +226,73 @@ of by an agent burning its quota on it. Both take the same `--config <file>`
 npx tsx src/cli.ts doctor --config ~/ownerswitch.mcp.json
 ```
 
-Five one-line checks, each printed as `✔`/`✘`, and every `✘` line names what
-to do about it:
+Five one-line checks, printed as `✔` (pass), `⚠` (action required), or `✘`
+(failed) — every non-`✔` line names what to do about it:
 
 | check | what it does |
 | --- | --- |
 | node version | `process.version` is 22 or newer |
 | config | the file parses and every field validates (same loader the gateway uses) |
-| control plane | `GET /status` responds within `timeoutMs` |
+| control plane | `GET /status` responds within `timeoutMs` — and if it responds `killed:true`, that is a `⚠`, **not** a pass: the plane is reachable but every call will be refused (`-32054`) until an owner runs the 2GO restore ceremony, and the fix line says exactly that |
 | device credentials | a signed, deliberately-malformed `POST /veto` gets `400` (signature accepted) rather than `401` (rejected) — this proves `device.id`/`device.secret` are right *without* opening a real veto window |
-| upstream command | your `upstream.command` spawns (then is killed immediately) — catches a wrong path or a missing dependency before the gateway ever tries it for real |
+| upstream command | launches your `upstream.command` exactly as the gateway will and completes a **real MCP initialize handshake**, then shuts it down through the SDK's close path (stdin end → wait for the child to exit, escalating only if it lingers) — a binary that starts but crashes on boot, or was never an MCP server, fails here instead of surfacing later as the client's opaque connection timeout |
 
 A failing check skips whatever depends on it (a bad config skips
 control-plane/device/upstream; an unreachable control plane skips the
 device-credentials check) rather than printing a confusing cascade. Exits 0
-if every check passes, 1 otherwise.
+only when every line is `✔` — a `⚠` exits 1 too, because you must not
+connect an agent over it.
 
 ### `ownerswitch-mcp verify`
 
 ```bash
-npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json --owner-token <token>
+npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json
 ```
 
 Proves the policy is actually enforced, against the real control plane, by
 exercising the same decision path the gateway uses at runtime — without
-forwarding anything to the real upstream tool:
+forwarding anything to the real upstream tool, and **without touching the
+global kill switch**:
 
 1. a call matching your policy's first `allow` rule → **allowed**
 2. a call matching no rule → hits `defaultDecision`, and **fails loudly** if
    that default is itself `"allow"` (that's not fail-closed, and `verify`
    won't pass a policy that can't back up the claim)
-3. engages the **real kill switch**, confirms the same call from step 1 is
-   now refused, then **restores** it and confirms `/status` is back to
-   `killed:false`
+3. the **veto lane, end to end**: registers a real window (device-signed,
+   exactly as the gateway would for a held call), vetoes it with your owner
+   token — the owner's one tap — and confirms it reads back `vetoed` and
+   stays that way. The only residue is that one terminally-vetoed demo
+   window in the control plane's in-memory map.
 
-The owner token (`--owner-token`, or `OWNERSWITCH_OWNER_TOKEN`) is
-**required** — printed by the dev control plane at startup — because step 3
-needs it to restore what it kills, and `verify` checks the token *before*
-touching the kill switch (a harmless probe against `/restore` — 409 "not
-killed" for a valid token, 401 for an invalid one — so an invalid token
-never gets near the kill switch). If a restore genuinely fails after a real
-kill, `verify` says so as loudly as possible, with the exact `curl` command
-to recover, rather than pretending the system is back to normal. Exits 0
-only if every step passed.
+The owner token is **required** (it plays the owner's veto tap) and comes
+from `OWNERSWITCH_OWNER_TOKEN` or an interactive prompt — never a CLI flag,
+which would leak it into shell history and process listings. It is
+validated up front by a harmless probe (`POST /restore` with a ceremony id
+the server can never have minted: the uniform `409` proves the token is
+accepted, `401` proves it isn't, and neither mutates anything).
+
+#### `--include-kill-test`
+
+"A killed plane denies everything" is worth proving once — but engaging the
+real kill switch is not a casual preflight step: kill state persists across
+restarts, and the only way back is the full 2GO ceremony. So it is **off by
+default** and opt-in:
+
+```bash
+npx tsx src/cli.ts verify --config ~/ownerswitch.mcp.json --include-kill-test
+```
+
+With the flag, verify engages the real kill switch, confirms `/status`
+reports killed and that the previously-allowed call now evaluates to a
+refusal, then restores through the **real ceremony**: `POST
+/restore/ceremony` (GO 1/2), wait out the server's ~30 s cooldown, `POST
+/restore` with the minted ceremony id (GO 2/2). The whole sequence runs
+inside a try/finally with a Ctrl-C handler: **every** exit path — success,
+error, interrupt — ends by querying `GET /status`, and if the plane is
+still killed, verify prints the exact `curl` sequence to recover (ceremony
+start → cooldown → restore) rather than pretending the system is back to
+normal. Exits 0 only if every step passed, including the final
+`killed:false` confirmation.
 
 ## Configuration
 

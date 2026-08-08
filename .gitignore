@@ -4,3 +4,7 @@ dist/
 .env.*
 .DS_Store
 .vercel
+
+# dev control-plane kill-state persistence (created wherever dev:control-plane runs)
+ownerswitch-kill-state.json
+ownerswitch-kill-state.json.*
