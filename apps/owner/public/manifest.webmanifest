@@ -1,0 +1,18 @@
+{
+  "name": "OwnerSwitch Owner",
+  "short_name": "OwnerSwitch",
+  "description": "The owner's phone in the loop: renders held actions, carries the veto tap and the passkey.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EFF1F4",
+  "theme_color": "#14171B",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
