@@ -2,9 +2,14 @@
 
 **The kill switch your AI agents can't talk their way around.**
 
-Owner-controlled, fail-closed control layer for AI agents. Agents never
-hold real credentials — they get short-lived, scoped tokens through the
-OwnerSwitch gateway. Kill = no more tokens.
+Owner-controlled, fail-closed control layer for AI agents. Every tool
+call routed through the gateway is checked against live policy and kill
+state before it runs. The architecture we're building toward: agents
+never hold real credentials at all — they get short-lived, scoped
+tokens issued by an OwnerSwitch broker, so kill means no more tokens.
+That broker is roadmap, not shipping code (`packages/sdk` is a stub);
+until it lands, "no real keys in the agent's hands" is deployment
+discipline on your side, not a guarantee OwnerSwitch enforces.
 
 *One press to stop. Two GOs to start.*
 
@@ -23,18 +28,20 @@ doesn't know an action, the owner decides.
 ## What KILL guarantees (and what it doesn't)
 
 **The guarantee:** no NEW authorized action crosses the OwnerSwitch
-enforcement boundary after KILL. Every tool call through the gateway is
-checked against live kill state at decision time, and no new tokens are
-issued.
+enforcement boundary after KILL. Every tool call routed through the
+gateway is checked against live kill state at decision time; once KILL
+is engaged, every one of them is denied.
 
-**The limit:** in-flight actions and already-issued downstream
-credentials are bounded by their TTL and by each connector's revocation
-capability — not every provider supports instant revocation, so a
-short-lived credential issued before KILL may keep working until it
-expires.
+**The limit:** in-flight actions aren't interrupted. And today that's
+the whole guarantee — it covers calls that route through the gateway,
+nothing an agent reaches by other means (see
+[Enforcement boundary](#enforcement-boundary)).
 
-**The mitigation:** short TTLs. The shorter the token lifetime, the
-smaller the window between KILL and everything downstream going dark.
+**Where this is headed:** once the credential broker above ships, KILL
+also means no more tokens — the shorter the TTL, the smaller the window
+between KILL and everything downstream going dark. That's the
+highest-ranked deployment model in the
+[threat model](packages/mcp/THREAT-MODEL.md); it isn't built yet.
 
 ## Enforcement boundary
 
