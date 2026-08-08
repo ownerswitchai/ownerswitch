@@ -27,6 +27,7 @@ apps/web              — ownerswitch.ai landing (static)
 packages/shared       — policy model types
 packages/gateway      — the decision engine (start here)
 packages/sdk          — agent-side client (stub)
+packages/button       — physical kill button daemon (V0: keyboard-mode USB buttons)
 packages/control-plane— policies, kill state, audit (stub)
 ```
 

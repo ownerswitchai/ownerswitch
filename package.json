@@ -6,7 +6,8 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "demo": "tsx examples/demo.ts"
+    "demo": "tsx examples/demo.ts",
+    "demo:button": "tsx examples/button-demo.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
