@@ -19,6 +19,7 @@ import type { OnPress } from "./input.js";
 const BACKOFF_MS = [200, 400, 800] as const;
 const STEADY_RETRY_MS = 2_000;
 const DEFAULT_DEBOUNCE_MS = 1_000;
+const DEFAULT_KILL_TIMEOUT_MS = 1_500;
 
 export interface KillConfirmation {
   /** Attempts in the sequence that finally landed (1 = first try). */
@@ -47,6 +48,13 @@ export interface ButtonDaemonOptions {
   now?: () => number;
   /** Injectable for tests. */
   fetchImpl?: typeof fetch;
+  /**
+   * Abort each `POST /kill` attempt after this many ms; default 1500. A
+   * timed-out attempt is an ordinary failed attempt — it counts against the
+   * same retry schedule as a network error or a non-2xx response, it never
+   * stalls the sequence silently.
+   */
+  timeoutMs?: number;
   /** One line per event, loud by default (console.error). */
   log?: (line: string) => void;
 }
@@ -68,6 +76,7 @@ export function createButtonDaemon(opts: ButtonDaemonOptions): ButtonDaemon {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const log = opts.log ?? ((line: string) => console.error(line));
   const debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
   const reason = opts.reason ?? `physical button ${opts.deviceId}`;
   const killUrl = new URL("/kill", opts.controlPlaneUrl);
 
@@ -151,6 +160,8 @@ export function createButtonDaemon(opts: ButtonDaemonOptions): ButtonDaemon {
       opts.secret,
     );
     log(`[button] → POST ${killUrl} (attempt ${attempt}, device ${opts.deviceId})`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetchImpl(killUrl, {
         method: "POST",
@@ -162,6 +173,7 @@ export function createButtonDaemon(opts: ButtonDaemonOptions): ButtonDaemon {
           "x-device-signature": signature,
         },
         body,
+        signal: controller.signal,
       });
       if (!res.ok) {
         return { ok: false, status: res.status, detail: `control plane answered HTTP ${res.status}` };
@@ -169,7 +181,14 @@ export function createButtonDaemon(opts: ButtonDaemonOptions): ButtonDaemon {
       const parsed: unknown = await res.json().catch(() => undefined);
       return { ok: true, status: res.status, body: parsed, detail: `HTTP ${res.status}` };
     } catch (err) {
-      return { ok: false, status: 0, detail: err instanceof Error ? err.message : String(err) };
+      const detail = controller.signal.aborted
+        ? `no response within ${timeoutMs}ms — aborted`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+      return { ok: false, status: 0, detail };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
