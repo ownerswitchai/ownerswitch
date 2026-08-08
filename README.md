@@ -20,6 +20,22 @@ OwnerSwitch gateway. Kill = no more tokens.
 Unknown tools hit the fail-closed default (`approve`): if OwnerSwitch
 doesn't know an action, the owner decides.
 
+## What KILL guarantees (and what it doesn't)
+
+**The guarantee:** no NEW authorized action crosses the OwnerSwitch
+enforcement boundary after KILL. Every tool call through the gateway is
+checked against live kill state at decision time, and no new tokens are
+issued.
+
+**The limit:** in-flight actions and already-issued downstream
+credentials are bounded by their TTL and by each connector's revocation
+capability — not every provider supports instant revocation, so a
+short-lived credential issued before KILL may keep working until it
+expires.
+
+**The mitigation:** short TTLs. The shorter the token lifetime, the
+smaller the window between KILL and everything downstream going dark.
+
 ## Layout
 
 ```

@@ -1,3 +1,11 @@
+/**
+ * Enforcement boundary: engaging KILL guarantees that no NEW authorized
+ * action crosses the OwnerSwitch boundary from that moment on. It does NOT
+ * instantly kill in-flight actions or revoke credentials already issued
+ * downstream — those remain bounded by their TTL and by each connector's
+ * revocation capability. Short TTLs are the mitigation. Don't re-introduce
+ * the "kill revokes existing tokens" overclaim in docs or comments.
+ */
 import type { RestoreAuthorization } from "./twogo.js";
 
 /**

@@ -1,3 +1,13 @@
+/**
+ * Enforcement boundary: after KILL, no NEW authorized action crosses this
+ * point — every call is evaluated against live kill state at decision time
+ * (the guarantee holds for callers that supply it, as the gateway's
+ * fail-closed remote kill lookup does). KILL does NOT
+ * retroactively revoke credentials already issued downstream; those are
+ * bounded by their TTL and by each connector's revocation capability.
+ * Short TTLs are the mitigation. Don't document KILL as "revokes existing
+ * tokens" — that overclaims what this boundary can enforce.
+ */
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 
 /** Global kill state — when engaged, EVERYTHING is denied. Fail-closed. */
