@@ -17,6 +17,21 @@ Agents are never left hanging or guessing: every refusal is a distinct MCP
 error whose message says what was blocked, why, whether it ran (it didn't),
 and what to do next — written to be relayed to the human.
 
+## Enforcement boundary
+
+This gateway decides and audits **the calls that route through it** —
+only those. An agent that also has built-in tools or direct
+file/shell/network access can act without asking, and a denial removes
+permission, not capability. We have watched exactly that (2026-08-08):
+two correct fail-closed denials, then — after the user repeated the
+request — the agent did the write with its own built-in tool, announcing
+it as it went. The gateway held; the effect happened anyway.
+
+If you need containment, build the deployment around the gateway for it:
+credential broker, sandboxed egress, OS-level enforcement — honestly
+ranked in **[THREAT-MODEL.md](./THREAT-MODEL.md)**. The quickstart alone
+is policy and audit, not a cage.
+
 ## The 5-minute quickstart
 
 Goal: your first *blocked* tool call in under 5 minutes.
