@@ -16,6 +16,17 @@ describe("KillSwitch", () => {
     expect(k.auditLog()).toHaveLength(2);
   });
 
+  it("every engage bumps the kill epoch, even while already killed", () => {
+    const k = new KillSwitch(() => 1000);
+    expect(k.epoch).toBe(0);
+    k.engage("button");
+    expect(k.epoch).toBe(1);
+    k.engage("api"); // already killed — a repeat trigger still opens a new epoch
+    expect(k.epoch).toBe(2);
+    k.restore(auth);
+    expect(k.epoch).toBe(2); // restoring does not
+  });
+
   it("restore needs a ceremony-shaped authorization", () => {
     const k = new KillSwitch(() => 1000);
     k.engage("app");

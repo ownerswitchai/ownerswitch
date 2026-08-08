@@ -32,6 +32,7 @@ export type AuditEntry =
 
 export class KillSwitch {
   private killedState = false;
+  private epochCounter = 0;
   private log: AuditEntry[] = [];
   private consumedCeremonies = new Set<string>();
 
@@ -39,6 +40,7 @@ export class KillSwitch {
 
   /** Idempotent: repeated triggers only add audit entries, never throw. */
   engage(source: KillSource, reason?: string, opts: { unauthenticated?: boolean } = {}): void {
+    this.epochCounter += 1;
     this.log.push({
       type: "kill",
       event: {
@@ -56,10 +58,19 @@ export class KillSwitch {
   }
 
   /**
-   * Restore requires a completed ceremony. This method trusts its input's
-   * SHAPE only — verifying the ceremony itself is the caller's job.
-   * Each ceremony authorizes exactly one restore: replaying an
-   * authorization whose ceremony id was already consumed throws.
+   * Every engage() starts a new kill epoch. A restore ceremony binds to the
+   * epoch in force when it started; a later kill bumps the counter and
+   * invalidates every ceremony in flight.
+   */
+  get epoch(): number {
+    return this.epochCounter;
+  }
+
+  /**
+   * Restore requires a RestoreAuthorization produced by a completed 2GO
+   * ceremony. Verifying live ceremony state (ownership, cooldown, TTL, kill
+   * epoch) is the HTTP layer's job (server.ts); the checks here — shape and
+   * single-use ceremony ids — are a last line of defense, not the gate.
    */
   restore(auth: RestoreAuthorization): void {
     if (!this.killedState) throw new Error("not killed — nothing to restore");

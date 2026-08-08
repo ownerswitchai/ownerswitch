@@ -9,6 +9,7 @@ import {
   type OwnerSession,
 } from "./auth.js";
 import { KillSwitch, type KillSource } from "./kill.js";
+import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow } from "./veto.js";
 
 /**
@@ -24,7 +25,16 @@ import { VetoWindow } from "./veto.js";
  *                     with neither, loopback callers may still kill (recorded
  *                     as an unauthenticated "api" kill). Stopping must never
  *                     fail because auth was misconfigured.
- *  - POST /restore  — owner session required. No exceptions, no loopback bypass.
+ *  - POST /restore/ceremony     — owner session required; starts 2GO (GO 1/2)
+ *                     while the system is killed. The ceremony binds to the
+ *                     owner, the kill epoch in force, and its start time.
+ *  - GET  /restore/ceremony/:id — owner session required; the ceremony's
+ *                     state and how long until its cooldown ends.
+ *  - POST /restore  — owner session required plus a live server-side ceremony
+ *                     (GO 2/2): owned by this owner, past its cooldown, inside
+ *                     its TTL, bound to the current kill epoch, consumed
+ *                     atomically. No exceptions, no loopback bypass, no
+ *                     shape-only path.
  *  - POST /veto     — device signature required; a gateway registers a window
  *                     for a call it is holding. Registration puts text in
  *                     front of the owner and grows server state, so unlike
@@ -110,6 +120,10 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   const killSwitch = new KillSwitch(now);
   const vetoWindows = new Map<string, VetoWindow>();
   const seenNonces = new Map<string, number>();
+  // Live restore ceremonies, keyed by id. Deliberately process-local: losing
+  // this map (a restart) can only make restores harder, never easier — an id
+  // that is not in here restores nothing, whatever its body claims.
+  const ceremonies = new Map<string, { ceremony: RestoreCeremony; epoch: number }>();
 
   function ownerSessionFrom(req: IncomingMessage): OwnerSession | null {
     const token = bearerToken(req);
@@ -159,27 +173,85 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 200, { killed: true });
   }
 
-  async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Owner session required — no exceptions, no loopback bypass. Restoring is
-    // the expensive direction and stays that way.
-    if (ownerSessionFrom(req) === null) {
+  async function postCeremonyStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // GO 1/2. Owner session required — no exceptions, no loopback bypass.
+    const session = ownerSessionFrom(req);
+    if (session === null) {
       sendUnauthorized(res);
       return;
     }
-    // TODO(2go): also verify the ceremony itself completed — for now we trust
-    // the authorization's shape only.
-    const body = parseJsonBody(await readRawBody(req));
-    try {
-      killSwitch.restore({
-        ceremonyId: String(body.ceremonyId ?? ""),
-        ownerId: String(body.ownerId ?? ""),
-        completedAt: Number(body.completedAt ?? 0),
-      });
-      sendJson(res, 200, { killed: false });
-    } catch (err) {
-      // Detailed conflict messages are for authenticated callers only.
-      sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+    parseJsonBody(await readRawBody(req)); // drain and validate; nothing else is trusted from the body
+    if (!killSwitch.killed) {
+      sendJson(res, 409, { error: "not killed — nothing to restore" });
+      return;
     }
+    // Dead ceremonies (past their TTL, whatever their state) are unspendable;
+    // sweep here to keep the map bounded in a long-lived process.
+    for (const [staleId, record] of ceremonies) {
+      if (now() >= record.ceremony.expiresAt) ceremonies.delete(staleId);
+    }
+    const id = `cer_${randomBytes(6).toString("hex")}`;
+    const ceremony = new RestoreCeremony(id, session.ownerId, { now });
+    ceremonies.set(id, { ceremony, epoch: killSwitch.epoch });
+    sendJson(res, 201, {
+      id,
+      state: ceremony.tick(),
+      cooldownRemainingMs: ceremony.cooldownRemainingMs(),
+    });
+  }
+
+  function getCeremony(req: IncomingMessage, res: ServerResponse, id: string): void {
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const record = ceremonies.get(id);
+    // Another owner's ceremony reads as absent — existence is not revealed.
+    if (record === undefined || record.ceremony.ownerId !== session.ownerId) {
+      sendJson(res, 404, { error: `no ceremony "${id}"` });
+      return;
+    }
+    const ticked = record.ceremony.tick();
+    // "completed" only ever happens via /restore, so it reads as consumed; a
+    // ceremony from a superseded kill epoch is dead and reads as expired.
+    const state =
+      ticked === "completed"
+        ? "consumed"
+        : record.epoch !== killSwitch.epoch
+          ? "expired"
+          : ticked;
+    sendJson(res, 200, { state, cooldownRemainingMs: record.ceremony.cooldownRemainingMs() });
+  }
+
+  async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // GO 2/2. Owner session required — no exceptions, no loopback bypass.
+    // Restoring is the expensive direction and stays that way.
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const body = parseJsonBody(await readRawBody(req));
+    const ceremonyId = typeof body.ceremonyId === "string" ? body.ceremonyId : "";
+    const record = ceremonies.get(ceremonyId);
+    // Every rejection is the same generic 409: which check failed (wrong
+    // owner, wrong epoch, timing, replay) is not information a caller
+    // holding a stolen session gets to enumerate.
+    const rejected = () => sendJson(res, 409, { error: "restore rejected" });
+    if (record === undefined) return rejected();
+    if (record.ceremony.ownerId !== session.ownerId) return rejected();
+    if (record.epoch !== killSwitch.epoch) return rejected();
+    if (!killSwitch.killed) return rejected();
+    try {
+      // confirm() is the atomic consume: it only succeeds in "ready" (past
+      // the cooldown, inside the TTL) and transitions to "completed" before
+      // returning, so a concurrent second spend of the same ceremony throws.
+      killSwitch.restore(record.ceremony.confirm());
+    } catch {
+      return rejected();
+    }
+    sendJson(res, 200, { killed: false });
   }
 
   async function postVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
@@ -257,9 +329,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const method = req.method ?? "GET";
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
+    const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "POST" && path === "/kill") return postKill(req, res);
+    if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
+    if (method === "GET" && ceremonyMatch) {
+      return getCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
+    }
     if (method === "POST" && path === "/restore") return postRestore(req, res);
     if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);
     if (vetoMatch) {

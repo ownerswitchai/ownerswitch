@@ -2,7 +2,6 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
 import { createControlPlane, type ControlPlane } from "./server.js";
-import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow } from "./veto.js";
 
 const clock = (start = 0) => {
@@ -235,45 +234,234 @@ describe("control-plane HTTP API", () => {
     expect(window.vetoedBy).toBe("adam");
   });
 
-  it("POST /restore without a session -> 401 generic, even from loopback", async () => {
+  /** GO 1/2 over HTTP; returns the ceremony id the server minted. */
+  const startCeremony = async (url: string, token: string): Promise<string> => {
+    const res = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(token),
+    });
+    expect(res.status).toBe(201);
+    return ((await res.json()) as { id: string }).id;
+  };
+
+  /** GO 2/2 over HTTP. */
+  const postRestore = (url: string, token: string, ceremonyId: string) =>
+    fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer(token),
+      body: JSON.stringify({ ceremonyId }),
+    });
+
+  it("POST /restore/ceremony without a session -> 401 generic, even from loopback", async () => {
     const c = clock();
     const cp = createControlPlane({ now: c.now });
     const url = await start(cp);
 
     cp.killSwitch.engage("api");
-    const ceremony = new RestoreCeremony("cer-1", "adam", { now: c.now });
+    const res = await fetch(`${url}/restore/ceremony`, { method: "POST" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("POST /restore/ceremony while not killed -> 409", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    const res = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/nothing to restore/);
+  });
+
+  it("GET /restore/ceremony/:id tracks go1 -> ready and counts the cooldown down", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("button");
+    const id = await startCeremony(url, session.token);
+
+    const read = async () =>
+      (await (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(session.token) })).json()) as {
+        state: string;
+        cooldownRemainingMs: number;
+      };
+
+    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 30_000 });
+    c.advance(10_000);
+    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 20_000 });
+    c.advance(20_000);
+    expect(await read()).toEqual({ state: "ready", cooldownRemainingMs: 0 });
+  });
+
+  it("GET /restore/ceremony/:id needs a session; unknown and foreign ids read as absent", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const owner = createOwnerSession("adam", { now: c.now });
+    const other = createOwnerSession("eve", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, owner.token);
+
+    expect((await fetch(`${url}/restore/ceremony/${id}`)).status).toBe(401);
+    const foreign = await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(other.token) });
+    expect(foreign.status).toBe(404); // existence is not revealed across owners
+    const unknown = await fetch(`${url}/restore/ceremony/cer_missing`, {
+      headers: bearer(owner.token),
+    });
+    expect(unknown.status).toBe(404);
+  });
+
+  it("GO 2/2 before the cooldown -> 409 and still killed; after the cooldown -> restores", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("honeytoken", "decoy key touched");
+    const id = await startCeremony(url, session.token);
+
+    const early = await postRestore(url, session.token, id);
+    expect(early.status).toBe(409);
+    expect(await early.json()).toEqual({ error: "restore rejected" }); // generic — no timing details
+    expect(cp.killSwitch.killed).toBe(true);
+
+    c.advance(30_000); // past the cooldown
+    const res = await postRestore(url, session.token, id);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ killed: false });
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("the same ceremony twice -> second attempt rejected, system stays killed", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, session.token);
     c.advance(30_000);
-    const auth = ceremony.confirm();
+    expect((await postRestore(url, session.token, id)).status).toBe(200);
+
+    cp.killSwitch.engage("api"); // killed again — the spent ceremony must not restore twice
+    const replay = await postRestore(url, session.token, id);
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toEqual({ error: "restore rejected" });
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the spent ceremony reads as consumed on the status surface
+    const status = await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(session.token) });
+    expect(((await status.json()) as { state: string }).state).toBe("consumed");
+  });
+
+  it("a ceremony from a different owner -> 409, system stays killed", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const owner = createOwnerSession("adam", { now: c.now });
+    const other = createOwnerSession("eve", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, owner.token);
+    c.advance(30_000);
+
+    const res = await postRestore(url, other.token, id);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "restore rejected" });
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the ceremony is intact — its owner can still spend it
+    expect((await postRestore(url, owner.token, id)).status).toBe(200);
+  });
+
+  it("a second kill invalidates a ceremony in flight (kill epoch)", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("button", "first kill");
+    const id = await startCeremony(url, session.token);
+    c.advance(30_000);
+    cp.killSwitch.engage("honeytoken", "second kill mid-ceremony");
+
+    const res = await postRestore(url, session.token, id);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "restore rejected" });
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the superseded ceremony reads as dead, and a fresh one under the new
+    // epoch restores normally
+    const status = await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(session.token) });
+    expect(((await status.json()) as { state: string }).state).toBe("expired");
+    const fresh = await startCeremony(url, session.token);
+    c.advance(30_000);
+    expect((await postRestore(url, session.token, fresh)).status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("an expired ceremony -> 409, system stays killed", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, session.token);
+    c.advance(5 * 60_000); // the whole TTL elapses
+
+    const status = await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(session.token) });
+    expect(((await status.json()) as { state: string }).state).toBe("expired");
+
+    const res = await postRestore(url, session.token, id);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "restore rejected" });
+    expect(cp.killSwitch.killed).toBe(true);
+  });
+
+  it("two concurrent /restore calls with one ceremony -> exactly one succeeds", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, session.token);
+    c.advance(30_000);
+
+    const [a, b] = await Promise.all([
+      postRestore(url, session.token, id),
+      postRestore(url, session.token, id),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("POST /restore without a session -> 401 generic, even from loopback", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, session.token); // a genuinely ready ceremony...
+    c.advance(30_000);
 
     const res = await fetch(`${url}/restore`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(auth),
+      body: JSON.stringify({ ceremonyId: id }), // ...does not help without a session
     });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" }); // no domain details leak
     expect(cp.killSwitch.killed).toBe(true);
-  });
-
-  it("POST /restore with a session and a valid ceremony restores", async () => {
-    const c = clock();
-    const cp = createControlPlane({ now: c.now });
-    const url = await start(cp);
-
-    cp.killSwitch.engage("honeytoken", "decoy key touched");
-    const ceremony = new RestoreCeremony("cer-1", "adam", { now: c.now });
-    c.advance(30_000); // past the cooldown
-    const auth = ceremony.confirm();
-    const session = createOwnerSession("adam", { now: c.now });
-
-    const res = await fetch(`${url}/restore`, {
-      method: "POST",
-      headers: bearer(session.token),
-      body: JSON.stringify(auth),
-    });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: false });
-    expect(cp.killSwitch.killed).toBe(false);
   });
 
   it("POST /restore with an expired session -> 401", async () => {
@@ -285,40 +473,48 @@ describe("control-plane HTTP API", () => {
     const session = createOwnerSession("adam", { now: c.now });
     c.advance(16 * 60_000); // past the 15 min TTL
 
-    const res = await fetch(`${url}/restore`, {
-      method: "POST",
-      headers: bearer(session.token),
-      body: JSON.stringify({ ceremonyId: "cer-1", ownerId: "adam", completedAt: c.now() }),
-    });
+    const res = await postRestore(url, session.token, "cer_whatever");
     expect(res.status).toBe(401);
     expect(cp.killSwitch.killed).toBe(true);
   });
 
-  it("replaying a restore authorization -> 409 with the detailed message (authenticated)", async () => {
+  it("an authorization-shaped body without server-side ceremony state -> 409", async () => {
     const c = clock();
     const cp = createControlPlane({ now: c.now });
     const url = await start(cp);
-
-    cp.killSwitch.engage("api");
-    const ceremony = new RestoreCeremony("cer-1", "adam", { now: c.now });
-    c.advance(30_000);
-    const auth = ceremony.confirm();
     const session = createOwnerSession("adam", { now: c.now });
 
-    const post = () =>
-      fetch(`${url}/restore`, {
-        method: "POST",
-        headers: bearer(session.token),
-        body: JSON.stringify(auth),
-      });
-
-    expect((await post()).status).toBe(200);
-
-    cp.killSwitch.engage("api"); // killed again — same ceremony must not restore twice
-    const replay = await post();
-    expect(replay.status).toBe(409);
-    expect((await replay.json()).error).toMatch(/single-use/);
+    cp.killSwitch.engage("api");
+    // the exact shape the old code trusted — a valid-looking RestoreAuthorization
+    const res = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ ceremonyId: "cer-forged", ownerId: "adam", completedAt: c.now() }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "restore rejected" });
     expect(cp.killSwitch.killed).toBe(true);
+  });
+
+  it("a control-plane restart mid-ceremony fails closed: the ceremony does not survive", async () => {
+    const c = clock();
+    const before = createControlPlane({ now: c.now });
+    const url = await start(before);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    before.killSwitch.engage("button");
+    const id = await startCeremony(url, session.token);
+    c.advance(30_000); // ready — and then the process dies
+    server?.close();
+
+    const after = createControlPlane({ now: c.now }); // fresh process, fresh state
+    const url2 = await start(after);
+    after.killSwitch.engage("button"); // the kill is re-asserted on the new process
+
+    const res = await postRestore(url2, session.token, id);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "restore rejected" });
+    expect(after.killSwitch.killed).toBe(true);
   });
 
   it("POST /veto/:id without a session -> 401, window untouched", async () => {

@@ -218,14 +218,19 @@ What limits the blast radius today — real code, caveats included:
   restore. Caveat: the seen-nonce store is process memory; a restart
   reopens a ≤60 s replay window (flagged in code — shared store before
   multi-process).
-- **Single-use restore authorizations.** Restore demands a completed 2GO
-  ceremony; each `ceremonyId` is consumed on first use and replay throws
-  (`packages/control-plane/src/kill.ts`). Ceremonies expire after 5 min
-  with a mandatory 30 s cooldown between GO 1 and GO 2 — a stolen
-  authorization is stale in minutes and dead after one spend. Caveat: the
-  server currently verifies the authorization's *shape*, not the ceremony
-  itself (TODO(2go) in `server.ts`); until that wiring lands, this
-  guarantee leans on the owner-session requirement in front of it.
+- **Server-side, single-use restore ceremonies.** Restore demands a live
+  2GO ceremony that the control plane itself started and tracks
+  (`packages/control-plane/src/server.ts`). `POST /restore` verifies the
+  ceremony exists in server state, belongs to the session's owner, has
+  passed its mandatory 30 s cooldown, is inside its 5 min TTL, and is
+  bound to the kill epoch still in force — then consumes it atomically,
+  so exactly one restore can spend it and every other outcome is the
+  same generic 409. Every kill increments the epoch, so a second kill
+  invalidates ceremonies already in flight. There is no shape-only path:
+  an authorization-shaped body without live server state restores
+  nothing, and ceremony state is process-local, so a control-plane
+  restart loses ceremonies *closed* — they must be restarted, never
+  resurrected.
 - **Short TTLs everywhere.** Owner sessions: 15 min. Ceremonies: 5 min.
   Downstream connector tokens, in the broker model: minutes. A stolen
   artifact is a window, not a standing capability.

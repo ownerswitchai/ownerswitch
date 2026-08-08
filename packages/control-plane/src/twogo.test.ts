@@ -30,6 +30,17 @@ describe("RestoreCeremony (2GO)", () => {
     expect(() => r.confirm()).toThrow(/expired/);
   });
 
+  it("reports the remaining cooldown and its expiry instant", () => {
+    const c = clock(100);
+    const r = new RestoreCeremony("c1", "adam", { cooldownMs: 1000, ttlMs: 5000, now: c.now });
+    expect(r.cooldownRemainingMs()).toBe(1000);
+    expect(r.expiresAt).toBe(5100);
+    c.advance(600);
+    expect(r.cooldownRemainingMs()).toBe(400);
+    c.advance(600);
+    expect(r.cooldownRemainingMs()).toBe(0); // never negative
+  });
+
   it("completion is terminal — no double-spend of a ceremony", () => {
     const c = clock();
     const r = new RestoreCeremony("c1", "adam", { cooldownMs: 10, now: c.now });
