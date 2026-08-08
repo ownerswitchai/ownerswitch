@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ToolCall } from "@ownerswitchai/shared";
 import {
@@ -59,6 +59,13 @@ export interface ControlPlane {
 }
 
 const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voice", "api"];
+
+/**
+ * Ceiling on live restore ceremonies held in memory. A real owner needs one
+ * (plus a few fumbles); the cap exists so a hostile holder of an owner
+ * session cannot mint ceremonies until the process falls over.
+ */
+export const MAX_LIVE_CEREMONIES = 64;
 
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
@@ -190,7 +197,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     for (const [staleId, record] of ceremonies) {
       if (now() >= record.ceremony.expiresAt) ceremonies.delete(staleId);
     }
-    const id = `cer_${randomBytes(6).toString("hex")}`;
+    // The sweep bounds normal traffic; the cap bounds an owner session gone
+    // hostile. Full means NEW ceremonies are refused — a live ceremony is
+    // never evicted to make room, and fullness can only ever deny a restore
+    // path, never open one.
+    if (ceremonies.size >= MAX_LIVE_CEREMONIES) {
+      sendJson(res, 409, { error: "ceremony rejected" });
+      return;
+    }
+    // Unguessable capability id: 122 bits from the CSPRNG. Holding one id
+    // (or watching them mint) must not help anyone name another.
+    const id = `cer_${randomUUID()}`;
     const ceremony = new RestoreCeremony(id, session.ownerId, { now });
     ceremonies.set(id, { ceremony, epoch: killSwitch.epoch });
     sendJson(res, 201, {

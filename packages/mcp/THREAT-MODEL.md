@@ -230,7 +230,10 @@ What limits the blast radius today — real code, caveats included:
   an authorization-shaped body without live server state restores
   nothing, and ceremony state is process-local, so a control-plane
   restart loses ceremonies *closed* — they must be restarted, never
-  resurrected.
+  resurrected. The same locality is a deployment limit: ceremony state
+  neither survives nor spans multi-instance / HA deployments, so a shared
+  ceremony store is required before running more than one control-plane
+  instance.
 - **Short TTLs everywhere.** Owner sessions: 15 min. Ceremonies: 5 min.
   Downstream connector tokens, in the broker model: minutes. A stolen
   artifact is a window, not a standing capability.

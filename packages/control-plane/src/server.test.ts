@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
-import { createControlPlane, type ControlPlane } from "./server.js";
+import { createControlPlane, MAX_LIVE_CEREMONIES, type ControlPlane } from "./server.js";
 import { VetoWindow } from "./veto.js";
 
 const clock = (start = 0) => {
@@ -381,6 +382,31 @@ describe("control-plane HTTP API", () => {
     expect((await postRestore(url, owner.token, id)).status).toBe(200);
   });
 
+  it("a valid-but-foreign id and a random nonexistent id reject byte-identically", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const owner = createOwnerSession("adam", { now: c.now });
+    const other = createOwnerSession("eve", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const real = await startCeremony(url, owner.token); // live and adam's — just not eve's
+    c.advance(30_000); // fully ready, so not even ceremony timing can show through
+
+    const foreign = await postRestore(url, other.token, real);
+    const missing = await postRestore(url, other.token, `cer_${randomUUID()}`);
+
+    // "no such id", "wrong owner" and "expired" must be one indistinguishable
+    // answer: same status, same headers, byte-identical body
+    expect(foreign.status).toBe(409);
+    expect(missing.status).toBe(409);
+    const [foreignBody, missingBody] = [await foreign.text(), await missing.text()];
+    expect(foreignBody).toBe(missingBody);
+    expect(foreignBody).toBe(JSON.stringify({ error: "restore rejected" }));
+    expect(foreign.headers.get("content-type")).toBe(missing.headers.get("content-type"));
+    expect(cp.killSwitch.killed).toBe(true);
+  });
+
   it("a second kill invalidates a ceremony in flight (kill epoch)", async () => {
     const c = clock();
     const cp = createControlPlane({ now: c.now });
@@ -515,6 +541,53 @@ describe("control-plane HTTP API", () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "restore rejected" });
     expect(after.killSwitch.killed).toBe(true);
+  });
+
+  it("the ceremonies map is capped: full -> generic 409, and no live ceremony is evicted", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_LIVE_CEREMONIES; i++) {
+      ids.push(await startCeremony(url, session.token));
+    }
+
+    // full: minting fails closed with a generic 409 and changes nothing else
+    const overflow = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(overflow.status).toBe(409);
+    expect(await overflow.json()).toEqual({ error: "ceremony rejected" });
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // no eviction to make room: the very first ceremony is still spendable
+    c.advance(30_000);
+    expect((await postRestore(url, session.token, ids[0])).status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("expired ceremonies are swept before the cap rejects: a map full of dead ones frees itself", async () => {
+    const c = clock();
+    const cp = createControlPlane({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    for (let i = 0; i < MAX_LIVE_CEREMONIES; i++) {
+      await startCeremony(url, session.token);
+    }
+    c.advance(5 * 60_000); // every ceremony's TTL elapses; the owner session (15 min) lives on
+
+    // the sweep runs before the cap check, so a fresh ceremony fits again
+    const res = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(res.status).toBe(201);
   });
 
   it("POST /veto/:id without a session -> 401, window untouched", async () => {
