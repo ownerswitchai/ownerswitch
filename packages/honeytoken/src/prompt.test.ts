@@ -80,7 +80,50 @@ function fakeOutput() {
   return { output: { write: (chunk: string) => void written.push(chunk) }, written };
 }
 
+/** A stdin-like object with NO setRawMode at all — e.g. a non-TTY stream. */
+function fakeInputWithoutRawMode() {
+  const emitter = new EventEmitter();
+  let resumed = 0;
+  let onCalls = 0;
+  const input = {
+    on: (event: "data", listener: (chunk: string) => void) => {
+      onCalls++;
+      emitter.on(event, listener);
+    },
+    removeListener: (event: "data", listener: (chunk: string) => void) => emitter.removeListener(event, listener),
+    resume: () => {
+      resumed++;
+    },
+    pause: () => {},
+    // setEncoding present, setRawMode deliberately absent
+    setEncoding: () => {},
+  };
+  return {
+    input,
+    get resumed() {
+      return resumed;
+    },
+    get onCalls() {
+      return onCalls;
+    },
+  };
+}
+
 describe("readHiddenLine", () => {
+  it("fails closed when setRawMode is unavailable: no prompt written, no input ever read", async () => {
+    const tty = fakeInputWithoutRawMode();
+    const out = fakeOutput();
+
+    await expect(readHiddenLine("Canary key: ", tty.input, out.output)).resolves.toBeUndefined();
+
+    // Nothing was written — not even the prompt — and no attempt was made to
+    // read: getting this wrong would mean SOME input path exists that reads
+    // characters without a guarantee they aren't echoed by the terminal.
+    expect(out.written).toEqual([]);
+    expect(tty.onCalls).toBe(0);
+    expect(tty.resumed).toBe(0);
+  });
+
   it("writes the prompt but NEVER echoes typed characters, and returns the typed line on Enter", async () => {
     const tty = fakeTtyInput();
     const out = fakeOutput();

@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateHoneytoken } from "./generate.js";
 import {
   HoneytokenRegistry,
@@ -13,6 +13,30 @@ import {
   requireDeploymentId,
   writeRegistryFile,
 } from "./registry.js";
+
+/**
+ * Arms a one-shot short write for the NEXT writeSync(fd, buffer, ...) call
+ * `writeRegistryFile` makes (registry.ts's own import — mocked at module
+ * resolution, not by mutating the frozen node:fs namespace object, which
+ * vi.spyOn cannot do for a native builtin's exports). Every other call, and
+ * every other test in this file, goes through the real implementation
+ * unchanged: the mock delegates to `importOriginal()` unless armed.
+ */
+let armShortWriteOnce = false;
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    writeSync: (fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null) => {
+      if (!armShortWriteOnce) return actual.writeSync(fd, buffer, offset, length, position);
+      armShortWriteOnce = false; // one-shot: only the first call after arming is short
+      const requested = length ?? buffer.length;
+      const short = Math.max(1, Math.floor(requested / 2));
+      return actual.writeSync(fd, buffer, offset, short, position);
+    },
+  };
+});
 
 const CANARY_KEY = "canary-key-9f3a7c2e1b8d4056aa771122";
 const OTHER_KEY = "canary-key-different-0011223344556677";
@@ -257,6 +281,14 @@ describe("readRegistryFile / writeRegistryFile — symlink-safe, size-capped, mo
     expect(readRegistryFile(path)).toHaveLength(MAX_REGISTRY_FILE_BYTES);
   });
 
+  it("rejects a file many times over the cap — enforcement isn't an off-by-one tied to the exact +1 boundary", () => {
+    const path = join(dir, "way-too-big.json");
+    writeFileSync(path, "x".repeat(MAX_REGISTRY_FILE_BYTES * 4));
+    expect(() => readRegistryFile(path)).toThrow(
+      new RegExp(`over the ${MAX_REGISTRY_FILE_BYTES}-byte honeytoken registry limit`),
+    );
+  });
+
   it("write replaces a symlink at the destination rather than writing through it", () => {
     const decoyTarget = join(dir, "decoy-target.json");
     writeFileSync(decoyTarget, "untouched original content");
@@ -274,5 +306,25 @@ describe("readRegistryFile / writeRegistryFile — symlink-safe, size-capped, mo
 
   it("read on a missing file fails with a clear error, not a crash", () => {
     expect(() => readRegistryFile(join(dir, "does-not-exist.json"))).toThrow();
+  });
+
+  it("survives a short writeSync() — fix #2: the whole buffer lands, not a truncated prefix", () => {
+    const registry = registryOf();
+    const full = registry.serialize();
+    const path = join(dir, "registry.json");
+
+    armShortWriteOnce = true; // the first writeSync() call inside writeRegistryFile returns short
+    writeRegistryFile(path, full);
+
+    // The published file is COMPLETE — not the truncated first chunk a naive
+    // single-call write would have published (and fsynced, and renamed into
+    // place) as if it had succeeded.
+    expect(readFileSync(path, "utf8")).toBe(full);
+    expect(readRegistryFile(path)).toBe(full);
+    // And it still verifies — a truncated write would fail here even if it
+    // happened to remain syntactically valid JSON.
+    expect(loadRegistry(readRegistryFile(path), { canaryKey: CANARY_KEY, deploymentId: DEPLOY }).size).toBe(
+      registry.size,
+    );
   });
 });

@@ -83,20 +83,57 @@ secret on argv leaks into shell history and `ps`/process listings, and for
 life of the process, not just one command. `plant` and `watch` both read
 `OWNERSWITCH_CANARY_KEY`, or prompt for it (echo-suppressed, TTY-gated) if
 the variable isn't set; passing `--canary-key` on either command is refused
-outright, naming the leak.
+outright, naming the leak. The prompt itself fails closed: if the terminal
+can't confirm raw mode (no `setRawMode`), it refuses to read anything at all
+rather than risk echoing the key in the open — the one failure mode that
+would defeat the entire point of prompting instead of taking a flag.
 
 `readRegistryFile` / `writeRegistryFile` (used by both this package's CLI and
 the gateway's config loader) match the safety properties of control-plane's
-kill-state store: a read refuses to follow a symlink at the registry path and
-is capped at `MAX_REGISTRY_FILE_BYTES` **before** the bytes are handed to
-`JSON.parse` — a locally replaced huge or symlinked file is rejected on sight,
-not after the read+parse already paid for it. A write lands at file mode
-`0600` via an atomic temp-file-then-rename, which is itself symlink-safe on
-the destination side: `rename(2)` replaces whatever sits at the target path
-— including a symlink — rather than writing through it. `loadRegistry` also
-caps the number of entries at `MAX_REGISTRY_ENTRIES`, checked before the
-per-entry shape validation runs, so an oversized array can't burn CPU on
-validation before being rejected.
+kill-state store, with two caveats stated plainly rather than glossed over:
+
+- **The symlink refusal depends on `O_NOFOLLOW`, which isn't universally
+  available**, and there is no portable way to detect its absence ahead of
+  time. Where it IS available (Linux, macOS, every platform this ships on
+  today), a read genuinely refuses to follow a symlink at the registry path.
+  Where it degrades to a no-op, `open()` follows a symlink like normal, and
+  `fstat()` on the resulting descriptor cannot tell the difference after the
+  fact — it reports the followed target's type, which is indistinguishable
+  from a real regular file sitting directly at the path. On such a platform
+  there is **no** symlink protection on the read side.
+- **`MAX_REGISTRY_FILE_BYTES` is enforced DURING the read, not via a
+  pre-check.** An earlier version stat'd the file, compared the size, and
+  then handed the descriptor to a single unbounded read — a check-then-read
+  race: another writer to the same inode can grow the file between the stat
+  and the read. The cap is enforced by reading directly off the descriptor
+  in a bounded loop that rejects the instant one byte over the limit is
+  observed, so the file can never occupy more than `MAX_REGISTRY_FILE_BYTES
+  + 1` bytes of memory here, regardless of what happens to it concurrently.
+
+A write lands at file mode `0600` via an atomic temp-file-then-rename, every
+byte of which is confirmed written in a loop before the fsync — a single
+`write()` call is not guaranteed to write the whole buffer even for a local
+regular file, and an unchecked short write would still get fsynced and
+rename-published as a truncated (and confusingly, only later-detected) file.
+The rename is itself symlink-safe on the destination side regardless of
+`O_NOFOLLOW`: `rename(2)` replaces whatever sits at the target path —
+including a symlink — rather than writing through it, so this half of the
+picture holds even on a platform where the read-side protection doesn't.
+
+**Publication is atomic, not power-loss durable.** The temp file is fsynced
+before the rename, so a reader never observes a torn write — only the
+previous complete registry or the new one. The *parent directory* is
+deliberately not fsynced after the rename, so a crash immediately after
+publishing could still lose the directory-entry update on some filesystems,
+resurfacing the previous file (or none) on the next boot. Unlike the control
+plane's kill-state file — where losing that update means booting into an
+ambiguous kill state — a lost or reverted registry is cheaply recoverable:
+re-run `plant`. That asymmetry is why the extra ceremony of an explicit
+directory fsync isn't implemented here.
+
+`loadRegistry` also caps the number of entries at `MAX_REGISTRY_ENTRIES`,
+checked before the per-entry shape validation runs, so an oversized array
+can't burn CPU on validation before being rejected.
 
 ## What honeytokens catch — and what they don't
 

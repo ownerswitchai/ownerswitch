@@ -6,7 +6,7 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
-  readFileSync as fsReadFileSync,
+  readSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -46,11 +46,14 @@ import type { Honeytoken, HoneytokenKind } from "./generate.js";
  * into the MAC. See README.md for what that means for where this file lives.
  *
  * readRegistryFile / writeRegistryFile below mirror the safety properties of
- * control-plane's kill-state store: reads refuse to follow a symlink and are
- * capped in size before the bytes are ever handed to JSON.parse, and writes
- * land at 0600 via an atomic temp-file-then-rename (which itself can never be
- * tricked into writing through a symlink at the destination — rename(2)
- * replaces the link, it never follows it).
+ * control-plane's kill-state store: reads refuse to follow a symlink and
+ * enforce MAX_REGISTRY_FILE_BYTES DURING the read itself (not via a
+ * check-then-read stat, which a concurrent writer could race), so the bytes
+ * handed to JSON.parse afterward are already bounded. Writes land at 0600
+ * via an atomic temp-file-then-rename, every byte confirmed written before
+ * the fsync (a single write() call is not guaranteed to write it all), which
+ * itself can never be tricked into writing through a symlink at the
+ * destination — rename(2) replaces the link, it never follows it.
  */
 
 const REGISTRY_VERSION = 1;
@@ -310,9 +313,19 @@ export function loadRegistry(serialized: string, identity: RegistryIdentity): Ho
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
 
-// O_NOFOLLOW is POSIX; on a platform without it the flag degrades to 0 and
-// the fstat regular-file check in readRegistryFile is the remaining guard —
-// same fallback control-plane's kill-state store uses.
+// O_NOFOLLOW is POSIX; there is no portable way to detect its absence ahead
+// of time, so on a platform without it the flag silently degrades to 0 and
+// open() FOLLOWS a symlink at `path` like normal. The fstat regular-file
+// check in readRegistryFile does NOT recover any of that protection: by the
+// time you have an fd, the kernel has already resolved any symlink to reach
+// it, so fstat(fd) reports the FOLLOWED target's type — a symlink to a
+// regular file is indistinguishable, from fstat's point of view, from a real
+// regular file sitting directly at that path. Plainly stated: on a platform
+// lacking O_NOFOLLOW, readRegistryFile provides NO symlink protection at
+// all — it will happily follow a symlink planted at the registry path and
+// read whatever it points to. This is the same gap control-plane's
+// kill-state store has (its own comment here made the identical incorrect
+// claim before this one was corrected).
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 // New files only: never reuse an existing name, never follow a symlink
 // planted at it, and 0600 — a honeytoken registry is nobody else's to read.
@@ -321,9 +334,18 @@ const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |
 /**
  * Read a registry file the way it must be read: refuse to follow a symlink
  * at `path` (O_NOFOLLOW — the race-free version of "lstat, then read"), and
- * refuse anything over MAX_REGISTRY_FILE_BYTES BEFORE the bytes are pulled
- * into memory, let alone handed to JSON.parse. A locally-replaced huge file
- * is rejected on its size, not after the read+parse already paid for it.
+ * enforce MAX_REGISTRY_FILE_BYTES DURING the read, not merely before it.
+ *
+ * An earlier version checked `fstatSync(fd).size` and then handed the fd to
+ * a single unbounded read — that is a check-then-use race: another writer to
+ * the same inode can grow the file between the fstat and the read (or while
+ * the read is still in progress), so a size checked beforehand is not a size
+ * actually enforced. This instead reads directly off the descriptor in a
+ * loop, into a buffer sized exactly MAX_REGISTRY_FILE_BYTES + 1, and rejects
+ * the instant that extra byte is observed. The file can never occupy more
+ * than MAX_REGISTRY_FILE_BYTES + 1 bytes of memory here, regardless of its
+ * size on disk, its size at any single point in time, or what happens to it
+ * concurrently while this function runs.
  */
 export function readRegistryFile(path: string): string {
   let fd: number;
@@ -336,17 +358,24 @@ export function readRegistryFile(path: string): string {
     throw new Error(`cannot open honeytoken registry ${path}: ${message(err)}`);
   }
   try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) {
+    if (!fstatSync(fd).isFile()) {
       throw new Error(`${path} is not a regular file`);
     }
-    if (stat.size > MAX_REGISTRY_FILE_BYTES) {
-      throw new Error(
-        `${path} is ${stat.size} bytes, over the ${MAX_REGISTRY_FILE_BYTES}-byte honeytoken registry ` +
-          `limit — refusing to read it into memory`,
-      );
+    const limit = MAX_REGISTRY_FILE_BYTES;
+    const buffer = Buffer.alloc(limit + 1);
+    let total = 0;
+    for (;;) {
+      const bytesRead = readSync(fd, buffer, total, buffer.length - total, null);
+      if (bytesRead === 0) break; // EOF, within bounds
+      total += bytesRead;
+      if (total > limit) {
+        throw new Error(
+          `${path} is at least ${total} bytes, over the ${limit}-byte honeytoken registry limit — ` +
+            `refusing to read it into memory`,
+        );
+      }
     }
-    return fsReadFileSync(fd, "utf8");
+    return buffer.toString("utf8", 0, total);
   } finally {
     closeSync(fd);
   }
@@ -354,19 +383,40 @@ export function readRegistryFile(path: string): string {
 
 /**
  * Write a registry file the way it must be written: a temp file created with
- * O_EXCL|O_NOFOLLOW at 0600, fsynced, then published with an atomic rename.
- * The rename is itself symlink-safe on the destination side by construction
- * — rename(2) replaces whatever sits at `path`, including a symlink, rather
- * than following it — so this can't be tricked into writing through a link
- * planted at the destination.
+ * O_EXCL|O_NOFOLLOW at 0600, every byte written in a loop (see below),
+ * fsynced, then published with an atomic rename. The rename is itself
+ * symlink-safe on the destination side by construction — rename(2) replaces
+ * whatever sits at `path`, including a symlink, rather than following it —
+ * so this can't be tricked into writing through a link planted there.
+ *
+ * The FILE is fsynced before the rename, so publication is atomic — a reader
+ * never observes a torn write, only the previous complete file or the new
+ * complete one. The PARENT DIRECTORY is deliberately not fsynced after the
+ * rename, so this is not power-loss durable: a crash immediately after
+ * publishing could still lose the directory-entry update on some
+ * filesystems, resurfacing the previous file (or none) on next boot. See
+ * README.md — unlike the control plane's kill-state file, a lost registry is
+ * recoverable by re-running `plant`, so the extra ceremony of an explicit
+ * directory fsync isn't implemented here.
  */
 export function writeRegistryFile(path: string, contents: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  const data = Buffer.from(contents, "utf8");
   let fd: number | undefined;
   try {
     fd = openSync(tmp, CREATE_FLAGS, 0o600);
-    writeSync(fd, contents);
+    // A single writeSync() is not guaranteed to write the whole buffer —
+    // POSIX write() may return short even for a regular local file, with no
+    // error raised. An unchecked short write here would still get fsynced
+    // and rename-published as a truncated file: it reports SUCCESS to the
+    // caller (plant) while the JSON is corrupt, so the failure only surfaces
+    // later — and confusingly — as "not valid JSON" or a MAC mismatch when a
+    // gateway tries to load it. Loop until every byte has actually landed.
+    let written = 0;
+    while (written < data.length) {
+      written += writeSync(fd, data, written, data.length - written);
+    }
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;

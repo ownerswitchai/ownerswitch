@@ -34,16 +34,25 @@ export interface HiddenLineOutput {
  * writes nothing back except the literal prompt and a trailing newline once
  * the user presses Enter. Used for the canary-key prompt so a pasted secret
  * never lands in terminal scrollback or a captured recording.
+ *
+ * Fails closed if `setRawMode` is unavailable: without it there is no way to
+ * suppress the terminal's own echo, so reading anyway would silently
+ * downgrade "hidden" to "typed in the open" — the one outcome this function
+ * exists to prevent. Nothing is written and nothing is read in that case;
+ * the caller sees the same `undefined` it would get from an empty line (the
+ * same fallback `promptCanaryKeyFromTty` already uses one level up for "not
+ * a TTY at all").
  */
 export async function readHiddenLine(
   promptText: string,
   input: HiddenLineInput,
   output: HiddenLineOutput,
 ): Promise<string | undefined> {
+  if (input.setRawMode === undefined) return undefined;
   output.write(promptText);
   const wasRaw = input.isRaw ?? false;
   input.setEncoding?.("utf8");
-  input.setRawMode?.(true);
+  input.setRawMode(true);
   input.resume();
 
   // Control characters compared by code point, not string literals — a raw
