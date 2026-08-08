@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import type { Decision, Policy, PolicyRule } from "@ownerswitchai/shared";
 import type { DeviceIdentity } from "./veto-client.js";
 
@@ -169,6 +169,89 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
   };
 }
 
+const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
+
+// O_NOFOLLOW is POSIX; on a platform without it the flag degrades to 0 and
+// the fstat regular-file check in readConfigFile is the remaining guard —
+// same caveat, and the same gap, as packages/honeytoken/src/registry.ts and
+// packages/control-plane/src/kill-state.ts.
+const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+
+/** Hard ceiling on the config file's byte size — see readConfigFile(). */
+export const MAX_CONFIG_FILE_BYTES = 1024 * 1024;
+
+/**
+ * Warn — loudly, but non-fatally — when the config file's mode grants more
+ * than owner read/write. It holds device.secret in plaintext; a group- or
+ * world-readable config leaks that secret to every other local account. This
+ * doesn't refuse to start: an operator's umask or a mounted secrets volume
+ * may legitimately produce a mode this check doesn't love, and a hard
+ * refusal here would turn a permissions slip into an outage of the whole
+ * gateway. Owner-only extra bits (e.g. execute) aren't flagged — they don't
+ * expose the secret to anyone else.
+ */
+function warnIfModeTooPermissive(path: string, rawMode: number): void {
+  const mode = rawMode & 0o777;
+  if ((mode & ~0o600) === 0) return;
+  console.error(
+    `[ownerswitch] config file "${path}" has mode ${mode.toString(8).padStart(3, "0")} — it holds ` +
+      `device.secret in plaintext and should be 0600 (owner read/write only). Run: chmod 600 ${path}`,
+  );
+}
+
+/**
+ * Read the config file the way a file holding device.secret in plaintext
+ * must be read: refuse to follow a symlink at `path` (O_NOFOLLOW — the
+ * race-free version of "lstat, then read" — and fstat the open descriptor
+ * rather than trusting the path), enforce MAX_CONFIG_FILE_BYTES DURING the
+ * read itself rather than via a check-then-read stat (which a concurrent
+ * writer could race), and warn loudly when the file's mode is looser than it
+ * needs to be.
+ *
+ * This follows packages/honeytoken/src/registry.ts's readRegistryFile, not
+ * packages/control-plane/src/kill-state.ts's load(). Both refuse a symlink
+ * the same way (O_NOFOLLOW + fstat), but they differ on the size cap: the
+ * registry reads directly off the descriptor in a loop, into a buffer sized
+ * exactly limit + 1, and rejects the instant that extra byte is observed —
+ * kill-state's load(), once past the regular-file check, hands the fd to a
+ * single unbounded readFileSync with no size ceiling at all. Since a real
+ * requirement here is "cap the size with a bounded read before parsing", the
+ * registry's version is the one that actually does that; kill-state's does
+ * not, despite CONTRIBUTING.md citing kill-state.ts as the example for the
+ * whole hardened-I/O pattern including the size cap.
+ */
+export function readConfigFile(path: string): string {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | O_NOFOLLOW);
+  } catch (err) {
+    if (errCode(err) === "ELOOP") throw new Error(`${path} is a symlink — refusing to follow it`);
+    throw err;
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`${path} is not a regular file`);
+    warnIfModeTooPermissive(path, stat.mode);
+    const limit = MAX_CONFIG_FILE_BYTES;
+    const buffer = Buffer.alloc(limit + 1);
+    let total = 0;
+    for (;;) {
+      const bytesRead = readSync(fd, buffer, total, buffer.length - total, null);
+      if (bytesRead === 0) break; // EOF, within bounds
+      total += bytesRead;
+      if (total > limit) {
+        throw new Error(
+          `${path} is at least ${total} bytes, over the ${limit}-byte config file limit — ` +
+            `refusing to read it into memory`,
+        );
+      }
+    }
+    return buffer.toString("utf8", 0, total);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Resolve the gateway's config. Precedence:
  *   1. --config <file> / --config=<file> on the command line
@@ -178,7 +261,7 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
 export function loadConfig(
   argv: string[],
   env: Record<string, string | undefined>,
-  readFile: (path: string) => string = (p) => readFileSync(p, "utf8"),
+  readFile: (path: string) => string = readConfigFile,
 ): OwnerSwitchMcpConfig {
   let file: string | undefined;
   for (let i = 0; i < argv.length; i++) {
