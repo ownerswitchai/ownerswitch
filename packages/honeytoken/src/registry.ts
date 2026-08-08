@@ -1,4 +1,17 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync as fsReadFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import type { Honeytoken, HoneytokenKind } from "./generate.js";
 
 /**
@@ -25,10 +38,28 @@ import type { Honeytoken, HoneytokenKind } from "./generate.js";
  * rejected at load. The plaintext values live in the file and in any gateway
  * that loads it — a deliberate trade: the gateway is the enforcement point,
  * and a compromise there already defeats honeytokens (see README).
+ *
+ * The MAC gives INTEGRITY, not FRESHNESS: it proves the entries were minted
+ * by whoever holds the canary key, not that this is the CURRENT registry. An
+ * old-but-validly-signed file replayed back over a rotated one still verifies
+ * for the same deployment — there is no version counter or timestamp bound
+ * into the MAC. See README.md for what that means for where this file lives.
+ *
+ * readRegistryFile / writeRegistryFile below mirror the safety properties of
+ * control-plane's kill-state store: reads refuse to follow a symlink and are
+ * capped in size before the bytes are ever handed to JSON.parse, and writes
+ * land at 0600 via an atomic temp-file-then-rename (which itself can never be
+ * tricked into writing through a symlink at the destination — rename(2)
+ * replaces the link, it never follows it).
  */
 
 const REGISTRY_VERSION = 1;
 const MAC_DOMAIN = "ownerswitch-honeytoken-registry-v1";
+
+/** Hard ceiling on the number of entries a registry may hold — see loadRegistry(). */
+export const MAX_REGISTRY_ENTRIES = 10_000;
+/** Hard ceiling on the registry file's byte size — see readRegistryFile(). */
+export const MAX_REGISTRY_FILE_BYTES = 8 * 1024 * 1024;
 
 export interface RegistryEntry {
   canaryId: string;
@@ -245,7 +276,19 @@ export function loadRegistry(serialized: string, identity: RegistryIdentity): Ho
       `honeytoken registry is for deployment "${String(obj.deploymentId)}", not "${identity.deploymentId}"`,
     );
   }
-  if (!Array.isArray(obj.entries) || !obj.entries.every(isEntry)) {
+  if (!Array.isArray(obj.entries)) {
+    throw new Error("honeytoken registry entries must be an array");
+  }
+  // Reject an oversized entry count BEFORE the O(n) shape-validation pass
+  // below: a huge array is itself the resource-exhaustion risk (parse-time
+  // memory plus per-call match() cost scales with entry count), so the size
+  // check has to run first, not after paying to validate every element.
+  if (obj.entries.length > MAX_REGISTRY_ENTRIES) {
+    throw new Error(
+      `honeytoken registry has ${obj.entries.length} entries, over the ${MAX_REGISTRY_ENTRIES}-entry limit`,
+    );
+  }
+  if (!obj.entries.every(isEntry)) {
     throw new Error("honeytoken registry entries are malformed");
   }
   if (typeof obj.mac !== "string") {
@@ -262,4 +305,85 @@ export function loadRegistry(serialized: string, identity: RegistryIdentity): Ho
     );
   }
   return registry;
+}
+
+const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
+
+// O_NOFOLLOW is POSIX; on a platform without it the flag degrades to 0 and
+// the fstat regular-file check in readRegistryFile is the remaining guard —
+// same fallback control-plane's kill-state store uses.
+const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+// New files only: never reuse an existing name, never follow a symlink
+// planted at it, and 0600 — a honeytoken registry is nobody else's to read.
+const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
+
+/**
+ * Read a registry file the way it must be read: refuse to follow a symlink
+ * at `path` (O_NOFOLLOW — the race-free version of "lstat, then read"), and
+ * refuse anything over MAX_REGISTRY_FILE_BYTES BEFORE the bytes are pulled
+ * into memory, let alone handed to JSON.parse. A locally-replaced huge file
+ * is rejected on its size, not after the read+parse already paid for it.
+ */
+export function readRegistryFile(path: string): string {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | O_NOFOLLOW);
+  } catch (err) {
+    if (errCode(err) === "ELOOP") {
+      throw new Error(`${path} is a symlink — refusing to follow it`);
+    }
+    throw new Error(`cannot open honeytoken registry ${path}: ${message(err)}`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error(`${path} is not a regular file`);
+    }
+    if (stat.size > MAX_REGISTRY_FILE_BYTES) {
+      throw new Error(
+        `${path} is ${stat.size} bytes, over the ${MAX_REGISTRY_FILE_BYTES}-byte honeytoken registry ` +
+          `limit — refusing to read it into memory`,
+      );
+    }
+    return fsReadFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Write a registry file the way it must be written: a temp file created with
+ * O_EXCL|O_NOFOLLOW at 0600, fsynced, then published with an atomic rename.
+ * The rename is itself symlink-safe on the destination side by construction
+ * — rename(2) replaces whatever sits at `path`, including a symlink, rather
+ * than following it — so this can't be tricked into writing through a link
+ * planted at the destination.
+ */
+export function writeRegistryFile(path: string, contents: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, CREATE_FLAGS, 0o600);
+    writeSync(fd, contents);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, path);
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best effort */
+      }
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best effort — the temp name is random, a leftover is inert */
+    }
+    throw err;
+  }
 }

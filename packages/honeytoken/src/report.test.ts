@@ -222,6 +222,96 @@ describe("trip reporter", () => {
     });
   });
 
+  describe("attempt timeout — a hung request is bounded, not infinite", () => {
+    /** A fetchImpl whose Promise never settles unless its AbortSignal fires. */
+    function hangingFetchImpl(calls: Array<{ signal: AbortSignal | null | undefined }> = []) {
+      return ((_url: URL | RequestInfo, init?: RequestInit) => {
+        calls.push({ signal: init?.signal });
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        });
+      }) as typeof fetch;
+    }
+
+    it("aborts after attemptTimeoutMs and counts as a failed attempt — a /kill still lands once the hang clears", async () => {
+      const calls: Array<{ signal: AbortSignal | null | undefined }> = [];
+      let mode: "hang" | "succeed" = "hang";
+      const fetchImpl = ((url: URL | RequestInfo, init?: RequestInit) => {
+        if (mode === "succeed") return Promise.resolve(okResponse());
+        return hangingFetchImpl(calls)(url, init);
+      }) as typeof fetch;
+      const logs: string[] = [];
+      const delivered: Array<{ trip: Trip; confirmation: DeliveryConfirmation }> = [];
+      const reporter = createTripReporter({
+        controlPlaneUrl: "http://127.0.0.1:4999",
+        deviceId: "honeytoken-host",
+        secret: SECRET,
+        fetchImpl,
+        attemptTimeoutMs: 1_000,
+        log: (l) => logs.push(l),
+        onDelivered: (trip, confirmation) => delivered.push({ trip, confirmation }),
+      });
+
+      reporter.report(KILL_TRIP);
+      await settle();
+      expect(calls).toHaveLength(1); // the request is in flight, and hanging
+      expect(reporter.pending()).toBe(1);
+
+      // cancelWait (the backoff canceller) has NO reach into this — only the
+      // per-attempt AbortController timeout can move it past a genuine hang.
+      await vi.advanceTimersByTimeAsync(999);
+      expect(delivered).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(logs.some((l) => l.includes("timed out after 1000ms"))).toBe(true);
+      expect(reporter.pending()).toBe(1); // not lost — queued for the next attempt
+
+      // the hang clears; the very next attempt (after the normal 200ms backoff) lands
+      mode = "succeed";
+      await vi.advanceTimersByTimeAsync(200);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0].confirmation.attempts).toBe(2);
+      expect(reporter.pending()).toBe(0);
+    });
+
+    it("flush() completes in BOUNDED time even when every attempt hangs until aborted", async () => {
+      const logs: string[] = [];
+      const reporter = createTripReporter({
+        controlPlaneUrl: "http://127.0.0.1:4999",
+        deviceId: "honeytoken-host",
+        secret: SECRET,
+        fetchImpl: hangingFetchImpl(),
+        attemptTimeoutMs: 500,
+        log: (l) => logs.push(l),
+      });
+
+      reporter.report(KILL_TRIP);
+      await settle();
+
+      const flushing = reporter.flush({ maxAttempts: 3 });
+      let settled = false;
+      void flushing.then(() => (settled = true));
+
+      // attempt 1: hangs 500ms then aborts; 200ms backoff; attempt 2: hangs
+      // 500ms then aborts; 400ms backoff; attempt 3: hangs 500ms then aborts
+      // and gives up (maxAttempts reached) — 2100ms total, not "forever".
+      await vi.advanceTimersByTimeAsync(500);
+      expect(settled).toBe(false); // still bounded work in progress, not resolved early
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(400);
+      await vi.advanceTimersByTimeAsync(500);
+
+      const result = await flushing;
+      expect(result).toEqual({ delivered: false, pending: 1 });
+      expect(logs.filter((l) => l.includes("timed out after 500ms"))).toHaveLength(3);
+      expect(logs.some((l) => l.includes("giving up after 3"))).toBe(true);
+    });
+  });
+
   it("stop() cancels retries and warns about unconfirmed trips", async () => {
     const h = harness(() => {
       throw new Error("down");

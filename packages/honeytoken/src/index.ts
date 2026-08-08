@@ -16,8 +16,12 @@ export type { GenerateOptions, Honeytoken, HoneytokenKind } from "./generate.js"
 export {
   HoneytokenRegistry,
   loadRegistry,
+  MAX_REGISTRY_ENTRIES,
+  MAX_REGISTRY_FILE_BYTES,
+  readRegistryFile,
   requireCanaryKey,
   requireDeploymentId,
+  writeRegistryFile,
 } from "./registry.js";
 export type { HoneytokenMatch, RegistryEntry, RegistryIdentity } from "./registry.js";
 
@@ -26,7 +30,13 @@ export { scanForHoneytokens } from "./scan.js";
 export { fsReportsReads, watchHoneytokenFiles } from "./watch.js";
 export type { FileTrip, HoneytokenWatcher, TripCause, WatchHoneytokenFilesOptions } from "./watch.js";
 
-export { createTripReporter, DEFAULT_FLUSH_ATTEMPTS, killReason, tripReason } from "./report.js";
+export {
+  createTripReporter,
+  DEFAULT_ATTEMPT_TIMEOUT_MS,
+  DEFAULT_FLUSH_ATTEMPTS,
+  killReason,
+  tripReason,
+} from "./report.js";
 export type {
   DeliveryConfirmation,
   Trip,

@@ -63,6 +63,41 @@ tripwire — is rejected at load. The plaintext values live in that file and in
 any gateway that loads it: a deliberate trade, since the gateway is the
 enforcement point and a compromise there already defeats honeytokens.
 
+**The MAC is integrity, not freshness.** It proves a registry's entries were
+minted by whoever holds the canary key — it does **not** prove this is the
+*current* registry. There is no version counter or timestamp bound into the
+MAC, so an old-but-validly-signed file, replayed back over a rotated one,
+still verifies for the same deployment. If tokens are ever rotated because a
+previous set is believed compromised, an attacker who kept a copy of the
+*old* registry could restore it and have the gateway/watcher trust the
+retired values again. The practical consequence: **the registry file must
+live somewhere an agent (or anything an agent can influence) cannot write** —
+the same "outside the blast radius" placement already required for the
+control plane's own kill-state file. A registry sitting in an agent-writable
+directory is a rollback target, not just a "map of what to avoid."
+
+**The canary key is never a command-line flag**, for the same reason
+`--owner-token` isn't one in `packages/mcp` (fixed in PR #19): a long-lived
+secret on argv leaks into shell history and `ps`/process listings, and for
+`watch` — which keeps running — stays visible in process metadata for the
+life of the process, not just one command. `plant` and `watch` both read
+`OWNERSWITCH_CANARY_KEY`, or prompt for it (echo-suppressed, TTY-gated) if
+the variable isn't set; passing `--canary-key` on either command is refused
+outright, naming the leak.
+
+`readRegistryFile` / `writeRegistryFile` (used by both this package's CLI and
+the gateway's config loader) match the safety properties of control-plane's
+kill-state store: a read refuses to follow a symlink at the registry path and
+is capped at `MAX_REGISTRY_FILE_BYTES` **before** the bytes are handed to
+`JSON.parse` — a locally replaced huge or symlinked file is rejected on sight,
+not after the read+parse already paid for it. A write lands at file mode
+`0600` via an atomic temp-file-then-rename, which is itself symlink-safe on
+the destination side: `rename(2)` replaces whatever sits at the target path
+— including a symlink — rather than writing through it. `loadRegistry` also
+caps the number of entries at `MAX_REGISTRY_ENTRIES`, checked before the
+per-entry shape validation runs, so an oversized array can't burn CPU on
+validation before being rejected.
+
 ## What honeytokens catch — and what they don't
 
 Honest version, before you rely on this:
@@ -124,14 +159,26 @@ per attempt), and `flush()` before shutdown blocks until both lanes drain or a
 bounded number of retries is exhausted — so an agent that can influence
 process exit cannot silently swallow a tripped-but-unconfirmed report.
 
+Separate lanes bound one failure mode — an endpoint that answers fast with an
+error. They don't, by themselves, bound a request that never answers at all:
+`cancelWait` only wakes a pending *backoff*, it has no reach into an in-flight
+`fetch`. Every attempt therefore carries its own `AbortController` timeout
+(`attemptTimeoutMs`, default 5 s) — a hung connection is aborted and counted
+as an ordinary failed attempt, so it retries (and, under `flush()`, exhausts
+its attempt budget) exactly like a 500 would, instead of stalling its lane —
+and `flush()`'s bound — indefinitely.
+
 ## Use
 
 ```bash
-# Provision a DEDICATED canary key and a deployment id (NOT the device secret):
+# Provision a DEDICATED canary key and a deployment id (NOT the device secret).
+# The key is an env var, never a flag — plant/watch also prompt for it
+# (echo-suppressed) if you leave this unset and run them in a terminal.
 export OWNERSWITCH_CANARY_KEY=$(openssl rand -hex 24)
 export OWNERSWITCH_DEPLOYMENT_ID=prod-us-east
 
-# 1. plant decoys and write the signed registry (keep it OUT of the decoy dir)
+# 1. plant decoys and write the signed registry (keep it OUT of the decoy dir,
+#    and OUT of anything an agent can write to — see "bound to the deployment" above)
 ownerswitch-honeytoken plant --dir /srv/agent-home \
   --registry /etc/ownerswitch/honeytokens.json
 
@@ -147,9 +194,10 @@ ownerswitch-mcp --config gateway.json     # loads + verifies the registry, then 
 ```
 
 Library surface: `generateHoneytoken({ kind, label })`, `HoneytokenRegistry` /
-`loadRegistry` / `requireCanaryKey`, `scanForHoneytokens(text, registry)`,
-`watchHoneytokenFiles({ paths, onTrip, registry })`, `createTripReporter(...)`,
-`plantHoneytokens({ dir, canaryKey, deploymentId })`, `createTripwire(...)`.
+`loadRegistry` / `requireCanaryKey` / `readRegistryFile` / `writeRegistryFile`,
+`scanForHoneytokens(text, registry)`, `watchHoneytokenFiles({ paths, onTrip,
+registry })`, `createTripReporter(...)`, `plantHoneytokens({ dir, canaryKey,
+deploymentId })`, `createTripwire(...)`.
 
 ## How detection works (and its physics)
 

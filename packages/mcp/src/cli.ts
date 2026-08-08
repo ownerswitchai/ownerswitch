@@ -6,11 +6,10 @@
  * stderr. The upstream server is spawned as a child with its stderr
  * inherited, so its logs surface in the client's logs too.
  */
-import { readFileSync } from "node:fs";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
-import { createTripwire, loadRegistry, type Tripwire } from "@ownerswitchai/honeytoken";
+import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
@@ -38,7 +37,10 @@ function armTripwire(controlPlaneUrl: string, device: { id: string; secret: stri
   }
   let serialized: string;
   try {
-    serialized = readFileSync(registryPath, "utf8");
+    // readRegistryFile refuses to follow a symlink at registryPath and caps
+    // the file size before the bytes are read into memory — a locally
+    // replaced huge or symlinked file is rejected here, before parsing.
+    serialized = readRegistryFile(registryPath);
   } catch (err) {
     throw new ConfigError(
       `cannot read honeytoken registry "${registryPath}": ${err instanceof Error ? err.message : String(err)}`,

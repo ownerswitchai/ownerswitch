@@ -28,6 +28,16 @@ import { signDeviceRequest } from "@ownerswitchai/control-plane";
  *  - flush() before shutdown blocks until both lanes drain or a bounded
  *    number of retries per trip is exhausted, so a tripped-but-unconfirmed
  *    report is not lost when the process exits.
+ *
+ * Every attempt carries its OWN AbortController timeout (attemptTimeoutMs).
+ * Without one, a request that never settles — the control plane accepts the
+ * TCP connection but the process behind it is wedged — hangs `await
+ * fetchImpl(...)` forever: the lane can't log a retry, can't move on, and
+ * flush()'s bound (documented above) would be a lie, because cancelWait only
+ * wakes an in-progress BACKOFF, never an in-flight request. A per-attempt
+ * timeout aborts the fetch and counts it as a normal failed attempt, so the
+ * existing retry/backoff machinery — and flush()'s attempt budget — cover it
+ * exactly like a 500 or a connection refusal.
  */
 
 const BACKOFF_MS = [200, 400, 800] as const;
@@ -35,6 +45,9 @@ const STEADY_RETRY_MS = 2_000;
 
 /** Attempts flush() allows per trip before giving up (loudly) so exit isn't blocked forever. */
 export const DEFAULT_FLUSH_ATTEMPTS = 8;
+
+/** Per-attempt network timeout — bounds a request that never settles, not just one that errors fast. */
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 5_000;
 
 export type TripTier = "alert" | "kill";
 
@@ -67,6 +80,8 @@ export interface TripReporterOptions {
   now?: () => number;
   fetchImpl?: typeof fetch;
   log?: (line: string) => void;
+  /** Abort and count as a failed attempt if a single POST doesn't settle in this many ms. Default 5000. */
+  attemptTimeoutMs?: number;
 }
 
 export interface TripReporter {
@@ -102,6 +117,7 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
   const now = opts.now ?? Date.now;
   const fetchImpl = opts.fetchImpl ?? fetch;
   const log = opts.log ?? ((line: string) => console.error(line));
+  const attemptTimeoutMs = opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
   const endpoint: Record<TripTier, URL> = {
     kill: new URL("/kill", opts.controlPlaneUrl),
     alert: new URL("/alert", opts.controlPlaneUrl),
@@ -116,6 +132,12 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
     const body = JSON.stringify({ source: "honeytoken", reason: tripReason(trip) });
     const signature = signDeviceRequest({ deviceId: opts.deviceId, timestamp, nonce }, body, opts.secret);
     log(`[honeytoken] → POST ${url} (${trip.tier}, attempt ${n}, device ${opts.deviceId})`);
+    // Bounds a request that never SETTLES, not just one that errors fast —
+    // cancelWait (the backoff-wait canceller) has no reach into an in-flight
+    // fetch, so without this a hung connection stalls the lane, and flush(),
+    // forever. Aborting folds a timeout into the same failure path as a 500.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
     try {
       const res = await fetchImpl(url, {
         method: "POST",
@@ -127,6 +149,7 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
           "x-device-signature": signature,
         },
         body,
+        signal: controller.signal,
       });
       if (!res.ok) {
         return { ok: false, status: res.status, detail: `control plane answered HTTP ${res.status}` };
@@ -134,7 +157,14 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
       const parsed: unknown = await res.json().catch(() => undefined);
       return { ok: true, status: res.status, body: parsed, detail: `HTTP ${res.status}` };
     } catch (err) {
-      return { ok: false, status: 0, detail: err instanceof Error ? err.message : String(err) };
+      const detail = controller.signal.aborted
+        ? `timed out after ${attemptTimeoutMs}ms`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+      return { ok: false, status: 0, detail };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

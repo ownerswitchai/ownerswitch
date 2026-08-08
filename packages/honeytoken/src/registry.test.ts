@@ -1,10 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { generateHoneytoken } from "./generate.js";
 import {
   HoneytokenRegistry,
   loadRegistry,
+  MAX_REGISTRY_ENTRIES,
+  MAX_REGISTRY_FILE_BYTES,
+  readRegistryFile,
   requireCanaryKey,
   requireDeploymentId,
+  writeRegistryFile,
 } from "./registry.js";
 
 const CANARY_KEY = "canary-key-9f3a7c2e1b8d4056aa771122";
@@ -154,5 +161,118 @@ describe("serialize / loadRegistry — fix #1/#2 tamper + deployment binding", (
     expect(() => loadRegistry(JSON.stringify({ version: 1, deploymentId: DEPLOY, entries: [] }), id)).toThrow(
       /missing its integrity MAC/,
     );
+  });
+});
+
+describe("MAX_REGISTRY_ENTRIES — a locally replaced huge registry is rejected before it does any real work", () => {
+  const id = { canaryKey: CANARY_KEY, deploymentId: DEPLOY };
+
+  it("rejects an oversized entries array cheaply, before shape-validating a single element", () => {
+    // Every element is `null` — not RegistryEntry-shaped at all. If the count
+    // check ran AFTER shape validation this would fail with a DIFFERENT
+    // message ("entries are malformed"); getting the entry-limit message
+    // proves the cheap length check runs first.
+    const entries = new Array<null>(MAX_REGISTRY_ENTRIES + 1).fill(null);
+    const payload = JSON.stringify({ version: 1, deploymentId: DEPLOY, entries, mac: "irrelevant" });
+    expect(() => loadRegistry(payload, id)).toThrow(
+      new RegExp(`${MAX_REGISTRY_ENTRIES + 1} entries, over the ${MAX_REGISTRY_ENTRIES}-entry limit`),
+    );
+  });
+
+  it("accepts exactly MAX_REGISTRY_ENTRIES (the cap is a ceiling, not an off-by-one)", () => {
+    const registry = new HoneytokenRegistry(CANARY_KEY, DEPLOY);
+    for (let i = 0; i < MAX_REGISTRY_ENTRIES; i += 1) {
+      registry.add({
+        kind: "generic",
+        canaryId: String(i).padStart(12, "A"),
+        core: `CANARYFAKE${i}`,
+        value: `FAKEVALUE${i}`,
+      });
+    }
+    const loaded = loadRegistry(registry.serialize(), id);
+    expect(loaded.size).toBe(MAX_REGISTRY_ENTRIES);
+  });
+});
+
+describe("readRegistryFile / writeRegistryFile — symlink-safe, size-capped, mode 0600", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "oswt-registry-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("round-trips: what writeRegistryFile writes, readRegistryFile reads back exactly", () => {
+    const registry = registryOf();
+    const path = join(dir, "registry.json");
+    writeRegistryFile(path, registry.serialize());
+    expect(readRegistryFile(path)).toBe(registry.serialize());
+  });
+
+  it("writes at mode 0600 — nobody else's to read", () => {
+    const path = join(dir, "registry.json");
+    writeRegistryFile(path, "{}");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("creates parent directories as needed", () => {
+    const path = join(dir, "nested", "deeper", "registry.json");
+    writeRegistryFile(path, "{}");
+    expect(readFileSync(path, "utf8")).toBe("{}");
+  });
+
+  it("leaves no stray temp file behind after a successful write", () => {
+    writeRegistryFile(join(dir, "registry.json"), "{}");
+    expect(readdirSync(dir)).toEqual(["registry.json"]);
+  });
+
+  it("overwrites an existing file atomically", () => {
+    const path = join(dir, "registry.json");
+    writeRegistryFile(path, "{\"v\":1}");
+    writeRegistryFile(path, "{\"v\":2}");
+    expect(readFileSync(path, "utf8")).toBe('{"v":2}');
+  });
+
+  it("read refuses to follow a symlink at the target path", () => {
+    const real = join(dir, "elsewhere.json");
+    writeFileSync(real, "top secret, not a registry");
+    const link = join(dir, "registry.json");
+    symlinkSync(real, link);
+    expect(() => readRegistryFile(link)).toThrow(/symlink/);
+  });
+
+  it("read rejects a file over MAX_REGISTRY_FILE_BYTES before parsing it", () => {
+    const path = join(dir, "huge.json");
+    writeFileSync(path, "x".repeat(MAX_REGISTRY_FILE_BYTES + 1));
+    expect(() => readRegistryFile(path)).toThrow(
+      new RegExp(`over the ${MAX_REGISTRY_FILE_BYTES}-byte honeytoken registry limit`),
+    );
+  });
+
+  it("read accepts a file exactly at the byte cap", () => {
+    const path = join(dir, "at-cap.json");
+    writeFileSync(path, "x".repeat(MAX_REGISTRY_FILE_BYTES));
+    expect(readRegistryFile(path)).toHaveLength(MAX_REGISTRY_FILE_BYTES);
+  });
+
+  it("write replaces a symlink at the destination rather than writing through it", () => {
+    const decoyTarget = join(dir, "decoy-target.json");
+    writeFileSync(decoyTarget, "untouched original content");
+    const link = join(dir, "registry.json");
+    symlinkSync(decoyTarget, link);
+
+    writeRegistryFile(link, '{"fresh":true}');
+
+    // the symlink's ORIGINAL target must be untouched — the write must not
+    // have gone "through" the link to clobber whatever it pointed at
+    expect(readFileSync(decoyTarget, "utf8")).toBe("untouched original content");
+    // `link` is now a plain regular file holding the new content
+    expect(readFileSync(link, "utf8")).toBe('{"fresh":true}');
+  });
+
+  it("read on a missing file fails with a clear error, not a crash", () => {
+    expect(() => readRegistryFile(join(dir, "does-not-exist.json"))).toThrow();
   });
 });

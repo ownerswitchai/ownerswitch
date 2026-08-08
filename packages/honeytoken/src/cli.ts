@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { plantHoneytokens } from "./plant.js";
-import { loadRegistry, requireCanaryKey, requireDeploymentId } from "./registry.js";
+import { CANARY_KEY_FLAG_ERROR, hasCanaryKeyFlag, resolveCanaryKey } from "./prompt.js";
+import { loadRegistry, readRegistryFile, requireCanaryKey, requireDeploymentId, writeRegistryFile } from "./registry.js";
 import { createTripReporter, type TripTier } from "./report.js";
 import { fsReportsReads, watchHoneytokenFiles } from "./watch.js";
 
@@ -18,9 +19,12 @@ Recognition is by membership in a per-deployment registry, so plant and watch
 (and the gateway) must all use the SAME dedicated canary key and deployment id.
 The canary key is NOT the device secret — provision a separate random secret.
 
+The canary key is NEVER a command-line flag — it would leak into shell history
+and process listings. Set OWNERSWITCH_CANARY_KEY, or run in a terminal and
+paste it at the prompt.
+
 Options (plant):
   --dir <path>            directory to plant decoys into (created if missing)
-  --canary-key <secret>   dedicated per-deployment canary key; or OWNERSWITCH_CANARY_KEY
   --deployment-id <id>    immutable deployment id; or OWNERSWITCH_DEPLOYMENT_ID
   --registry <file>       where to write the signed registry (keep it OUT of --dir)
   --force                 replace existing files with the decoy names
@@ -28,7 +32,6 @@ Options (plant):
 Options (watch):
   --dir <path>            directory whose files to arm
   --registry <file>       the signed registry written by plant
-  --canary-key <secret>   canary key to verify the registry; or OWNERSWITCH_CANARY_KEY
   --deployment-id <id>    deployment id the registry must be for; or OWNERSWITCH_DEPLOYMENT_ID
   --url <url>             control plane base URL, e.g. http://localhost:4000
   --device-id <id>        this tripwire's provisioned device id (no "." allowed)
@@ -48,7 +51,6 @@ interface CliValues {
   dir?: string;
   force: boolean;
   registry?: string;
-  "canary-key"?: string;
   "deployment-id"?: string;
   url?: string;
   "device-id"?: string;
@@ -57,16 +59,23 @@ interface CliValues {
   "poll-ms"?: string;
 }
 
-/** Resolve the canary identity from flags/env, validating loudly. */
-function canaryIdentity(values: CliValues): { canaryKey: string; deploymentId: string } {
-  const canaryKey =
-    values["canary-key"] ??
-    process.env.OWNERSWITCH_CANARY_KEY ??
-    fail("--canary-key (or OWNERSWITCH_CANARY_KEY) is required — a dedicated secret, not the device secret");
+/**
+ * Resolve the canary identity: the deployment id from flag/env (not a
+ * secret — fine on argv), the canary key from OWNERSWITCH_CANARY_KEY or an
+ * echo-suppressed prompt — NEVER argv, which the caller has already refused
+ * outright (see hasCanaryKeyFlag in main()).
+ */
+async function canaryIdentity(values: CliValues): Promise<{ canaryKey: string; deploymentId: string }> {
   const deploymentId =
     values["deployment-id"] ??
     process.env.OWNERSWITCH_DEPLOYMENT_ID ??
     fail("--deployment-id (or OWNERSWITCH_DEPLOYMENT_ID) is required");
+  const canaryKey =
+    (await resolveCanaryKey(process.env)) ??
+    fail(
+      "no canary key available — set OWNERSWITCH_CANARY_KEY (export it for this shell, unset it when " +
+        "done), or run this command in a terminal and paste the key when prompted",
+    );
   try {
     requireCanaryKey(canaryKey, deploymentId);
     requireDeploymentId(deploymentId);
@@ -76,10 +85,10 @@ function canaryIdentity(values: CliValues): { canaryKey: string; deploymentId: s
   return { canaryKey, deploymentId };
 }
 
-function plant(values: CliValues): void {
+async function plant(values: CliValues): Promise<void> {
   const dir = values.dir ?? fail("--dir is required");
   const registryPath = values.registry ?? fail("--registry <file> is required (where to write the signed registry)");
-  const { canaryKey, deploymentId } = canaryIdentity(values);
+  const { canaryKey, deploymentId } = await canaryIdentity(values);
 
   const result = plantHoneytokens({ dir, canaryKey, deploymentId, force: values.force });
 
@@ -96,7 +105,7 @@ function plant(values: CliValues): void {
       "⚠ the registry is INSIDE the planted directory — it contains the decoy values, i.e. a map of exactly what to avoid. Move it.",
     );
   }
-  writeFileSync(registryPath, result.registry.serialize());
+  writeRegistryFile(registryPath, result.registry.serialize());
   console.log(`\nSigned registry written to ${registryPath} (deployment "${deploymentId}").`);
   console.log(
     `Arm them (same key + id): ownerswitch-honeytoken watch --dir ${dir} --registry ${registryPath} --url <control-plane> ...`,
@@ -112,7 +121,7 @@ async function watchCommand(values: CliValues): Promise<void> {
     values.secret ??
     process.env.OWNERSWITCH_DEVICE_SECRET ??
     fail("--secret (or OWNERSWITCH_DEVICE_SECRET) is required");
-  const { canaryKey, deploymentId } = canaryIdentity(values);
+  const { canaryKey, deploymentId } = await canaryIdentity(values);
   const tier: TripTier = values["DANGER-kill-on-touch"] ? "kill" : "alert";
   const pollMs = values["poll-ms"] === undefined ? undefined : Number(values["poll-ms"]);
   if (pollMs !== undefined && (!Number.isInteger(pollMs) || pollMs <= 0)) {
@@ -121,7 +130,7 @@ async function watchCommand(values: CliValues): Promise<void> {
 
   let registry;
   try {
-    registry = loadRegistry(readFileSync(registryPath, "utf8"), { canaryKey, deploymentId });
+    registry = loadRegistry(readRegistryFile(registryPath), { canaryKey, deploymentId });
   } catch (err) {
     fail(`cannot load registry ${registryPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -194,6 +203,13 @@ async function watchCommand(values: CliValues): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Checked BEFORE parseArgs, and before anything else runs: a secret must
+  // never even be parsed off argv, let alone acted on. Bare "canary-key"
+  // isn't in the options below, so leaving detection to parseArgs would only
+  // produce a generic "unknown option" — this names the actual leak instead,
+  // matching how --owner-token was refused in packages/mcp (PR #19).
+  if (hasCanaryKeyFlag(process.argv.slice(2))) fail(CANARY_KEY_FLAG_ERROR);
+
   let values;
   let positionals;
   try {
@@ -203,7 +219,6 @@ async function main(): Promise<void> {
         dir: { type: "string" },
         force: { type: "boolean", default: false },
         registry: { type: "string" },
-        "canary-key": { type: "string" },
         "deployment-id": { type: "string" },
         url: { type: "string" },
         "device-id": { type: "string" },
