@@ -53,6 +53,8 @@ export class KillSwitch {
   private log: AuditEntry[] = [];
   private consumedCeremonies = new Set<string>();
   private readonly store?: KillStateStore;
+  private lastKillEvent?: KillEvent;
+  private degradedSince?: { at: number; reason: string };
 
   constructor(
     private readonly now: () => number = Date.now,
@@ -63,16 +65,17 @@ export class KillSwitch {
     // Loading happens HERE, synchronously in the constructor — before any
     // server built on this switch can accept a request.
     const loaded = this.store.load();
-    if (loaded.outcome === "absent") return; // first boot: armed, epoch 0
+    if (loaded.outcome === "absent") return; // genuine first boot: armed, epoch 0
     if (loaded.outcome === "corrupt") {
-      // FAIL CLOSED: kill state that exists but cannot be trusted reads as
-      // killed. Booting free because the file rotted would make disk
-      // corruption (or one hostile write) a silent restore.
+      // FAIL CLOSED: kill state that exists-but-unreadable, malformed, or
+      // missing-after-initialisation reads as killed. Booting free because
+      // the file rotted or vanished would make disk corruption (or one
+      // hostile write or delete) a silent restore.
       console.error(
-        `[ownerswitch] kill-state file is unreadable (${loaded.detail}) — ` +
+        `[ownerswitch] kill state cannot be trusted (${loaded.detail}) — ` +
           `booting KILLED. Restoring requires a 2GO ceremony.`,
       );
-      this.engage("api", `kill-state file unreadable at boot — failed closed (${loaded.detail})`);
+      this.engage("api", `kill state cannot be trusted at boot — failed closed (${loaded.detail})`);
       return;
     }
     this.killedState = loaded.state.killed;
@@ -80,6 +83,7 @@ export class KillSwitch {
     if (loaded.state.lastKill !== undefined) {
       // Re-seat the attributing kill event so the audit surface can still
       // answer what killed the system, and when, across the restart.
+      this.lastKillEvent = loaded.state.lastKill;
       this.log.push({ type: "kill", event: loaded.state.lastKill });
     }
   }
@@ -87,21 +91,40 @@ export class KillSwitch {
   /** Idempotent: repeated triggers only add audit entries, never throw. */
   engage(source: KillSource, reason?: string, opts: { unauthenticated?: boolean } = {}): void {
     this.epochCounter += 1;
-    this.log.push({
-      type: "kill",
-      event: {
-        source,
-        reason,
-        at: this.now(),
-        ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
-      },
-    });
+    const event: KillEvent = {
+      source,
+      reason,
+      at: this.now(),
+      ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
+    };
+    this.log.push({ type: "kill", event });
+    this.lastKillEvent = event;
     this.killedState = true;
     this.persist();
   }
 
   get killed(): boolean {
     return this.killedState;
+  }
+
+  /**
+   * The newest kill event, tracked directly so the hot paths — persist on
+   * every kill, /status on every gateway poll — never copy or scan the audit
+   * log. Both routes are reachable without authentication (deliberately, for
+   * the stop direction), so their cost must not grow with history.
+   */
+  get lastKill(): KillEvent | undefined {
+    return this.lastKillEvent;
+  }
+
+  /**
+   * True while the most recent attempt to persist a transition failed: the
+   * in-memory state is authoritative and in force, but a restart may not
+   * come back with it (the store has been degraded so a restart fails
+   * CLOSED, never open). Cleared by the next successful persist.
+   */
+  get persistenceDegraded(): boolean {
+    return this.degradedSince !== undefined;
   }
 
   /**
@@ -142,28 +165,38 @@ export class KillSwitch {
 
   /**
    * Persistence must never block a transition — above all not a kill: if the
-   * disk is the thing that's broken, the switch still flips in memory and the
-   * failure is logged loudly. The cost is stated where it belongs (threat
-   * model): a crash after an unpersisted transition restarts into the last
-   * state that DID persist.
+   * disk is the thing that's broken, the switch still flips in memory. But a
+   * failed persist is never swallowed either: durability is recorded as
+   * DEGRADED (surfaced by the HTTP layer on /kill and /status), the failure
+   * is logged loudly, and the store is degraded — best-effort — so that a
+   * later restart fails CLOSED instead of resurrecting the stale on-disk
+   * state this save failed to replace.
    */
   private persist(): void {
     if (this.store === undefined) return;
-    const lastKill = this.killedState
-      ? [...this.log].reverse().find((e): e is Extract<AuditEntry, { type: "kill" }> => e.type === "kill")
-      : undefined;
     try {
       this.store.save({
         version: 1,
         killed: this.killedState,
         epoch: this.epochCounter,
-        ...(lastKill !== undefined ? { lastKill: lastKill.event } : {}),
+        ...(this.killedState && this.lastKillEvent !== undefined
+          ? { lastKill: this.lastKillEvent }
+          : {}),
       });
+      this.degradedSince = undefined; // durable again as of this write
     } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.degradedSince = { at: this.now(), reason };
       console.error(
-        `[ownerswitch] FAILED to persist kill state (${err instanceof Error ? err.message : String(err)}) — ` +
-          `the in-memory state stands, but a restart may not remember this transition.`,
+        `[ownerswitch] FAILED to persist kill state (${reason}) — the in-memory state stands ` +
+          `and durability is now reported DEGRADED; the on-disk store is being degraded so a ` +
+          `restart boots killed rather than resurrecting stale state.`,
       );
+      try {
+        this.store.degrade();
+      } catch {
+        /* the contract says degrade() never throws; belt over braces */
+      }
     }
   }
 }

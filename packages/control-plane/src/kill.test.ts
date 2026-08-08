@@ -1,5 +1,8 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import type { KillStateLoad, KillStateStore, PersistedKillState } from "./kill-state.js";
+import { KillStateFileStore, type KillStateLoad, type KillStateStore, type PersistedKillState } from "./kill-state.js";
 import { KillSwitch } from "./kill.js";
 
 const auth = { ceremonyId: "c1", ownerId: "adam", completedAt: 2000 };
@@ -9,12 +12,16 @@ class FakeStore implements KillStateStore {
   saved: PersistedKillState[] = [];
   loadResult: KillStateLoad = { outcome: "absent" };
   failSaves = false;
+  degradeCalls = 0;
   load(): KillStateLoad {
     return this.loadResult;
   }
   save(state: PersistedKillState): void {
     if (this.failSaves) throw new Error("disk full");
     this.saved.push(state);
+  }
+  degrade(): void {
+    this.degradeCalls += 1;
   }
 }
 
@@ -127,17 +134,73 @@ describe("KillSwitch", () => {
     }
   });
 
-  it("a failing save never blocks the transition — the kill still engages, loudly", () => {
+  it("a failing save never blocks the transition, but is never swallowed: degraded is recorded, the store degraded", () => {
     const store = new FakeStore();
     store.failSaves = true;
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const k = new KillSwitch(() => 1000, { store });
+      expect(k.persistenceDegraded).toBe(false);
       expect(() => k.engage("button")).not.toThrow();
-      expect(k.killed).toBe(true);
+      expect(k.killed).toBe(true); // the in-memory kill is in force no matter what
+      expect(k.persistenceDegraded).toBe(true); // ...but durability is admitted lost
+      expect(store.degradeCalls).toBe(1); // and the stale on-disk state was quarantined
       expect(errors).toHaveBeenCalled();
+
+      // the next persist that succeeds clears the degradation
+      store.failSaves = false;
+      k.engage("api");
+      expect(k.persistenceDegraded).toBe(false);
+      expect(store.saved.at(-1)?.killed).toBe(true);
     } finally {
       errors.mockRestore();
     }
+  });
+
+  it("a kill whose save fails still fails CLOSED on restart: stale not-killed state cannot survive", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "ownerswitch-kill-")), "kill-state.json");
+    const real = new KillStateFileStore(path);
+
+    // provision a healthy, initialised, NOT-killed store (as after a restore)
+    const k1 = new KillSwitch(() => 1000, { store: real });
+    k1.engage("button");
+    k1.restore(auth);
+    expect(new KillStateFileStore(path).load()).toMatchObject({
+      outcome: "loaded",
+      state: { killed: false },
+    });
+
+    // now a kill whose persist fails: the on-disk file still says not-killed
+    const failing: KillStateStore = {
+      load: () => real.load(),
+      save: () => {
+        throw new Error("disk full");
+      },
+      degrade: () => real.degrade(),
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const k2 = new KillSwitch(() => 2000, { store: failing });
+      expect(k2.killed).toBe(false); // booted from the healthy file
+      k2.engage("honeytoken", "incident");
+      expect(k2.killed).toBe(true);
+      expect(k2.persistenceDegraded).toBe(true);
+
+      // the restart: it must NOT boot not-killed off the stale file
+      const k3 = new KillSwitch(() => 3000, { store: new KillStateFileStore(path) });
+      expect(k3.killed).toBe(true); // degraded store reads as untrustworthy -> fail closed
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("lastKill tracks the newest kill directly — no audit-log scan on hot paths", () => {
+    const k = new KillSwitch(() => 1000);
+    expect(k.lastKill).toBeUndefined();
+    k.engage("button", "first");
+    k.engage("api", "second");
+    expect(k.lastKill?.reason).toBe("second");
+    k.restore(auth);
+    expect(k.lastKill?.reason).toBe("second"); // survives restore for the audit surface
   });
 });

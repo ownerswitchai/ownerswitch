@@ -30,10 +30,18 @@ import { VetoWindow } from "./veto.js";
  *  - POST /restore/ceremony     — owner session required; starts 2GO (GO 1/2)
  *                     while the system is killed. The ceremony binds to the
  *                     owner, the kill epoch in force, and its start time. An
- *                     owner holds at most ONE live ceremony per kill epoch —
- *                     a repeat GO 1/2 replaces their pending one.
+ *                     owner holds at most ONE live ceremony per kill epoch,
+ *                     and GO 1/2 is IDEMPOTENT: while one is pending, a
+ *                     repeat call returns that same ceremony (200) with its
+ *                     clocks untouched — a retry or second tab cannot
+ *                     invalidate the id the owner holds, and a stolen
+ *                     same-owner session cannot reset the cooldown.
+ *  - DELETE /restore/ceremony/:id — owner session required; explicitly
+ *                     cancels the owner's pending ceremony. The only way to
+ *                     abandon one early — and cancelling only ever makes
+ *                     restore harder, never easier.
  *  - GET  /restore/ceremony/:id — owner session required; the ceremony's
- *                     state and how long until its cooldown ends.
+ *                     state, cooldown remaining, and expiry.
  *  - POST /restore  — owner session required plus a live server-side ceremony
  *                     (GO 2/2): owned by this owner, past its cooldown, inside
  *                     its TTL, bound to the current kill epoch, consumed
@@ -174,16 +182,26 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     return verifyDeviceSignature(credential, rawBody, opts.deviceSecret, { now, seenNonces });
   }
 
+  // Degraded durability is worth a field only when true: the in-memory state
+  // in this response is in force either way, but a restart may not preserve
+  // it. Absence of the field means persistence is healthy (or deliberately
+  // ephemeral).
+  const degradedFields = () =>
+    killSwitch.persistenceDegraded ? { persistenceDegraded: true as const } : {};
+
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
-      sendJson(res, 200, { killed: false });
+      sendJson(res, 200, { killed: false, ...degradedFields() });
       return;
     }
-    const lastKill = [...killSwitch.auditLog()].reverse().find((e) => e.type === "kill");
+    // lastKill is tracked directly — this route is polled by every gateway
+    // and must not scan an ever-growing audit log.
+    const lastKill = killSwitch.lastKill;
     sendJson(res, 200, {
       killed: true,
-      reason: lastKill?.event.reason,
-      at: lastKill?.event.at,
+      reason: lastKill?.reason,
+      at: lastKill?.at,
+      ...degradedFields(),
     });
   }
 
@@ -207,7 +225,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const source = authenticated ? claimed : "api";
     const reason = typeof body.reason === "string" ? body.reason : undefined;
     killSwitch.engage(source, reason, { unauthenticated: !authenticated });
-    sendJson(res, 200, { killed: true });
+    // The kill is in force in memory no matter what; the response only claims
+    // durability when the persist actually succeeded.
+    sendJson(res, 200, { killed: true, ...degradedFields() });
   }
 
   async function postCeremonyStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -235,18 +255,32 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         record.epoch !== killSwitch.epoch;
       if (dead) ceremonies.delete(staleId);
     }
-    // One live ceremony per owner per kill epoch: a repeat GO 1/2 replaces
-    // the owner's own pending ceremony — the superseded id stops working the
-    // moment the new one is minted — so a single owner session, however
-    // hostile, occupies exactly one slot.
-    for (const [supersededId, record] of ceremonies) {
-      if (record.ceremony.ownerId === session.ownerId) ceremonies.delete(supersededId);
+    // One live ceremony per owner per kill epoch, and GO 1/2 is IDEMPOTENT:
+    // while this owner already has a live ceremony (post-purge, so it is
+    // current-epoch, unconsumed and unexpired), return THAT ceremony with
+    // its clocks untouched. A double-click, a browser retry or a second tab
+    // must not invalidate the id the owner is holding — and a stolen
+    // same-owner session must not be able to reset the cooldown forever by
+    // hammering this route. Abandoning a pending ceremony is an explicit,
+    // separate act: DELETE /restore/ceremony/:id, then start anew.
+    for (const [existingId, record] of ceremonies) {
+      if (record.ceremony.ownerId === session.ownerId) {
+        sendJson(res, 200, {
+          id: existingId,
+          state: record.ceremony.tick(),
+          cooldownRemainingMs: record.ceremony.cooldownRemainingMs(),
+          expiresAt: record.ceremony.expiresAt,
+        });
+        return;
+      }
     }
-    // Secondary backstop only — with the purge and the per-owner limit above,
-    // size counts distinct owners, so reaching this ceiling means a flood of
-    // hostile sessions, not normal use. Full fails closed: new ceremonies are
-    // refused, a live ceremony is never evicted to make room, and fullness
-    // can only ever deny a restore path, never open one.
+    // Secondary backstop only — with the purge and the one-per-owner rule
+    // above, size counts distinct owners, so reaching this ceiling means a
+    // flood of hostile sessions, not normal use. Full fails closed: new
+    // ceremonies are refused (an owner with a pending one still gets it back
+    // via the idempotent path above), a live ceremony is never evicted to
+    // make room, and fullness can only ever deny a restore path, never open
+    // one.
     if (ceremonies.size >= MAX_CEREMONY_RECORDS) {
       sendJson(res, 409, { error: "ceremony rejected" });
       return;
@@ -260,6 +294,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       id,
       state: ceremony.tick(),
       cooldownRemainingMs: ceremony.cooldownRemainingMs(),
+      expiresAt: ceremony.expiresAt,
     });
   }
 
@@ -284,7 +319,32 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         : record.epoch !== killSwitch.epoch
           ? "expired"
           : ticked;
-    sendJson(res, 200, { state, cooldownRemainingMs: record.ceremony.cooldownRemainingMs() });
+    sendJson(res, 200, {
+      state,
+      cooldownRemainingMs: record.ceremony.cooldownRemainingMs(),
+      expiresAt: record.ceremony.expiresAt,
+    });
+  }
+
+  function deleteCeremony(req: IncomingMessage, res: ServerResponse, id: string): void {
+    // The explicit cancel: the ONLY way to abandon a pending ceremony, since
+    // GO 1/2 is idempotent and never replaces one implicitly. Cancelling
+    // deletes server state, so it can only make restore harder — the next
+    // GO 1/2 starts a fresh ceremony with a fresh cooldown. Kill state is
+    // untouched.
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const record = ceremonies.get(id);
+    // Same absence semantics as GET: another owner's ceremony reads as absent.
+    if (record === undefined || record.ceremony.ownerId !== session.ownerId) {
+      sendJson(res, 404, { error: `no ceremony "${id}"` });
+      return;
+    }
+    ceremonies.delete(id);
+    sendJson(res, 200, { cancelled: true });
   }
 
   async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -399,6 +459,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
     if (method === "GET" && ceremonyMatch) {
       return getCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
+    }
+    if (method === "DELETE" && ceremonyMatch) {
+      return deleteCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
     }
     if (method === "POST" && path === "/restore") return postRestore(req, res);
     if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);

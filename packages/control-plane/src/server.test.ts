@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -310,13 +310,14 @@ describe("control-plane HTTP API", () => {
       (await (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(session.token) })).json()) as {
         state: string;
         cooldownRemainingMs: number;
+        expiresAt: number;
       };
 
-    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 30_000 });
+    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 30_000, expiresAt: 300_000 });
     c.advance(10_000);
-    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 20_000 });
+    expect(await read()).toEqual({ state: "go1", cooldownRemainingMs: 20_000, expiresAt: 300_000 });
     c.advance(20_000);
-    expect(await read()).toEqual({ state: "ready", cooldownRemainingMs: 0 });
+    expect(await read()).toEqual({ state: "ready", cooldownRemainingMs: 0, expiresAt: 300_000 });
   });
 
   it("GET /restore/ceremony/:id needs a session; unknown and foreign ids read as absent", async () => {
@@ -625,6 +626,63 @@ describe("control-plane HTTP API", () => {
     expect(await (await fetch(`${url2}/status`)).json()).toEqual({ killed: false });
   });
 
+  it("deleting the state file of an initialised store boots FAIL-CLOSED, not fresh", async () => {
+    const c = clock();
+    const stateFile = tempStateFile();
+    const before = createControlPlane({ now: c.now, killStateFile: stateFile });
+    before.killSwitch.engage("button", "incident");
+
+    rmSync(stateFile); // the file vanishes — deletion, tampering, wrong volume
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const after = createControlPlane({ now: c.now, killStateFile: stateFile });
+      expect(after.killSwitch.killed).toBe(true); // NOT a first boot: the marker says this store has history
+      expect(errors).toHaveBeenCalled();
+      const [entry] = after.killSwitch.auditLog();
+      expect(entry.type === "kill" && entry.event.reason).toMatch(/missing/);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a never-initialised store is a genuine first boot: not killed", () => {
+    const cp = createControlPlane({ now: clock().now, killStateFile: tempStateFile() });
+    expect(cp.killSwitch.killed).toBe(false);
+    expect(cp.killSwitch.epoch).toBe(0);
+  });
+
+  it("failed persistence is admitted on the wire: /kill and /status report degraded durability", async () => {
+    const c = clock(500);
+    // A DIRECTORY where the state file should be: loading fails closed
+    // (not a regular file) and every save fails (rename onto a directory) —
+    // a deterministic, real-filesystem persistence failure.
+    const stateDir = mkdtempSync(join(tmpdir(), "ownerswitch-test-"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cp = createControlPlane({ now: c.now, killStateFile: stateDir });
+      expect(cp.killSwitch.killed).toBe(true); // fail-closed boot...
+      expect(cp.killSwitch.persistenceDegraded).toBe(true); // ...whose own persist already failed
+
+      const url = await start(cp);
+      const kill = await fetch(`${url}/kill`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "manual stop" }),
+      });
+      // the kill is in force, but the response does not claim durability it lacks
+      expect(await kill.json()).toEqual({ killed: true, persistenceDegraded: true });
+      expect(await (await fetch(`${url}/status`)).json()).toEqual({
+        killed: true,
+        reason: "manual stop",
+        at: 500,
+        persistenceDegraded: true,
+      });
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
   /** GO 1/2 for `count` DISTINCT owners; returns their sessions and ceremony ids. */
   const fillCeremonies = async (url: string, now: () => number, count: number) => {
     const sessions = [];
@@ -637,27 +695,79 @@ describe("control-plane HTTP API", () => {
     return { sessions, ids };
   };
 
-  it("one live ceremony per owner: a repeat GO 1/2 replaces it, and the older id stops working", async () => {
+  it("GO 1/2 is idempotent: a repeat returns the SAME ceremony — same id, same expiry, cooldown NOT reset", async () => {
     const c = clock();
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
     const session = createOwnerSession("adam", { now: c.now });
 
     cp.killSwitch.engage("api");
-    const first = await startCeremony(url, session.token);
-    const second = await startCeremony(url, session.token);
-    expect(second).not.toBe(first);
+    const firstRes = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(firstRes.status).toBe(201);
+    const first = (await firstRes.json()) as { id: string; cooldownRemainingMs: number; expiresAt: number };
+    expect(first.cooldownRemainingMs).toBe(30_000);
 
-    // the replaced ceremony is gone from every surface...
-    const read = await fetch(`${url}/restore/ceremony/${first}`, { headers: bearer(session.token) });
-    expect(read.status).toBe(404);
+    c.advance(10_000); // a retry, a double-click, a second tab — 10 s later
+    const repeatRes = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+    });
+    expect(repeatRes.status).toBe(200); // returned, not created
+    const repeat = (await repeatRes.json()) as { id: string; cooldownRemainingMs: number; expiresAt: number };
+    expect(repeat.id).toBe(first.id); // same ceremony...
+    expect(repeat.expiresAt).toBe(first.expiresAt); // ...same expiry...
+    expect(repeat.cooldownRemainingMs).toBe(20_000); // ...and the cooldown kept counting — NOT reset
+
+    // the id the owner has been holding all along still spends
+    c.advance(20_000); // 30 s since GO 1/2
+    expect((await postRestore(url, session.token, first.id)).status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("DELETE /restore/ceremony/:id is the explicit cancel: the id dies, and GO 1/2 then mints fresh", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const owner = createOwnerSession("adam", { now: c.now });
+    const other = createOwnerSession("eve", { now: c.now });
+
+    cp.killSwitch.engage("api");
+    const id = await startCeremony(url, owner.token);
+
+    // no session -> 401; a foreign owner sees absence and cancels nothing
+    expect((await fetch(`${url}/restore/ceremony/${id}`, { method: "DELETE" })).status).toBe(401);
+    const foreign = await fetch(`${url}/restore/ceremony/${id}`, {
+      method: "DELETE",
+      headers: bearer(other.token),
+    });
+    expect(foreign.status).toBe(404);
+    expect(
+      (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(owner.token) })).status,
+    ).toBe(200); // still alive
+
+    // the owner cancels: the id is gone from every surface and never spends
+    const cancel = await fetch(`${url}/restore/ceremony/${id}`, {
+      method: "DELETE",
+      headers: bearer(owner.token),
+    });
+    expect(cancel.status).toBe(200);
+    expect(await cancel.json()).toEqual({ cancelled: true });
+    expect(
+      (await fetch(`${url}/restore/ceremony/${id}`, { headers: bearer(owner.token) })).status,
+    ).toBe(404);
     c.advance(30_000);
-    const spendOld = await postRestore(url, session.token, first);
-    expect(spendOld.status).toBe(409);
+    expect((await postRestore(url, owner.token, id)).status).toBe(409);
     expect(cp.killSwitch.killed).toBe(true);
 
-    // ...and the replacement is the owner's one live ceremony, spendable normally
-    expect((await postRestore(url, session.token, second)).status).toBe(200);
+    // only after the explicit cancel does GO 1/2 mint a NEW ceremony — with a
+    // fresh cooldown of its own
+    const fresh = await startCeremony(url, owner.token);
+    expect(fresh).not.toBe(id);
+    c.advance(30_000);
+    expect((await postRestore(url, owner.token, fresh)).status).toBe(200);
     expect(cp.killSwitch.killed).toBe(false);
   });
 
@@ -718,10 +828,14 @@ describe("control-plane HTTP API", () => {
     expect(await overflow.json()).toEqual({ error: "ceremony rejected" });
     expect(cp.killSwitch.killed).toBe(true);
 
-    // an owner already holding a slot still can restart their OWN ceremony at
-    // the ceiling — replacement frees their slot before the ceiling is checked
-    const replaced = await startCeremony(url, sessions[5].token);
-    expect(replaced).not.toBe(ids[5]);
+    // an owner already holding a slot is never refused at the ceiling: the
+    // idempotent GO 1/2 hands back their own pending ceremony (200, same id)
+    const repeat = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(sessions[5].token),
+    });
+    expect(repeat.status).toBe(200);
+    expect(((await repeat.json()) as { id: string }).id).toBe(ids[5]);
 
     // and no other live ceremony was evicted: the very first is still spendable
     c.advance(30_000);

@@ -1,6 +1,15 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { KillStateFileStore, type PersistedKillState } from "./kill-state.js";
 
@@ -35,8 +44,52 @@ describe("KillStateFileStore", () => {
     const store = new KillStateFileStore(path);
     store.save(killedState);
     expect(existsSync(path)).toBe(true);
-    expect(existsSync(`${path}.tmp`)).toBe(false); // temp file was renamed, not left as a twin
+    // the random-named temp file was renamed into place, not left as a twin
+    expect(readdirSync(dirname(path)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(killedState); // plain JSON, auditable with cat
+    expect(statSync(path).mode & 0o777).toBe(0o600); // the state is nobody else's to read or replace
+  });
+
+  it("save provisions the initialisation marker; a missing state file then loads as corrupt, not first boot", () => {
+    const path = tempPath();
+    const store = new KillStateFileStore(path);
+    store.save(killedState);
+    expect(existsSync(store.markerPath)).toBe(true);
+
+    rmSync(path); // the state file vanishes — deleted, tampered with, or lost
+    const loaded = store.load();
+    expect(loaded.outcome).toBe("corrupt"); // NOT "absent": this store has history
+    if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/missing.*initialised/);
+  });
+
+  it("loading a marker-less state file heals the marker onto it (stores written before the marker existed)", () => {
+    const path = tempPath();
+    writeFileSync(path, `${JSON.stringify(killedState)}\n`, "utf8"); // a pre-marker store
+    const store = new KillStateFileStore(path);
+    expect(existsSync(store.markerPath)).toBe(false);
+    expect(store.load().outcome).toBe("loaded");
+    expect(existsSync(store.markerPath)).toBe(true); // from now on, missing != first boot
+  });
+
+  it("a symlink at the state path is refused, whatever it points at", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-killstate-"));
+    const target = join(dir, "target.json");
+    writeFileSync(target, `${JSON.stringify({ version: 1, killed: false, epoch: 0 })}\n`, "utf8");
+    const path = join(dir, "kill.json");
+    symlinkSync(target, path); // an attacker aims the state path somewhere else
+    const loaded = new KillStateFileStore(path).load();
+    expect(loaded.outcome).toBe("corrupt"); // boots killed — the link is never followed
+    if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/symlink|not a regular file/);
+  });
+
+  it("degrade() makes stale state unable to pass for healthy: next load fails closed", () => {
+    const path = tempPath();
+    const store = new KillStateFileStore(path);
+    store.save({ version: 1, killed: false, epoch: 2 }); // stale not-killed state on disk
+    store.degrade(); // called after a failed save of a NEWER state
+    const loaded = store.load();
+    expect(loaded.outcome).toBe("corrupt"); // never "loaded { killed: false }", never "absent"
+    expect(existsSync(store.markerPath)).toBe(true);
   });
 
   it("unparseable content loads as corrupt, with the why", () => {
@@ -71,10 +124,10 @@ describe("KillStateFileStore", () => {
     }
   });
 
-  it("an unreadable path (a directory where the file should be) loads as corrupt", () => {
+  it("a non-regular file (a directory where the file should be) loads as corrupt", () => {
     const dirAsFile = mkdtempSync(join(tmpdir(), "ownerswitch-killstate-"));
     const loaded = new KillStateFileStore(dirAsFile).load();
     expect(loaded.outcome).toBe("corrupt");
-    if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/cannot read/);
+    if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/not a regular file/);
   });
 });
