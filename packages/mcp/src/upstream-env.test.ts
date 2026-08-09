@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { upstreamEnvironment } from "./upstream-env.js";
+import { ConfigError } from "./config.js";
+import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 
 const TOKEN = "ghp_ownerswitch_own_credential_0123456789";
 const DEVICE_SECRET = "device-secret-value";
@@ -62,5 +63,69 @@ describe("upstreamEnvironment — the spawn config the upstream child receives",
       secretValues: ["", undefined],
     });
     expect(env).toEqual({ PATH: "/usr/bin", HOME: "/h" });
+  });
+
+  it("strips by NAME even when the value doesn't byte-match anything in secretValues", () => {
+    // a known credential-alias NAME holding a value the value-filter can't
+    // catch (stale, truncated, differently-encoded, or just not yet known to
+    // this call) — the name filter is defense in depth for exactly this
+    const env = upstreamEnvironment({
+      base: { PATH: "/usr/bin", GITHUB_TOKEN: "some-other-value-not-in-secretValues" },
+      secretValues: [TOKEN], // does NOT include "some-other-value-not-in-secretValues"
+      secretNames: ["GITHUB_TOKEN"],
+    });
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("name matching is case-insensitive", () => {
+    const env = upstreamEnvironment({
+      base: { PATH: "/usr/bin", github_token: "whatever" },
+      secretNames: ["GITHUB_TOKEN"],
+    });
+    expect(env.github_token).toBeUndefined();
+  });
+
+  it("without secretNames, only OWNERSWITCH_* and value matches are stripped", () => {
+    const env = upstreamEnvironment({
+      base: { PATH: "/usr/bin", GITHUB_TOKEN: "unrelated-value" },
+      secretValues: [TOKEN],
+    });
+    expect(env.GITHUB_TOKEN).toBe("unrelated-value"); // no secretNames given: passes through
+  });
+});
+
+describe("assertUpstreamArgsCredentialFree — argv is a worse leak surface than env", () => {
+  it("refuses to start when an upstream.args entry contains a gateway credential value", () => {
+    expect(() =>
+      assertUpstreamArgsCredentialFree(["--token", TOKEN, "--verbose"], [TOKEN]),
+    ).toThrowError(ConfigError);
+    try {
+      assertUpstreamArgsCredentialFree(["--token", TOKEN, "--verbose"], [TOKEN]);
+      throw new Error("expected assertUpstreamArgsCredentialFree to throw");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // names the OFFENDING ARGUMENT (by position) — never the secret value
+      expect(message).toContain("upstream.args[1]");
+      expect(message).not.toContain(TOKEN);
+    }
+  });
+
+  it("passes when no argument contains a gateway secret", () => {
+    expect(() =>
+      assertUpstreamArgsCredentialFree(["--flag", "value"], [TOKEN, DEVICE_SECRET]),
+    ).not.toThrow();
+  });
+
+  it("is a no-op when args is undefined or no secret values are given", () => {
+    expect(() => assertUpstreamArgsCredentialFree(undefined, [TOKEN])).not.toThrow();
+    expect(() => assertUpstreamArgsCredentialFree(["--token", TOKEN], [])).not.toThrow();
+    expect(() => assertUpstreamArgsCredentialFree(["--token", TOKEN], [undefined, ""])).not.toThrow();
+  });
+
+  it("catches a credential composed into a larger argument value", () => {
+    expect(() =>
+      assertUpstreamArgsCredentialFree([`--header=Bearer ${TOKEN}`], [TOKEN]),
+    ).toThrowError(/upstream\.args\[0\]/);
   });
 });

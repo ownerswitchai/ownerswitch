@@ -117,7 +117,16 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
   }
 
   async function status(id: string): Promise<VetoWireStatus | "missing"> {
-    const res = await request(new URL(`/veto/${encodeURIComponent(id)}`, baseUrl), { method: "GET" });
+    // cache: "no-store" plus explicit request headers: a cached "released"
+    // is exactly as dangerous as a cached killed:false — it would resurrect
+    // a spent release. The control plane also serves /veto/:id with
+    // Cache-Control: no-store (server.ts sendJson) — both ends refuse
+    // caching, matching the gateway's /status client (client.ts).
+    const res = await request(new URL(`/veto/${encodeURIComponent(id)}`, baseUrl), {
+      method: "GET",
+      cache: "no-store",
+      headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
+    });
     if (res.status === 404) return "missing";
     if (!res.ok) {
       throw new VetoClientError(`control plane refused veto status lookup (HTTP ${res.status})`, res.status);

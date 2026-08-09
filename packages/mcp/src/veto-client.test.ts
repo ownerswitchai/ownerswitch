@@ -59,6 +59,22 @@ describe("createVetoClient", () => {
     await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toBe("spent");
   });
 
+  it("status() requests /veto/:id with caching defeated — a cached 'released' is as dangerous as a cached killed:false", async () => {
+    let captured: RequestInit | undefined;
+    const capturing: typeof fetch = async (_input, init) => {
+      captured = init;
+      return new Response(JSON.stringify({ status: "pending" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    await client(capturing).status("veto_1");
+    expect(captured?.cache).toBe("no-store");
+    const headers = new Headers(captured?.headers);
+    expect(headers.get("cache-control")).toContain("no-store");
+    expect(headers.get("pragma")).toBe("no-cache");
+  });
+
   it("times out hung requests and fails closed", async () => {
     const hanging: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {

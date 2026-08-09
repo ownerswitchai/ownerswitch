@@ -169,10 +169,11 @@ export function honeytokenTripped(tool: string, canaryIds: string[]): OwnerSwitc
  * yes and run. The approval is void: a retry goes through the whole
  * decision path again from the start.
  *
- * The guarantee behind this refusal, stated precisely: an action not yet
- * dispatched when the kill lands is refused; an action already dispatched
- * cannot be recalled. The refusal window closes at dispatch — the same
- * in-flight boundary THREAT-MODEL.md draws for the kill switch itself.
+ * The guarantee behind this refusal, stated precisely: a ticket is refused
+ * if the final pre-dispatch live-state check observes a kill or an epoch
+ * change. A kill landing after that check may race with dispatch; once the
+ * connector call is dispatched it cannot be recalled — the same in-flight
+ * boundary THREAT-MODEL.md draws for the kill switch itself.
  */
 export function ticketRefused(
   tool: string,

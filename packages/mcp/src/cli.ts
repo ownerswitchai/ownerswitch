@@ -19,9 +19,16 @@ import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
-import { upstreamEnvironment } from "./upstream-env.js";
+import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
+
+/**
+ * Un-prefixed alias names a gateway credential might ride into the upstream
+ * child under, stripped from its environment by NAME regardless of value
+ * (see upstream-env.ts). OWNERSWITCH_* names are always stripped separately.
+ */
+const KNOWN_CREDENTIAL_ENV_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "DEVICE_SECRET", "CANARY_KEY"];
 
 /**
  * Arm the honeytoken tripwire when a registry is configured. Opt-in, and
@@ -124,24 +131,35 @@ async function runGateway(argv: string[]): Promise<void> {
     });
   };
 
+  // Every gateway credential this process holds, in one place: reused for
+  // both the environment filter (by value AND by known alias name) and the
+  // args check below (by value — a credential in argv is a hard refusal,
+  // not a filter, since argv is visible to any process that can read it).
+  const gatewaySecretValues = [
+    config.device.secret,
+    githubToken,
+    process.env.OWNERSWITCH_CANARY_KEY,
+    process.env.OWNERSWITCH_DEVICE_SECRET,
+  ];
+  // Command-line arguments are a worse leak surface than an environment
+  // variable (visible via /proc/<pid>/cmdline, `ps aux`, …) — refuse to
+  // start rather than filter, naming the offending argument, never its value.
+  assertUpstreamArgsCredentialFree(config.upstream.args, gatewaySecretValues);
+
   await proxy.connectUpstream(
     new StdioClientTransport({
       command: config.upstream.command,
       args: config.upstream.args ?? [],
       // The child's environment is EXACTLY upstreamEnvironment()'s output:
       // built explicitly, every gateway/executor/connector credential
-      // stripped by name (OWNERSWITCH_*) and by value (aliases). The
-      // upstream child is the agent's side of the boundary — it must never
-      // inherit the credential the executor exists to keep away from it.
+      // stripped by name (OWNERSWITCH_* and known aliases) and by value.
+      // The upstream child is the agent's side of the boundary — it must
+      // never inherit the credential the executor exists to keep away from it.
       env: upstreamEnvironment({
         base: getDefaultEnvironment(),
         configured: config.upstream.env,
-        secretValues: [
-          config.device.secret,
-          githubToken,
-          process.env.OWNERSWITCH_CANARY_KEY,
-          process.env.OWNERSWITCH_DEVICE_SECRET,
-        ],
+        secretValues: gatewaySecretValues,
+        secretNames: KNOWN_CREDENTIAL_ENV_NAMES,
       }),
       cwd: config.upstream.cwd,
       stderr: "inherit",

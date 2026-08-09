@@ -36,9 +36,11 @@ import { createVetoClient } from "./veto-client.js";
  * wire, a fake upstream MCP server, and a fake GitHub HTTP client. The
  * agent asks, OwnerSwitch performs, the agent never sees a credential.
  *
- * Stated precisely (DESIGN.md §3): an action NOT YET DISPATCHED when the
- * kill lands is refused; an action already dispatched cannot be recalled.
- * Every "kill wins" test here exercises the refused side of that line.
+ * Stated precisely (DESIGN.md §3): a ticket is refused if the final
+ * pre-dispatch live-state check observes a kill or an epoch change. A kill
+ * landing after that check may race with dispatch; once dispatched it
+ * cannot be recalled. Every "kill wins" test here exercises a kill the
+ * pre-dispatch check does observe.
  */
 
 const CP_URL = "http://control-plane.test";
@@ -254,8 +256,8 @@ const resultJson = (result: unknown): unknown => {
   return JSON.parse(first.text);
 };
 
-describe("the central claim: a kill before dispatch refuses the ticket, backend never called", () => {
-  it("an approval is minted, a kill lands before dispatch, the ticket is refused", async () => {
+describe("the central claim: a kill the pre-dispatch check observes refuses the ticket, backend never called", () => {
+  it("an approval is minted, a kill lands before the pre-dispatch check, the ticket is refused", async () => {
     const t = await startRoutedProxy();
 
     // the owner-review flow: held, then released by silence — an approval
@@ -264,7 +266,7 @@ describe("the central claim: a kill before dispatch refuses the ticket, backend 
 
     // The retry re-evaluates against live kill state (fetch #2, alive) and
     // mints the ticket — then the kill lands BEFORE the executor's live
-    // re-check (fetch #3). Not yet dispatched → refused.
+    // re-check (fetch #3), so that check observes it and refuses.
     t.controlPlane.hooks.onStatus = (n) => {
       if (n === 3) {
         t.controlPlane.state.killed = true;
@@ -395,12 +397,12 @@ describe("the central claim: a kill before dispatch refuses the ticket, backend 
     await t.close();
   });
 
-  it("a kill between the re-check and dispatch is still caught by the pre-dispatch check", async () => {
+  it("a kill the first re-check misses is still caught by the second, pre-dispatch check", async () => {
     const t = await startRoutedProxy({ lane: "allow" });
     // fetch #1 decision, #2 first re-check (alive), #3 the pre-dispatch
-    // check — the kill lands there. This check NARROWS the undetectable
-    // window to the dispatch itself; a kill later than this cannot recall
-    // an action already on the wire, and nothing can (DESIGN.md §3).
+    // check — the kill lands there and that check observes it. A kill
+    // landing after THIS check resolves, or while the connector call is on
+    // the wire, races with dispatch instead of being caught (DESIGN.md §3).
     t.controlPlane.hooks.onStatus = (n) => {
       if (n === 3) {
         t.controlPlane.state.killed = true;

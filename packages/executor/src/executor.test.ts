@@ -58,9 +58,9 @@ describe("Executor", () => {
     const { calls, backend } = recordingBackend();
 
     // First fetch (the re-check) sees a healthy world; the kill lands before
-    // the second, pre-dispatch fetch. The pre-dispatch check NARROWS this
-    // race — a kill after it, or mid-flight, is out of reach by design: not
-    // yet dispatched → refused; already dispatched → not recallable.
+    // the second, pre-dispatch fetch — so THAT check observes it and
+    // refuses. A kill landing after this check resolves, or mid-flight, is
+    // out of reach by design: it races with dispatch instead of being caught.
     const answers: LiveKillState[] = [
       { killed: false, epoch: 3 },
       { killed: true, epoch: 4 },

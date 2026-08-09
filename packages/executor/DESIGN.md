@@ -128,18 +128,20 @@ control plane** — never a cached answer:
 3. `now < ticket.expiresAt`;
 4. the nonce must not already be burned.
 
-**The guarantee, stated precisely: an action not yet dispatched when the
-kill lands is refused; an action already dispatched cannot be recalled.**
-The refusal boundary is dispatch — the moment the connector call is on the
-wire. A kill can land after the last check and before (or during) that
-call, and against an external API with no fencing no mechanism can close
-that gap; anything claiming otherwise would be theater. This is the same
-boundary the kill switch itself documents for in-flight actions
-(`packages/mcp/THREAT-MODEL.md`, `gateway/src/engine.ts`): kill stops *new*
-actions, it does not recall dispatched ones. What the executor does is run
-a **second live re-check immediately before dispatch**, after the nonce
-burn — it *narrows* the undetected window to the dispatch itself; it does
-not and cannot close it.
+**The guarantee, stated precisely: a ticket is refused if the final
+pre-dispatch live-state check observes a kill or an epoch change. A kill
+landing after that check may race with dispatch; once the connector call is
+dispatched it cannot be recalled.** The check is not the same instant as
+dispatch — there is a small, irreducible gap between the check resolving and
+the connector call going out, and a kill landing in that gap, or while the
+call is on the wire, is not caught. Against an external API with no fencing
+no mechanism can close that gap; anything claiming otherwise would be
+theater. This is the same boundary the kill switch itself documents for
+in-flight actions (`packages/mcp/THREAT-MODEL.md`, `gateway/src/engine.ts`):
+kill stops *new* actions, it does not recall dispatched ones. What the
+executor does is run a **second live re-check immediately before
+dispatch**, after the nonce burn — it *narrows* the window in which a kill
+can land undetected; it does not and cannot close it.
 
 **A veto release binds to its window's kill epoch — server-side.** The
 epoch rule would be worthless if it only covered the ticket: a veto window
@@ -230,15 +232,15 @@ Honesty about the boundary, in the same spirit as the threat model:
   this package never hears about it. The executor closes the gap *for
   actions routed through OwnerSwitch* — routing everything through
   OwnerSwitch is a deployment property, not something this code can force.
-- **Kill stops new executions, not in-flight ones.** Precisely: an action
-  not yet dispatched when the kill lands is refused; an action already
-  dispatched cannot be recalled (§3). The re-checks in §3 run up to
-  immediately before `backend.execute()`; once the connector call is on
-  the wire, a kill cannot recall it. This is the same enforcement boundary
-  the kill switch itself documents — kill guarantees no *new* authorized
-  action crosses the boundary, nothing more. What the executor removes is
-  the other half of that caveat: for actions routed through it, there are
-  no credentials issued downstream to outlive the kill.
+- **Kill stops new executions, not in-flight ones.** Precisely (§3): a
+  ticket is refused if the final pre-dispatch live-state check observes a
+  kill or an epoch change; a kill landing after that check may race with
+  dispatch, and once the connector call is on the wire it cannot be
+  recalled. This is the same enforcement boundary the kill switch itself
+  documents — kill guarantees no *new* authorized action crosses the
+  boundary, nothing more. What the executor removes is the other half of
+  that caveat: for actions routed through it, there are no credentials
+  issued downstream to outlive the kill.
 - **OwnerSwitch's credential is now the prize.** The executor holds a
   standing GitHub credential; whoever compromises the executor process
   merges without any ticket. Least privilege (a GitHub App with
@@ -246,13 +248,21 @@ Honesty about the boundary, in the same spirit as the threat model:
   one permission needed) shrinks the blast radius; it does not eliminate it.
   Two containments ship with the wiring. First, the upstream child process —
   the agent's side of the boundary — gets an EXPLICITLY built environment
-  with every gateway/executor/connector credential stripped, by name
-  (`OWNERSWITCH_*`) and by value (aliases), so the premise "the agent's side
-  holds no credential" cannot be silently falsified by environment
-  inheritance (`packages/mcp/src/upstream-env.ts`). Second, the backend
-  scrubs its own token from results and errors. The scrubbing is a SECOND
-  line of defence, not the design: the real connector client must be written
-  so a credential never enters a log or an error in the first place —
+  with every gateway/executor/connector credential stripped: by name
+  (`OWNERSWITCH_*` always, plus known alias names like `GITHUB_TOKEN` and
+  `DEVICE_SECRET` regardless of their current value) and by value (any
+  entry containing a known secret, so a credential can't ride in composed
+  into an unrelated variable). `upstream.args` gets the harder stance: a
+  credential value found there is not filtered, it is a startup refusal
+  naming which argument is at fault — command-line arguments are visible to
+  any process on the host that can read this process's argv, a worse leak
+  surface than an environment variable (`packages/mcp/src/upstream-env.ts`).
+  Together this means the premise "the agent's side holds no credential"
+  cannot be silently falsified by environment inheritance or a
+  misconfigured launch command. Second, the backend scrubs its own token
+  from results and errors. The scrubbing is a SECOND line of defence, not
+  the design: the real connector client must be written so a credential
+  never enters a log or an error in the first place —
   redaction only catches what should never have been emitted at all.
 - **Tickets are structs, not cryptography.** Gateway and executor are the
   same trust domain in v0 — a compromised process can mint its own
@@ -298,14 +308,14 @@ routes, ticket minting on yes, `executor.run()` instead of `forward()` for
 routed operations, result relayed to the agent
 (`packages/mcp/src/executor-route.ts`, `proxy.ts`, `config.ts`);
 credential scrubbing in the GitHub backend; end-to-end tests over a fake
-backend proving the claim as stated in §3 — a kill landing before dispatch
-refuses the ticket and the backend is never called (engaged,
-kill-then-restore epoch mismatch, and a spent veto release), expired
-ticket refused, replayed nonce refused, unreachable control plane refused,
-a happy path where the backend runs exactly once and the agent receives
-the result, never a token — and a leak test where the backend genuinely
-holds the credential and an upstream error that echoes it reaches the
-agent scrubbed.
+backend proving the claim as stated in §3 — a kill observed by the
+pre-dispatch check refuses the ticket and the backend is never called
+(engaged, kill-then-restore epoch mismatch, and a spent veto release),
+expired ticket refused, replayed nonce refused, unreachable control plane
+refused, a happy path where the backend runs exactly once and the agent
+receives the result, never a token — and a leak test where the backend
+genuinely holds the credential and an upstream error that echoes it
+reaches the agent scrubbed.
 
 **Still stubbed / not yet:** the live GitHub call —
 `GitHubMergePrExecutor`'s HTTP call stays behind its injectable

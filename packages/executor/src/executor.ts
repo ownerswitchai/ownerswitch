@@ -8,14 +8,14 @@ import type { ActionTicket } from "./ticket.js";
  *   4. only then does a backend run the action, with OwnerSwitch's own
  *      credential — the agent gets the result, never a token.
  *
- * The guarantee, stated precisely: an action NOT YET DISPATCHED when the
- * kill lands is refused; an action ALREADY DISPATCHED cannot be recalled.
- * Against an external API with no fencing there is no mechanism that could
- * close the gap between the last check and the connector call being on the
- * wire — the second re-check in run() narrows that gap, it does not close
- * it. This is the same boundary the kill switch itself documents for
- * in-flight actions (packages/mcp/THREAT-MODEL.md, gateway/src/engine.ts).
- * See DESIGN.md §3.
+ * The guarantee, stated precisely: a ticket is refused if the final
+ * pre-dispatch live-state check observes a kill or an epoch change. A kill
+ * landing after that check may race with dispatch; once the connector call
+ * is dispatched it cannot be recalled. Against an external API with no
+ * fencing there is no mechanism that could close that race — the second
+ * re-check in run() narrows it, it does not close it. This is the same
+ * boundary the kill switch itself documents for in-flight actions
+ * (packages/mcp/THREAT-MODEL.md, gateway/src/engine.ts). See DESIGN.md §3.
  */
 
 /** Live answer from the control plane at execution time. */
@@ -107,12 +107,14 @@ export class Executor {
 
     // Second live re-check, immediately before dispatch. This NARROWS the
     // window in which a kill can land unseen — it does not and cannot close
-    // it: a kill arriving after this fetch, or while the connector call is
-    // on the wire, cannot recall the action. The guarantee stays exactly
-    // "not yet dispatched → refused; already dispatched → not recallable".
-    // The nonce is checked against an empty set here because THIS attempt
-    // burned it above; a refusal at this point still spends the ticket —
-    // at-most-once means the owner re-approves, never that we retry.
+    // it: a kill arriving after this fetch resolves, or while the connector
+    // call is on the wire, races with dispatch and may not be caught. The
+    // guarantee stays exactly what this check can deliver: refused if THIS
+    // check observes a kill or an epoch change; not recallable once
+    // dispatched. The nonce is checked against an empty set here because
+    // THIS attempt burned it above; a refusal at this point still spends
+    // the ticket — at-most-once means the owner re-approves, never that we
+    // retry.
     const liveAtDispatch = await this.fetchLive();
     const lateRefusal = refuseTicket(ticket, liveAtDispatch, this.now(), NO_BURNED_NONCES);
     if (lateRefusal) return { status: "refused", refusal: lateRefusal };

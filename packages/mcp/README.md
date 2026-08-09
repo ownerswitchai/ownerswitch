@@ -322,7 +322,7 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 | `-32053` `OwnerVetoed` | the owner stopped this exact action | no |
 | `-32054` `Lockdown` | kill switch engaged, or control plane unreachable | once restored |
 | `-32055` `HoneytokenTripped` | a decoy credential surfaced in the call — the kill is already firing | no |
-| `-32056` `TicketRefused` | an executor-routed action was approved, but refused at execution time: expired, replayed, a kill happened since the approval, or its veto release predates a kill (release "spent") — it did NOT run. The precise guarantee: an action not yet dispatched when the kill lands is refused; an action already dispatched cannot be recalled | a retry starts a fresh owner decision |
+| `-32056` `TicketRefused` | an executor-routed action was approved, but refused at execution time: expired, replayed, a kill happened since the approval, or its veto release predates a kill (release "spent") — it did NOT run. The precise guarantee: a ticket is refused if the final pre-dispatch live-state check observes a kill or an epoch change; a kill landing after that check may race with dispatch, and once dispatched it cannot be recalled | a retry starts a fresh owner decision |
 | `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed — the action MAY OR MAY NOT have completed | check the resource first; a retry could duplicate the action |
 
 Each error's `data` carries the machine-readable detail:
