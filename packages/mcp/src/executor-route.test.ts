@@ -115,10 +115,12 @@ function createFakeControlPlane() {
     reason: undefined as string | undefined,
     epoch: 0,
     vetoStatus: "pending" as string,
+    /** when set, GET /veto/:id returns this raw body instead of JSON */
+    vetoRawBody: undefined as string | undefined,
   };
   let statusFetches = 0;
   const hooks = { onStatus: undefined as ((n: number) => void) | undefined };
-  const registrations: Array<{ body: unknown; killEpoch: number }> = [];
+  const registrations: Array<{ body: unknown; killEpoch: number; lost?: boolean }> = [];
 
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -146,7 +148,11 @@ function createFakeControlPlane() {
     const match = /^\/veto\/veto_(\d+)$/.exec(url.pathname);
     if (method === "GET" && match) {
       const registration = registrations[Number(match[1]) - 1];
-      if (registration === undefined) return json({ error: "no such window" }, 404);
+      // a restart loses window records: the id is simply unknown afterwards
+      if (registration === undefined || registration.lost === true) {
+        return json({ error: "no such window" }, 404);
+      }
+      if (state.vetoRawBody !== undefined) return new Response(state.vetoRawBody, { status: 200 });
       let status = state.vetoStatus;
       if (status === "released" && registration.killEpoch !== state.epoch) status = "spent";
       return json({ status });
@@ -160,6 +166,10 @@ function createFakeControlPlane() {
     registrations,
     fetchImpl,
     statusFetchCount: () => statusFetches,
+    /** simulate a control-plane restart: every live window record is forgotten */
+    restart: () => {
+      for (const registration of registrations) registration.lost = true;
+    },
   };
 }
 
@@ -327,6 +337,46 @@ describe("the central claim: a kill before dispatch refuses the ticket, backend 
     expect(t.controlPlane.registrations).toHaveLength(2);
     expect(t.controlPlane.registrations[1]?.killEpoch).toBe(1);
     expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+
+  it("a control-plane restart that loses the window refuses — it can never become a fresh release", async () => {
+    const t = await startRoutedProxy();
+
+    // window opens, releases… and then the control plane restarts and
+    // forgets it. Whatever the window's state WAS, the record is gone — the
+    // only safe meaning of a missing window is "start owner review over".
+    await refusalOf(t.client.callTool(MERGE));
+    t.controlPlane.state.vetoStatus = "released";
+    t.controlPlane.restart();
+
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.VetoPending); // a fresh PENDING window — never a release
+    expect(t.controlPlane.registrations).toHaveLength(2);
+    expect(t.github.merges).toEqual([]); // nothing executed
+    expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+
+  it("an unknown veto status refuses, fail closed — it does not read as a release", async () => {
+    const t = await startRoutedProxy();
+    await refusalOf(t.client.callTool(MERGE));
+    t.controlPlane.state.vetoStatus = "sideways"; // not in the protocol
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.Lockdown);
+    expect(t.github.merges).toEqual([]);
+    expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+
+  it("an unparseable veto-status body refuses, fail closed — garbage is not a release", async () => {
+    const t = await startRoutedProxy();
+    await refusalOf(t.client.callTool(MERGE));
+    t.controlPlane.state.vetoRawBody = "<html>proxy error</html>";
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.Lockdown);
+    expect(t.github.merges).toEqual([]);
+    expect(t.upstream.calls).toEqual([]);
     await t.close();
   });
 

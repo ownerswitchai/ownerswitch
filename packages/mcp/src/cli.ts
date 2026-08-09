@@ -19,6 +19,7 @@ import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
+import { upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
 
@@ -127,7 +128,21 @@ async function runGateway(argv: string[]): Promise<void> {
     new StdioClientTransport({
       command: config.upstream.command,
       args: config.upstream.args ?? [],
-      env: { ...getDefaultEnvironment(), ...(config.upstream.env ?? {}) },
+      // The child's environment is EXACTLY upstreamEnvironment()'s output:
+      // built explicitly, every gateway/executor/connector credential
+      // stripped by name (OWNERSWITCH_*) and by value (aliases). The
+      // upstream child is the agent's side of the boundary — it must never
+      // inherit the credential the executor exists to keep away from it.
+      env: upstreamEnvironment({
+        base: getDefaultEnvironment(),
+        configured: config.upstream.env,
+        secretValues: [
+          config.device.secret,
+          githubToken,
+          process.env.OWNERSWITCH_CANARY_KEY,
+          process.env.OWNERSWITCH_DEVICE_SECRET,
+        ],
+      }),
       cwd: config.upstream.cwd,
       stderr: "inherit",
     }),

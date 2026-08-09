@@ -208,7 +208,19 @@ function parseJsonBody(raw: string): Record<string, unknown> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json" });
+  // NOTHING this server serves is cacheable. Every response is live security
+  // state — kill state and epoch on /status, window status on /veto/:id,
+  // ceremony state — and a reverse proxy or intermediate cache replaying a
+  // stale {killed:false, epoch:N} or "released" after a kill would defeat
+  // the exact checks that state exists for (the executor's live re-checks,
+  // the window-epoch binding). no-store on EVERY response, plus Pragma for
+  // legacy intermediaries; the deployment requirement — no cache may sit in
+  // front of the control plane — is stated in packages/mcp/THREAT-MODEL.md.
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "cache-control": "no-store, max-age=0",
+    pragma: "no-cache",
+  });
   res.end(JSON.stringify(body));
 }
 

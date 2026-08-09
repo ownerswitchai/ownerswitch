@@ -244,6 +244,16 @@ Honesty about the boundary, in the same spirit as the threat model:
   merges without any ticket. Least privilege (a GitHub App with
   short-lived installation tokens scoped to exactly the repos and the
   one permission needed) shrinks the blast radius; it does not eliminate it.
+  Two containments ship with the wiring. First, the upstream child process —
+  the agent's side of the boundary — gets an EXPLICITLY built environment
+  with every gateway/executor/connector credential stripped, by name
+  (`OWNERSWITCH_*`) and by value (aliases), so the premise "the agent's side
+  holds no credential" cannot be silently falsified by environment
+  inheritance (`packages/mcp/src/upstream-env.ts`). Second, the backend
+  scrubs its own token from results and errors. The scrubbing is a SECOND
+  line of defence, not the design: the real connector client must be written
+  so a credential never enters a log or an error in the first place —
+  redaction only catches what should never have been emitted at all.
 - **Tickets are structs, not cryptography.** Gateway and executor are the
   same trust domain in v0 — a compromised process can mint its own
   tickets or skip the checks. Signed tickets and a separated executor are

@@ -19,5 +19,7 @@ export {
 } from "./executor-route.js";
 export type { ExecutorWiring, MintContext } from "./executor-route.js";
 
+export { upstreamEnvironment } from "./upstream-env.js";
+
 export { createVetoClient, VetoClientError } from "./veto-client.js";
 export type { DeviceIdentity, VetoClient, VetoClientOptions } from "./veto-client.js";

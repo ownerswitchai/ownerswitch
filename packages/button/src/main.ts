@@ -65,7 +65,11 @@ export async function fetchAuditStatus(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(new URL("/status", url), { signal: controller.signal });
+    // /status is live security state — never accept a cached answer
+    const res = await fetchImpl(new URL("/status", url), {
+      signal: controller.signal,
+      cache: "no-store",
+    });
     return (await res.json()) as { killed?: boolean; reason?: string; at?: number };
   } catch {
     return undefined;

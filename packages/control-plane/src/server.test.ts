@@ -96,6 +96,17 @@ describe("control-plane HTTP API", () => {
     server = undefined;
   });
 
+  it("GET /status is served uncacheable — a stale killed:false must be impossible to replay", async () => {
+    const url = await start(ephemeral({ now: clock().now }));
+    const res = await fetch(`${url}/status`);
+    expect(res.headers.get("cache-control")).toBe("no-store, max-age=0");
+    expect(res.headers.get("pragma")).toBe("no-cache");
+    // the veto status surface carries the same live-state weight: a cached
+    // "released" would resurrect a spent release across a kill
+    const veto = await fetch(`${url}/veto/nope`);
+    expect(veto.headers.get("cache-control")).toBe("no-store, max-age=0");
+  });
+
   it("GET /status before and after kill", async () => {
     const c = clock(1_000);
     const url = await start(ephemeral({ now: c.now }));
@@ -1146,6 +1157,38 @@ describe("control-plane HTTP API", () => {
     expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
     // and it stays spent — the epoch never goes back
     expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
+  });
+
+  it("no endpoint reports 'released' for an epoch-dead window — the binding has no bypass", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow({ agentId: "agent-1", tool: "github.merge_pr" }, cp.killSwitch.epoch, {
+      now: c.now,
+      windowMs: 1000,
+    });
+    window.markDelivered();
+    cp.vetoWindows.set("v-1", window);
+    c.advance(1001);
+    cp.killSwitch.engage("api", "incident");
+    cp.killSwitch.restore({ ceremonyId: "cer-nobypass", ownerId: "adam", completedAt: c.now() });
+
+    // GET /veto/:id — the ONLY status surface the gateway reads — says spent
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
+
+    // POST /veto/:id (the owner surface) cannot be used to read a release
+    // out of it either: the window is internally past pending/extended, so
+    // the veto attempt 409s — an error, not an authorization
+    const session = createOwnerSession("adam", { now: c.now });
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { status?: string };
+    expect(body.status).toBeUndefined(); // no status field at all on the error path
   });
 
   it("a vetoed window stays vetoed across a kill — 'no' survives everything", async () => {

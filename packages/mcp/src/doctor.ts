@@ -102,7 +102,11 @@ export async function checkControlPlane(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(new URL("/status", baseUrl), { signal: controller.signal });
+    // /status is live security state — never accept a cached answer
+    const res = await fetchImpl(new URL("/status", baseUrl), {
+      signal: controller.signal,
+      cache: "no-store",
+    });
     if (!res.ok) {
       return {
         reachable: false,

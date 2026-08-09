@@ -210,6 +210,23 @@ What limits the blast radius today — real code, caveats included:
   timeouts and garbage as killed within 500 ms. To keep agents running,
   an attacker must keep serving a well-formed lie; crashing, wedging, or
   firewalling the control plane stops the fleet instead of freeing it.
+- **`/status` must NEVER be cached — a deployment requirement.** Every
+  kill check in the system (the gateway's per-call lookup, the executor's
+  two live re-checks before dispatch) is a fetch of `GET /status`; a
+  reverse proxy or intermediate cache replaying a stale
+  `{killed:false, epoch:N}` after a kill would defeat all of them at once,
+  and a cached `"released"` on `/veto/:id` would resurrect a spent release
+  across a kill-and-restore. Both ends refuse caching in code: the control
+  plane serves EVERY response with `Cache-Control: no-store, max-age=0`
+  and `Pragma: no-cache` (`server.ts` `sendJson` — nothing this server
+  serves is cacheable), and clients fetch `/status` with
+  `cache: "no-store"` plus explicit no-store request headers
+  (`packages/gateway/src/client.ts`). The residual requirement is on the
+  deployment: do not place a cache, CDN, or "optimizing" reverse proxy in
+  front of the control plane, and if a proxy is unavoidable, it must be
+  configured to honor `no-store` on this origin. An infrastructure layer
+  that strips or ignores these headers reintroduces the stale-answer
+  window no client code can close.
 - **Device HMAC, scoped to the cheap direction.** Device secrets sign
   kill requests: HMAC-SHA256 over the exact bytes on the wire,
   single-use nonce, 60 s skew window, timing-safe comparison

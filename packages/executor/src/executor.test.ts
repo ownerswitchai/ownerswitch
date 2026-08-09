@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { Executor, type ExecutorBackend, type LiveKillState } from "./executor.js";
+import {
+  Executor,
+  type ExecutionOutcome,
+  type ExecutorBackend,
+  type LiveKillState,
+} from "./executor.js";
 import type { ActionTicket } from "./ticket.js";
 
 const TICKET: ActionTicket = {
@@ -69,6 +74,50 @@ describe("Executor", () => {
     expect(outcome.status).toBe("refused");
     if (outcome.status === "refused") expect(outcome.refusal.code).toBe("kill-engaged");
     expect(calls).toHaveLength(0); // never dispatched
+  });
+
+  it("pins the order: nonce burn, then pre-dispatch re-check, then dispatch", async () => {
+    let fetches = 0;
+    let fetchesAtDispatch = -1;
+    const calls: ActionTicket[] = [];
+    let replayDuringPreDispatch: ExecutionOutcome | undefined;
+
+    const backend: ExecutorBackend = {
+      execute: async (ticket) => {
+        fetchesAtDispatch = fetches;
+        calls.push(ticket);
+        return { resourceId: ticket.resourceId, detail: { merged: true } };
+      },
+    };
+    const executor: Executor = new Executor(backend, {
+      fetchLiveKillState: async () => {
+        fetches += 1;
+        if (fetches === 2) {
+          // The pre-dispatch re-check is IN FLIGHT. If (and only if) the
+          // burn precedes it, a concurrent replay of the SAME ticket must
+          // already refuse on the nonce — this pins burn-before-re-check,
+          // not just burn-before-dispatch. (The replay performs fetch #3
+          // for its own first check, then refuses without dispatching.)
+          replayDuringPreDispatch = await executor.run(TICKET);
+        }
+        return { killed: false, epoch: 3 };
+      },
+      now: () => 1_000,
+    });
+
+    const outcome = await executor.run(TICKET);
+    expect(outcome.status).toBe("executed");
+    expect(calls).toHaveLength(1); // dispatched exactly once, ever
+
+    // burn ordered BEFORE the pre-dispatch re-check completed
+    expect(replayDuringPreDispatch?.status).toBe("refused");
+    if (replayDuringPreDispatch?.status === "refused") {
+      expect(replayDuringPreDispatch.refusal.code).toBe("nonce-consumed");
+    }
+    // dispatch ordered AFTER the pre-dispatch re-check resolved: by the time
+    // the backend ran, all three fetches (two for this run, one for the
+    // replay's own first check) had already happened
+    expect(fetchesAtDispatch).toBe(3);
   });
 
   it("a late refusal still spends the ticket: burn happens before dispatch, not after", async () => {
