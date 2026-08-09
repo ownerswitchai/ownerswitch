@@ -33,6 +33,12 @@ importers:
         specifier: workspace:*
         version: link:../shared
 
+  packages/escalation:
+    dependencies:
+      '@ownerswitchai/shared':
+        specifier: workspace:*
+        version: link:../shared
+
   packages/executor:
     dependencies:
       '@ownerswitchai/gateway':
