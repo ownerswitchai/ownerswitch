@@ -17,6 +17,7 @@ export type {
   VetoWireStatus,
   WindowRevision,
   Delivery,
+  AckEvidence,
   OwnerAlertPush,
   VetoWindowDetail,
   SeenAck,
@@ -30,4 +31,10 @@ export type {
   MintedSession,
   OwnerAppEndpoint,
 } from "./types.js";
-export { OWNER_APP_ENDPOINTS, ENROLL_POP_LABEL, DEVICE_SIG_LABEL } from "./types.js";
+export {
+  OWNER_APP_ENDPOINTS,
+  ENROLL_POP_LABEL,
+  DEVICE_SIG_LABEL,
+  MIN_VETO_RESPONSE_MS_DEFAULT,
+  RENDERABLE_ALERT_V1_LIMITS,
+} from "./types.js";

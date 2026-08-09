@@ -43,6 +43,10 @@ section:target ~ section.default{display:none}
 .kv{display:grid;grid-template-columns:92px 1fr;gap:4px 10px;font-size:13px;line-height:1.5}
 .kv b{font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--ink-dim);text-transform:uppercase;padding-top:2px}
 .kv code{font-family:var(--mono);font-size:12px}
+/* Truthful rendering (DESIGN.md §3): every agent-supplied field renders
+   in its own bidi isolate, so legitimate RTL text displays correctly
+   but can never visually reorder across field boundaries (UTR #36). */
+.kv code,.kv span{unicode-bidi:isolate}
 .lane{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--red);text-transform:uppercase}
 .countdown{font-family:var(--mono);font-size:13px;color:var(--ink);margin-top:10px}
 .countdown i{color:var(--ink-dim);font-style:normal}

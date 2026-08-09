@@ -47,6 +47,37 @@ export const ENROLL_POP_LABEL = "ownerswitch/enroll-cheap-lane/v1";
  */
 export const DEVICE_SIG_LABEL = "ownerswitch/device-sig/v1";
 
+/**
+ * Minimum owner-response interval, ms (DESIGN.md §3). An ack is valid
+ * delivery evidence only when receivedAt ≤ deadline − this interval: a
+ * notification landing five milliseconds before the deadline must not
+ * count as "the owner was reached and chose not to object". 60 s is a
+ * decision interval (wake, read, unlock, tap — without rushing), small
+ * against the 4-minute window, and matches the 60 s skew/replay bound
+ * the signature scheme already uses. Server-side policy knob with a
+ * hard floor — never configurable to zero.
+ */
+export const MIN_VETO_RESPONSE_MS_DEFAULT = 60_000;
+
+/**
+ * RenderableAlertV1 — the bounded canonical alert format (DESIGN.md §3,
+ * "Truthful rendering"). The payload hash proves the device rendered
+ * the issued bytes; these bounds are what make the rendered bytes mean
+ * what the human read (UTR #36: bidi overrides, control characters, and
+ * truncation can make true bytes read as a false sentence). Enforced at
+ * MINT: fields exceeding the limits, containing any C0/C1 control
+ * (incl. CR/LF/TAB — single-line only), or containing explicit bidi
+ * embedding/override/isolate controls (LRE RLE LRO RLO PDF LRI RLI FSI
+ * PDI) are refused server-side. Clients render each field in its own
+ * bidi isolate and never ack a truncated render. Limits are Unicode
+ * code points, sized to fit un-truncated in common lock-screen budgets.
+ */
+export const RENDERABLE_ALERT_V1_LIMITS = {
+  agentId: 64,
+  tool: 64,
+  summary: 200,
+} as const;
+
 /* ------------------------------------------------------------------ */
 /* Enrolment — the root of trust (DESIGN.md §2)                        */
 /* ------------------------------------------------------------------ */
@@ -290,6 +321,28 @@ export interface Delivery {
 }
 
 /**
+ * Server-side record of an ACCEPTED ack — the full coordinates of what
+ * was actually shown, never a bare "seen" bit. Validation and insertion
+ * are one serialized operation: the insert compare-and-sets on the
+ * window's CURRENT revision, so an ack validated against revision 1
+ * that races the transition to revision 2 fails the CAS and is
+ * recorded-and-ignored. Release, revision change, and revocation
+ * operate on the same serialized window state; release for revision N
+ * counts only evidence with revision == N from a device still active at
+ * deviceGeneration (DESIGN.md §3, §4).
+ */
+export interface AckEvidence {
+  windowId: string;
+  revision: number;
+  deliveryId: string;
+  deviceId: string;
+  deviceGeneration: number;
+  payloadHash: Base64Url;
+  /** server receive time — the only clock that counts */
+  receivedAt: UnixMs;
+}
+
+/**
  * The encrypted push payload. It carries the renderable summary and the
  * delivery coordinates, because on the iOS cold-start path (WebKit bug
  * 283793) the service worker may wake with indexedDB undefined — the
@@ -299,9 +352,11 @@ export interface Delivery {
  * cold-push veto capability was dropped — it had no consumer, since the
  * only iOS gesture is the tap that opens the app where the key is
  * foreground-accessible (DESIGN.md §3). Payload capture gains one
- * window's summary — nothing actionable. The dispatcher keeps the whole
- * plaintext under RFC 8291's 3993-byte ceiling or degrades to a generic
- * alert, which never acks.
+ * window's summary — nothing actionable. agentId/tool/summary conform
+ * to RenderableAlertV1 (RENDERABLE_ALERT_V1_LIMITS above) — enforced at
+ * mint, so a conforming payload cannot hide or reorder its decisive
+ * facts. The dispatcher keeps the whole plaintext under RFC 8291's
+ * 3993-byte ceiling or degrades to a generic alert, which never acks.
  */
 export interface OwnerAlertPush {
   kind: "veto-window";
@@ -372,13 +427,16 @@ export interface VetoWindowDetail {
  * window's current open revision; `renderedPayloadHash` equals the hash
  * the server recorded for `deliveryId`; that Delivery belongs to the
  * signing device at its current generation; the window is still
- * pending/extended; server time is before that revision's deadline.
- * Anything else — late, stale-revision, wrong-hash, forged-delivery —
- * is recorded in the audit trail and ignored. An accepted ack is stored
- * as EVIDENCE {deviceId, revocationGeneration, receivedAt}, and
- * release-on-silence requires at least one piece of evidence from a
- * device still active at the same generation at the moment of the
- * release decision — an ack does not outlive its device (DESIGN.md §4).
+ * pending/extended; and receivedAt ≤ deadline − minVetoResponseMs
+ * (MIN_VETO_RESPONSE_MS_DEFAULT — a last-second delivery extends or
+ * holds, never releases). Anything else — late, last-second,
+ * stale-revision, wrong-hash, forged-delivery — is recorded in the
+ * audit trail and ignored. An accepted ack is stored as AckEvidence,
+ * inserted atomically under a compare-and-set on the current revision;
+ * release for revision N requires revision-N evidence from a device
+ * still active at the same generation at the moment of the release
+ * decision — an ack does not outlive its device or its revision
+ * (DESIGN.md §3, §4).
  */
 export interface SeenAck {
   windowId: string;
@@ -451,10 +509,13 @@ export type AssertionChallengeRequest = AssertionBinding;
  * mutation — a raced assertion mints one invite, one session, one
  * restore, one execution, never two (DESIGN.md §3). For purpose
  * "approve", the server additionally binds the approval record's
- * canonical action hash into the challenge record, and the record
- * itself is immutable once created — the passkey signs the exact
- * action the owner was shown, and confirm re-verifies record and kill
- * epoch (DESIGN.md §5).
+ * canonical action hash into the challenge record; the record itself
+ * is immutable once created and carries a TTL (minutes, not hours);
+ * confirm re-verifies — inside the atomic commit — record hash, kill
+ * epoch, session + device generation, and that the action STILL routes
+ * to the approve lane under the CURRENT policy; queued executions
+ * re-check the approving device's generation immediately before
+ * dispatch (DESIGN.md §3, §5).
  */
 export type AssertionChallenge = AssertionBinding & {
   challengeId: string;
@@ -479,14 +540,21 @@ export interface WebAuthnAssertion {
  * A fresh assertion presented to the control plane: GO 2 confirmation
  * (POST /restore gains this field), approve-lane confirmation (when the
  * approval queue exists), passkey-gated session minting, and the
- * device-invite / device-revoke gates. Verification, with each check in
- * its actual location: `type`, `challenge`, and `origin` are verified
- * from clientDataJSON; `rpIdHash` and the required UP+UV flags from
+ * device-invite / device-revoke gates. A captured-but-unredeemed
+ * BoundAssertion is bearer authority for its exact bound mutation, so
+ * EVERY redemption request is additionally DEVICE-SIGNED by the same
+ * device whose credential produced the assertion — a captured
+ * assertion alone redeems nothing, because the device key never
+ * travels (DESIGN.md §3). Verification, with each check in its actual
+ * location: `type`, `challenge`, and `origin` are verified from
+ * clientDataJSON; `rpIdHash` and the required UP+UV flags from
  * authenticatorData; the signature (ES256 on P-256 — the only algorithm
  * enrolment admits) with the stored public key over
  * authenticatorData || SHA-256(clientDataJSON); the challenge matched
  * and burned; the signature counter monotonic where the authenticator
- * provides one.
+ * provides one. Session validity + device generation, challenge
+ * ownership, target state, and kill epoch are re-verified INSIDE the
+ * atomic consume-and-commit, never before it (DESIGN.md §3).
  */
 export interface BoundAssertion {
   challengeId: string;
@@ -526,7 +594,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "delivery ack — the production caller of markDelivered(); counts only under the versioned-delivery rule: current open revision, matching renderedPayloadHash for a server-minted Delivery owned by the signing device at its current generation, window still pending/extended, server time before that revision's deadline; renderedAt is audit-only; everything else recorded and ignored; stores evidence {deviceId, revocationGeneration, receivedAt} — release requires evidence from a still-active device at the same generation",
+      "delivery ack — the production caller of markDelivered(); counts only under the versioned-delivery rule: current open revision, matching renderedPayloadHash for a server-minted Delivery owned by the signing device at its current generation, window still pending/extended, and receivedAt <= deadline - minVetoResponseMs (default 60 s — a last-second delivery extends or holds, never releases); renderedAt is audit-only; everything else recorded and ignored; stores revision-scoped AckEvidence inserted atomically via compare-and-set on the current revision — release for revision N requires revision-N evidence from a still-active device at the same generation",
   },
   {
     method: "POST",
@@ -555,7 +623,7 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/devices/invite",
-    auth: "owner-session + fresh UV assertion (purpose: device-invite); bootstrap/no-devices-left recovery via host CLI or permission-protected Unix socket — NEVER an HTTP loopback bypass",
+    auth: "owner-session + device-signed + fresh UV assertion (purpose: device-invite) — redemption is device-signed; bootstrap/no-devices-left recovery via host CLI or permission-protected Unix socket — NEVER an HTTP loopback bypass",
     status: "addition",
     purpose:
       "mint a single-use enrolment invite carrying the full WebAuthn creation contract; records the issuing device's {deviceId, revocationGeneration} (bootstrap: a bootstrap generation); token rides in the URL fragment where a URL form exists, is spent in a POST body, and is never logged",
@@ -579,7 +647,7 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/devices/:id/revoke",
-    auth: "owner-session + fresh UV assertion (purpose: device-revoke, subject: target deviceId); host CLI / Unix socket can always revoke",
+    auth: "owner-session + device-signed + fresh UV assertion (purpose: device-revoke, subject: target deviceId) — redemption is device-signed; host CLI / Unix socket can always revoke",
     status: "addition",
     purpose:
       "kill a device's standing: bump its revocation generation and atomically void credentials, push subscription, live sessions, outstanding challenges, unspent invites it issued, its deliveries, and its ack evidence",
@@ -603,18 +671,18 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/session",
-    auth: "verified assertion (purpose: session)",
+    auth: "device-signed + verified assertion (purpose: session) — redemption is device-signed",
     status: "addition",
     purpose:
-      "passkey-gated session minting — closes TODO(passkey) in auth.ts; atomic redemption: one assertion, one session; session binds to deviceId + revocation generation and is re-checked against the device on every use",
+      "passkey-gated session minting — closes TODO(passkey) in auth.ts; atomic redemption with all checks inside the commit: one assertion, one session; session binds to deviceId + revocation generation and is re-checked against the device on every use",
   },
   {
     method: "POST",
     path: "/restore",
-    auth: "owner-session + verified assertion (purpose: restore-go2, subject: ceremonyId)",
+    auth: "owner-session + device-signed + verified assertion (purpose: restore-go2, subject: ceremonyId) — redemption is device-signed",
     status: "extension",
     purpose:
-      "GO 2 stops accepting the bearer token GO 1 already saw; the ceremony stores GO 1 provenance {ownerId, go1SessionDeviceId, go1SessionGeneration, killEpoch}, re-checked atomically at GO 2 — revoking the GO 1 device kills the pending ceremony; ceremony + assertion consumed in one atomic spend",
+      "GO 2 stops accepting the bearer token GO 1 already saw; the ceremony stores GO 1 provenance {ownerId, go1SessionDeviceId, go1SessionGeneration, killEpoch}; session + device generation, challenge ownership, ceremony state, and kill epoch are re-verified INSIDE the atomic consume-and-commit — revoking the GO 1 device kills the pending ceremony",
   },
 ] as const;
 

@@ -464,6 +464,73 @@ owner never saw. The fix is a versioned delivery contract:
   oracle: a countable ack must name a delivery the server itself
   issued, of content the server itself hashed, to this device at this
   generation.
+- **Evidence is revision-scoped and inserted atomically.** An accepted
+  ack is stored as evidence `{deviceId, deviceGeneration, revision,
+  deliveryId, payloadHash, receivedAt}` — the full coordinates of what
+  was actually shown, never a bare "seen" bit. Validation and
+  insertion are **one serialized operation**: the insert
+  compare-and-sets on the window's *current* revision, so an ack
+  validated against revision 1 that races the transition to revision 2
+  fails the CAS and is recorded-and-ignored — it can never be stored
+  against a revision that was never rendered. Release, revision
+  change, and revocation all operate on that same serialized window
+  state, and release for revision N counts only evidence whose
+  `revision == N` from a device still active at its recorded
+  generation (§4).
+- **A last-second ack must not release.** `serverNow < deadline` alone
+  would let a notification landing five milliseconds before the
+  deadline count as "the owner was reached and chose not to object" —
+  when the owner had no chance to object at all, which inverts what
+  the veto lane means. So valid delivery evidence additionally
+  requires `receivedAt ≤ deadline − minVetoResponseMs`. The default is
+  **60 seconds**, and here is why: it is enough to wake the screen,
+  read a one-line summary, unlock, and tap VETO without rushing — a
+  *decision* interval, where 5–15 s would be a reflex test — while
+  staying small against the 4-minute window, so an on-time delivery
+  still leaves the owner most of it; and it matches the 60 s
+  skew/replay bound the device-signature scheme already uses, so the
+  deployment reasons about one human-and-network latency budget, not
+  two. The knob is server-side policy with a hard floor — never
+  configurable to zero. An ack inside the final interval is stored as
+  audit, ignored as evidence, and the window runs its fail-closed
+  course — extend, then hold — where the extension re-alerts with a
+  fresh revision and a fresh delivery, giving the owner a full
+  response interval. Late delivery can only ever add friction, never a
+  near-immediate release.
+
+### Truthful rendering — the hash proves bytes, not truth
+
+`textContent` stops markup injection (§4), and the payload hash proves
+the device rendered the bytes the server issued — neither proves the
+*human saw something true*. Agent-controlled text can still lie
+typographically: Unicode bidirectional overrides can visually reorder
+a summary so it reads as its own opposite, control characters can hide
+a decisive suffix, an embedded newline can push the fact that matters
+below an OS truncation fold — the class of attack catalogued in
+**Unicode Technical Report #36**. So what the owner is shown is a
+bounded canonical format, **`RenderableAlertV1`**, enforced where the
+text is *minted*:
+
+- **Per-field length limits** — `agentId` ≤ 64, `tool` ≤ 64, `summary`
+  ≤ 200 Unicode code points — chosen so a conforming alert fits
+  un-truncated inside common lock-screen budgets. If it fits by
+  construction, "the OS cut off the decisive part" stops being an
+  attack surface.
+- **Control characters are rejected, not escaped**: all C0/C1
+  controls, including CR, LF, and TAB — every field is a single line —
+  and every explicit bidirectional embedding, override, and isolate
+  control (LRE, RLE, LRO, RLO, PDF, LRI, RLI, FSI, PDI). The server
+  refuses to mint a `WindowRevision` whose fields violate this; the
+  client has nothing to sanitize, only to verify.
+- **Bidi isolation at display**: the client renders each field in its
+  own bidi isolate (CSS `unicode-bidi: isolate`; the scaffold does),
+  so legitimate RTL text displays correctly but can never visually
+  reorder *across* field boundaries.
+- **No ack from a truncated render.** If any critical field was
+  truncated or substituted at render time — an over-limit legacy
+  value, a platform that cut the body anyway — the surface shows the
+  generic alert and does not ack, like every other partial render
+  (§4).
 
 **Expensive lane.** Approve and GO 2 each require a fresh
 `navigator.credentials.get()` with `userVerification: "required"`
@@ -497,6 +564,44 @@ go1SessionGeneration, killEpoch}` — and GO 2 re-checks it atomically:
 revoking that device moves its generation and kills the pending
 ceremony. The veto stays the intentional, irreversible exception to
 identity continuity: any enrolled device stops, always.
+
+**And the checks live inside the commit, not before it.** Session
+validity and device generation, challenge ownership and binding, the
+target's state (ceremony ready; approval record intact), and the kill
+epoch are re-verified **inside the atomic consume-and-commit** — never
+in a look-before-you-leap prologue that a revocation, a kill, or a
+policy change can invalidate mid-flight. For approvals the commit-time
+check goes one further: the action must **still route to the
+`approve` lane under the current policy** when confirmed — an approval
+created while a tool sat in the approve lane must not execute after
+the policy moved it to `deny`, hash match or not — and an approval
+carries a **TTL** (minutes, not hours: a yes is not a standing grant,
+the executor's own rule). If execution is queued rather than
+immediate, the dispatcher re-checks the approving device's generation
+**immediately before dispatch** — an approval whose approver was
+revoked while it sat in the queue dies in the queue.
+
+**A captured, unredeemed assertion is bearer authority — so
+redemption is device-signed too.** Between the authenticator ceremony
+and the server's consume, a `BoundAssertion` in transit is a bearer
+token for its exact bound mutation: whoever holds those bytes can
+redeem them once. The two honest options: rest its confidentiality on
+HTTPS and origin integrity and say so, or close it. The call:
+**every assertion-redemption request is also device-signed** —
+`/session`, GO 2, approval confirm, device-invite, device-revoke — by
+the same device whose credential produced the assertion. The cost is
+one cheap-lane signature on a request the foreground app is already
+making: WebAuthn is a foreground ceremony, so wherever an assertion
+exists, the key store is reachable — the cold-path constraint (§3)
+never applies here. The gain is structural: a captured assertion
+alone now redeems nothing, because the device key never travels; and
+the identity-continuity line above becomes enforceable at the wire —
+transport signer, challenge issuer, and asserting credential are
+checked as one device before the commit begins. Honest bound: this
+does not defend against a compromised origin, which can request both
+the signature and the assertion while its code runs (§4); it defends
+the transport, and it removes the one place where a bare bearer blob
+was sufficient authority.
 
 **What a stolen, unlocked phone can and cannot do — plainly.** It can
 read every pending alert. It can veto everything (a stop: paralysis of
@@ -562,36 +667,45 @@ will actually prove, and what it will not.
   the full versioned-delivery rule (§3): current open revision,
   matching rendered-payload hash for a server-minted delivery, a
   delivery belonging to the signing device at its current generation,
-  window still `pending`/`extended`, and server time before that
-  revision's deadline — all judged on the **server's own clock and
-  records**. The client-supplied `renderedAt` is audit data, never
-  enforcement. Everything else — late, stale-revision, wrong-hash,
-  forged-delivery, post-deadline — is recorded in the audit trail and
-  **ignored**: a delayed, backdated, or replayed ack must never flip
+  window still `pending`/`extended`, and — not merely before the
+  deadline — received at least the **minimum owner-response interval**
+  before it (`receivedAt ≤ deadline − minVetoResponseMs`, default
+  60 s; §3): a last-second delivery extends or holds, never releases.
+  All of it judged on the **server's own clock and records**; the
+  client-supplied `renderedAt` is audit data, never enforcement.
+  Everything else — late, last-second, stale-revision, wrong-hash,
+  forged-delivery — is recorded in the audit trail and **ignored**: a
+  delayed, backdated, or replayed ack must never flip
   `markDelivered()` after the fact and let the next tick read past
   silence as consent. That is the fail-open direction this whole lane
   exists to avoid, so every one of these checks belongs to the server,
   not to anything the phone asserts.
-- **An ack must not outlive its device.** Delivery is recorded as
-  **evidence** — `{deviceId, revocationGeneration, receivedAt}` per
-  accepted ack — and a window releases on silence only if, *at the
-  moment of the release decision*, at least one piece of evidence
-  comes from a device that is still active at the same generation.
+- **An ack must not outlive its device — and evidence is
+  revision-scoped.** Delivery is recorded as **evidence** —
+  `{deviceId, deviceGeneration, revision, deliveryId, payloadHash,
+  receivedAt}` per accepted ack, inserted atomically under a
+  compare-and-set on the window's current revision (§3) — and a
+  revision releases on silence only if, *at the moment of the release
+  decision*, at least one piece of evidence **for that revision**
+  comes from a device still active at the same generation.
   `markDelivered()`'s boolean becomes this evidence list — a contract
-  change on the window record, stated here on purpose. Chosen over the
-  alternative (revocation eagerly sweeping delivered windows to
-  `held`) for three reasons: it is the same at-use standing check as
-  every session and challenge in this design; it keeps a legitimate
-  release alive when a *second, still-active* device also rendered the
-  alert — the eager sweep would hold windows the owner genuinely saw;
-  and it needs no revocation-time sweep racing in-flight ticks — the
-  check runs exactly once, where the release decision is made. The
-  consequences fall out correctly: a stolen phone that acked an open
-  window and was then revoked contributes nothing at the deadline, so
-  the window extends → `held`; zero active devices means zero valid
-  evidence, so *every* open window goes `held`. Two things stand
-  regardless: a release already executed is not recalled, and a veto
-  stays irreversible.
+  change on the window record, stated here on purpose — and release,
+  revision change, and revocation all act on the same serialized
+  window state. Chosen over the alternative (revocation eagerly
+  sweeping delivered windows to `held`) for three reasons: it is the
+  same at-use standing check as every session and challenge in this
+  design; it keeps a legitimate release alive when a *second,
+  still-active* device also rendered the alert — the eager sweep would
+  hold windows the owner genuinely saw; and it needs no
+  revocation-time sweep racing in-flight ticks — the check runs
+  exactly once, where the release decision is made. The consequences
+  fall out correctly: a stolen phone that acked an open window and was
+  then revoked contributes nothing at the deadline, so the window
+  extends → `held`; an ack that raced a revision change is never
+  stored against the revision it did not render; zero active devices
+  means zero valid evidence, so *every* open window goes `held`. Two
+  things stand regardless: a release already executed is not recalled,
+  and a veto stays irreversible.
 - **A forged ack fails open; the enrolment boundary is what prevents
   it.** Absence of acks degrades safely (extend → `held`). A *false*
   ack is the dangerous direction — it converts the veto lane's silence
@@ -673,17 +787,23 @@ will actually prove, and what it will not.
   from asking a key to sign while that code is resident on the
   device. Subresource integrity and a pinned native wrapper are
   further hardening, listed and not shipped.
-- **Agent-supplied strings render as text, never markup.** `agentId`,
-  `tool`, `summary` — every string that originates from an agent, a
-  tool call, or the server — is assigned via `textContent`, never
-  `innerHTML`, never interpolated into markup. The alert surface
-  renders attacker-influenced input *by design* (that is its job), and
-  a summary that could smuggle HTML into the owner-app origin would be
-  XSS exactly where the device keys live — able to request permissive
-  device signatures with the owner none the wiser. The scaffold
-  demonstrates the rule (`public/app.js` assigns the sample values
-  with `textContent` and says why); the strict CSP is the second
-  fence, never the first.
+- **Agent-supplied strings render as text, never markup — and text
+  alone is not truth.** `agentId`, `tool`, `summary` — every string
+  that originates from an agent, a tool call, or the server — is
+  assigned via `textContent`, never `innerHTML`, never interpolated
+  into markup. The alert surface renders attacker-influenced input *by
+  design* (that is its job), and a summary that could smuggle HTML
+  into the owner-app origin would be XSS exactly where the device keys
+  live — able to request permissive device signatures with the owner
+  none the wiser. But `textContent` only stops markup: bidi overrides,
+  control characters, and truncation games (UTR #36) can still make
+  true bytes read as a false sentence, which is why the fields are
+  bound to `RenderableAlertV1` — length-limited, single-line,
+  bidi-control-free at mint, bidi-isolated at display, and never acked
+  when truncated (§3, "Truthful rendering"). The scaffold demonstrates
+  both rules (`public/app.js` assigns sample values with
+  `textContent`; `app.css` isolates the fields); the strict CSP is the
+  second fence, never the first.
 - **No HMAC fallback is a security decision, not an omission.** A
   client-selectable key mode is attacker-negotiated: hostile served
   code would pick the downgrade at enrolment and walk away with a raw
@@ -712,17 +832,17 @@ and response shapes.
 
 | # | addition | route | auth | what it does |
 | --- | --- | --- | --- | --- |
-| 1 | delivery ack | `POST /veto/:id/seen` | device signature (owner-device class only) | the production caller of `markDelivered()` — an ack counts only under the versioned-delivery rule (§3): current open revision, matching rendered-payload hash for a server-minted `Delivery` belonging to the signing device at its current generation, window still `pending`/`extended`, server time before that revision's deadline; `renderedAt` is audit data, never enforcement; everything else recorded and ignored. Stores **evidence** `{deviceId, revocationGeneration, receivedAt}`; release requires evidence from a still-active device at the same generation (§4). Idempotent; 404 on unknown window |
+| 1 | delivery ack | `POST /veto/:id/seen` | device signature (owner-device class only) | the production caller of `markDelivered()` — an ack counts only under the versioned-delivery rule (§3): current open revision, matching rendered-payload hash for a server-minted `Delivery` belonging to the signing device at its current generation, window still `pending`/`extended`, and `receivedAt ≤ deadline − minVetoResponseMs` (default 60 s — a last-second delivery extends or holds, never releases); `renderedAt` is audit data, never enforcement; everything else recorded and ignored. Stores revision-scoped **evidence** `{deviceId, deviceGeneration, revision, deliveryId, payloadHash, receivedAt}`, inserted atomically via compare-and-set on the current revision; release for revision N requires revision-N evidence from a still-active device at the same generation (§3, §4). Idempotent; 404 on unknown window |
 | 2 | device-signed veto relay | `POST /veto/:id` (extended) | device signature **or** owner session | one-tap veto without a live session; `vetoedBy` resolves to the enrolled device's `ownerId`, audit records the device. Idempotent: re-vetoing an already-vetoed window succeeds as a no-op, so the service worker can retry blindly. (The v0.3 cold-push capability is **dropped** — no consumer; §3) |
 | 3 | window detail for rendering | `GET /veto/:id` (extended) | device signature for detail | adds `deadline`, `delivered`, the call summary, and the current `revision` — and the read itself mints a `Delivery` whose id and hash the ack must echo (§3); `status` speaks the shared wire vocabulary (`VetoWireStatus`, #28) including terminal `spent`. The existing open read stays status-only: what an alert says is for enrolled devices, not for anyone who can reach the port (same disclosure discipline as the `/status` `epoch` note) |
-| 4 | enrolment: invite | `POST /devices/invite` | owner session **+** fresh UV assertion (`purpose: "device-invite"`); bootstrap / no-devices-left recovery via the host CLI / permission-protected Unix socket (§2), **never** an HTTP loopback bypass | single-use, short-TTL invite + the full WebAuthn creation contract (RP info, opaque `user.id`, ES256-only `pubKeyCredParams`, authenticator selection); records the issuing device's `{deviceId, revocationGeneration}` (bootstrap invites: a bootstrap generation instead); token in the URL fragment where a URL form exists, spent in a POST body, never logged |
+| 4 | enrolment: invite | `POST /devices/invite` | owner session **+** device signature **+** fresh UV assertion (`purpose: "device-invite"`) — redemption is device-signed, §3; bootstrap / no-devices-left recovery via the host CLI / permission-protected Unix socket (§2), **never** an HTTP loopback bypass | single-use, short-TTL invite + the full WebAuthn creation contract (RP info, complete user entity, ES256-only `pubKeyCredParams`, authenticator selection); records the issuing device's `{deviceId, revocationGeneration}` (bootstrap invites: a bootstrap generation instead); token in the URL fragment where a URL form exists, spent in a POST body, never logged |
 | 5 | enrolment: enroll | `POST /devices/enroll` | invite token | verifies the WebAuthn registration in the right places (`type`/`challenge`/`origin` in `clientDataJSON`; `rpIdHash` + UP/UV flags in the authenticator data; ES256 on P-256) **and** the pinned cheap-lane proof of possession (§2) *before* the invite is consumed; re-checks the issuer's standing (or bootstrap generation + zero active devices) atomically at spend; stores **one** `EnrolledDevice` holding both credentials. `cheapLaneKey` is required — no HMAC mode exists to fall back to (§2). The invite burns atomically and **only on success** |
-| 6 | enrolment: list / revoke | `GET /devices`, `POST /devices/:id/revoke` | list: owner session; remote revoke: owner session **+** fresh UV assertion (`purpose: "device-revoke"`, subject = target device); host CLI / Unix socket can always revoke | list returns a **redacted `DeviceSummary`** — never the `EnrolledDevice` record: the push `endpoint`, `p256dh`, and above all the `auth` secret stay server-side (RFC 8291: disclosing `auth` lets anyone generate pushes the user agent accepts). Revoke bumps the revocation generation and atomically voids the device's credentials, push subscription, **live sessions, outstanding challenges, unspent invites it issued, its deliveries, and its ack evidence** (§2, §4) |
+| 6 | enrolment: list / revoke | `GET /devices`, `POST /devices/:id/revoke` | list: owner session; remote revoke: owner session **+** device signature **+** fresh UV assertion (`purpose: "device-revoke"`, subject = target device) — redemption is device-signed, §3; host CLI / Unix socket can always revoke | list returns a **redacted `DeviceSummary`** — never the `EnrolledDevice` record: the push `endpoint`, `p256dh`, and above all the `auth` secret stay server-side (RFC 8291: disclosing `auth` lets anyone generate pushes the user agent accepts). Revoke bumps the revocation generation and atomically voids the device's credentials, push subscription, **live sessions, outstanding challenges, unspent invites it issued, its deliveries, and its ack evidence** (§2, §4) |
 | 7 | push subscription upsert | `PUT /devices/:id/push-subscription` | device signature (owner-device class only) | stores/refreshes the Web Push subscription; the `:id` is derived from the authenticated identity — a mismatched path id is rejected. Subscriptions must be **restricted to the configured VAPID public key** (`applicationServerKey`, RFC 8292) — an unrestricted subscription is refused. The `endpoint` is an SSRF surface and is validated at write: HTTPS only, known push-service endpoint shapes, and rejection of localhost, private, link-local, and metadata addresses |
 | 8 | assertion challenge | `POST /assert/challenge` | device signature (owner-device class only) | mints a single-use challenge bound to a **discriminated** `{purpose, subject}` (subject required for `approve`/`restore-go2`/`device-revoke`, absent for `session`/`device-invite`), TTL ~2 min; the response carries `rpId` and `allowCredentials` naming the issuing device's paired credential (§3 — identity continuity); challenges record the minting device's revocation generation and die with it (§2). Redemption is atomic: verify, consume, exactly one protected mutation (§3) |
-| 9 | passkey-gated sessions | `POST /session` | verified assertion (`purpose: "session"`) | replaces in-process minting — closes `TODO(passkey)` in `auth.ts`. Atomic redemption: one assertion, one session (§3). The minted session records `deviceId` + revocation generation, and every session check re-verifies the device is still active (§2) |
-| 10 | GO 2 hardening | `POST /restore` (extended) | owner session **+** verified assertion (`purpose: "restore-go2"`, `subjectId` = ceremony id) | GO 2 stops accepting the bearer token GO 1 already saw. The ceremony record stores GO 1 provenance `{ownerId, go1SessionDeviceId, go1SessionGeneration, killEpoch}`; GO 2 re-checks it atomically — revoking the GO 1 device kills the pending ceremony — and consumes ceremony + assertion in one atomic spend (§3) |
-| 11 | alert dispatcher | (not a route) | — | the process that actually web-pushes on window register/extend: VAPID key custody, fan-out to enrolled devices, and per (device, revision) minting the `Delivery` the ack must echo (§3). Channel correctness: an RFC 8030 **Topic** so an undelivered push is *replaced*, not queued behind — the same topic token reused across transport retries of one revision, **rotated on pending → extended** so the extension supersedes the stale alert; push **TTL capped at the remaining deadline** (an alert that outlives its window is noise); the notification `tag` does the same replacement display-side, best-effort. Enforces the RFC 8291 **3993-byte plaintext ceiling** — an oversized summary degrades to a generic alert, which never acks (§4). It re-validates every `endpoint` at send time — the checks from row 7 again, **after DNS resolution as well as before**, plus no redirect following and hard size/timeout caps — because a stored-then-repointed hostname is the classic SSRF. Needs its own design; send-failure feeds back into nothing, because the window's fail-closed path already covers silence |
+| 9 | passkey-gated sessions | `POST /session` | device signature **+** verified assertion (`purpose: "session"`) — redemption is device-signed, §3 | replaces in-process minting — closes `TODO(passkey)` in `auth.ts`. Atomic redemption: one assertion, one session, all checks inside the commit (§3). The minted session records `deviceId` + revocation generation, and every session check re-verifies the device is still active (§2) |
+| 10 | GO 2 hardening | `POST /restore` (extended) | owner session **+** device signature **+** verified assertion (`purpose: "restore-go2"`, `subjectId` = ceremony id) — redemption is device-signed, §3 | GO 2 stops accepting the bearer token GO 1 already saw. The ceremony record stores GO 1 provenance `{ownerId, go1SessionDeviceId, go1SessionGeneration, killEpoch}`; session and device generation, challenge ownership, ceremony state, and kill epoch are re-verified **inside** the atomic consume-and-commit — revoking the GO 1 device kills the pending ceremony (§3) |
+| 11 | alert dispatcher | (not a route) | — | the process that actually web-pushes on window register/extend: VAPID key custody, fan-out to enrolled devices, and per (device, revision) minting the `Delivery` the ack must echo (§3). Channel correctness: an RFC 8030 **Topic**, used precisely — the *same* topic replaces an outstanding undelivered push, so one topic token is reused across transport retries of a single revision (retries collapse into one), and the topic is **rotated on pending → extended exactly so the extension does NOT replace a still-undelivered pending alert: both are preserved and delivered**, each able to ack only its own revision (a stale revision's ack is ignored by §3, and the notification `tag` collapses the display best-effort); push **TTL capped at the remaining deadline** (an alert that outlives its window is noise). Enforces the RFC 8291 **3993-byte plaintext ceiling** — an oversized summary degrades to a generic alert, which never acks (§4). It re-validates every `endpoint` at send time — the checks from row 7 again, **after DNS resolution as well as before**, plus no redirect following and hard size/timeout caps — because a stored-then-repointed hostname is the classic SSRF. Needs its own design; send-failure feeds back into nothing, because the window's fail-closed path already covers silence |
 | 12 | open-window reconciliation | `GET /veto` (collection read) | device signature (owner-device class only) | lists the owner's open (`pending`/`extended`) windows with their current revisions — the inbox a root-launched app renders when iOS loses the click handoff (§3). Listing never acks; rendering ONE window's detail (row 3) mints the delivery its ack must echo, so an inbox can never bulk-ack |
 
 **Wire-status alignment with #28, and how each status renders.**
@@ -762,9 +882,16 @@ creation, never recomputed from mutable state. The assertion challenge
 for `purpose: "approve"` binds `{purpose, subjectId, that action
 hash}` server-side, so the passkey signs the exact action the owner
 was shown, not a mutable id that could be repointed between render and
-confirm. Confirm re-verifies that the record still matches its hash
-and that the kill epoch is still current before anything executes; a
-record that changed, or an epoch that moved, gets the same generic
+confirm. Confirm is device-signed like every redemption (§3), carries
+a **TTL** (minutes, not hours), and re-verifies **inside the atomic
+consume-and-commit**: the record against its hash, the kill epoch, the
+session and device generation, challenge ownership — and the **current
+policy**: the action must still route to the `approve` lane at confirm
+time, so an approval created under one policy cannot execute after the
+policy moved the tool to `deny`, hash match or not. Queued executions
+re-check the approving device's generation immediately before
+dispatch. A record that changed, an epoch that moved, a policy that
+tightened, or an approver since revoked — each gets the same generic
 refusal as every other failed check. The shapes are already in
 `src/types.ts` so that design can start from this contract.
 
