@@ -41,7 +41,12 @@ export class VetoWindow {
     this.deadline = this.now() + (opts.windowMs ?? 4 * 60_000);
   }
 
-  /** Push/SMS delivery confirmed on the owner's device. */
+  /**
+   * The owner's enrolled app confirmed the alert was seen — the only
+   * signal that may flip this bit. A carrier SMS receipt doesn't count:
+   * after a SIM swap it's proof the attacker's handset got the bytes,
+   * not that the owner did. See packages/escalation/DESIGN.md §3.
+   */
   markDelivered(): void {
     this.delivered = true;
   }
