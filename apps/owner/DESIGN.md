@@ -42,15 +42,20 @@ Three jobs, one per lane of the asymmetry:
    veto is always device-signed (§2) — on iOS the tap opens the app,
    the key becomes foreground-accessible, and the veto goes out signed
    (§3) — because stopping must never acquire meaningful friction.
-2. **The ack.** The moment the summary is actually rendered on the
-   enrolled device, the app reports it: `POST /veto/:id/seen`,
-   device-signed. That is the production caller `markDelivered()` has
-   been waiting for. From then on the window's silence carries the most
-   meaning web push can give it — *the alert was rendered where the
-   owner should have seen it, and no objection came* — instead of
-   "nobody was listening". The server accepts an ack only while the
-   window is still open on the server's own clock (§4); §4 also states
-   exactly how much an accepted ack proves — it is less than it sounds.
+2. **The ack.** When the window's detail view is rendered in the
+   **foreground** of the enrolled device — document visible and
+   focused, paint completed, re-checked immediately before signing —
+   the app reports it: `POST /veto/:id/seen`, device-signed. That is
+   the production caller `markDelivered()` has been waiting for.
+   Notifications **alert; they never produce evidence** (§3): the
+   Notifications API returns no truncation or visibility result, so
+   the only render the app can attest is its own foreground view.
+   From then on the window's silence carries real meaning — *the owner
+   opened this exact review and chose not to object* — instead of
+   "nobody was listening". The server accepts an ack only under the
+   versioned-delivery rule on its own clock and records (§3, §4); §4
+   states exactly how much an accepted ack proves — it is less than
+   it sounds.
 3. **The passkey lanes.** At enrolment the app creates a WebAuthn
    credential on the phone's platform authenticator. Approving an
    `approve`-lane action and confirming GO 2 of the restore ceremony
@@ -83,15 +88,24 @@ tightens it back up. So it is designed first.
    would land the token in the wrong partition (and, on iOS, in a
    browser that cannot receive push at all). An invite URL opened in a
    browser renders install instructions only.
-2. **Invite.** An enrolment invite is minted server-side:
-   `POST /devices/invite`, requiring an owner session **plus a fresh
-   UV assertion** with `purpose: "device-invite"` (§3 — a stolen
-   bearer token alone must not be able to add a device). The invite is
-   a single-use CSPRNG token (≥128 bits), TTL ~10 minutes, bound to
-   the `ownerId` that minted it, and its server-side record stores the
-   **issuing device's `{deviceId, revocationGeneration}`** — re-checked
-   atomically when the invite is spent, so revoking the issuer voids
-   its outstanding invites. The invite carries the full WebAuthn
+2. **Invite.** The invite secret **never travels from the server**.
+   The inviting device (or the host CLI, for bootstrap) generates the
+   single-use ≥128-bit CSPRNG secret **locally**, shows it to the new
+   phone (QR / typed code), and registers only its **SHA-256 hash** in
+   the mint request: `POST /devices/invite`, device-signed and
+   requiring an owner session **plus a fresh UV assertion** with
+   `purpose: "device-invite"` (§3 — a stolen bearer token alone must
+   not be able to add a device). The server stores the hash, the TTL
+   (~10 minutes), the bound `ownerId`, and the **issuing device's
+   `{deviceId, revocationGeneration}`** — re-checked atomically at
+   spend, so revoking the issuer voids its outstanding invites — and
+   returns **no secret at all**. Spending presents the preimage; the
+   server compares hashes. This closes complete-request capture:
+   device-signing the mint already stopped a forged request, but an
+   attacker who raced or replayed an *exact captured signed request*
+   would previously have received the bearer secret in the response —
+   now the response contains nothing worth capturing, and a captured
+   mint request carries only a hash that cannot enrol. The invite carries the full WebAuthn
    creation contract: the RP (`rpId`, `rpName`), a **complete user
    entity** — an opaque CSPRNG `user.id` (stable per owner, never PII)
    plus display-only `name` and `displayName` — `pubKeyCredParams` as
@@ -136,9 +150,13 @@ tightens it back up. So it is designed first.
    after this list is why.
 5. **Verification and storage.** The control plane verifies, in the
    right places: `type`, `challenge`, and `origin` live in
-   `clientDataJSON`; `rpIdHash` and the **UP and UV flags** live in the
-   authenticator data *inside the attestation object*; the credential's
-   algorithm must be ES256 (COSE `-7`) on P-256. It verifies the proof
+   `clientDataJSON` — and `clientDataJSON` is additionally rejected if
+   it carries `crossOrigin: true` or a `topOrigin` other than the
+   expected one (a ceremony performed inside someone else's frame is
+   not the owner's ceremony — §4, clickjacking); `rpIdHash` and the
+   **UP and UV flags** live in the authenticator data *inside the
+   attestation object*; the credential's algorithm must be ES256
+   (COSE `-7`) on P-256. It verifies the proof
    of possession with the submitted key, re-checks the invite's issuing
    device is still active at its recorded generation (or, for a
    bootstrap invite, that there are still **zero** active devices and
@@ -284,11 +302,13 @@ deployment boundary the threat model already names for kill state.
   fails. Without the session↔device binding, a stolen phone that
   minted a session five minutes before revocation could keep acting
   until the token expired; with it, revocation cuts that off at the
-  next request. Two honest bounds: a request already past its auth
-  check when revocation lands may still complete (one process, one
-  event loop — the same single-spend honesty as the restore ceremony),
-  and a veto already accepted is not recalled — a veto is a stop, and
-  stays irreversible.
+  next request. Two honest bounds, stated tightly: revocation and
+  every guarded mutation serialize on the same authority (§5,
+  "serialization authority"), so **only a mutation that committed
+  before the revocation may win** — nothing straddles the boundary,
+  and no in-flight request completes against a generation that has
+  already moved; and a veto already accepted is not recalled — a veto
+  is a stop, and stays irreversible.
 - **Two devices:** each enrolls independently — own invite, own
   passkey, own cheap-lane key, own subscription. Alerts fan out to every
   enrolled device; the *first* render acks; any device can veto; any
@@ -394,11 +414,13 @@ carries what a keyless worker needs to be *useful*:
 
 **What iOS gets in v0, plainly:** a cold notification showing the
 concrete action; a tap that opens the app; a **signed** veto — and, if
-the window is still open, a signed ack — from the foreground. No
-automatic ack on the cold path: an alert the owner never touches runs
+the window is still open, a signed ack from the foreground detail
+view. And with notifications alert-only everywhere (versioned
+delivery, below), this is no longer an iOS degradation at all — it is
+the model: on every platform, an alert the owner never opens runs
 extend → `held`. Friction, not permission — silence releases only when
-a warm context or a human actually engaged, which is the reachability
-rule doing its job.
+a human actually opened the review, which is the reachability rule
+doing its job with the assumption made explicit.
 
 **Click handoff carries no secrets and trusts no URL.**
 `PushEvent.data` does not survive to `notificationclick`, so the
@@ -439,64 +461,96 @@ happily accept; silence then releases a review whose current form the
 owner never saw. The fix is a versioned delivery contract:
 
 - Every state the owner can be shown is a **`WindowRevision`** —
-  `{windowId, revision, status, deadline, immutableActionHash}`. The
-  revision increments on every status or deadline change; the action
-  hash (the same canonicalization vocabulary as the approval hash, §5)
-  never changes across revisions — one window, one action, many
-  showings.
+  `{windowId, revision, status, deadline, immutableActionHash,
+  renderContentHash}`. The revision increments on **every** status,
+  deadline, visible-content, or render-schema change;
+  `renderContentHash` is the SHA-256 of the revision's canonical
+  `RenderableAlertV1` envelope (below), so one revision pins exactly
+  one rendering — two different summaries, or two schema versions, can
+  never both be "valid" under one revision. The action hash (the same
+  canonicalization vocabulary as the approval hash, §5) never changes
+  across revisions — one window, one action, many showings.
 - Every time the server hands renderable content to a device — a push
-  dispatch, a device-signed detail read, an inbox render — it mints a
-  **`Delivery`**: `{deliveryId, windowId, revision, deviceId,
-  deviceGeneration, payloadHash, expiresAt}`, where `payloadHash` is
-  the SHA-256 of the exact bytes issued.
+  dispatch, a device-signed detail read — it mints a **`Delivery`**:
+  `{deliveryId, windowId, revision, deviceId, deviceGeneration,
+  renderClass, payloadHash, expiresAt}`, where `payloadHash` is the
+  SHA-256 of the exact bytes issued. `renderClass` is decided by the
+  server from how the delivery was minted — `"notification"` for push
+  dispatch, `"foreground-detail"` for the device-signed detail read —
+  and **only `"foreground-detail"` deliveries are ack-eligible**.
+- **Notifications alert; they never produce evidence.** The
+  Notifications API delegates display to the platform and returns no
+  truncation or visibility result — no field-length budget can *prove*
+  the decisive part was visible on a surface the app does not control.
+  So a notification never creates delivery evidence, structurally: its
+  delivery is `"notification"`-class and the server refuses an ack
+  naming it — refused server-side, never trusted to an obedient
+  client. Generic and degraded alerts are non-ackable the same way:
+  no ack-eligible delivery exists for them at all. An ack comes only
+  from the **foreground detail view**: the exact window's view
+  selected, the document visible **and** focused, a paint opportunity
+  completed, and visibility re-checked immediately before signing —
+  app discipline the server cannot verify (like the persistence test,
+  §2), sitting on top of the structural render-class check it can. On
+  the flow already chosen this costs nothing — the iOS tap opens the
+  app anyway, and that opening is the ack moment — it converts a
+  platform assumption into an explicit one, on every platform.
 - An ack carries `{windowId, revision, deliveryId,
   renderedPayloadHash, renderedAt, surface}` and **counts only if all
-  of these hold, judged by the server**: the revision is still the
-  window's current open revision; the rendered payload hash equals the
-  hash the server recorded for that delivery; the delivery belongs to
-  the signing device at its current generation; the window is still
-  `pending` or `extended`; and server time is before that revision's
-  deadline. Anything else is recorded in the audit trail and ignored.
-- **The warm path prefers the fetch.** A worker that can device-sign
-  fetches the authoritative `VetoWindowDetail`, renders *that*, and
-  acks the revision and delivery the fetch minted. A forged or
-  replayed push therefore cannot turn the device into an ack-signing
-  oracle: a countable ack must name a delivery the server itself
-  issued, of content the server itself hashed, to this device at this
-  generation.
-- **Evidence is revision-scoped and inserted atomically.** An accepted
-  ack is stored as evidence `{deviceId, deviceGeneration, revision,
-  deliveryId, payloadHash, receivedAt}` — the full coordinates of what
-  was actually shown, never a bare "seen" bit. Validation and
-  insertion are **one serialized operation**: the insert
-  compare-and-sets on the window's *current* revision, so an ack
-  validated against revision 1 that races the transition to revision 2
-  fails the CAS and is recorded-and-ignored — it can never be stored
-  against a revision that was never rendered. Release, revision
-  change, and revocation all operate on that same serialized window
-  state, and release for revision N counts only evidence whose
+  of these hold, judged by the server inside one transaction (below)**:
+  the named delivery exists, is unexpired (`Delivery.expiresAt`),
+  belongs to **this window** (`ack.windowId == delivery.windowId`), is
+  `"foreground-detail"`-class, and belongs to the signing device at
+  its current generation; the ack's revision equals the delivery's
+  revision equals the window's current open revision; the rendered
+  payload hash equals the hash the server recorded for that delivery;
+  the window is still `pending` or `extended`. Anything else is
+  recorded in the audit trail and ignored.
+- **The foreground path fetches the truth it renders.** The app's
+  detail view fetches the authoritative `VetoWindowDetail`, renders
+  *that*, and acks the revision and delivery the fetch minted. A
+  forged or replayed push therefore cannot turn the device into an
+  ack-signing oracle: a countable ack must name a foreground-detail
+  delivery the server itself issued, of content the server itself
+  hashed, to this device at this generation.
+- **Evidence insertion transacts over the window AND the witnessing
+  device.** An accepted ack is stored as evidence `{deviceId,
+  deviceGeneration, revision, deliveryId, payloadHash, receivedAt}` —
+  the full coordinates of what was shown, never a bare "seen" bit —
+  and the validate-and-insert runs as **one transaction on the
+  serialization authority (§5) spanning both the window state and the
+  witnessing device's generation record**: a window-only CAS could
+  race a generation bump stored on the device record, so the
+  transaction is written to make a concurrent revocation *necessarily
+  conflict*. An ack validated against revision 1 that races the
+  transition to revision 2 fails and is recorded-and-ignored; an ack
+  racing its device's revocation fails the same way. Release,
+  revision change, and revocation all serialize on the same
+  authority, and release for revision N counts only evidence whose
   `revision == N` from a device still active at its recorded
   generation (§4).
 - **A last-second ack must not release.** `serverNow < deadline` alone
-  would let a notification landing five milliseconds before the
-  deadline count as "the owner was reached and chose not to object" —
-  when the owner had no chance to object at all, which inverts what
-  the veto lane means. So valid delivery evidence additionally
-  requires `receivedAt ≤ deadline − minVetoResponseMs`. The default is
+  would let a delivery landing five milliseconds before the deadline
+  count as "the owner was reached and chose not to object" — when the
+  owner had no chance to object at all, which inverts what the veto
+  lane means. So valid delivery evidence additionally requires
+  `receivedAt ≤ deadline − minVetoResponseMs`. The default is
   **60 seconds**, and here is why: it is enough to wake the screen,
-  read a one-line summary, unlock, and tap VETO without rushing — a
-  *decision* interval, where 5–15 s would be a reflex test — while
-  staying small against the 4-minute window, so an on-time delivery
-  still leaves the owner most of it; and it matches the 60 s
-  skew/replay bound the device-signature scheme already uses, so the
-  deployment reasons about one human-and-network latency budget, not
-  two. The knob is server-side policy with a hard floor — never
-  configurable to zero. An ack inside the final interval is stored as
-  audit, ignored as evidence, and the window runs its fail-closed
-  course — extend, then hold — where the extension re-alerts with a
-  fresh revision and a fresh delivery, giving the owner a full
-  response interval. Late delivery can only ever add friction, never a
-  near-immediate release.
+  read a one-line summary, unlock, and open the review without
+  rushing — a *decision* interval, where 5–15 s would be a reflex
+  test — while staying small against the 4-minute window, so an
+  on-time delivery still leaves the owner most of it; and it matches
+  the 60 s skew/replay bound the device-signature scheme already uses,
+  so the deployment reasons about one human-and-network latency
+  budget, not two. **The floor is the reviewed minimum and it is
+  enforced**: the control plane checks `minVetoResponseMs ≥ 60 000` at
+  startup and refuses to start otherwise — the same stance as the
+  kill-state path guard; "configurable" never means "configurable to
+  1 ms". An ack inside the final interval is stored as audit, ignored
+  as evidence, and the window runs its fail-closed course — extend,
+  then hold — where the extension re-alerts with a fresh revision and
+  a fresh delivery, giving the owner a full response interval. Late
+  delivery can only ever add friction, never a near-immediate release.
 
 ### Truthful rendering — the hash proves bytes, not truth
 
@@ -508,7 +562,11 @@ a summary so it reads as its own opposite, control characters can hide
 a decisive suffix, an embedded newline can push the fact that matters
 below an OS truncation fold — the class of attack catalogued in
 **Unicode Technical Report #36**. So what the owner is shown is a
-bounded canonical format, **`RenderableAlertV1`**, enforced where the
+**versioned canonical envelope**, **`RenderableAlertV1`** — `{v: 1,
+agentId, tool, summary}` in a fixed canonical encoding — whose SHA-256
+is pinned into the `WindowRevision` as `renderContentHash`: any change
+to visible content *or* to the envelope schema is, by construction, a
+new revision with new deliveries. Conformance is enforced where the
 text is *minted*:
 
 - **Per-field length limits** — `agentId` ≤ 64, `tool` ≤ 64, `summary`
@@ -526,11 +584,13 @@ text is *minted*:
   own bidi isolate (CSS `unicode-bidi: isolate`; the scaffold does),
   so legitimate RTL text displays correctly but can never visually
   reorder *across* field boundaries.
-- **No ack from a truncated render.** If any critical field was
-  truncated or substituted at render time — an over-limit legacy
-  value, a platform that cut the body anyway — the surface shows the
-  generic alert and does not ack, like every other partial render
-  (§4).
+- **Degraded renders are non-ackable structurally, not politely.** A
+  generic or truncated alert has no `"foreground-detail"` delivery
+  behind it, so there is nothing a well-behaved *or* hostile client
+  could ack — the refusal lives server-side in the render-class and
+  hash checks (§3, versioned delivery), never in trusting the client
+  to abstain. The client-side rule ("show the generic alert, don't
+  ack") remains as discipline; the server no longer depends on it.
 
 **Expensive lane.** Approve and GO 2 each require a fresh
 `navigator.credentials.get()` with `userVerification: "required"`
@@ -571,15 +631,31 @@ target's state (ceremony ready; approval record intact), and the kill
 epoch are re-verified **inside the atomic consume-and-commit** — never
 in a look-before-you-leap prologue that a revocation, a kill, or a
 policy change can invalidate mid-flight. For approvals the commit-time
-check goes one further: the action must **still route to the
-`approve` lane under the current policy** when confirmed — an approval
-created while a tool sat in the approve lane must not execute after
-the policy moved it to `deny`, hash match or not — and an approval
+check goes further, because the world the yes was given in can move in
+more than one place: the action must **still route to the `approve`
+lane under the current policy**, the **current
+`executorRoutes[sourceTool]` must still equal the stored
+`{connector, operation}`** (a policy that stands while the routing
+table repoints the tool would execute something the owner never
+reviewed), and the **whole current authorization version** — policy
+plus routes — must match what the approval recorded. An approval also
 carries a **TTL** (minutes, not hours: a yes is not a standing grant,
-the executor's own rule). If execution is queued rather than
-immediate, the dispatcher re-checks the approving device's generation
-**immediately before dispatch** — an approval whose approver was
-revoked while it sat in the queue dies in the queue.
+the executor's own rule).
+
+**And "consume-and-execute" is two commits, never one.** An external
+connector call can never sit inside a transaction — it can hang, half
+succeed, or return ambiguity, none of which a transaction can absorb.
+So the atomic consume of challenge + approval creates exactly **one
+durable execution intent**, and that intent is **claimed and burned in
+a second atomic step immediately before dispatch**, re-checking at
+claim time: kill epoch, intent expiry, the approving device's
+generation, and the policy-plus-routes authorization version. An
+approval whose approver was revoked, whose epoch moved, or whose
+routing changed while the intent sat in the queue dies in the queue.
+The burn precedes the connector call (at-most-once, the executor's own
+nonce rule), and an **ambiguous dispatch is never retried without
+connector-level idempotency** — a duplicate merge is not a retry, it
+is an incident.
 
 **A captured, unredeemed assertion is bearer authority — so
 redemption is device-signed too.** Between the authenticator ceremony
@@ -601,7 +677,12 @@ checked as one device before the commit begins. Honest bound: this
 does not defend against a compromised origin, which can request both
 the signature and the assertion while its code runs (§4); it defends
 the transport, and it removes the one place where a bare bearer blob
-was sufficient authority.
+was sufficient authority. One gap remained past device-signing:
+capturing a *complete signed request* whose **response** returns a
+secret — the invite mint was exactly that, and it is closed by the
+hash-commit in §2: the secret is generated on the inviting device,
+only its hash travels up, and no response contains anything worth
+racing for.
 
 **What a stolen, unlocked phone can and cannot do — plainly.** It can
 read every pending alert. It can veto everything (a stop: paralysis of
@@ -638,31 +719,32 @@ device-invite assertion closes exactly that.
 In the spirit of `packages/mcp/THREAT-MODEL.md`: what the shipped thing
 will actually prove, and what it will not.
 
-- **An ack proves *rendered on the enrolled device*. Nothing more.**
-  Not read, not understood, not that the eyes in front of the screen
-  were the owner's — a phone face-down in a bag acks exactly like an
-  attentive owner. And "rendered" itself means "the OS accepted and
-  displayed the notification as far as the API can tell":
-  `showNotification()` resolves even when Do-Not-Disturb, focus modes,
-  or a notification summary suppress every visible and audible trace.
-  The ack is the strongest claim web push can make, and it is a
-  strictly weaker claim than the words "the owner saw it". The veto
-  state machine is designed for exactly this honesty — the ack only
-  flips which *fail-safe* applies (release on silence vs extend→held);
-  it never executes anything by itself.
-- **The ack only fires on a concrete render, from a reachable key.**
-  The service worker acks after — and only after — content carrying
-  the actual action summary is displayed, and only when it can
-  device-sign the ack. A cold worker that cannot reach its key renders
-  without acking — the ack arrives later, from a warm context or from
-  the opened app, if the window is still live (§3). The warm path
-  prefers to fetch the authoritative detail and render *that*, acking
-  the revision and delivery the fetch minted (§3). If the payload is
-  unreadable, oversized, or truncated and only a generic "an action is
-  waiting for review" can be shown, the app shows it *without acking*:
-  the device rendered that something is pending, but since the owner
-  could not judge *what*, silence must not release it. Fail-closed on
-  partial delivery.
+- **An ack proves the detail view was rendered foreground-and-focused
+  on the enrolled device. Nothing more.** Not read, not understood,
+  not that the eyes in front of the screen were the owner's — an
+  unlocked phone in the wrong hands acks exactly like an attentive
+  owner. Notifications prove even less, which is why they are
+  **alert-only** and never evidence (§3): `showNotification()`
+  resolves even when Do-Not-Disturb, focus modes, or a notification
+  summary suppress every visible trace, the platform reports no
+  truncation result, and no length budget can *prove* visibility on a
+  surface the app does not control. The ack is therefore bound to the
+  one render the app can actually attest — its own foreground
+  document, visible and focused, after a completed paint, re-checked
+  immediately before signing — and even that is a claim about pixels,
+  not comprehension. The veto state machine is designed for exactly
+  this honesty — the ack only flips which *fail-safe* applies (release
+  on silence vs extend→held); it never executes anything by itself.
+- **The ack fires only from the foreground detail view, from a
+  reachable key.** Notifications — cold or warm — render and stop
+  there; no service-worker context ever acks. When the owner opens the
+  window's view, the app fetches the authoritative detail, renders
+  *that*, and acks the revision and foreground-detail delivery the
+  fetch minted (§3). If only a generic "an action is waiting for
+  review" can be shown, there is no ack-eligible delivery behind it
+  and nothing to ack — the owner learned that something is pending,
+  but since they could not judge *what*, silence must not release it.
+  Fail-closed on partial delivery, enforced server-side (§3).
 - **A late or stale ack changes nothing.** An ack counts only under
   the full versioned-delivery rule (§3): current open revision,
   matching rendered-payload hash for a server-minted delivery, a
@@ -683,15 +765,15 @@ will actually prove, and what it will not.
 - **An ack must not outlive its device — and evidence is
   revision-scoped.** Delivery is recorded as **evidence** —
   `{deviceId, deviceGeneration, revision, deliveryId, payloadHash,
-  receivedAt}` per accepted ack, inserted atomically under a
-  compare-and-set on the window's current revision (§3) — and a
-  revision releases on silence only if, *at the moment of the release
-  decision*, at least one piece of evidence **for that revision**
-  comes from a device still active at the same generation.
-  `markDelivered()`'s boolean becomes this evidence list — a contract
-  change on the window record, stated here on purpose — and release,
-  revision change, and revocation all act on the same serialized
-  window state. Chosen over the alternative (revocation eagerly
+  receivedAt}` per accepted ack, inserted in one transaction on the
+  serialization authority spanning the window *and* the witnessing
+  device's generation record (§3, §5) — and a revision releases on
+  silence only if, *at the moment of the release decision*, at least
+  one piece of evidence **for that revision** comes from a device
+  still active at the same generation. `markDelivered()`'s boolean
+  becomes this evidence list — a contract change on the window record,
+  stated here on purpose — and release, revision change, and
+  revocation all serialize on the same authority. Chosen over the alternative (revocation eagerly
   sweeping delivered windows to `held`) for three reasons: it is the
   same at-use standing check as every session and challenge in this
   design; it keeps a legitimate release alive when a *second,
@@ -804,6 +886,19 @@ will actually prove, and what it will not.
   both rules (`public/app.js` assigns sample values with
   `textContent`; `app.css` isolates the fields); the strict CSP is the
   second fence, never the first.
+- **The owner app must be un-frameable, and ceremonies must be
+  top-level.** A framed owner app is a clickjacking kit: overlay the
+  real VETO or APPROVE surface and harvest real gestures. Three
+  requirements: the app is served with an **HTTP-header CSP** including
+  `frame-ancestors 'none'` — a `<meta>` CSP cannot express
+  `frame-ancestors`, so the header is the requirement, not a nicety; a
+  restrictive **Permissions-Policy** scopes WebAuthn to the app itself
+  (`publickey-credentials-get=(self)`,
+  `publickey-credentials-create=(self)`); and the server independently
+  rejects any WebAuthn `clientDataJSON` carrying `crossOrigin: true`
+  or a `topOrigin` other than the expected one (§2) — a ceremony
+  performed inside someone else's frame is not the owner's ceremony,
+  even if every other check passes.
 - **No HMAC fallback is a security decision, not an omission.** A
   client-selectable key mode is attacker-negotiated: hostile served
   code would pick the downgrade at enrolment and walk away with a raw
@@ -830,13 +925,30 @@ Listed here so each can be scoped and reviewed separately — none are
 implemented in this PR. The app's `src/types.ts` carries the request
 and response shapes.
 
+**The serialization authority — stated once, meant everywhere.** Every
+"atomic", "compare-and-set", "transaction", "single-spend", and
+"serialized" claim in this document means one specific thing: **v0
+runs exactly one control-plane process**, and all mutable owner-app
+state — windows, revisions, deliveries, ack evidence, devices and
+generations, invites, challenges, ceremonies, approvals, execution
+intents — lives in that process and is mutated only on its single
+event loop, which *is* the linearizable authority. This is the same
+constraint the restore ceremony already leans on ("one process, one
+event loop"), promoted from an aside to a rule. Running more than one
+control-plane process without first replacing this with a shared
+linearizable store — a real transaction boundary — forfeits every
+atomicity claim in this document, so it is a deployment violation,
+not a scaling option. When such a store lands, it inherits this
+paragraph; the claims elsewhere reference the authority, not the
+mechanism.
+
 | # | addition | route | auth | what it does |
 | --- | --- | --- | --- | --- |
-| 1 | delivery ack | `POST /veto/:id/seen` | device signature (owner-device class only) | the production caller of `markDelivered()` — an ack counts only under the versioned-delivery rule (§3): current open revision, matching rendered-payload hash for a server-minted `Delivery` belonging to the signing device at its current generation, window still `pending`/`extended`, and `receivedAt ≤ deadline − minVetoResponseMs` (default 60 s — a last-second delivery extends or holds, never releases); `renderedAt` is audit data, never enforcement; everything else recorded and ignored. Stores revision-scoped **evidence** `{deviceId, deviceGeneration, revision, deliveryId, payloadHash, receivedAt}`, inserted atomically via compare-and-set on the current revision; release for revision N requires revision-N evidence from a still-active device at the same generation (§3, §4). Idempotent; 404 on unknown window |
+| 1 | delivery ack | `POST /veto/:id/seen` | device signature (owner-device class only) | the production caller of `markDelivered()` — an ack counts only under the versioned-delivery rule (§3), evaluated in **one transaction on the serialization authority spanning the window and the witnessing device's generation record**: named `Delivery` exists, unexpired, same `windowId`, `"foreground-detail"` render class (a notification-class delivery is refused — notifications never produce evidence), owned by the signing device at its current generation; ack revision == delivery revision == current open revision; matching rendered-payload hash; window still `pending`/`extended`; `receivedAt ≤ deadline − minVetoResponseMs` (floor 60 s, enforced at startup). `renderedAt` is audit data, never enforcement; everything else recorded and ignored. Stores revision-scoped **evidence**; release for revision N requires revision-N evidence from a still-active device at the same generation (§3, §4). Idempotent; 404 on unknown window |
 | 2 | device-signed veto relay | `POST /veto/:id` (extended) | device signature **or** owner session | one-tap veto without a live session; `vetoedBy` resolves to the enrolled device's `ownerId`, audit records the device. Idempotent: re-vetoing an already-vetoed window succeeds as a no-op, so the service worker can retry blindly. (The v0.3 cold-push capability is **dropped** — no consumer; §3) |
-| 3 | window detail for rendering | `GET /veto/:id` (extended) | device signature for detail | adds `deadline`, `delivered`, the call summary, and the current `revision` — and the read itself mints a `Delivery` whose id and hash the ack must echo (§3); `status` speaks the shared wire vocabulary (`VetoWireStatus`, #28) including terminal `spent`. The existing open read stays status-only: what an alert says is for enrolled devices, not for anyone who can reach the port (same disclosure discipline as the `/status` `epoch` note) |
-| 4 | enrolment: invite | `POST /devices/invite` | owner session **+** device signature **+** fresh UV assertion (`purpose: "device-invite"`) — redemption is device-signed, §3; bootstrap / no-devices-left recovery via the host CLI / permission-protected Unix socket (§2), **never** an HTTP loopback bypass | single-use, short-TTL invite + the full WebAuthn creation contract (RP info, complete user entity, ES256-only `pubKeyCredParams`, authenticator selection); records the issuing device's `{deviceId, revocationGeneration}` (bootstrap invites: a bootstrap generation instead); token in the URL fragment where a URL form exists, spent in a POST body, never logged |
-| 5 | enrolment: enroll | `POST /devices/enroll` | invite token | verifies the WebAuthn registration in the right places (`type`/`challenge`/`origin` in `clientDataJSON`; `rpIdHash` + UP/UV flags in the authenticator data; ES256 on P-256) **and** the pinned cheap-lane proof of possession (§2) *before* the invite is consumed; re-checks the issuer's standing (or bootstrap generation + zero active devices) atomically at spend; stores **one** `EnrolledDevice` holding both credentials. `cheapLaneKey` is required — no HMAC mode exists to fall back to (§2). The invite burns atomically and **only on success** |
+| 3 | window detail for rendering | `GET /veto/:id` (extended) | device signature for detail | adds `deadline`, `delivered`, the `RenderableAlertV1` content, and the current `revision` — and the read itself mints the **`"foreground-detail"` `Delivery`** whose id and hash the ack must echo: the only ack-eligible render class (§3); `status` speaks the shared wire vocabulary (`VetoWireStatus`, #28) including terminal `spent`. The existing open read stays status-only: what an alert says is for enrolled devices, not for anyone who can reach the port (same disclosure discipline as the `/status` `epoch` note) |
+| 4 | enrolment: invite | `POST /devices/invite` | owner session **+** device signature **+** fresh UV assertion (`purpose: "device-invite"`) — redemption is device-signed, §3; bootstrap / no-devices-left recovery via the host CLI / permission-protected Unix socket (§2), **never** an HTTP loopback bypass | registers a client-generated invite by **hash commitment**: the inviting device (or host) generates the ≥128-bit secret locally and submits only its SHA-256 — **the server stores the hash and returns no secret**, so a captured signed request or raced response yields nothing (§2). Record carries the WebAuthn creation contract (RP info, complete user entity, ES256-only `pubKeyCredParams`, authenticator selection) and the issuing device's `{deviceId, revocationGeneration}` (bootstrap invites: a bootstrap generation instead); the secret travels device-to-device only (QR / typed code, URL-fragment rules where a URL form exists), is spent as a preimage in a POST body, never logged |
+| 5 | enrolment: enroll | `POST /devices/enroll` | invite secret (preimage of the committed hash) | verifies the WebAuthn registration in the right places (`type`/`challenge`/`origin` in `clientDataJSON`, **rejecting `crossOrigin: true` or an unexpected `topOrigin`** — §2, §4; `rpIdHash` + UP/UV flags in the authenticator data; ES256 on P-256) **and** the pinned cheap-lane proof of possession (§2) *before* the invite is consumed; re-checks the issuer's standing (or bootstrap generation + zero active devices) atomically at spend on the serialization authority; stores **one** `EnrolledDevice` holding both credentials. `cheapLaneKey` is required — no HMAC mode exists to fall back to (§2). The invite burns atomically and **only on success** |
 | 6 | enrolment: list / revoke | `GET /devices`, `POST /devices/:id/revoke` | list: owner session; remote revoke: owner session **+** device signature **+** fresh UV assertion (`purpose: "device-revoke"`, subject = target device) — redemption is device-signed, §3; host CLI / Unix socket can always revoke | list returns a **redacted `DeviceSummary`** — never the `EnrolledDevice` record: the push `endpoint`, `p256dh`, and above all the `auth` secret stay server-side (RFC 8291: disclosing `auth` lets anyone generate pushes the user agent accepts). Revoke bumps the revocation generation and atomically voids the device's credentials, push subscription, **live sessions, outstanding challenges, unspent invites it issued, its deliveries, and its ack evidence** (§2, §4) |
 | 7 | push subscription upsert | `PUT /devices/:id/push-subscription` | device signature (owner-device class only) | stores/refreshes the Web Push subscription; the `:id` is derived from the authenticated identity — a mismatched path id is rejected. Subscriptions must be **restricted to the configured VAPID public key** (`applicationServerKey`, RFC 8292) — an unrestricted subscription is refused. The `endpoint` is an SSRF surface and is validated at write: HTTPS only, known push-service endpoint shapes, and rejection of localhost, private, link-local, and metadata addresses |
 | 8 | assertion challenge | `POST /assert/challenge` | device signature (owner-device class only) | mints a single-use challenge bound to a **discriminated** `{purpose, subject}` (subject required for `approve`/`restore-go2`/`device-revoke`, absent for `session`/`device-invite`), TTL ~2 min; the response carries `rpId` and `allowCredentials` naming the issuing device's paired credential (§3 — identity continuity); challenges record the minting device's revocation generation and die with it (§2). Redemption is atomic: verify, consume, exactly one protected mutation (§3) |
@@ -884,16 +996,23 @@ hash}` server-side, so the passkey signs the exact action the owner
 was shown, not a mutable id that could be repointed between render and
 confirm. Confirm is device-signed like every redemption (§3), carries
 a **TTL** (minutes, not hours), and re-verifies **inside the atomic
-consume-and-commit**: the record against its hash, the kill epoch, the
-session and device generation, challenge ownership — and the **current
-policy**: the action must still route to the `approve` lane at confirm
-time, so an approval created under one policy cannot execute after the
-policy moved the tool to `deny`, hash match or not. Queued executions
-re-check the approving device's generation immediately before
-dispatch. A record that changed, an epoch that moved, a policy that
-tightened, or an approver since revoked — each gets the same generic
-refusal as every other failed check. The shapes are already in
-`src/types.ts` so that design can start from this contract.
+consume** on the serialization authority: the record against its hash,
+the kill epoch, the session and device generation, challenge ownership
+— and the **whole current authorization version**: the action must
+still route to the `approve` lane under the current policy, *and* the
+current `executorRoutes[sourceTool]` must still equal the stored
+`{connector, operation}` — a repointed routing table must refuse
+exactly like a tightened policy, hash match or not. The consume
+creates **one durable execution intent** and never calls a connector
+inside the transaction; the intent is claimed and burned in a second
+atomic step immediately before dispatch, re-checking kill epoch,
+expiry, the approving device's generation, and policy-plus-routes at
+that moment; ambiguous dispatches are never retried without
+connector-level idempotency (§3). A record that changed, an epoch
+that moved, a route or policy that shifted, or an approver since
+revoked — each gets the same generic refusal as every other failed
+check. The shapes are already in `src/types.ts` so that design can
+start from this contract.
 
 ## 6. In this PR / not in this PR
 

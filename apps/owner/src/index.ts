@@ -8,6 +8,7 @@ export type {
   Base64Url,
   UnixMs,
   EnrollmentInvite,
+  InviteMintRequest,
   WebAuthnRegistration,
   EnrollmentRequest,
   EnrollmentResponse,
@@ -16,6 +17,7 @@ export type {
   DeviceSummary,
   VetoWireStatus,
   WindowRevision,
+  RenderableAlertV1,
   Delivery,
   AckEvidence,
   OwnerAlertPush,
@@ -36,5 +38,6 @@ export {
   ENROLL_POP_LABEL,
   DEVICE_SIG_LABEL,
   MIN_VETO_RESPONSE_MS_DEFAULT,
+  MIN_VETO_RESPONSE_MS_FLOOR,
   RENDERABLE_ALERT_V1_LIMITS,
 } from "./types.js";

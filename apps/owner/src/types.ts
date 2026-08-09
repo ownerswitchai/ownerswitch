@@ -50,14 +50,22 @@ export const DEVICE_SIG_LABEL = "ownerswitch/device-sig/v1";
 /**
  * Minimum owner-response interval, ms (DESIGN.md §3). An ack is valid
  * delivery evidence only when receivedAt ≤ deadline − this interval: a
- * notification landing five milliseconds before the deadline must not
+ * delivery landing five milliseconds before the deadline must not
  * count as "the owner was reached and chose not to object". 60 s is a
- * decision interval (wake, read, unlock, tap — without rushing), small
+ * decision interval (wake, read, unlock, open — without rushing), small
  * against the 4-minute window, and matches the 60 s skew/replay bound
- * the signature scheme already uses. Server-side policy knob with a
- * hard floor — never configurable to zero.
+ * the signature scheme already uses.
  */
 export const MIN_VETO_RESPONSE_MS_DEFAULT = 60_000;
+
+/**
+ * The enforced FLOOR for minVetoResponseMs, checked AT STARTUP: a
+ * control plane configured below this refuses to start (the same
+ * stance as the kill-state path guard). The reviewed minimum is the
+ * enforced minimum — "configurable" never means "configurable to 1 ms"
+ * (DESIGN.md §3).
+ */
+export const MIN_VETO_RESPONSE_MS_FLOOR = 60_000;
 
 /**
  * RenderableAlertV1 — the bounded canonical alert format (DESIGN.md §3,
@@ -77,6 +85,21 @@ export const RENDERABLE_ALERT_V1_LIMITS = {
   tool: 64,
   summary: 200,
 } as const;
+
+/**
+ * The versioned canonical alert envelope. Its SHA-256 over the fixed
+ * canonical encoding is the WindowRevision's renderContentHash, so any
+ * change to visible content OR to this schema (a new `v`) is by
+ * construction a new revision with new deliveries — two different
+ * summaries or schema versions can never both be valid under one
+ * revision (DESIGN.md §3).
+ */
+export interface RenderableAlertV1 {
+  v: 1;
+  agentId: string;
+  tool: string;
+  summary: string;
+}
 
 /* ------------------------------------------------------------------ */
 /* Enrolment — the root of trust (DESIGN.md §2)                        */
@@ -98,13 +121,18 @@ export const RENDERABLE_ALERT_V1_LIMITS = {
 export interface EnrollmentInvite {
   inviteId: string;
   /**
-   * single-use bearer capability, ≥128 bits from a CSPRNG. Where a URL
-   * form exists it travels ONLY in the fragment (never query or path —
-   * fragments stay out of access logs and the Referer header), is
-   * cleared with history.replaceState the moment the app reads it, is
-   * spent in a POST body, and is never written to a log on either end.
-   * Burned atomically and only on a SUCCESSFUL registration — a failed
-   * attempt does not consume it (DESIGN.md §2).
+   * single-use bearer capability, ≥128 bits from a CSPRNG — generated
+   * ON the inviting device (or the host CLI for bootstrap) and NEVER
+   * returned by the server, which stores only its SHA-256 (hash
+   * commitment: a captured mint request or raced response yields
+   * nothing — DESIGN.md §2). Travels device-to-device only (QR / typed
+   * code); where a URL form exists it rides ONLY in the fragment
+   * (never query or path — fragments stay out of access logs and the
+   * Referer header), is cleared with history.replaceState the moment
+   * the app reads it, is spent as a preimage in a POST body, and is
+   * never written to a log on either end. Burned atomically and only
+   * on a SUCCESSFUL registration — a failed attempt does not consume
+   * it (DESIGN.md §2).
    */
   token: string;
   expiresAt: UnixMs;
@@ -137,6 +165,19 @@ export interface EnrollmentInvite {
   challenge: Base64Url;
 }
 
+/**
+ * POST /devices/invite — the hash-commitment mint (DESIGN.md §2). The
+ * inviting device generated the secret locally and submits only its
+ * hash; the server's response carries no secret. Device-signed, plus
+ * owner session and a device-invite assertion (DESIGN.md §3).
+ */
+export interface InviteMintRequest {
+  /** SHA-256 of the locally generated ≥128-bit invite secret */
+  tokenHash: Base64Url;
+  /** human label for the device being invited, e.g. "Adam's new phone" */
+  deviceName: string;
+}
+
 /** The phone's WebAuthn registration, as produced by credentials.create(). */
 export interface WebAuthnRegistration {
   credentialId: Base64Url;
@@ -149,6 +190,7 @@ export interface WebAuthnRegistration {
 /** POST /devices/enroll — spends the invite, registers the credential. */
 export interface EnrollmentRequest {
   inviteId: string;
+  /** the invite secret — the preimage of the committed hash (DESIGN.md §2) */
   token: string;
   /** human label shown in the device list, e.g. "Adam's phone" */
   deviceName: string;
@@ -289,9 +331,11 @@ export interface DeviceSummary {
 /**
  * A showing of a veto window — the versioned-delivery contract's unit
  * of truth (DESIGN.md §3, "Versioned delivery"). `revision` increments
- * on every status or deadline change; `immutableActionHash` (the same
- * canonicalization vocabulary as the approval hash, DESIGN.md §5) never
- * changes across revisions — one window, one action, many showings.
+ * on EVERY status, deadline, visible-content, or render-schema change;
+ * `renderContentHash` pins the exact RenderableAlertV1 envelope this
+ * revision shows; `immutableActionHash` (the same canonicalization
+ * vocabulary as the approval hash, DESIGN.md §5) never changes across
+ * revisions — one window, one action, many showings.
  */
 export interface WindowRevision {
   windowId: string;
@@ -299,16 +343,22 @@ export interface WindowRevision {
   status: "pending" | "extended";
   deadline: UnixMs;
   immutableActionHash: Base64Url;
+  /** SHA-256 of this revision's canonical RenderableAlertV1 envelope */
+  renderContentHash: Base64Url;
 }
 
 /**
  * Server-side record minted every time renderable content is handed to
- * a device — a push dispatch, a device-signed detail read, an inbox
- * render. `payloadHash` is the SHA-256 of the exact bytes issued. An
- * ack counts only by naming a live Delivery and matching its hash — so
- * a forged or replayed push cannot turn the device into an ack-signing
- * oracle (DESIGN.md §3). Dies with the window's terminal state, its
- * own expiry, or the device's revocation generation.
+ * a device — a push dispatch or a device-signed detail read.
+ * `payloadHash` is the SHA-256 of the exact bytes issued. `renderClass`
+ * is decided by the server from how the delivery was minted — never by
+ * a client field — and ONLY "foreground-detail" deliveries are
+ * ack-eligible: notifications alert, they never produce evidence
+ * (DESIGN.md §3). An ack counts only by naming a live, same-window,
+ * foreground-detail Delivery and matching its hash — so a forged or
+ * replayed push cannot turn the device into an ack-signing oracle.
+ * Dies with the window's terminal state, its own expiry, or the
+ * device's revocation generation.
  */
 export interface Delivery {
   deliveryId: string;
@@ -316,6 +366,8 @@ export interface Delivery {
   revision: number;
   deviceId: string;
   deviceGeneration: number;
+  /** "notification" = alert-only, never ack-eligible; server-decided */
+  renderClass: "notification" | "foreground-detail";
   payloadHash: Base64Url;
   expiresAt: UnixMs;
 }
@@ -323,12 +375,15 @@ export interface Delivery {
 /**
  * Server-side record of an ACCEPTED ack — the full coordinates of what
  * was actually shown, never a bare "seen" bit. Validation and insertion
- * are one serialized operation: the insert compare-and-sets on the
- * window's CURRENT revision, so an ack validated against revision 1
- * that races the transition to revision 2 fails the CAS and is
- * recorded-and-ignored. Release, revision change, and revocation
- * operate on the same serialized window state; release for revision N
- * counts only evidence with revision == N from a device still active at
+ * run as ONE transaction on the serialization authority (DESIGN.md §5)
+ * spanning the window state AND the witnessing device's generation
+ * record — a window-only CAS could race a generation bump stored on the
+ * device record, so a concurrent revocation necessarily conflicts. An
+ * ack validated against revision 1 that races the transition to
+ * revision 2 fails and is recorded-and-ignored; so does one racing its
+ * device's revocation. Release, revision change, and revocation
+ * serialize on the same authority; release for revision N counts only
+ * evidence with revision == N from a device still active at
  * deviceGeneration (DESIGN.md §3, §4).
  */
 export interface AckEvidence {
@@ -422,38 +477,44 @@ export interface VetoWindowDetail {
  * Sent device-signed, only after content carrying the CONCRETE action
  * summary rendered (a generic, oversized, or truncated render must not
  * ack — DESIGN.md §4). Proves rendered-on-enrolled-device; nothing more.
- * Counts ONLY under the full versioned-delivery rule, judged on the
- * server's clock and records (DESIGN.md §3): `revision` is still the
- * window's current open revision; `renderedPayloadHash` equals the hash
- * the server recorded for `deliveryId`; that Delivery belongs to the
- * signing device at its current generation; the window is still
- * pending/extended; and receivedAt ≤ deadline − minVetoResponseMs
- * (MIN_VETO_RESPONSE_MS_DEFAULT — a last-second delivery extends or
- * holds, never releases). Anything else — late, last-second,
- * stale-revision, wrong-hash, forged-delivery — is recorded in the
- * audit trail and ignored. An accepted ack is stored as AckEvidence,
- * inserted atomically under a compare-and-set on the current revision;
- * release for revision N requires revision-N evidence from a device
- * still active at the same generation at the moment of the release
- * decision — an ack does not outlive its device or its revision
- * (DESIGN.md §3, §4).
+ * Sent ONLY from the foreground detail view — the exact window's view
+ * selected, document visible AND focused, a paint opportunity
+ * completed, visibility re-checked immediately before signing
+ * (DESIGN.md §3). Notifications never ack: no service-worker context
+ * produces evidence, and a notification-class delivery is refused
+ * server-side. Counts ONLY under the full versioned-delivery rule,
+ * judged in one transaction on the server's clock and records
+ * (DESIGN.md §3): the named Delivery exists, is unexpired, is for THIS
+ * window, is "foreground-detail" class, and belongs to the signing
+ * device at its current generation; ack revision == delivery revision
+ * == the window's current open revision; `renderedPayloadHash` equals
+ * the hash the server recorded; the window is still pending/extended;
+ * and receivedAt ≤ deadline − minVetoResponseMs (floor 60 s, enforced
+ * at startup — a last-second delivery extends or holds, never
+ * releases). Anything else is recorded in the audit trail and ignored.
+ * An accepted ack is stored as AckEvidence in a transaction spanning
+ * the window and the witnessing device's generation record; release
+ * for revision N requires revision-N evidence from a device still
+ * active at the same generation at the moment of the release decision
+ * — an ack does not outlive its device or its revision (DESIGN.md §3,
+ * §4).
  */
 export interface SeenAck {
   windowId: string;
   /** the WindowRevision the device actually rendered */
   revision: number;
-  /** the server-minted Delivery that carried it */
+  /** the server-minted foreground-detail Delivery that carried it */
   deliveryId: string;
   /** SHA-256 of the exact payload bytes as received and rendered */
   renderedPayloadHash: Base64Url;
   /**
-   * when the summary was rendered on this device — AUDIT DATA ONLY. The
+   * when the view was rendered on this device — AUDIT DATA ONLY. The
    * server's own receive time and records decide whether the ack
    * counts; nothing the phone asserts moves the deadline.
    */
   renderedAt: UnixMs;
-  /** where it rendered */
-  surface: "notification" | "app";
+  /** the only ack-eligible render class (DESIGN.md §3) */
+  surface: "foreground-detail";
 }
 
 /**
@@ -594,7 +655,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "delivery ack — the production caller of markDelivered(); counts only under the versioned-delivery rule: current open revision, matching renderedPayloadHash for a server-minted Delivery owned by the signing device at its current generation, window still pending/extended, and receivedAt <= deadline - minVetoResponseMs (default 60 s — a last-second delivery extends or holds, never releases); renderedAt is audit-only; everything else recorded and ignored; stores revision-scoped AckEvidence inserted atomically via compare-and-set on the current revision — release for revision N requires revision-N evidence from a still-active device at the same generation",
+      "delivery ack — the production caller of markDelivered(); counts only under the versioned-delivery rule, judged in ONE transaction spanning the window and the witnessing device's generation record: named Delivery exists, unexpired, same windowId, foreground-detail render class (notification-class deliveries are refused — notifications never produce evidence), owned by the signing device at its current generation; ack revision == delivery revision == current open revision; matching renderedPayloadHash; window still pending/extended; receivedAt <= deadline - minVetoResponseMs (floor 60 s, enforced at startup); renderedAt audit-only; everything else recorded and ignored; release for revision N requires revision-N evidence from a still-active device at the same generation",
   },
   {
     method: "POST",
@@ -610,7 +671,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed for detail; open read stays status-only",
     status: "extension",
     purpose:
-      "deadline + delivered + call summary + current revision, for enrolled devices only; the read mints the Delivery the ack must echo; status speaks VetoWireStatus (#28) including terminal 'spent'",
+      "deadline + delivered + RenderableAlertV1 content + current revision, for enrolled devices only; the read mints the foreground-detail Delivery the ack must echo — the only ack-eligible render class; status speaks VetoWireStatus (#28) including terminal 'spent'",
   },
   {
     method: "GET",
@@ -626,15 +687,15 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "owner-session + device-signed + fresh UV assertion (purpose: device-invite) — redemption is device-signed; bootstrap/no-devices-left recovery via host CLI or permission-protected Unix socket — NEVER an HTTP loopback bypass",
     status: "addition",
     purpose:
-      "mint a single-use enrolment invite carrying the full WebAuthn creation contract; records the issuing device's {deviceId, revocationGeneration} (bootstrap: a bootstrap generation); token rides in the URL fragment where a URL form exists, is spent in a POST body, and is never logged",
+      "register a client-generated invite by hash commitment (InviteMintRequest): the inviting device generates the secret locally, submits only its SHA-256, and the server stores the hash and RETURNS NO SECRET — a captured signed request or raced response yields nothing; records the WebAuthn creation contract and the issuing device's {deviceId, revocationGeneration} (bootstrap: a bootstrap generation); the secret travels device-to-device only and is spent as a preimage, never logged",
   },
   {
     method: "POST",
     path: "/devices/enroll",
-    auth: "invite-token",
+    auth: "invite secret (preimage of the committed hash)",
     status: "addition",
     purpose:
-      "verify the WebAuthn registration (type/challenge/origin from clientDataJSON; rpIdHash + UP/UV from authenticatorData; ES256 on P-256) AND the pinned cheap-lane proof of possession, re-check the issuer's standing (or bootstrap generation + zero active devices) atomically, then store ONE EnrolledDevice holding both credentials; the invite burns atomically and only on success; a successful bootstrap enrolment invalidates sibling bootstrap invites",
+      "verify the WebAuthn registration (type/challenge/origin from clientDataJSON, REJECTING crossOrigin:true or an unexpected topOrigin; rpIdHash + UP/UV from authenticatorData; ES256 on P-256) AND the pinned cheap-lane proof of possession, re-check the issuer's standing (or bootstrap generation + zero active devices) atomically, then store ONE EnrolledDevice holding both credentials; the invite burns atomically and only on success; a successful bootstrap enrolment invalidates sibling bootstrap invites",
   },
   {
     method: "GET",
