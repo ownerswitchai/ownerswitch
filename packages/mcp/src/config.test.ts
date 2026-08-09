@@ -127,6 +127,45 @@ describe("loadConfig", () => {
     ).toThrowError(/non-empty tool names/);
   });
 
+  it("refuses a config whose route aliases put one operation in different policy lanes", () => {
+    // github.automerge_pr (allow) and github.merge_pr (veto) both reach
+    // merge_pull_request: an agent would call whichever alias is looser.
+    // This is a forbidden configuration — refused at startup, both tools named.
+    const bypass = {
+      ...VALID,
+      policy: {
+        rules: [
+          { id: "merge", tool: "github.merge_pr", decision: "veto" },
+          { id: "automerge", tool: "github.automerge_pr", decision: "allow" },
+        ],
+        defaultDecision: "approve",
+      },
+      executorRoutes: {
+        "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+        "github.automerge_pr": { connector: "github", operation: "merge_pull_request" },
+      },
+    };
+    expect(() => load(bypass)).toThrowError(ConfigError);
+    expect(() => load(bypass)).toThrowError(/github\.merge_pr/);
+    expect(() => load(bypass)).toThrowError(/github\.automerge_pr/);
+    expect(() => load(bypass)).toThrowError(/decide them differently/);
+  });
+
+  it("accepts aliases of one operation when one covering rule makes their verdicts identical", () => {
+    const coherent = {
+      ...VALID,
+      policy: {
+        rules: [{ id: "merges", tool: "github.*merge_pr", decision: "veto" }],
+        defaultDecision: "approve",
+      },
+      executorRoutes: {
+        "github.merge_pr": { connector: "github", operation: "merge_pull_request" },
+        "github.automerge_pr": { connector: "github", operation: "merge_pull_request" },
+      },
+    };
+    expect(load(coherent).executorRoutes).toBeDefined();
+  });
+
   it("accepts executor routes from OWNERSWITCH_EXECUTOR_ROUTES (JSON)", () => {
     const config = loadConfig(
       [],

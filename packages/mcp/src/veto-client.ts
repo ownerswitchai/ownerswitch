@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { signDeviceRequest, type VetoStatus } from "@ownerswitchai/control-plane";
+import { signDeviceRequest, type VetoWireStatus } from "@ownerswitchai/control-plane";
 import type { ToolCall } from "@ownerswitchai/shared";
 
 /**
@@ -36,7 +36,12 @@ export interface VetoClientOptions {
 
 export interface VetoClient {
   register(call: ToolCall): Promise<{ id: string }>;
-  status(id: string): Promise<VetoStatus | "missing">;
+  /**
+   * The window's wire status; "spent" is a would-be release from a dead kill
+   * epoch (the control plane's rule, see control-plane/src/veto.ts), and
+   * "missing" is a 404 — drop the stale record and re-register.
+   */
+  status(id: string): Promise<VetoWireStatus | "missing">;
 }
 
 /** Carries the fail-closed detail for the refusal message. Never a secret. */
@@ -52,7 +57,14 @@ export class VetoClientError extends Error {
 
 const UNREACHABLE = "control plane unreachable — fail closed";
 
-const VETO_STATUSES: readonly VetoStatus[] = ["pending", "vetoed", "released", "extended", "held"];
+const VETO_STATUSES: readonly VetoWireStatus[] = [
+  "pending",
+  "vetoed",
+  "released",
+  "extended",
+  "held",
+  "spent",
+];
 
 export function createVetoClient(options: VetoClientOptions): VetoClient {
   const { baseUrl, device, timeoutMs = 1500, fetchImpl = fetch, now = Date.now } = options;
@@ -104,7 +116,7 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
     return { id };
   }
 
-  async function status(id: string): Promise<VetoStatus | "missing"> {
+  async function status(id: string): Promise<VetoWireStatus | "missing"> {
     const res = await request(new URL(`/veto/${encodeURIComponent(id)}`, baseUrl), { method: "GET" });
     if (res.status === 404) return "missing";
     if (!res.ok) {
@@ -112,8 +124,8 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
     }
     const parsed: unknown = await res.json().catch(() => null);
     const status = (parsed as { status?: unknown } | null)?.status;
-    if (!VETO_STATUSES.includes(status as VetoStatus)) throw new VetoClientError(UNREACHABLE);
-    return status as VetoStatus;
+    if (!VETO_STATUSES.includes(status as VetoWireStatus)) throw new VetoClientError(UNREACHABLE);
+    return status as VetoWireStatus;
   }
 
   return { register, status };

@@ -8,7 +8,7 @@ import {
   type ActionTicket,
   type ExecutionOutcome,
 } from "@ownerswitchai/executor";
-import type { Policy, ToolCall } from "@ownerswitchai/shared";
+import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import type { ExecutorRouteConfig } from "./config.js";
 
 /**
@@ -39,13 +39,19 @@ export interface ExecutorWiring {
 }
 
 /**
- * `Policy` has no version field, so the version IS the content hash of its
- * canonical JSON (same canonicalization as ticket args — key-sorted, no
- * whitespace). If the policy changed between decision and execution, the
- * audit trail shows which policy said yes.
+ * The ticket's `policyVersion`: a content hash of the WHOLE authorization
+ * semantics — the policy AND the executor-route mapping, canonical JSON
+ * (same canonicalization as ticket args — key-sorted, no whitespace).
+ * Routes decide which real operation an MCP tool name reaches, so hashing
+ * the policy alone would identify only half of what was authorized: the
+ * same policy with a re-pointed route is a different authorization world,
+ * and the audit trail must say so.
  */
-export function policyVersionOf(policy: Policy): string {
-  const canonical = canonicalizeArgs(policy as unknown as Record<string, unknown>);
+export function authorizationVersionOf(
+  policy: Policy,
+  routes: Record<string, ExecutorRouteConfig>,
+): string {
+  const canonical = canonicalizeArgs({ executorRoutes: routes, policy });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
@@ -75,15 +81,24 @@ export interface MintContext {
   nonce: string;
 }
 
-/** Throws when the arguments cannot form a valid action for the route. */
+/**
+ * Throws when the arguments cannot form a valid action for the route.
+ * `verdict` is the yes that authorized this mint — its decision and rule id
+ * ride in the ticket so the audit trail says WHAT was approved (the source
+ * tool the agent called) and UNDER WHICH rule.
+ */
 export function mintActionTicket(
   call: ToolCall,
   route: ExecutorRouteConfig,
+  verdict: Verdict,
   ctx: MintContext,
 ): ActionTicket {
   const canonicalArgs = canonicalizeArgs(call.args ?? {});
   return {
     agentId: call.agentId,
+    sourceTool: call.tool,
+    decision: verdict.decision,
+    ruleId: verdict.ruleId,
     connector: route.connector,
     operation: route.operation,
     canonicalArgs,

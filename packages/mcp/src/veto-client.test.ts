@@ -55,6 +55,10 @@ describe("createVetoClient", () => {
     );
   });
 
+  it("status passes 'spent' through — a release from a dead kill epoch must reach the proxy", async () => {
+    await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toBe("spent");
+  });
+
   it("times out hung requests and fails closed", async () => {
     const hanging: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {

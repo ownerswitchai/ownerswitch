@@ -37,11 +37,14 @@ executor never reaches back into the gateway's memory.
 | field           | type      | why it exists |
 | --------------- | --------- | ------------- |
 | `agentId`       | `string`  | who the action was authorized *for* — same id as `ToolCall.agentId`; lands in the audit trail |
+| `sourceTool`    | `string`  | the MCP tool name the agent actually called. Several MCP surfaces may front one operation, and the audit trail must say which one the owner's decision was about |
+| `decision`      | `Decision` | the verdict that authorized the ticket — `"allow"`, or `"veto"` after release |
+| `ruleId`        | `string \| null` | the policy rule that produced the verdict (`null` for the default decision) — what was approved, *under which rule* |
 | `connector`     | `string`  | which backend performs it, e.g. `"github"` |
 | `operation`     | `string`  | which action within the connector, e.g. `"merge_pull_request"` |
 | `canonicalArgs` | `string`  | the arguments, canonicalized (below). The executor runs *these bytes* — not a re-supplied copy — so what runs is exactly what was evaluated and approved |
 | `resourceId`    | `string`  | stable id of the object acted on, e.g. `github:pr:ownerswitchai/ownerswitch#7` — audit and future per-resource rules key on this, independent of args shape |
-| `policyVersion` | `string`  | content hash of the policy the verdict came from. `Policy` has no version field today, so the version *is* the hash of its canonical JSON; if the policy changed between decision and execution, the audit trail shows which policy said yes |
+| `policyVersion` | `string`  | content hash of the **whole authorization semantics** the verdict came from: the policy *and* the executor-route mapping, as canonical JSON. Routes decide which real operation a tool name reaches, so a hash of the policy alone would identify only half of what was authorized — the same policy with a re-pointed route is a different authorization world |
 | `killEpoch`     | `number`  | `KillSwitch.epoch` at mint time (§3). Must still match at execution time |
 | `expiresAt`     | `number`  | unix ms. Tickets are short-lived (minutes, not hours) — a yes is not a standing grant |
 | `nonce`         | `string`  | unique per ticket; burned on first execution attempt |
@@ -57,9 +60,20 @@ connectors use today.)
 
 **Naming.** The MCP-visible tool id (`github.merge_pr` in today's policy)
 maps to `(connector: "github", operation: "merge_pull_request")` at mint
-time. The ticket stores the connector/operation pair, not the MCP name, so
-several MCP surfaces can front the same executor operation without the
-executor caring.
+time. The ticket stores the connector/operation pair *and* the source tool
+name, so several MCP surfaces can front the same executor operation without
+the executor caring — while the audit trail still says which surface the
+owner's decision was about.
+
+**Alias coherence is enforced.** Policy judges the agent-chosen tool NAME;
+routes map names to real operations afterwards. Two aliases of one
+operation sitting in different policy lanes would therefore be a policy
+bypass — the agent simply calls the looser alias. The gateway refuses such
+a configuration at startup (config load AND proxy construction), naming
+both tools: aliases of one `(connector, operation)` must have provably
+identical verdicts — the same ordered candidate-rule list (id, decision,
+argsPattern) and the same default — e.g. one glob rule covering all of
+them.
 
 ## 2. The flow
 
@@ -76,7 +90,10 @@ agent ──MCP──▶ proxy ── evaluate() ──▶ allow ─────
                                                        2. killed? epoch moved? expired?
                                                           nonce burned?  ──▶ refuse
                                                        3. burn the nonce
-                                                       4. backend.execute(ticket) ──▶ GitHub API,
+                                                       4. re-fetch LIVE state, re-check
+                                                          right before dispatch ──▶ refuse
+                                                          (narrows the race; cannot close it)
+                                                       5. backend.execute(ticket) ──▶ GitHub API,
                                                                   │                   OwnerSwitch's OWN credential
 agent ◀────────── result: { merged: true, sha } ──────────────────┘
                   (data, never a token)
@@ -110,6 +127,32 @@ control plane** — never a cached answer:
 2. `ticket.killEpoch` must equal the current kill epoch;
 3. `now < ticket.expiresAt`;
 4. the nonce must not already be burned.
+
+**The guarantee, stated precisely: an action not yet dispatched when the
+kill lands is refused; an action already dispatched cannot be recalled.**
+The refusal boundary is dispatch — the moment the connector call is on the
+wire. A kill can land after the last check and before (or during) that
+call, and against an external API with no fencing no mechanism can close
+that gap; anything claiming otherwise would be theater. This is the same
+boundary the kill switch itself documents for in-flight actions
+(`packages/mcp/THREAT-MODEL.md`, `gateway/src/engine.ts`): kill stops *new*
+actions, it does not recall dispatched ones. What the executor does is run
+a **second live re-check immediately before dispatch**, after the nonce
+burn — it *narrows* the undetected window to the dispatch itself; it does
+not and cannot close it.
+
+**A veto release binds to its window's kill epoch — server-side.** The
+epoch rule would be worthless if it only covered the ticket: a veto window
+opened under epoch N, released, then killed-and-restored would otherwise be
+retried and minted with the *retry's* epoch — a pre-kill approval executing
+in the post-kill world. So the control plane records the kill epoch in
+force when a window is **created**, in the window record itself (not in any
+gateway's memory — the binding survives gateway restarts and holds across
+multiple gateways). A would-be `released` status from a window whose epoch
+is no longer current is served as `spent`: the release authorizes nothing,
+the proxy refuses the call, and only a fresh window — a fresh owner
+decision — can let it run. An owner's `vetoed` is never downgraded: "no"
+survives everything.
 
 **The kill epoch is the control plane's, not ours.** `KillSwitch` already
 maintains it: `epochCounter`, bumped on every `engage()`, exposed as
@@ -166,9 +209,9 @@ on the agent's side.
 | --- | --- | --- |
 | `@ownerswitchai/shared` | `Decision`, `ToolCall`, `Policy`, `Verdict` | unchanged |
 | gateway `evaluate()` / `evaluateRemote()` | the decision, live kill state required | unchanged — still the sole authority |
-| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` returns `epoch` too (§3) | unchanged |
-| mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | **wired**: for operations declared in the gateway config's `executorRoutes` (MCP tool name → connector/operation), a yes — allow, or veto after release — mints an `ActionTicket` (`packages/mcp/src/executor-route.ts`) and calls `executor.run()`; the result is relayed to the agent. Every unrouted tool keeps forwarding exactly as before |
-| **this package** | — | ticket type, refusal core, `ExecutorBackend`, `liveKillStateFromControlPlane` (§3), GitHub merge backend with the HTTP call still stubbed |
+| control plane | `KillSwitch` with `killed` + persisted `epoch`; ceremonies bound to the epoch; `GET /status` returns `epoch` too (§3) | veto windows now record the kill epoch at registration, server-side in the window record; a would-be release from a dead epoch is served `spent` (§3) |
+| mcp proxy, on yes | `forward(call)` — hand the call to the upstream MCP server, pass the result through | **wired**: for operations declared in the gateway config's `executorRoutes` (MCP tool name → connector/operation, alias-coherence enforced at startup, §1), a yes — allow, or veto after release with the window's epoch still current — mints an `ActionTicket` (`packages/mcp/src/executor-route.ts`) and calls `executor.run()`; the result is relayed to the agent. Every unrouted tool keeps forwarding exactly as before |
+| **this package** | — | ticket type, refusal core with a second pre-dispatch re-check (§3), `ExecutorBackend`, `liveKillStateFromControlPlane` (§3), GitHub merge backend that scrubs its own credential from results and errors, HTTP call still stubbed |
 
 The wiring is deliberately thin: the proxy's decision path did not change —
 same lanes, same refusals, same honeytoken scan immediately before anything
@@ -187,13 +230,15 @@ Honesty about the boundary, in the same spirit as the threat model:
   this package never hears about it. The executor closes the gap *for
   actions routed through OwnerSwitch* — routing everything through
   OwnerSwitch is a deployment property, not something this code can force.
-- **Kill stops new executions, not in-flight ones.** The re-check in §3
-  runs immediately before `backend.execute()`; once the connector call is
-  on the wire, a kill cannot recall it. This is the same enforcement
-  boundary the kill switch itself documents — kill guarantees no *new*
-  authorized action crosses the boundary, nothing more. What the executor
-  removes is the other half of that caveat: for actions routed through it,
-  there are no credentials issued downstream to outlive the kill.
+- **Kill stops new executions, not in-flight ones.** Precisely: an action
+  not yet dispatched when the kill lands is refused; an action already
+  dispatched cannot be recalled (§3). The re-checks in §3 run up to
+  immediately before `backend.execute()`; once the connector call is on
+  the wire, a kill cannot recall it. This is the same enforcement boundary
+  the kill switch itself documents — kill guarantees no *new* authorized
+  action crosses the boundary, nothing more. What the executor removes is
+  the other half of that caveat: for actions routed through it, there are
+  no credentials issued downstream to outlive the kill.
 - **OwnerSwitch's credential is now the prize.** The executor holds a
   standing GitHub credential; whoever compromises the executor process
   merges without any ticket. Least privilege (a GitHub App with
@@ -209,30 +254,55 @@ Honesty about the boundary, in the same spirit as the threat model:
   it does not make the owner infallible.
 - **GitHub-side paths remain.** Other collaborators, other bots, and
   branch-protection gaps are GitHub's access model, not ours.
-- **The nonce store is per-process.** In-memory in v0; two executor
-  instances behind a balancer could each burn the same nonce once. A
-  shared store is part of productionizing, not of this proof.
+- **The nonce store is per-process — this is a deployment constraint, not
+  a footnote.** The store lives in one `Executor` instance inside one
+  gateway process, so a ticket is single-use *within that process* and
+  nothing more: a gateway restart forgets every burned nonce, a second
+  gateway process has its own empty store, and a future remote executor
+  would share nothing. The wiring is defensible TODAY because of two facts
+  that must both stay true: the agent never holds a ticket (mint and run
+  happen inside one proxy call), and there is no executor endpoint to
+  replay one against. **Deployment constraint: run exactly one gateway
+  process per deployment, and do not stand up a remote executor, until a
+  shared nonce store exists.** A shared atomic consume would require, at
+  minimum: a unique-constraint insert (or Redis `SET NX`) so exactly one
+  consumer wins; keys namespaced by deployment so environments cannot burn
+  each other's nonces; entry TTL ≥ the maximum ticket lifetime plus clock
+  skew, so a nonce cannot be forgotten while its ticket could still be
+  presented; fail closed on any storage error (an unreachable store refuses
+  the ticket, never assumes it fresh); and the burn still ordered before
+  dispatch, exactly as in-process.
 
 ## 6. Wired / still stubbed
 
-**Wired:** this document; `ActionTicket`; the pure refusal core (kill /
-epoch / expiry / nonce); `ExecutorBackend` with `execute(ticket)`; the
-control-plane `/status` epoch field and its fail-closed client;
-`liveKillStateFromControlPlane` backing the executor's live re-check (§3);
-the proxy wiring — config-declared `executorRoutes`, ticket minting on yes,
-`executor.run()` instead of `forward()` for routed operations, result
-relayed to the agent (`packages/mcp/src/executor-route.ts`, `proxy.ts`,
-`config.ts`); end-to-end tests over a fake backend proving the central
-claim — kill between mint and execution refuses before the backend is ever
-called (engaged, and kill-then-restore epoch mismatch), expired ticket
-refused, replayed nonce refused, unreachable control plane refused, and a
-happy path where the backend runs exactly once and the agent receives the
-result, never a token.
+**Wired:** this document; `ActionTicket` (including source tool, verdict
+decision and rule id for the audit trail); the pure refusal core (kill /
+epoch / expiry / nonce) plus the second pre-dispatch re-check (§3);
+`ExecutorBackend` with `execute(ticket)`; the control-plane `/status` epoch
+field and its fail-closed client; veto windows epoch-bound server-side,
+with `spent` served for a release from a dead epoch (§3);
+`liveKillStateFromControlPlane` backing the executor's live re-checks
+(§3); the proxy wiring — config-declared `executorRoutes` with the
+alias-coherence gate (§1), the authorization hash covering policy AND
+routes, ticket minting on yes, `executor.run()` instead of `forward()` for
+routed operations, result relayed to the agent
+(`packages/mcp/src/executor-route.ts`, `proxy.ts`, `config.ts`);
+credential scrubbing in the GitHub backend; end-to-end tests over a fake
+backend proving the claim as stated in §3 — a kill landing before dispatch
+refuses the ticket and the backend is never called (engaged,
+kill-then-restore epoch mismatch, and a spent veto release), expired
+ticket refused, replayed nonce refused, unreachable control plane refused,
+a happy path where the backend runs exactly once and the agent receives
+the result, never a token — and a leak test where the backend genuinely
+holds the credential and an upstream error that echoes it reaches the
+agent scrubbed.
 
 **Still stubbed / not yet:** the live GitHub call —
 `GitHubMergePrExecutor`'s HTTP call stays behind its injectable
-`GitHubMergeClient`, and the CLI wires the backend with no client, so a
-routed call that clears every check fails with an explicit "not
-implemented" (`ExecutionFailed`, `-32057`) rather than silently
-forwarding. Also not yet: ticket signing; a persistent/shared nonce store;
-any connector beyond `merge_pull_request`.
+`GitHubMergeClient`, and the CLI wires the backend with no client (the
+`OWNERSWITCH_GITHUB_TOKEN` credential seam exists and only arms
+scrubbing), so a routed call that clears every check fails with an
+explicit "not implemented" (`ExecutionFailed`, `-32057`) rather than
+silently forwarding. Also not yet: ticket signing; a shared nonce store —
+until one exists the deployment constraint in §5 stands (one gateway
+process, no remote executor); any connector beyond `merge_pull_request`.

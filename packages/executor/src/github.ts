@@ -25,6 +25,18 @@ export interface GitHubMergeClient {
   mergePullRequest(args: MergePrArgs): Promise<{ merged: boolean; sha: string; message: string }>;
 }
 
+/**
+ * OwnerSwitch's OWN GitHub credential — the one the live client will
+ * authenticate with. It exists on this side of the boundary only; the agent
+ * must never see it, so the backend that holds it also owns scrubbing it
+ * from everything it emits: results AND errors. APIs quote credentials back
+ * ("bad token ghp_… "), and an unscrubbed backend error would otherwise ride
+ * an ExecutionFailed refusal straight to the agent.
+ */
+export interface GitHubCredential {
+  token: string;
+}
+
 /** e.g. "github:pr:ownerswitchai/ownerswitch#7" */
 export function githubPrResourceId(owner: string, repo: string, pullNumber: number): string {
   return `github:pr:${owner}/${repo}#${pullNumber}`;
@@ -58,7 +70,23 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
 }
 
 export class GitHubMergePrExecutor implements ExecutorBackend {
-  constructor(private readonly client?: GitHubMergeClient) {}
+  /**
+   * `credential` is the config path a real connector uses: the live client
+   * will authenticate with it, and even while the HTTP call is stubbed, the
+   * backend already scrubs the token from every string it emits — so wiring
+   * a credential in can never widen what the agent sees.
+   */
+  constructor(
+    private readonly client?: GitHubMergeClient,
+    private readonly credential?: GitHubCredential,
+  ) {}
+
+  /** The one secret this backend holds never leaves it, even quoted back. */
+  private scrub(text: string): string {
+    const token = this.credential?.token;
+    if (token === undefined || token === "") return text;
+    return text.split(token).join("[REDACTED]");
+  }
 
   async execute(ticket: ActionTicket): Promise<ExecutionResult> {
     if (ticket.connector !== GITHUB_CONNECTOR || ticket.operation !== MERGE_PULL_REQUEST) {
@@ -72,10 +100,21 @@ export class GitHubMergePrExecutor implements ExecutorBackend {
         "not implemented: the live GitHub call lands in a later PR — inject a GitHubMergeClient",
       );
     }
-    const outcome = await this.client.mergePullRequest(args);
+    let outcome;
+    try {
+      outcome = await this.client.mergePullRequest(args);
+    } catch (err) {
+      // GitHub quotes credentials back in auth errors; the scrubbed message
+      // is what may ride an ExecutionFailed refusal to the agent
+      throw new Error(this.scrub(err instanceof Error ? err.message : String(err)));
+    }
     return {
       resourceId: githubPrResourceId(args.owner, args.repo, args.pullNumber),
-      detail: { merged: outcome.merged, sha: outcome.sha, message: outcome.message },
+      detail: {
+        merged: outcome.merged,
+        sha: this.scrub(outcome.sha),
+        message: this.scrub(outcome.message),
+      },
     };
   }
 }

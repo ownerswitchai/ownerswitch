@@ -12,6 +12,7 @@ import {
 import type { ActionTicket, ExecutionOutcome } from "@ownerswitchai/executor";
 import { evaluateRemote, type ControlPlaneClient, type KillState } from "@ownerswitchai/gateway";
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
+import { assertExecutorRoutesCoherent } from "./config.js";
 import {
   approvalRequired,
   controlPlaneUnavailable,
@@ -23,11 +24,12 @@ import {
   ticketRefused,
   vetoHeld,
   vetoPending,
+  vetoReleaseSpent,
 } from "./errors.js";
 import {
+  authorizationVersionOf,
   DEFAULT_TICKET_TTL_MS,
   mintActionTicket,
-  policyVersionOf,
   type ExecutorWiring,
 } from "./executor-route.js";
 import { VetoClientError, type VetoClient } from "./veto-client.js";
@@ -137,12 +139,16 @@ const detail = (err: unknown): string =>
 export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy {
   const agentId = options.agentId ?? PROXY_NAME;
   const executor = options.executor;
+  // Defense in depth alongside the config loader's identical check: routes
+  // that let aliases of one operation land in different policy lanes are a
+  // policy bypass, and a proxy handed such routes must refuse to exist.
+  if (executor !== undefined) assertExecutorRoutesCoherent(options.policy, executor.routes);
   const ticketTtlMs = executor?.ticketTtlMs ?? DEFAULT_TICKET_TTL_MS;
   const mintNow = executor?.now ?? Date.now;
   const mintNonce = executor?.mintNonce ?? randomUUID;
-  // pinned once: every ticket names the policy that was in force when this
-  // gateway started judging calls with it
-  const policyVersion = policyVersionOf(options.policy);
+  // pinned once: every ticket names the authorization semantics — policy AND
+  // route mapping — in force when this gateway started judging calls with it
+  const policyVersion = authorizationVersionOf(options.policy, executor?.routes ?? {});
   const upstream = new Client({ name: `${PROXY_NAME} (upstream side)`, version: PROXY_VERSION });
   const server = new Server(
     { name: PROXY_NAME, version: PROXY_VERSION },
@@ -181,7 +187,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
 
     switch (verdict.decision) {
       case "allow":
-        return forwardOrKill(call, observedKill?.epoch);
+        return forwardOrKill(call, verdict, observedKill?.epoch);
       case "deny":
         alertIfDecoy(call, "policy denied");
         throw policyDenied(call.tool, verdict);
@@ -210,6 +216,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    */
   async function forwardOrKill(
     call: ToolCall,
+    verdict: Verdict,
     mintEpoch: number | undefined,
   ): Promise<CallToolResult> {
     const canaryIds = decoyIds(call);
@@ -219,7 +226,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     }
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {
-      return runRouted(call, executor, route, mintEpoch);
+      return runRouted(call, executor, route, verdict, mintEpoch);
     }
     // the client validated the result against CallToolResultSchema; the SDK's
     // return type is a union over every possible schema, so narrow it here
@@ -239,6 +246,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     call: ToolCall,
     wiring: ExecutorWiring,
     route: { connector: string; operation: string },
+    verdict: Verdict,
     mintEpoch: number | undefined,
   ): Promise<CallToolResult> {
     // The real control-plane client always carries an epoch on a live "not
@@ -252,7 +260,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     }
     let ticket: ActionTicket;
     try {
-      ticket = mintActionTicket(call, route, {
+      ticket = mintActionTicket(call, route, verdict, {
         policyVersion,
         killEpoch: mintEpoch,
         now: mintNow(),
@@ -339,15 +347,25 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         case "held":
           // fail closed on unconfirmed delivery: now an approval, still held
           throw vetoHeld(call.tool, id);
-        case "released":
-          // silence let it run; a released window authorizes exactly one run.
-          // Scan here, right before acting — a decoy released to cross the
-          // boundary kills, exactly as an allowed call would. mintEpoch is
-          // the epoch THIS attempt's evaluation observed, not the epoch when
-          // the window opened: the released retry re-evaluated against live
-          // kill state moments ago, and the ticket binds to that world.
+        case "spent":
+          // The window released, but the control plane's server-side record
+          // says a kill happened AFTER the window was opened — approvals do
+          // not survive a kill, even one since restored. The release
+          // authorizes nothing; drop the window so the next attempt opens a
+          // fresh owner review.
           windows.delete(key);
-          return forwardOrKill(call, mintEpoch);
+          throw vetoReleaseSpent(call.tool, id);
+        case "released":
+          // Silence let it run; a released window authorizes exactly one run.
+          // Scan here, right before acting — a decoy released to cross the
+          // boundary kills, exactly as an allowed call would. "released" (as
+          // opposed to "spent" above) means the control plane checked the
+          // window's registration-time kill epoch against the current one:
+          // no kill has happened since the owner was shown this call, so the
+          // epoch this attempt's evaluation observed is the same world the
+          // window was approved in, and the ticket may bind to it.
+          windows.delete(key);
+          return forwardOrKill(call, verdict, mintEpoch);
       }
     }
   }

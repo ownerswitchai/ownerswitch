@@ -8,14 +8,14 @@ export type { HoneytokenGuard, OwnerSwitchProxy, ProxyOptions } from "./proxy.js
 export { OwnerSwitchErrorCode, OwnerSwitchRefusal } from "./errors.js";
 export type { OwnerSwitchErrorCodeName, RefusalData } from "./errors.js";
 
-export { ConfigError, loadConfig, parseConfig } from "./config.js";
+export { assertExecutorRoutesCoherent, ConfigError, loadConfig, parseConfig } from "./config.js";
 export type { ExecutorRouteConfig, OwnerSwitchMcpConfig, UpstreamConfig } from "./config.js";
 
 export {
+  authorizationVersionOf,
   DEFAULT_TICKET_TTL_MS,
   deriveResourceId,
   mintActionTicket,
-  policyVersionOf,
 } from "./executor-route.js";
 export type { ExecutorWiring, MintContext } from "./executor-route.js";
 

@@ -1,3 +1,5 @@
+import type { Decision } from "@ownerswitchai/shared";
+
 /**
  * ActionTicket — the one data structure that crosses from "decided" to
  * "executed". Minted by the gateway when a call clears its lane
@@ -7,6 +9,16 @@
 export interface ActionTicket {
   /** who the action was authorized for — same id as ToolCall.agentId */
   agentId: string;
+  /**
+   * the MCP tool name the agent actually called — several MCP surfaces may
+   * front one executor operation, and the audit trail must say which one
+   * the owner's decision was about
+   */
+  sourceTool: string;
+  /** the verdict that authorized this ticket: "allow", or "veto" after release */
+  decision: Decision;
+  /** id of the policy rule that produced the verdict; null for the default decision */
+  ruleId: string | null;
   /** which backend performs it, e.g. "github" */
   connector: string;
   /** which action within the connector, e.g. "merge_pull_request" */
@@ -19,7 +31,12 @@ export interface ActionTicket {
   canonicalArgs: string;
   /** stable id of the object acted on, e.g. "github:pr:ownerswitchai/ownerswitch#7" */
   resourceId: string;
-  /** content hash of the policy the verdict came from */
+  /**
+   * content hash of the WHOLE authorization semantics the verdict came
+   * from: the policy AND the executor-route mapping. Routes decide which
+   * real operation a tool name reaches, so a hash of the policy alone would
+   * identify only half of what was authorized.
+   */
   policyVersion: string;
   /** the control plane's kill epoch at mint time; must still match at execution */
   killEpoch: number;

@@ -38,6 +38,9 @@ importers:
       '@ownerswitchai/gateway':
         specifier: workspace:*
         version: link:../gateway
+      '@ownerswitchai/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/gateway:
     dependencies:

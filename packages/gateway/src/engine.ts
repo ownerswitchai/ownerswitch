@@ -8,7 +8,7 @@
  * Short TTLs are the mitigation. Don't document KILL as "revokes existing
  * tokens" — that overclaims what this boundary can enforce.
  */
-import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
+import type { Policy, PolicyRule, ToolCall, Verdict } from "@ownerswitchai/shared";
 
 /** Global kill state — when engaged, EVERYTHING is denied. Fail-closed. */
 export interface KillState {
@@ -31,6 +31,18 @@ export interface KillState {
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const globToRegex = (glob: string) =>
   new RegExp("^" + glob.split("*").map(escapeRe).join(".*") + "$");
+
+/**
+ * The rules whose tool glob matches `tool`, in policy order — the exact
+ * candidate set evaluate() walks (argsPattern then decides per call which
+ * candidate fires). Exported so callers that need to reason about a tool
+ * NAME's possible verdicts — e.g. the executor-route coherence check in
+ * @ownerswitchai/mcp — use the engine's own matcher instead of re-deriving
+ * glob semantics that could drift.
+ */
+export function rulesMatchingTool(policy: Policy, tool: string): PolicyRule[] {
+  return policy.rules.filter((rule) => globToRegex(rule.tool).test(tool));
+}
 
 /**
  * The core decision function of OwnerSwitch.
@@ -60,8 +72,7 @@ export function evaluate(
     };
   }
 
-  for (const rule of policy.rules) {
-    if (!globToRegex(rule.tool).test(call.tool)) continue;
+  for (const rule of rulesMatchingTool(policy, call.tool)) {
     if (
       rule.argsPattern &&
       !new RegExp(rule.argsPattern).test(JSON.stringify(call.args ?? {}))

@@ -13,7 +13,7 @@ import {
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { RestoreCeremony } from "./twogo.js";
-import { VetoWindow } from "./veto.js";
+import { VetoWindow, type VetoWireStatus } from "./veto.js";
 
 /**
  * HTTP layer of the control plane. One process, one KillSwitch, one map of
@@ -563,7 +563,10 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return;
     }
     const id = `veto_${randomBytes(6).toString("hex")}`;
-    const window = new VetoWindow(call, { now });
+    // The window binds to the kill epoch in force NOW, in the server-side
+    // record — a release from a dead epoch is refused below regardless of
+    // which gateway retries it or whether that gateway restarted meanwhile.
+    const window = new VetoWindow(call, killSwitch.epoch, { now });
     vetoWindows.set(id, window);
     sendJson(res, 201, { id, status: window.state });
   }
@@ -574,7 +577,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    sendJson(res, 200, { status: window.tick() });
+    let status: VetoWireStatus = window.tick();
+    // A release authorizes exactly one run IN THE EPOCH IT WAS GRANTED. If a
+    // kill happened after the window was registered — even one since
+    // restored — the release is spent: `killed` alone flips back to false on
+    // restore, but the epoch never does, and a pre-kill approval must not
+    // execute in the post-kill world. An owner's veto is NOT overridden
+    // here: "no" survives everything.
+    if (status === "released" && window.killEpoch !== killSwitch.epoch) status = "spent";
+    sendJson(res, 200, { status });
   }
 
   function handler(req: IncomingMessage, res: ServerResponse): void {

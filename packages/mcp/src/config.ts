@@ -1,4 +1,5 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { rulesMatchingTool } from "@ownerswitchai/gateway";
 import type { Decision, Policy, PolicyRule } from "@ownerswitchai/shared";
 import type { DeviceIdentity } from "./veto-client.js";
 
@@ -126,6 +127,53 @@ function parseUpstream(v: unknown, path: string): UpstreamConfig {
   };
 }
 
+/**
+ * Everything that can influence the verdict for a tool NAME: the ordered
+ * candidate rules the engine would walk for it (id, decision, argsPattern —
+ * argsPattern included because it decides per call WHICH candidate fires),
+ * plus the fail-closed default. Two tool names with identical signatures
+ * provably get identical verdicts for identical arguments.
+ */
+const verdictSignature = (policy: Policy, tool: string): string =>
+  JSON.stringify([
+    rulesMatchingTool(policy, tool).map((r) => [r.id, r.decision, r.argsPattern ?? null]),
+    policy.defaultDecision,
+  ]);
+
+/**
+ * Refuse a config where one executor (connector, operation) is reachable
+ * through aliases the policy can decide DIFFERENTLY. Policy judges the
+ * agent-chosen MCP tool name; routes map names to real operations
+ * afterwards — so `github.automerge_pr: allow` next to
+ * `github.merge_pr: veto`, both routed to merge_pull_request, would let the
+ * agent reach the guarded operation through whichever alias is looser. That
+ * is a policy bypass, and it is a configuration error: fail loudly at
+ * startup, naming both tools. Aliases whose verdicts provably coincide
+ * (e.g. both covered by the same glob rule) remain allowed — several MCP
+ * surfaces may front one operation, but only in the same lane.
+ */
+export function assertExecutorRoutesCoherent(
+  policy: Policy,
+  routes: Record<string, ExecutorRouteConfig>,
+): void {
+  const seen = new Map<string, { tool: string; signature: string }>();
+  for (const [tool, route] of Object.entries(routes)) {
+    const operation = `${route.connector}.${route.operation}`;
+    const signature = verdictSignature(policy, tool);
+    const first = seen.get(operation);
+    if (first === undefined) {
+      seen.set(operation, { tool, signature });
+    } else if (first.signature !== signature) {
+      fail(
+        `executor routes "${first.tool}" and "${tool}" both reach ${operation}, but the policy ` +
+          `can decide them differently — an agent would simply call whichever alias is looser. ` +
+          `Refusing to start: give every alias of one operation the same policy outcome (one ` +
+          `glob rule covering all aliases is the simple fix), or route only one of them.`,
+      );
+    }
+  }
+}
+
 function parseExecutorRoutes(v: unknown, path: string): Record<string, ExecutorRouteConfig> {
   if (!isRecord(v)) return fail(`${path} must be an object mapping tool names to routes`);
   const routes: Record<string, ExecutorRouteConfig> = {};
@@ -155,6 +203,14 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
   if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !(timeoutMs > 0))) {
     return fail("timeoutMs must be a positive number");
   }
+  const policy = parsePolicy(v.policy, "policy");
+  const executorRoutes =
+    v.executorRoutes !== undefined
+      ? parseExecutorRoutes(v.executorRoutes, "executorRoutes")
+      : undefined;
+  // a route set that lets aliases of one operation land in different policy
+  // lanes is a policy bypass — a startup error, never a warning
+  if (executorRoutes !== undefined) assertExecutorRoutesCoherent(policy, executorRoutes);
   return {
     controlPlaneUrl,
     device: {
@@ -162,12 +218,10 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
       secret: requireString(v.device.secret, "device.secret"),
     },
     upstream: parseUpstream(v.upstream, "upstream"),
-    policy: parsePolicy(v.policy, "policy"),
+    policy,
     ...(v.agentId !== undefined ? { agentId: requireString(v.agentId, "agentId") } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-    ...(v.executorRoutes !== undefined
-      ? { executorRoutes: parseExecutorRoutes(v.executorRoutes, "executorRoutes") }
-      : {}),
+    ...(executorRoutes !== undefined ? { executorRoutes } : {}),
   };
 }
 

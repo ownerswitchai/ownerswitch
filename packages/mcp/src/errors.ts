@@ -168,6 +168,11 @@ export function honeytokenTripped(tool: string, canaryIds: string[]): OwnerSwitc
  * decision that produced the ticket was a yes; the world changed between
  * yes and run. The approval is void: a retry goes through the whole
  * decision path again from the start.
+ *
+ * The guarantee behind this refusal, stated precisely: an action not yet
+ * dispatched when the kill lands is refused; an action already dispatched
+ * cannot be recalled. The refusal window closes at dispatch — the same
+ * in-flight boundary THREAT-MODEL.md draws for the kill switch itself.
  */
 export function ticketRefused(
   tool: string,
@@ -184,11 +189,39 @@ export function ticketRefused(
 }
 
 /**
+ * A veto window released, but a kill happened after the window was opened —
+ * the control plane reports the release "spent" (its server-side record
+ * binds every window to the kill epoch at registration). Approvals do not
+ * survive a kill, even one that was later restored: the release authorizes
+ * nothing, and only a fresh window can.
+ */
+export function vetoReleaseSpent(tool: string, vetoWindowId: string): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.TicketRefused,
+    `OwnerSwitch refused "${tool}": its veto window ("${vetoWindowId}") was released, but a ` +
+      `kill switch engagement happened after the window was opened, so the release is spent — ` +
+      `approvals do not survive a kill, even one that was later restored. The action did NOT ` +
+      `run. Calling the tool again opens a fresh owner review; do not assume it will be ` +
+      `released again.`,
+    {
+      decision: "refused",
+      tool,
+      reason: "veto release spent — a kill happened after the window was opened",
+      vetoWindowId,
+      vetoStatus: "spent",
+      refusalCode: "release-spent",
+    },
+  );
+}
+
+/**
  * The connector call failed AFTER the single-use ticket was consumed. Unlike
  * every refusal above, this is the one genuinely ambiguous outcome: the
  * nonce burns before the call (at-most-once, DESIGN.md §3), so the action
- * may or may not have completed on the backend. Deliberately explicit about
- * that — the one wrong takeaway would be "retry until it works".
+ * may or may not have completed on the backend — dispatched work cannot be
+ * recalled, and undispatched work leaves no trace to distinguish itself by.
+ * Deliberately explicit about that — the one wrong takeaway would be "retry
+ * until it works".
  */
 export function executionFailed(tool: string, detail: string): OwnerSwitchRefusal {
   return new OwnerSwitchRefusal(

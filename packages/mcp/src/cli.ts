@@ -73,14 +73,23 @@ async function runGateway(argv: string[]): Promise<void> {
   // The executor re-checks live kill state through the SAME fail-closed
   // control-plane client the decision path uses. One Executor instance for
   // the gateway's lifetime — its nonce store is what makes tickets
-  // single-use. The GitHub backend has no HTTP client yet (deliberately
+  // single-use WITHIN THIS PROCESS (see DESIGN.md §5 for the deployment
+  // constraint). The GitHub backend has no HTTP client yet (deliberately
   // stubbed): a routed call that clears every check still fails at the
   // backend with a clear "not implemented" until the live client lands.
+  // OWNERSWITCH_GITHUB_TOKEN is the credential seam the live client will
+  // authenticate with; wiring it today only arms the backend's scrubbing of
+  // its own secret — it never widens what the agent can see.
   const routes = config.executorRoutes;
+  const githubToken = process.env.OWNERSWITCH_GITHUB_TOKEN;
   const executor =
     routes !== undefined && Object.keys(routes).length > 0
       ? (() => {
-          const runner = new Executor(new GitHubMergePrExecutor(), {
+          const backend = new GitHubMergePrExecutor(
+            undefined,
+            githubToken !== undefined && githubToken !== "" ? { token: githubToken } : undefined,
+          );
+          const runner = new Executor(backend, {
             fetchLiveKillState: liveKillStateFromControlPlane(controlPlane),
           });
           return { routes, run: (ticket: ActionTicket) => runner.run(ticket) };

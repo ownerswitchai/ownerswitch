@@ -7,6 +7,14 @@ import type { ActionTicket } from "./ticket.js";
  *   3. expiry and nonce
  *   4. only then does a backend run the action, with OwnerSwitch's own
  *      credential — the agent gets the result, never a token.
+ *
+ * The guarantee, stated precisely: an action NOT YET DISPATCHED when the
+ * kill lands is refused; an action ALREADY DISPATCHED cannot be recalled.
+ * Against an external API with no fencing there is no mechanism that could
+ * close the gap between the last check and the connector call being on the
+ * wire — the second re-check in run() narrows that gap, it does not close
+ * it. This is the same boundary the kill switch itself documents for
+ * in-flight actions (packages/mcp/THREAT-MODEL.md, gateway/src/engine.ts).
  * See DESIGN.md §3.
  */
 
@@ -88,14 +96,7 @@ export class Executor {
   }
 
   async run(ticket: ActionTicket): Promise<ExecutionOutcome> {
-    let live: LiveKillState;
-    try {
-      live = await this.opts.fetchLiveKillState();
-    } catch {
-      // an unreadable control plane never reads as "go"
-      live = { killed: true, epoch: -1 };
-    }
-
+    const live = await this.fetchLive();
     const refusal = refuseTicket(ticket, live, this.now(), this.consumedNonces);
     if (refusal) return { status: "refused", refusal };
 
@@ -104,7 +105,31 @@ export class Executor {
     // a retry, it's an incident.
     this.consumedNonces.add(ticket.nonce);
 
+    // Second live re-check, immediately before dispatch. This NARROWS the
+    // window in which a kill can land unseen — it does not and cannot close
+    // it: a kill arriving after this fetch, or while the connector call is
+    // on the wire, cannot recall the action. The guarantee stays exactly
+    // "not yet dispatched → refused; already dispatched → not recallable".
+    // The nonce is checked against an empty set here because THIS attempt
+    // burned it above; a refusal at this point still spends the ticket —
+    // at-most-once means the owner re-approves, never that we retry.
+    const liveAtDispatch = await this.fetchLive();
+    const lateRefusal = refuseTicket(ticket, liveAtDispatch, this.now(), NO_BURNED_NONCES);
+    if (lateRefusal) return { status: "refused", refusal: lateRefusal };
+
     const result = await this.backend.execute(ticket);
     return { status: "executed", result };
   }
+
+  private async fetchLive(): Promise<LiveKillState> {
+    try {
+      return await this.opts.fetchLiveKillState();
+    } catch {
+      // an unreadable control plane never reads as "go"
+      return { killed: true, epoch: -1 };
+    }
+  }
 }
+
+/** The pre-dispatch re-check runs after this attempt burned its own nonce. */
+const NO_BURNED_NONCES: ReadonlySet<string> = new Set();

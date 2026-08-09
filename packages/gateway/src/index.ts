@@ -1,4 +1,4 @@
-export { evaluate } from "./engine.js";
+export { evaluate, rulesMatchingTool } from "./engine.js";
 export type { KillState } from "./engine.js";
 
 export { createControlPlaneClient, evaluateRemote } from "./client.js";
