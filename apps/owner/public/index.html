@@ -110,16 +110,18 @@
       through the control-plane host, on purpose.</p>
     </section>
 
-    <!-- THE STOP PATH: a held veto window, rendered. Tapping VETO will be
-         a device-signed POST /veto/:id — cheap, no biometric, no session.
-         Rendering this view (or its notification) is what will send the
-         device-signed POST /veto/:id/seen ack. A window whose status is
-         "spent" (kill epoch moved — DESIGN.md §5) renders as "this review
-         expired after a kill" instead. Last in the DOM because it is the
-         :target-fallback default; see the CSS note in app.css. -->
+    <!-- THE STOP PATH: an OPEN veto window (pending/extended — the only
+         statuses that get a countdown, a VETO control, and an
+         ack-on-render; DESIGN.md §5). Tapping VETO will be a
+         device-signed POST /veto/:id — or, on the iOS cold path, the
+         payload's single-use veto capability (DESIGN.md §3). A "spent"
+         window renders "this review expired after a kill"; a terminal
+         "held" window renders the approval-required card below —
+         no countdown, no veto, no ack. Last in the DOM because it is
+         the :target-fallback default; see the CSS note in app.css. -->
     <section id="alert" class="default">
       <div class="card">
-        <span class="lane">VETO LANE · HELD</span>
+        <span class="lane">VETO LANE · PENDING</span>
         <h2 class="pad-top">An agent wants to act</h2>
         <div class="kv">
           <b>agent</b><code>deploy-bot</code>
@@ -131,8 +133,24 @@
         <button class="veto-btn" disabled aria-disabled="true">VETO</button>
         <div class="veto-sub">one tap · device-signed · always cheap</div>
       </div>
+      <!-- Terminal "held": delivery was never confirmed, the window
+           escalated to an approval. No countdown (nothing will release),
+           no veto control, no ack — DESIGN.md §5. -->
+      <div class="card">
+        <span class="lane">VETO LANE · HELD — APPROVAL REQUIRED</span>
+        <h2 class="pad-top">This action now needs your passkey</h2>
+        <div class="kv">
+          <b>agent</b><code>ops-bot</code>
+          <b>tool</b><code>k8s.scale</code>
+          <b>action</b><span>Scale prod deployment to 0 replicas</span>
+          <b>window</b><code>veto_9d2c11aa04e6</code>
+        </div>
+        <p class="muted">Delivery was never confirmed, so silence did not
+        release it. Review it in the Approve tab — it will not run on its
+        own.</p>
+      </div>
       <p class="muted">No session, no fingerprint, no confirmation dialog.
-      Stopping never acquires friction.</p>
+      Stopping never acquires meaningful friction.</p>
     </section>
 
     <footer>ownerswitch.ai — owner app scaffold · see DESIGN.md</footer>

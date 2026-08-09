@@ -15,7 +15,7 @@ export type {
   PushSubscriptionRecord,
   VetoWireStatus,
   OwnerAlertPush,
-  HeldWindowDetail,
+  VetoWindowDetail,
   SeenAck,
   VetoTap,
   AssertionPurpose,
@@ -26,4 +26,4 @@ export type {
   MintedSession,
   OwnerAppEndpoint,
 } from "./types.js";
-export { OWNER_APP_ENDPOINTS } from "./types.js";
+export { OWNER_APP_ENDPOINTS, ENROLL_POP_LABEL, DEVICE_SIG_LABEL } from "./types.js";

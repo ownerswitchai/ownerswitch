@@ -18,26 +18,62 @@ export type Base64Url = string;
 /** ms since epoch, like every timestamp in this repo. */
 export type UnixMs = number;
 
+/**
+ * Domain label of the enrolment proof of possession (DESIGN.md §2).
+ * Pinned format: ECDSA P-256 with SHA-256; signature is WebCrypto's raw
+ * IEEE P1363 r||s (64 bytes, two 32-byte big-endian integers — NOT DER),
+ * base64url (RFC 4648 §5, no padding). Transcript: concatenation of
+ * length-prefixed fields (4-byte big-endian unsigned byte counts), in
+ * order: this label (UTF-8), inviteId (UTF-8), ownerId (UTF-8), the
+ * WebAuthn credentialId (RAW bytes, base64url-decoded), the SPKI key
+ * (RAW bytes). Length-prefixing keeps the encoding injective.
+ */
+export const ENROLL_POP_LABEL = "ownerswitch/enroll-cheap-lane/v1";
+
+/**
+ * Domain label of every cheap-lane device signature (DESIGN.md §3).
+ * Same algorithm and signature encoding as the enrolment proof.
+ * Preimage: length-prefixed fields (4-byte big-endian counts), in order:
+ * this label (UTF-8), deviceId (UTF-8), upper-case HTTP method (UTF-8),
+ * request path+query byte-exact as sent (UTF-8), SHA-256 of the exact
+ * body bytes (32 raw bytes; empty body = hash of zero bytes — so a
+ * body-less GET /veto/:id is still bound to its method and id), decimal
+ * timestamp (UTF-8), nonce (UTF-8). The physical button's dot-joined
+ * HMAC shape binds none of method/path — which is why the app does not
+ * reuse it, and why the button is a distinct server-side credential
+ * class never authorised for /seen, detail reads, /assert/challenge, or
+ * push-subscription writes (the server record decides the class, never
+ * a client field).
+ */
+export const DEVICE_SIG_LABEL = "ownerswitch/device-sig/v1";
+
 /* ------------------------------------------------------------------ */
 /* Enrolment — the root of trust (DESIGN.md §2)                        */
 /* ------------------------------------------------------------------ */
 
 /**
- * A single-use enrolment invite, minted by the control plane and carried
- * out-of-band to the phone (QR / URL). Possession of a live invite IS the
- * proof at enrolment time — which is why its TTL is short, its spend is
- * atomic, and a leak of one is total compromise of the owner surface.
+ * A single-use enrolment invite, minted by the control plane and handed
+ * off INTO the installed app (in-app QR scan or typed code — never a
+ * browser navigation, which would land in the wrong storage partition;
+ * DESIGN.md §2 step 1). Possession of a live invite IS the proof at
+ * enrolment time — which is why its TTL is short, its spend is atomic,
+ * and a leak of one is total compromise of the owner surface. Minting a
+ * non-bootstrap invite requires an owner session PLUS a fresh UV
+ * assertion (purpose "device-invite"); the server-side invite record
+ * stores the issuing device's {deviceId, revocationGeneration} —
+ * re-checked atomically at spend — or, for host-minted bootstrap
+ * invites, the bootstrap generation (DESIGN.md §2).
  */
 export interface EnrollmentInvite {
   inviteId: string;
   /**
-   * single-use bearer capability, ≥128 bits from a CSPRNG. Travels ONLY
-   * in the URL fragment (never query or path — fragments stay out of
-   * access logs and the Referer header), is cleared from the address bar
-   * with history.replaceState the moment the app reads it, is spent in a
-   * POST body, and is never written to a log on either end. Burned
-   * atomically and only on a SUCCESSFUL registration — a failed attempt
-   * does not consume it (DESIGN.md §2).
+   * single-use bearer capability, ≥128 bits from a CSPRNG. Where a URL
+   * form exists it travels ONLY in the fragment (never query or path —
+   * fragments stay out of access logs and the Referer header), is
+   * cleared with history.replaceState the moment the app reads it, is
+   * spent in a POST body, and is never written to a log on either end.
+   * Burned atomically and only on a SUCCESSFUL registration — a failed
+   * attempt does not consume it (DESIGN.md §2).
    */
   token: string;
   expiresAt: UnixMs;
@@ -45,6 +81,22 @@ export interface EnrollmentInvite {
   ownerId: string;
   /** WebAuthn rpId the credential must be created under */
   rpId: string;
+  /** human-readable RP name shown by the platform's create() UI */
+  rpName: string;
+  /**
+   * WebAuthn user.id: an opaque CSPRNG handle, stable per owner, never
+   * PII — the spec forbids personal data here, and this design forbids
+   * reusing the ownerId string
+   */
+  userId: Base64Url;
+  /** COSE algorithm allow-list for create(); pinned to ES256 only */
+  pubKeyCredParams: readonly [-7];
+  /** the authenticator-selection contract, verbatim for create() */
+  authenticatorSelection: {
+    authenticatorAttachment: "platform";
+    residentKey: "preferred";
+    userVerification: "required";
+  };
   /** creation challenge for navigator.credentials.create() */
   challenge: Base64Url;
 }
@@ -66,25 +118,28 @@ export interface EnrollmentRequest {
   deviceName: string;
   registration: WebAuthnRegistration;
   /**
-   * SPKI public key of the SECOND, non-exportable WebCrypto keypair
-   * (ECDSA P-256, extractable: false) the device generated for the cheap
-   * lane. REQUIRED — there is no HMAC fallback and no client-selectable
-   * mode: an optional field here would let an origin that is already
-   * hostile at enrolment time pick its own downgrade (DESIGN.md §2).
-   * A platform that cannot hold a non-exportable key fails closed at
-   * enrolment rather than silently becoming the weakest device.
+   * Exportable SPKI public key of the SECOND WebCrypto keypair (ECDSA
+   * P-256) whose PRIVATE key the app creates non-extractable
+   * (extractable: false) and submits only after the persistence test —
+   * generate, commit, close/reopen, retrieve, sign from the service
+   * worker (DESIGN.md §2 step 4). REQUIRED — there is no HMAC fallback
+   * and no client-selectable mode: an optional field here would let an
+   * origin that is already hostile at enrolment pick its own downgrade
+   * (DESIGN.md §2). Precision matters (DESIGN.md §2, §4): the server
+   * cannot VERIFY non-extractability — it sees a public key and a
+   * proof, nothing more — so this removes the server-side shared secret
+   * and prevents byte-level export under honest code; it does not
+   * prevent persistent impersonation after a hostile enrolment or
+   * origin compromise. Only revocation + re-enrolment severs that.
    */
   cheapLaneKey: Base64Url;
   /**
-   * Proof of possession of cheapLaneKey's private half: an ECDSA P-256
-   * signature, under the new key, over the domain-separated enrolment
-   * transcript — the protocol label "ownerswitch/enroll-cheap-lane/v1",
-   * inviteId, ownerId, the WebAuthn credentialId, and the SPKI key bytes,
-   * each field length-prefixed so the encoding is injective. Verified
-   * with the submitted key BEFORE the invite is consumed: a key the
-   * client cannot sign with is refused and the invite survives — a
-   * root-of-trust ceremony must not accept a dead credential
-   * (DESIGN.md §2).
+   * Proof of possession of cheapLaneKey's private half, format pinned by
+   * ENROLL_POP_LABEL above: ECDSA P-256 / SHA-256, raw r||s (not DER),
+   * base64url, over the length-prefixed transcript. Verified with the
+   * submitted key BEFORE the invite is consumed: a key the client cannot
+   * sign with is refused and the invite survives — a root-of-trust
+   * ceremony must not accept a dead credential (DESIGN.md §2).
    */
   cheapLaneKeyProof: Base64Url;
 }
@@ -100,10 +155,16 @@ export interface EnrollmentResponse {
 }
 
 /**
- * What the control plane stores per enrolled device. Everything downstream
- * — ack, veto, approve, GO 2 — reduces to "is there a live record here".
- * Both lanes are asymmetric: the server holds only public keys, so a
- * control-plane compromise can deny and lie but cannot sign (DESIGN.md §4).
+ * What the control plane stores per enrolled device — ONE record holding
+ * BOTH credentials: the WebAuthn credential and the cheap-lane key
+ * belong to the same identity, governed by the same revocation
+ * generation, so revocation severs one device, never half of two
+ * (DESIGN.md §2). Everything downstream — ack, veto, approve, GO 2 —
+ * reduces to "is there a live record here". Both lanes are asymmetric:
+ * the server holds only public keys, so a control-plane compromise can
+ * deny and lie but cannot sign (DESIGN.md §4). This record's class is
+ * "owner-device"; the physical button's HMAC is a distinct class with
+ * strictly narrower authority (DESIGN.md §3).
  */
 export interface EnrolledDevice {
   deviceId: string;
@@ -113,9 +174,10 @@ export interface EnrolledDevice {
   /** COSE public key — verifies every future assertion */
   publicKey: Base64Url;
   /**
-   * SPKI public key verifying cheap-lane signatures. Always present —
-   * enrolment refuses a device without one (proof of possession included;
-   * DESIGN.md §2). There is no HMAC-fallback device class.
+   * Exportable SPKI public key verifying cheap-lane signatures. Always
+   * present — enrolment refuses a device without one (proof of
+   * possession included; DESIGN.md §2). There is no HMAC-fallback
+   * device class.
    */
   cheapLaneKey: Base64Url;
   /**
@@ -127,11 +189,12 @@ export interface EnrolledDevice {
   transports: string[];
   enrolledAt: UnixMs;
   /**
-   * bumped atomically by revocation. Sessions and assertion challenges
-   * record the generation they were minted under and are re-checked
-   * against it on EVERY use — so revoking a device kills its live
-   * sessions and outstanding challenges at the next request, not at
-   * token expiry (DESIGN.md §2).
+   * bumped atomically by revocation. Sessions, assertion challenges,
+   * unspent invites this device issued, cold-push capabilities minted
+   * for it, and its ack evidence all record the generation they were
+   * minted under and are re-checked against it at use — so revoking a
+   * device kills everything it minted at the next decision point, not
+   * at token expiry (DESIGN.md §2, §3, §4).
    */
   revocationGeneration: number;
   /**
@@ -162,20 +225,40 @@ export interface PushSubscriptionRecord {
 }
 
 /* ------------------------------------------------------------------ */
-/* The alert — a held veto window reaches the phone (DESIGN.md §1, §4) */
+/* The alert — an open veto window reaches the phone (DESIGN.md §1, §3) */
 /* ------------------------------------------------------------------ */
 
 /**
- * The encrypted push payload. Deliberately minimal: a pointer, not the
- * content. The service worker fetches the renderable detail with a
- * device-signed read, so a payload captured or logged en route names a
- * window id and nothing about the action.
+ * The encrypted push payload. It carries the renderable summary AND a
+ * one-time veto capability, because on the iOS cold-start path
+ * (WebKit bug 283793) the service worker may wake with indexedDB
+ * undefined — the key store unreachable — and must still be able to
+ * render and to stop (DESIGN.md §3, "The iOS cold-push path"). The
+ * payload is encrypted end-to-end (RFC 8291); what its capture gains an
+ * attacker — one window's summary and one single-use, veto-only stop —
+ * is analysed and accepted in DESIGN.md §3.
  */
 export interface OwnerAlertPush {
   kind: "veto-window";
   windowId: string;
-  /** hint for notification scheduling; the fetched detail is authoritative */
+  /** pushes are dispatched only for open windows */
+  status: "pending" | "extended";
+  /** who is acting and what they asked for — rendered verbatim */
+  agentId: string;
+  tool: string;
+  summary: string;
+  /** when silence releases (delivered) or extends/holds (not delivered) */
   deadline: UnixMs;
+  /**
+   * Single-use, server-minted, VETO-ONLY capability for the cold path.
+   * Its server-side record binds {deviceId, revocationGeneration,
+   * windowId, allowedOperation: "veto", expiresAt ≤ the window's
+   * deadline}; it dies with the window's terminal state or the device's
+   * revocation, and it can never ack — the ack is the permissive
+   * direction and never rides in a payload (DESIGN.md §3).
+   */
+  vetoCapability: string;
+  capabilityExpiresAt: UnixMs;
 }
 
 /**
@@ -193,11 +276,15 @@ export interface OwnerAlertPush {
 export type VetoWireStatus = "pending" | "vetoed" | "released" | "extended" | "held" | "spent";
 
 /**
- * Device-signed GET /veto/:id — the renderable truth about a held window.
- * The existing open (unauthenticated) read stays status-only; this shape
- * is for enrolled devices.
+ * Device-signed GET /veto/:id — the renderable truth about a veto
+ * window, whatever its status. (Renamed from HeldWindowDetail: "held" is
+ * a specific TERMINAL state, and this shape covers all of them.) The
+ * existing open (unauthenticated) read stays status-only; this shape is
+ * for enrolled devices. Rendering rules per status live in DESIGN.md §5:
+ * only pending/extended get a countdown and a VETO control; held renders
+ * "approval required" with neither.
  */
-export interface HeldWindowDetail {
+export interface VetoWindowDetail {
   windowId: string;
   status: VetoWireStatus;
   /** who is acting and what they asked for — rendered verbatim to the owner */
@@ -218,7 +305,12 @@ export interface HeldWindowDetail {
  * Accepted only while the window is still pending/extended on the
  * SERVER's clock and only from a device enrolled to the window's owner;
  * after the deadline an ack is recorded in the audit trail and ignored.
- * A "spent" window is past both states — never ackable.
+ * A "spent" window is past both states — never ackable, and the
+ * cold-push capability can never ack (DESIGN.md §3). An accepted ack is
+ * stored as EVIDENCE {deviceId, revocationGeneration, receivedAt}, and
+ * release-on-silence requires at least one piece of evidence from a
+ * device still active at the same generation at the moment of the
+ * release decision — an ack does not outlive its device (DESIGN.md §4).
  */
 export interface SeenAck {
   windowId: string;
@@ -233,14 +325,19 @@ export interface SeenAck {
 }
 
 /**
- * POST /veto/:id, device-signed — the one-tap stop. Cheap forever, and
- * IDEMPOTENT: re-vetoing an already-vetoed window succeeds as a no-op,
- * so the service worker can blind-retry a send it cannot prove arrived
- * (DESIGN.md §3).
+ * POST /veto/:id — the one-tap stop. Cheap forever, and IDEMPOTENT:
+ * re-vetoing an already-vetoed window succeeds as a no-op, so the
+ * service worker can blind-retry a send it cannot prove arrived
+ * (DESIGN.md §3). Normally device-signed; on the iOS cold path, where
+ * the key store may be unreachable, `capability` carries the payload's
+ * single-use veto capability instead — veto only, never any other
+ * operation (DESIGN.md §3).
  */
 export interface VetoTap {
   windowId: string;
   tappedAt: UnixMs;
+  /** cold-path only: the single-use veto capability from OwnerAlertPush */
+  capability?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -250,14 +347,25 @@ export interface VetoTap {
 /**
  * What a fresh assertion is FOR. The challenge binds to one purpose and
  * one subject; an assertion minted for ceremony A is useless for
- * ceremony B, for an approval, or for tomorrow.
+ * ceremony B, for an approval, or for tomorrow. "device-invite" and
+ * "device-revoke" exist so a stolen bearer session ALONE can never add
+ * or remove a device (DESIGN.md §2, §3).
  */
-export type AssertionPurpose = "approve" | "restore-go2" | "session";
+export type AssertionPurpose =
+  | "approve"
+  | "restore-go2"
+  | "session"
+  | "device-invite"
+  | "device-revoke";
 
 /** POST /assert/challenge — device-signed request for a bound challenge. */
 export interface AssertionChallengeRequest {
   purpose: AssertionPurpose;
-  /** approvalId for "approve", ceremonyId for "restore-go2", absent for "session" */
+  /**
+   * approvalId for "approve", ceremonyId for "restore-go2", the target
+   * deviceId for "device-revoke"; absent for "session" and
+   * "device-invite"
+   */
   subjectId?: string;
 }
 
@@ -293,9 +401,15 @@ export interface WebAuthnAssertion {
 /**
  * A fresh assertion presented to the control plane: GO 2 confirmation
  * (POST /restore gains this field), approve-lane confirmation (when the
- * approval queue exists), and passkey-gated session minting. Verification:
- * stored public key, rpId hash, UP+UV flags required, challenge matched
- * and burned, signature counter monotonic where provided.
+ * approval queue exists), passkey-gated session minting, and the
+ * device-invite / device-revoke gates. Verification, with each check in
+ * its actual location: `type`, `challenge`, and `origin` are verified
+ * from clientDataJSON; `rpIdHash` and the required UP+UV flags from
+ * authenticatorData; the signature (ES256 on P-256 — the only algorithm
+ * enrolment admits) with the stored public key over
+ * authenticatorData || SHA-256(clientDataJSON); the challenge matched
+ * and burned; the signature counter monotonic where the authenticator
+ * provides one.
  */
 export interface BoundAssertion {
   challengeId: string;
@@ -332,18 +446,18 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/veto/:id/seen",
-    auth: "device-signed",
+    auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "delivery ack — the production caller of markDelivered(); accepted only while the window is pending/extended on the SERVER's clock and only from a device enrolled to the window's owner; renderedAt is audit-only; late acks recorded and ignored",
+      "delivery ack — the production caller of markDelivered(); accepted only while the window is pending/extended on the SERVER's clock and only from a device enrolled to the window's owner; renderedAt is audit-only; late acks recorded and ignored; stores evidence {deviceId, revocationGeneration, receivedAt} — release requires evidence from a still-active device at the same generation",
   },
   {
     method: "POST",
     path: "/veto/:id",
-    auth: "device-signed | owner-session",
+    auth: "device-signed | owner-session | single-use cold-push veto capability",
     status: "extension",
     purpose:
-      "one-tap veto; today owner-session only — the device-signed relay is the addition; idempotent (re-veto of a vetoed window is a successful no-op) so the worker can retry blindly",
+      "one-tap veto; today owner-session only — the device-signed relay and the cold-path capability are the additions; idempotent (re-veto of a vetoed window is a successful no-op) so the worker can retry blindly",
   },
   {
     method: "GET",
@@ -356,10 +470,10 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/devices/invite",
-    auth: "owner-session; bootstrap/no-devices-left recovery via host CLI or permission-protected Unix socket — NEVER an HTTP loopback bypass",
+    auth: "owner-session + fresh UV assertion (purpose: device-invite); bootstrap/no-devices-left recovery via host CLI or permission-protected Unix socket — NEVER an HTTP loopback bypass",
     status: "addition",
     purpose:
-      "mint a single-use enrolment invite + creation challenge; token rides in the URL fragment, is spent in a POST body, and is never logged",
+      "mint a single-use enrolment invite carrying the full WebAuthn creation contract; records the issuing device's {deviceId, revocationGeneration} (bootstrap: a bootstrap generation); token rides in the URL fragment where a URL form exists, is spent in a POST body, and is never logged",
   },
   {
     method: "POST",
@@ -367,7 +481,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "invite-token",
     status: "addition",
     purpose:
-      "verify the WebAuthn registration AND the cheap-lane proof of possession (before the invite is consumed), register both lanes' public keys, store EnrolledDevice; cheapLaneKey required — no HMAC fallback exists; the invite burns atomically and only on success",
+      "verify the WebAuthn registration (type/challenge/origin from clientDataJSON; rpIdHash + UP/UV from authenticatorData; ES256 on P-256) AND the pinned cheap-lane proof of possession, re-check the issuer's standing (or bootstrap generation + zero active devices) atomically, then store ONE EnrolledDevice holding both credentials; the invite burns atomically and only on success; a successful bootstrap enrolment invalidates sibling bootstrap invites",
   },
   {
     method: "GET",
@@ -379,26 +493,26 @@ export const OWNER_APP_ENDPOINTS = [
   {
     method: "POST",
     path: "/devices/:id/revoke",
-    auth: "owner-session (host CLI / Unix socket can always revoke)",
+    auth: "owner-session + fresh UV assertion (purpose: device-revoke, subject: target deviceId); host CLI / Unix socket can always revoke",
     status: "addition",
     purpose:
-      "kill a device's standing: bump its revocation generation and atomically void credentials, push subscription, live sessions, and outstanding challenges",
+      "kill a device's standing: bump its revocation generation and atomically void credentials, push subscription, live sessions, outstanding challenges, unspent invites it issued, and its ack evidence",
   },
   {
     method: "PUT",
     path: "/devices/:id/push-subscription",
-    auth: "device-signed",
+    auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "store / refresh the Web Push subscription; endpoint validated as an SSRF surface (HTTPS, known push-service shapes, no private/metadata addresses)",
+      "store / refresh the Web Push subscription; :id derived from the authenticated identity — a mismatched path id is rejected; endpoint validated as an SSRF surface (HTTPS, known push-service shapes, no private/metadata addresses)",
   },
   {
     method: "POST",
     path: "/assert/challenge",
-    auth: "device-signed",
+    auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "mint a single-use challenge bound to {purpose, subjectId}; dies with the minting device's revocation generation",
+      "mint a single-use challenge bound to {purpose, subjectId} across all five purposes; dies with the minting device's revocation generation",
   },
   {
     method: "POST",
