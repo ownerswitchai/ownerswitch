@@ -1,9 +1,11 @@
 /*
- * Service worker STUB — scaffold only (see ../DESIGN.md §6).
+ * Service worker STUB — static design scaffold only (see ../DESIGN.md §6).
  *
- * Registered so the PWA is installable; it performs NO push handling, NO
- * caching, NO network interception. The handlers below exist to document
- * the flow the real implementation must follow — each body is a no-op.
+ * Registration is exercised so the scaffold shows the shape; nothing
+ * serves this app, so nothing installs it. It performs NO push handling,
+ * NO caching, NO network interception. The handlers below exist to
+ * document the flow the real implementation must follow — each body is a
+ * no-op.
  */
 
 self.addEventListener("install", () => {
@@ -40,11 +42,22 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   /*
    * REAL FLOW (not implemented here):
-   *  - action === "veto": device-signed POST /veto/:id (VetoTap) straight
-   *    from the worker — the one-tap stop, no app launch required.
-   *  - otherwise: focus or open the app on #alert for this window.
+   *  - action === "veto": the ENTIRE send lives inside event.waitUntil()
+   *    — the OS may kill the worker the moment this handler returns, and
+   *    a veto lost in flight is a stop that never happened. The
+   *    notification stays OPEN until the server confirms: close() only
+   *    on a confirmed response, so a failed send remains visible and
+   *    tappable. The relay is idempotent server-side (re-vetoing a
+   *    vetoed window succeeds as a no-op — DESIGN.md §5 row 2), so the
+   *    worker retries blindly and never double-stops.
+   *  - otherwise: focus or open the app on #alert for this window, also
+   *    inside event.waitUntil().
+   *
+   * Deliberately NOT calling event.notification.close() here: closing
+   * before the server confirms would make a killed-in-flight veto look
+   * done.
    */
-  event.notification.close();
+  void event;
 });
 
 self.addEventListener("pushsubscriptionchange", (event) => {

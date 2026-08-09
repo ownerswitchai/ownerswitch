@@ -1,8 +1,8 @@
 # Owner app — the phone in the loop
 
-**The only surface that can confirm the owner actually saw an alert, and
-the only one that can carry a passkey — so it unblocks two things at
-once.**
+**The only surface that can report an alert was rendered on a device the
+owner enrolled, and the only one that can carry a passkey — so it
+unblocks two things at once.**
 
 Two of the control plane's promises currently end at a stub:
 
@@ -38,15 +38,17 @@ Three jobs, one per lane of the asymmetry:
    summary — agent, tool, what it's about to do, when silence releases
    it. One tap on VETO stops it. Stopping stays one gesture, no
    biometric, no session dance: the veto is signed by the enrolled
-   device (§2), the same cheap HMAC mechanism the physical button
-   already uses, because stopping must never acquire friction.
+   device (§2), the same cheap signed-request shape the physical
+   button already uses, because stopping must never acquire friction.
 2. **The ack.** The moment the summary is actually rendered on the
    enrolled device, the app reports it: `POST /veto/:id/seen`,
    device-signed. That is the production caller `markDelivered()` has
-   been waiting for. From then on the window's silence means what the
-   state machine wants it to mean — *the owner was reached and chose not
-   to object* — instead of "nobody was listening". §4 states exactly how
-   much an ack proves; it is less than it sounds.
+   been waiting for. From then on the window's silence carries the most
+   meaning web push can give it — *the alert was rendered where the
+   owner should have seen it, and no objection came* — instead of
+   "nobody was listening". The server accepts an ack only while the
+   window is still open on the server's own clock (§4); §4 also states
+   exactly how much an accepted ack proves — it is less than it sounds.
 3. **The passkey lanes.** At enrolment the app creates a WebAuthn
    credential on the phone's platform authenticator. Approving an
    `approve`-lane action and confirming GO 2 of the restore ceremony
@@ -71,29 +73,53 @@ tightens it back up. So it is designed first.
    single-use CSPRNG token (≥128 bits), TTL ~10 minutes, bound to the
    `ownerId` that minted it, carrying a WebAuthn *creation* challenge.
    It is presented out-of-band — a QR code or URL shown where the
-   operator stands — and the phone opens it over HTTPS.
+   operator stands — and the phone opens it over HTTPS. The token rides
+   in the URL **fragment**, never the query string or path: fragments
+   are not sent to the server, so the secret stays out of access logs —
+   and out of the `Referer` header the app's own asset loads (icon,
+   manifest, service worker) would otherwise attach. The app reads it,
+   immediately clears it with `history.replaceState`, is served with
+   `Referrer-Policy: no-referrer` as a second fence, and spends it in a
+   POST body. No invite token is ever written to a log on either end.
 2. **Credential creation.** The phone calls
    `navigator.credentials.create()` against the invite's challenge:
    platform authenticator, `userVerification: "required"`,
    `residentKey: "preferred"`, attestation `"none"` (a deliberate
    choice, stated plainly in §4).
-3. **Verification and storage.** The control plane burns the invite
-   atomically (spent-or-refused, exactly once), checks the challenge,
-   origin and rpId in `clientDataJSON`, and stores the
-   `EnrolledDevice` record: credential id, COSE public key, signature
-   counter, transports, device name, `ownerId`, `enrolledAt`.
-4. **Cheap-lane secret.** In the same response the control plane
-   provisions a per-device HMAC secret — the credential for the cheap
-   direction (ack, veto tap, detail reads), verified by the existing
-   `verifyDeviceSignature()` machinery in
-   `packages/control-plane/src/auth.ts`. Returned exactly once, stored
-   on-device, never re-readable. The passkey's private key never leaves
-   the authenticator; the HMAC secret is symmetric and the server keeps
-   its copy — an asymmetry inside the asymmetry that §4 accounts for.
+3. **Verification and storage.** The control plane verifies the
+   challenge, origin and rpId in `clientDataJSON`, and only on a fully
+   successful registration burns the invite — atomically, exactly once:
+   two racing spends of the same token admit at most one device. A
+   failed or malformed attempt does not consume the invite, so a
+   stranger's garbage cannot burn the capability the owner is holding
+   mid-enrolment. (The flip side is accepted: an intercepted invite
+   stays spendable until its TTL — one more reason the TTL is short.)
+   On success the control plane stores the `EnrolledDevice` record:
+   credential id, COSE public key, signature counter, transports,
+   device name, `ownerId`, `enrolledAt`, and a **revocation
+   generation** starting at 0 — the counter that makes revocation mean
+   something (below).
+4. **Cheap-lane credential.** In the same ceremony the app generates a
+   *second*, non-exportable WebCrypto keypair (ECDSA P-256,
+   `extractable: false`) for the cheap direction — ack, veto tap,
+   detail reads — and registers its public key alongside the passkey's.
+   Preferred mode, stated as a requirement: the control plane stores
+   only *public* keys for **both** lanes, so nothing readable-and-worth-
+   stealing sits in the app's storage or in the control plane's (§4).
+   Only where a platform cannot hold a non-exportable key does
+   enrolment fall back to a per-device HMAC secret verified by the
+   existing `verifyDeviceSignature()` machinery in
+   `packages/control-plane/src/auth.ts` — returned exactly once, stored
+   on-device, never re-readable, and priced honestly in §4: fallback
+   devices are the ones an origin compromise can permanently
+   impersonate.
 5. **Push subscription.** After notification permission is granted, the
    app registers its Web Push subscription
    (`PUT /devices/:id/push-subscription`, device-signed) and re-upserts
-   it on `pushsubscriptionchange`.
+   it on `pushsubscriptionchange`. The subscription's `endpoint` is an
+   attacker-influenceable URL the dispatcher will later call — it is
+   validated as such (§5, rows 7 and 11), never trusted as a plain
+   string.
 
 **What proves it at enrolment time: possession of a live invite.**
 Nothing else. The WebAuthn ceremony proves the phone holds the new
@@ -112,22 +138,56 @@ guard invites like the kill-state directory.
 
 The first device cannot be enrolled with an owner session that requires
 a passkey — no passkey exists yet. The first invite is therefore minted
-from the control-plane host itself (in-process or CLI on the box),
-which is exactly the trust the system already runs on today: session
-minting is in-process, flagged in `auth.ts`. Enrolment doesn't add that
-assumption; it makes it explicit and *bounded in time*. After the first
-device is enrolled, invite minting demands an owner session, which
-demands an enrolled device: host access → first device → everything
-else. The control-plane host is, and remains, the recovery root — the
-same deployment boundary the threat model already names for kill state.
+from the control-plane host itself — and **not through any HTTP
+route**. Bootstrap and no-devices-left recovery are a local CLI (or a
+Unix domain socket protected by filesystem permissions, owner-only
+like the kill-state directory). There is deliberately no HTTP loopback
+exception: behind a same-host reverse proxy every remote caller
+*looks* local — the exact caveat already known on `/kill`'s loopback
+fallback — and enrolment, unlike kill, is the expensive direction, so
+it gets no such door. Deployment constraint, stated explicitly: if a
+reverse proxy or any forwarder runs on the control-plane host,
+"host-local" must mean the socket's file permissions or process
+identity, never a source address.
+
+The bootstrap lane also **self-closes**: host-local invite minting is
+allowed only while *zero* active devices are enrolled — the genuine
+first boot, and the lost-every-phone recovery case after a host-local
+revoke. The moment one active device exists, every invite demands an
+owner session, which demands an enrolled device: host access → first
+device → everything else. (The host CLI can always *revoke* — that is
+the safe direction, and whoever holds the host already holds the
+deployment boundary.) Minting the first invite is the same trust the
+system already runs on today — session minting is in-process, flagged
+in `auth.ts`; enrolment doesn't add that assumption, it makes it
+explicit and *bounded in time*. The control-plane host is, and
+remains, the recovery root — the same deployment boundary the threat
+model already names for kill state.
 
 ### Revocation, two devices, the lost phone
 
-- **Revoke:** `POST /devices/:id/revoke`, owner session required. The
-  HMAC secret dies immediately, the credential is removed, the push
-  subscription is dropped. Revocation applies to future requests; it
-  cannot recall an ack or veto already accepted (both are in the safe
-  direction — an attestation and a stop).
+- **Revoke:** `POST /devices/:id/revoke`, owner session required.
+  Revocation bumps the device's **revocation generation** and, in the
+  same atomic step, invalidates everything minted under it: the
+  cheap-lane key (or fallback secret) verifies nothing, the passkey
+  credential is removed, the push subscription is dropped, **every
+  owner session the device minted dies, and every outstanding
+  assertion challenge it requested is void**. Sessions make this
+  checkable: a session records the `deviceId` that minted it and that
+  device's generation at mint, and *every* session check re-verifies
+  that the device is still enrolled and its generation unchanged —
+  a session is never trusted on its own token again. So "dies
+  immediately" means precisely this: the next request authenticated by
+  *any* artifact of the revoked device — signature, session, or
+  challenge — fails. Without the session↔device binding, a stolen
+  phone that minted a session five minutes before revocation could
+  keep minting invites and starting GO 1 until the token expired; with
+  it, revocation cuts that off at the next request. Two honest bounds:
+  a request already past its auth check when revocation lands may
+  still complete (one process, one event loop — the same single-spend
+  honesty as the restore ceremony), and an ack or veto already
+  *accepted* is not recalled — a veto is a stop, and an ack on a
+  still-open window is answered by vetoing from a surviving device.
 - **Two devices:** each enrolls independently — own invite, own
   passkey, own secret, own subscription. Alerts fan out to every
   enrolled device; the *first* render acks; any device can veto; any
@@ -137,9 +197,12 @@ same deployment boundary the threat model already names for kill state.
   phone, revoke it from the other.
 - **Lost only phone:** the owner cannot mint a session (post-passkey,
   sessions require an enrolled device), so recovery goes through the
-  root: on the control-plane host, revoke the lost device and mint a
-  fresh invite. Deliberately no remote self-service recovery — a
-  recovery path cheaper than enrolment would *be* the attack surface.
+  root: at the control-plane host — CLI or permission-protected Unix
+  socket, never an HTTP route (see Bootstrap above) — revoke the lost
+  device; with zero active devices left, the bootstrap lane reopens
+  and mints a fresh invite. Deliberately no remote self-service
+  recovery — a recovery path cheaper than enrolment would *be* the
+  attack surface.
 - **All devices revoked / none enrolled:** veto windows can never
   confirm delivery, so every one runs extend → `held`; approvals and
   restores have no passkey to satisfy them. The system degrades to
@@ -155,19 +218,24 @@ app's two credentials:
 
 | action | credential | user verification | bound to |
 | --- | --- | --- | --- |
-| ack (`/veto/:id/seen`) | device HMAC | none | window id |
-| veto tap | device HMAC | none | window id |
-| read window detail | device HMAC | none | window id |
+| ack (`/veto/:id/seen`) | device signature | none | window id |
+| veto tap | device signature | none | window id |
+| read window detail | device signature | none | window id |
 | approve an action | fresh WebAuthn assertion | **required** | that approval id |
 | GO 2 of restore | fresh WebAuthn assertion | **required** | that ceremony id |
 | mint owner session | fresh WebAuthn assertion | **required** | session mint |
 
-**Cheap lane.** The ack and the veto are HMAC-signed requests the app
+**Cheap lane.** The ack and the veto are device-signed requests the app
 can send in one tap — from the service worker's notification action,
-without waking WebAuthn UI, without a live session. This is the same
-mechanism, the same headers, and the same verification code path as the
-physical button, and for the same reason: the stop direction must
-survive friction, dead sessions, and a sleepy owner.
+without waking WebAuthn UI, without a live session. The request shape
+is the physical button's — a signature over the exact bytes on the
+wire, a single-use nonce, a timestamp — with the signature computed
+under the device's non-exportable cheap-lane key (§2), or the button's
+HMAC scheme on fallback devices. Same shape for the same reason the
+button is cheap: the stop direction must survive friction, dead
+sessions, and a sleepy owner. The veto relay is also **idempotent** —
+re-vetoing an already-vetoed window succeeds as a no-op — so a service
+worker can blind-retry a send it cannot prove arrived (§5, row 2).
 
 **Expensive lane.** Approve and GO 2 each require a fresh
 `navigator.credentials.get()` with `userVerification: "required"`
@@ -198,7 +266,11 @@ shoulder-surfed typically both satisfies UV and can enroll a new
 biometric; and on most platforms the passcode also unlocks the synced
 passkey store. Stolen unlocked phone plus known passcode is full
 compromise of that device's owner powers; the answer is revocation
-from the second device or the host, not anything this app can do.
+from the second device or the host, not anything this app can do —
+and revocation now actually severs the phone (§2): every session it
+minted and every challenge it requested dies with its generation, so
+it cannot go on minting invites or starting GO 1 on a session it
+opened before it was taken.
 
 ## 4. Honest limits
 
@@ -221,9 +293,20 @@ will actually prove, and what it will not.
   after — and only after — a notification carrying the actual action
   summary is displayed. If the device-signed detail fetch fails and the
   app can only show a generic "an action is being held", it shows it
-  *without acking*: the owner saw that something is pending, but since
-  they could not judge *what*, silence must not release it. Fail-closed
-  on partial delivery.
+  *without acking*: the device rendered that something is pending, but
+  since the owner could not judge *what*, silence must not release it.
+  Fail-closed on partial delivery.
+- **A late ack changes nothing.** The server accepts an ack only while
+  the window is still `pending` or `extended` **on the server's own
+  clock**, and only from a device enrolled to the window's owner. The
+  client-supplied `renderedAt` is audit data, never enforcement — the
+  server's receive time and the window's live state decide. After the
+  deadline, or in any terminal state, an ack is recorded in the audit
+  trail and **ignored**: a delayed or backdated ack must never flip
+  `markDelivered()` after the fact and let the next tick read past
+  silence as consent. That is the fail-open direction this whole lane
+  exists to avoid, so the deadline check belongs to the server, not to
+  anything the phone asserts.
 - **A forged ack fails open; the enrolment boundary is what prevents
   it.** Absence of acks degrades safely (extend → `held`). A *false*
   ack is the dangerous direction — it converts the veto lane's silence
@@ -269,35 +352,56 @@ will actually prove, and what it will not.
   not at all) and costs enrolment friction; v0 takes the honest default
   and says so here instead of implying provenance checks that don't
   exist.
-- **The app is served code.** A PWA is JavaScript from an origin; who
-  controls the origin controls what the owner's screen *says*. WebAuthn
-  keeps the private key safe from a hostile origin, and challenge
+- **The app is served code — and an origin compromise steals keys, not
+  just pixels.** A PWA is JavaScript from an origin; who controls the
+  origin controls what the owner's screen *says*. WebAuthn keeps the
+  passkey's private key safe from a hostile origin, and challenge
   binding means the server-side subject is what gets approved — but the
   *rendering* of that subject ("merge PR #7") is app code, and a lying
   app can caption approval A with description B, or show "veto sent"
-  and send nothing. The origin server joins the trusted computing base
-  the moment the app is trusted with these decisions. WebAuthn signs
-  challenges, not human-readable intent — there is no deployable
-  transaction confirmation display on today's web platform. Mitigations
-  (subresource integrity, a pinned native wrapper) are hardening work,
-  listed and not shipped.
-- **The cheap lane is symmetric crypto.** The control plane stores each
-  device's HMAC secret, so a control-plane compromise can forge acks
-  and vetoes — including the ack that flips silence to release. This is
-  strictly less new exposure than it sounds: the threat model already
-  ranks a compromised control plane as the serious failure (it owns
-  kill state and the veto windows themselves — it doesn't need to forge
-  an ack to lie about a window). The passkey lane is deliberately
-  asymmetric so that same compromise cannot sign approvals or GO 2:
-  the server holds only public keys.
+  and send nothing. WebAuthn signs challenges, not human-readable
+  intent — there is no deployable transaction confirmation display on
+  today's web platform. And the UI lie is the *smaller* half. The
+  cheap-lane credential lives where the PWA's JavaScript can use it, so
+  an XSS, a compromised third-party script, or a hostile deploy forges
+  acks and vetoes *as the device, remotely* — and a forged ack is the
+  dangerous direction: it converts silence into release. On a fallback
+  device whose credential is a raw HMAC secret readable from app
+  storage, that theft is **permanent** — fixing the origin does not
+  un-steal the key. This is exactly why §2 makes the non-exportable
+  WebCrypto key the required mode: with only public keys on the server
+  and no extractable material on the device, hostile code is reduced
+  to requesting signatures *while it runs on the owner's device* —
+  bad, but bounded, observable, and revocable, not permanent.
+  Requirements, not suggestions: the owner app lives on a **dedicated
+  origin** that serves nothing else, with a strict Content-Security-
+  Policy and **zero third-party script**; and an origin compromise is
+  treated as compromise of *every* enrolled device — revoke them all,
+  rotate every credential, re-enrol. The residual limit, stated
+  plainly: no key design stops malicious code from asking a
+  non-exportable key to sign while that code is resident on the
+  device. Subresource integrity and a pinned native wrapper are
+  further hardening, listed and not shipped.
+- **Fallback devices lean on symmetric crypto at both ends.** For a
+  device in HMAC-fallback mode (§2), the control plane holds the
+  shared secret too, so a control-plane compromise can forge that
+  device's acks and vetoes — including the ack that flips silence to
+  release. This is strictly less new exposure than it sounds: the
+  threat model already ranks a compromised control plane as the
+  serious failure (it owns kill state and the veto windows themselves
+  — it doesn't need to forge an ack to lie about a window). In the
+  required mode the control plane stores only public keys for both
+  lanes, so that compromise can deny and lie, but not sign: not
+  approvals, not GO 2, and not a fallback-free device's acks.
 - **One owner, 1-of-N devices, no quorum.** Any single enrolled
   device's passkey approves and restores. Multi-owner and N-of-M
   confirmation are future, visible design changes.
 - **Nothing in this PR delivers anything.** This is a design and a
-  static shell. Until the control-plane additions in §5 and the push
-  dispatcher exist, `markDelivered()` still has no production caller
-  and the TODO(passkey) still stands. This document is the contract
-  they will be built against, not a claim that they work today.
+  static design scaffold — not a served, installable app (§6). Until
+  the control-plane additions in §5 and the push dispatcher exist,
+  `markDelivered()` still has no production caller and the
+  TODO(passkey) still stands. This document is the contract they will
+  be built against, not a claim that they work today.
 
 ## 5. Control-plane additions this requires
 
@@ -307,17 +411,17 @@ and response shapes.
 
 | # | addition | route | auth | what it does |
 | --- | --- | --- | --- | --- |
-| 1 | delivery ack | `POST /veto/:id/seen` | device HMAC | the production caller of `markDelivered()`. Idempotent; records `deviceId`, surface, and rendered-at in the audit trail; 404 on unknown window |
-| 2 | device-signed veto relay | `POST /veto/:id` (extended) | device HMAC **or** owner session | one-tap veto without a live session; `vetoedBy` resolves to the enrolled device's `ownerId`, audit records the device |
-| 3 | window detail for rendering | `GET /veto/:id` (extended) | device HMAC for detail | adds `deadline`, `delivered`, and the call summary — for device-signed callers only. The existing open read stays status-only: what an alert says is for enrolled devices, not for anyone who can reach the port (same disclosure discipline as the `/status` `epoch` note) |
-| 4 | enrolment: invite | `POST /devices/invite` | owner session (host-local for bootstrap and lost-phone recovery) | single-use, short-TTL invite + WebAuthn creation challenge |
-| 5 | enrolment: enroll | `POST /devices/enroll` | invite token | verifies registration, stores `EnrolledDevice`, provisions the per-device HMAC secret (returned once) |
-| 6 | enrolment: list / revoke | `GET /devices`, `POST /devices/:id/revoke` | owner session (host-local revoke fallback) | inventory and the kill switch for a device's standing |
-| 7 | push subscription upsert | `PUT /devices/:id/push-subscription` | device HMAC | stores/refreshes the Web Push subscription |
-| 8 | assertion challenge | `POST /assert/challenge` | device HMAC | mints a single-use challenge bound to `{purpose, subjectId}`, TTL ~2 min |
-| 9 | passkey-gated sessions | `POST /session` | verified assertion (`purpose: "session"`) | replaces in-process minting — closes `TODO(passkey)` in `auth.ts` |
+| 1 | delivery ack | `POST /veto/:id/seen` | device signature | the production caller of `markDelivered()` — accepted only while the window is `pending`/`extended` on the **server's** clock, and only from a device enrolled to the window's owner; `renderedAt` is audit data, never enforcement; a late ack is recorded and ignored. Idempotent; 404 on unknown window |
+| 2 | device-signed veto relay | `POST /veto/:id` (extended) | device signature **or** owner session | one-tap veto without a live session; `vetoedBy` resolves to the enrolled device's `ownerId`, audit records the device. Idempotent: re-vetoing an already-vetoed window succeeds as a no-op, so the service worker can retry blindly |
+| 3 | window detail for rendering | `GET /veto/:id` (extended) | device signature for detail | adds `deadline`, `delivered`, and the call summary — for device-signed callers only. The existing open read stays status-only: what an alert says is for enrolled devices, not for anyone who can reach the port (same disclosure discipline as the `/status` `epoch` note) |
+| 4 | enrolment: invite | `POST /devices/invite` | owner session — bootstrap and no-devices-left recovery mint via the host CLI / permission-protected Unix socket (§2), **never** an HTTP loopback bypass | single-use, short-TTL invite + WebAuthn creation challenge; token delivered in the URL fragment, spent in a POST body, never logged |
+| 5 | enrolment: enroll | `POST /devices/enroll` | invite token | verifies registration, registers both lane keys (cheap-lane public key preferred; HMAC secret provisioned only on fallback devices, returned once), stores `EnrolledDevice`; the invite burns atomically and **only on success** — a failed attempt does not consume it |
+| 6 | enrolment: list / revoke | `GET /devices`, `POST /devices/:id/revoke` | owner session (host CLI / Unix socket can always revoke) | inventory, and the kill switch for a device's standing: revoke bumps the revocation generation and atomically voids the device's credentials, push subscription, **live sessions, and outstanding challenges** (§2) |
+| 7 | push subscription upsert | `PUT /devices/:id/push-subscription` | device signature | stores/refreshes the Web Push subscription. The `endpoint` is an SSRF surface and is validated at write: HTTPS only, known push-service endpoint shapes, and rejection of localhost, private, link-local, and metadata addresses |
+| 8 | assertion challenge | `POST /assert/challenge` | device signature | mints a single-use challenge bound to `{purpose, subjectId}`, TTL ~2 min; challenges record the minting device's revocation generation and die with it (§2) |
+| 9 | passkey-gated sessions | `POST /session` | verified assertion (`purpose: "session"`) | replaces in-process minting — closes `TODO(passkey)` in `auth.ts`. The minted session records `deviceId` + revocation generation, and every session check re-verifies the device is still active (§2) |
 | 10 | GO 2 hardening | `POST /restore` (extended) | owner session **+** verified assertion (`purpose: "restore-go2"`, `subjectId` = ceremony id) | GO 2 stops accepting the bearer token GO 1 already saw |
-| 11 | alert dispatcher | (not a route) | — | the process that actually web-pushes on window register/extend: VAPID key custody, fan-out to enrolled devices, retry/TTL. Needs its own design; send-failure feeds back into nothing, because the window's fail-closed path already covers silence |
+| 11 | alert dispatcher | (not a route) | — | the process that actually web-pushes on window register/extend: VAPID key custody, fan-out to enrolled devices, retry/TTL. It re-validates every `endpoint` at send time — the checks from row 7 again, **after DNS resolution as well as before**, plus no redirect following and hard size/timeout caps — because a stored-then-repointed hostname is the classic SSRF. Needs its own design; send-failure feeds back into nothing, because the window's fail-closed path already covers silence |
 
 The approve lane's confirm endpoint is deliberately absent: the control
 plane has no server-side approval queue yet. When it exists, its
@@ -329,15 +433,19 @@ this contract.
 
 **In:** this document; `src/types.ts` — the wire types for enrolment,
 the alert payload, the ack, the veto tap, and the bound assertion,
-plus the endpoint contract above as data; a static installable shell
+plus the endpoint contract above as data; a **static design scaffold**
 (`public/index.html`, `manifest.webmanifest`) showing the alert /
 approve / restore / devices views with placeholder data and every
 live control disabled; a service-worker stub (`public/sw.js`) whose
 push and notification handlers document the real flow and perform
-none of it.
+none of it. Called a design scaffold on purpose: nothing serves it, so
+nothing installs it — it is the views and the contract, not an app.
 
 **Not in:** VAPID keys or any push sending or receiving; WebAuthn
 ceremony code (no `navigator.credentials` calls); any control-plane
 change (every route in §5 lands in its own scoped PR); any network
-call from the app at all; icons beyond a placeholder; multi-owner,
+call from the app at all; a dev server, build step, or any way to
+actually install this — real installability needs a served origin and
+real PNG icons including the `apple-touch-icon` iOS requires before
+home-screen install (and therefore before iOS push); multi-owner,
 quorums, native wrappers, attestation verification.

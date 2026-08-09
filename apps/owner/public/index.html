@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>OwnerSwitch — owner app</title>
+<!-- No Referer on ANY outgoing request: the enrolment invite token rides
+     in the URL fragment (DESIGN.md §2), and while fragments are never
+     sent in Referer, this is the second fence — nothing this page loads
+     or links to learns where the owner came from. -->
+<meta name="referrer" content="no-referrer">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#14171B">
 <!-- iOS install requires an apple-touch-icon (PNG) before push can work
@@ -93,9 +98,10 @@
     </nav>
 
     <div class="scaffold-note">
-      STATIC SHELL — nothing here is wired. No push, no WebAuthn, no
-      network calls. Placeholder data throughout; every live control is
-      disabled. The contract this will implement is DESIGN.md.
+      STATIC DESIGN SCAFFOLD — nothing here is wired, served, or
+      installable. No push, no WebAuthn, no network calls. Placeholder
+      data throughout; every live control is disabled. The contract this
+      will implement is DESIGN.md.
     </div>
 
     <div class="tabs" id="tabs">
@@ -202,8 +208,9 @@
   window.addEventListener('hashchange', sync);
   sync();
 
-  // Register the service-worker STUB so installability is real even though
-  // push is not. Guarded: file:// or ancient browsers just skip it.
+  // Register the service-worker STUB so the scaffold exercises the shape.
+  // This is a design scaffold, not a served app — nothing installs from
+  // here (DESIGN.md §6). Guarded: file:// or ancient browsers just skip it.
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function(){ /* scaffold: non-fatal */ });
   }

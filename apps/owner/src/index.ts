@@ -22,6 +22,7 @@ export type {
   AssertionChallenge,
   WebAuthnAssertion,
   BoundAssertion,
+  MintedSession,
   OwnerAppEndpoint,
 } from "./types.js";
 export { OWNER_APP_ENDPOINTS } from "./types.js";
