@@ -9,15 +9,21 @@
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  createGitHubMergeClient,
+  createInstallationTokenSource,
+  createSecretLedger,
   Executor,
   GitHubMergePrExecutor,
   liveKillStateFromControlPlane,
+  loadGitHubAppPrivateKey,
   type ActionTicket,
+  type GitHubMergeClient,
 } from "@ownerswitchai/executor";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
 import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
+import { resolveGitHubAppEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
 import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
@@ -82,20 +88,55 @@ async function runGateway(argv: string[]): Promise<void> {
   // control-plane client the decision path uses. One Executor instance for
   // the gateway's lifetime — its nonce store is what makes tickets
   // single-use WITHIN THIS PROCESS (see DESIGN.md §5 for the deployment
-  // constraint). The GitHub backend has no HTTP client yet (deliberately
-  // stubbed): a routed call that clears every check still fails at the
-  // backend with a clear "not implemented" until the live client lands.
-  // OWNERSWITCH_GITHUB_TOKEN is the credential seam the live client will
-  // authenticate with; wiring it today only arms the backend's scrubbing of
-  // its own secret — it never widens what the agent can see.
+  // constraint).
+  //
+  // The GitHub backend authenticates as a GitHub App (DESIGN.md §6):
+  // OWNERSWITCH_GITHUB_APP_ID + OWNERSWITCH_GITHUB_APP_INSTALLATION_ID +
+  // OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE, all-or-nothing (a partial set
+  // refused above at resolveGitHubAppEnv). The key file must live OUTSIDE
+  // the agent's workspace — same rule as the kill-state file, enforced at
+  // load. With no App configured the gateway still runs; a routed merge
+  // that clears every check fails cleanly as not-configured.
+  //
+  // OWNERSWITCH_GITHUB_TOKEN is NOT an accepted credential — a PAT is a
+  // standing, broadly-scoped secret, exactly what DESIGN.md §5 rules out.
+  // If it is set anyway, it still arms the backend's scrubbing and the
+  // upstream env-strip below, so a stray token can never widen what the
+  // agent sees.
   const routes = config.executorRoutes;
   const githubToken = process.env.OWNERSWITCH_GITHUB_TOKEN;
+  const githubApp = resolveGitHubAppEnv(process.env);
+  const ledger = createSecretLedger();
+  let githubClient: GitHubMergeClient | undefined;
+  let githubAppKeyPem: string | undefined;
+  if (githubApp !== undefined) {
+    let key;
+    try {
+      key = loadGitHubAppPrivateKey(githubApp.privateKeyFile, { workspaceDir: process.cwd() });
+    } catch (err) {
+      throw new ConfigError(err instanceof Error ? err.message : String(err));
+    }
+    githubAppKeyPem = key.pem;
+    ledger.add(key.pem);
+    githubClient = createGitHubMergeClient({
+      tokens: createInstallationTokenSource({
+        app: {
+          appId: githubApp.appId,
+          installationId: githubApp.installationId,
+          privateKey: key.key,
+        },
+        ledger,
+      }),
+      ledger,
+    });
+  }
   const executor =
     routes !== undefined && Object.keys(routes).length > 0
       ? (() => {
           const backend = new GitHubMergePrExecutor(
-            undefined,
+            githubClient,
             githubToken !== undefined && githubToken !== "" ? { token: githubToken } : undefined,
+            (text) => ledger.redact(text),
           );
           const runner = new Executor(backend, {
             fetchLiveKillState: liveKillStateFromControlPlane(controlPlane),
@@ -135,9 +176,13 @@ async function runGateway(argv: string[]): Promise<void> {
   // both the environment filter (by value AND by known alias name) and the
   // args check below (by value — a credential in argv is a hard refusal,
   // not a filter, since argv is visible to any process that can read it).
+  // The GitHub App PRIVATE KEY rides along: installation tokens minted from
+  // it exist only after startup and can't be inherited, but the key itself
+  // pasted into an env var or an argument absolutely can be.
   const gatewaySecretValues = [
     config.device.secret,
     githubToken,
+    githubAppKeyPem,
     process.env.OWNERSWITCH_CANARY_KEY,
     process.env.OWNERSWITCH_DEVICE_SECRET,
   ];
@@ -172,11 +217,15 @@ async function runGateway(argv: string[]): Promise<void> {
   process.on("SIGINT", () => shutdown(0));
   process.on("SIGTERM", () => shutdown(0));
 
+  const connectorState =
+    githubClient !== undefined
+      ? `github connector: live (App ${githubApp?.appId ?? "?"})`
+      : "github connector: not configured (routed merges will refuse)";
   console.error(
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
       `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}; ` +
-      `executor routes: ${executor !== undefined ? Object.keys(executor.routes).join(", ") : "none (all yes-decisions forward upstream)"}`,
+      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}`,
   );
 }
 

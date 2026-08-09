@@ -9,7 +9,7 @@ import {
   ToolListChangedNotificationSchema,
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { ActionTicket, ExecutionOutcome } from "@ownerswitchai/executor";
+import { ConnectorCallError, type ActionTicket, type ExecutionOutcome } from "@ownerswitchai/executor";
 import { evaluateRemote, type ControlPlaneClient, type KillState } from "@ownerswitchai/gateway";
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import { assertExecutorRoutesCoherent } from "./config.js";
@@ -279,8 +279,15 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     try {
       outcome = await wiring.run(ticket);
     } catch (err) {
-      // the nonce burned before the backend call — honestly ambiguous
-      throw executionFailed(call.tool, err instanceof Error ? err.message : String(err));
+      // The nonce burned before the backend call, so the ticket is spent —
+      // but the connector may still know whether the action definitively
+      // did not run (ConnectorCallError). Anything else reads as honestly
+      // ambiguous: "unknown" is the fail-safe answer, never the optimistic one.
+      throw executionFailed(
+        call.tool,
+        err instanceof Error ? err.message : String(err),
+        err instanceof ConnectorCallError ? err.outcome : "unknown",
+      );
     }
     if (outcome.status === "refused") {
       const { refusal } = outcome;

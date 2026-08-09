@@ -312,6 +312,16 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 `OWNERSWITCH_UPSTREAM_ARGS` (JSON array), `OWNERSWITCH_POLICY` (JSON),
 `OWNERSWITCH_AGENT_ID`, `OWNERSWITCH_TIMEOUT_MS`, `OWNERSWITCH_EXECUTOR_ROUTES` (JSON).
 
+The GitHub connector's credential is environment-only (never the config
+file, never argv) and all-or-nothing: `OWNERSWITCH_GITHUB_APP_ID`,
+`OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
+`OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE` — a GitHub App, not a personal
+access token, minting hour-long installation tokens scoped per merge to
+one repository (`packages/executor/DESIGN.md` §6 for the model and the
+provisioning steps, including where the key file must live). A partial
+triple refuses at startup; none at all runs the gateway with routed
+merges refusing cleanly as not-configured.
+
 ## What the agent sees (error codes)
 
 | code | meaning | retry? |
@@ -323,7 +333,7 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 | `-32054` `Lockdown` | kill switch engaged, or control plane unreachable | once restored |
 | `-32055` `HoneytokenTripped` | a decoy credential surfaced in the call — the kill is already firing | no |
 | `-32056` `TicketRefused` | an executor-routed action was approved, but refused at execution time: expired, replayed, a kill happened since the approval, or its veto release predates a kill (release "spent") — it did NOT run. The precise guarantee: a ticket is refused if the final pre-dispatch live-state check observes a kill or an epoch change; a kill landing after that check may race with dispatch, and once dispatched it cannot be recalled | a retry starts a fresh owner decision |
-| `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed — the action MAY OR MAY NOT have completed | check the resource first; a retry could duplicate the action |
+| `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed. The error's `data.connectorOutcome` says which kind: `"not-performed"` (the backend received and refused the request — the action definitively did NOT run) or `"unknown"` (it died on the wire and a post-dispatch verification read could not settle it — the action MAY OR MAY NOT have completed) | `not-performed`: a retry is safe but will likely refuse again until the cause is fixed. `unknown`: check the resource first; a retry could duplicate the action |
 
 Each error's `data` carries the machine-readable detail:
 `{ decision, tool, reason, ruleId, vetoWindowId?, vetoStatus?, refusalCode? }`.

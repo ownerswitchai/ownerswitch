@@ -24,3 +24,28 @@ export {
   parseMergePrArgs,
 } from "./github.js";
 export type { GitHubCredential, GitHubMergeClient, MergePrArgs } from "./github.js";
+
+export { ConnectorCallError } from "./connector-error.js";
+export type { ConnectorOutcome } from "./connector-error.js";
+
+export { createSecretLedger } from "./secret-ledger.js";
+export type { SecretLedger } from "./secret-ledger.js";
+
+export { loadGitHubAppPrivateKey, MAX_PRIVATE_KEY_FILE_BYTES } from "./github-app-key.js";
+export type { LoadedPrivateKey, LoadPrivateKeyOptions } from "./github-app-key.js";
+
+export {
+  createInstallationTokenSource,
+  EXPIRY_MARGIN_MS,
+  INSTALLATION_TOKEN_PERMISSIONS,
+} from "./github-app-auth.js";
+export type {
+  GitHubAppConfig,
+  InstallationTokenSource,
+  InstallationTokenSourceOptions,
+} from "./github-app-auth.js";
+
+export { createGitHubMergeClient } from "./github-client.js";
+export type { GitHubMergeClientOptions } from "./github-client.js";
+
+export { GITHUB_API_BASE_URL } from "./github-http.js";

@@ -243,9 +243,13 @@ Honesty about the boundary, in the same spirit as the threat model:
   issued downstream to outlive the kill.
 - **OwnerSwitch's credential is now the prize.** The executor holds a
   standing GitHub credential; whoever compromises the executor process
-  merges without any ticket. Least privilege (a GitHub App with
-  short-lived installation tokens scoped to exactly the repos and the
-  one permission needed) shrinks the blast radius; it does not eliminate it.
+  merges without any ticket. Least privilege shrinks the blast radius; it
+  does not eliminate it. That least privilege is now shipped, not
+  aspirational: the connector authenticates as a GitHub App whose private
+  key mints installation tokens that live at most an hour and are scoped,
+  per mint, to one named repository and two permissions — §6 has the full
+  model, including where the key must live and what a stolen artifact of
+  each kind is worth.
   Two containments ship with the wiring. First, the upstream child process —
   the agent's side of the boundary — gets an EXPLICITLY built environment
   with every gateway/executor/connector credential stripped: by name
@@ -293,7 +297,149 @@ Honesty about the boundary, in the same spirit as the threat model:
   the ticket, never assumes it fresh); and the burn still ordered before
   dispatch, exactly as in-process.
 
-## 6. Wired / still stubbed
+## 6. The GitHub connector, live
+
+The seam described above is now filled: `createGitHubMergeClient`
+(`src/github-client.ts`) is the real HTTP client behind
+`GitHubMergePrExecutor`, and OwnerSwitch performs approved merges itself.
+This section is the credential model and the honesty section for the one
+call that crosses to GitHub.
+
+### The credential is a GitHub App, not a PAT
+
+A personal access token is a standing, human-scoped credential: it lives
+until someone rotates it, it acts as its owner across every repo that
+owner touches, and revoking it is a manual act. The connector refuses that
+model. It authenticates as a **GitHub App** (`src/github-app-auth.ts`):
+
+1. The App's **RSA private key** signs a short-lived JWT — RS256, `iat`
+   backdated 60 s against clock drift, `exp` 9 minutes out (GitHub's cap
+   is 10). The JWT can do exactly one thing: mint installation tokens.
+2. The JWT calls
+   `POST /app/installations/{installation_id}/access_tokens` with an
+   explicit down-scoping body:
+   `repositories: [<the one repo in the ticket>]` and
+   `permissions: { contents: "write", pull_requests: "read" }`.
+   `contents: write` is the documented requirement of the merge endpoint;
+   `pull_requests: read` exists solely for the post-ambiguity verification
+   read below. Nothing else is ever requested.
+3. **Installation tokens expire one hour after minting** (GitHub's
+   lifetime, not configurable). The source caches one token per
+   repository and re-mints when a cached token is within 5 minutes of
+   expiry, so a token is never knowingly presented near its deadline.
+
+What a stolen artifact is worth: a leaked *installation token* is ≤ 1 hour
+of merge capability on one repository; a leaked *App private key* is the
+standing credential (rotate it in the App's settings; every outstanding
+JWT and token dies with its own short TTL). GitHub also exposes
+`DELETE /installation/token` to revoke a live installation token —
+wiring that into the kill path is future hardening, not shipped; today
+the bound on a leaked token is its ≤ 1 h expiry and one-repo scope.
+
+### Provisioning (once, by the operator)
+
+1. Create a GitHub App on the org (or user) that owns the target repos.
+   Repository permissions: **Contents: Read & write** and **Pull
+   requests: Read-only**. No webhooks, no other permissions.
+2. Install the App on **exactly the repositories** the executor may merge
+   in. The installation is itself a scope: a token minted here cannot
+   reach an uninstalled repo no matter what a ticket says.
+3. Generate a private key in the App's settings; a `.pem` downloads.
+4. Put the key where the **agent's side cannot read it — the same rule as
+   the kill-state file**: an absolute path outside the agent's workspace,
+   owned by the gateway's user, mode `0600`
+   (e.g. `/etc/ownerswitch/github-app.pem`). The loader
+   (`src/github-app-key.ts`) enforces what is checkable — absolute path,
+   not under the gateway's working directory, regular file behind no
+   symlink, ≤ 64 KiB, no group/world access, owned by the process's uid,
+   parses as an RSA key — and refuses to start otherwise. The placement
+   rule itself (a host path the agent has no route to) remains a
+   deployment requirement no process can self-verify.
+5. Configure the gateway by environment (never argv, never the config
+   file): `OWNERSWITCH_GITHUB_APP_ID`,
+   `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
+   `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`. All three or none —
+   a partial set is refused at startup, naming what is missing
+   (`packages/mcp/src/github-app-env.ts`). `OWNERSWITCH_GITHUB_TOKEN` is
+   NOT an accepted credential; if set anyway it only arms scrubbing and
+   the upstream env-strip.
+
+### The connector never logs or returns the credential — structurally
+
+The scrubbing in `GitHubMergePrExecutor` is the second line of defence.
+The client itself is written so a credential cannot enter a log line, an
+error, a thrown object or a rejection in the first place:
+
+- the private key, every App JWT and every installation token are
+  registered with a **SecretLedger** (`src/secret-ledger.ts`) the moment
+  they exist — the ledger accumulates forever, so an expired token is
+  still redacted from an error produced later;
+- no code path in `github-app-auth.ts` / `github-client.ts` logs, and no
+  thrown error is built from a request, a header, or a raw response body.
+  The ONLY thing lifted out of a response is its JSON `message` string —
+  **redacted first, then truncated** (the order is load-bearing: truncate
+  first and a long echoed credential is cut mid-way, leaving a fragment
+  exact-match redaction can no longer recognize; a unit test pinned
+  exactly that failure with an echoed App JWT), bounded to 300 chars;
+- every error message passes through the ledger's redaction at
+  construction, because GitHub's own auth errors quote credentials back
+  ("Bad credentials: ghs_…") — simulated in the unit tests with responses
+  that echo the live token and the App JWT;
+- the executor's scrub then runs over everything the backend emits —
+  results AND errors — with the same ledger, so even a path that somehow
+  escaped the client's own discipline crosses a second redaction before
+  an `ExecutionFailed` refusal can carry it to the agent.
+
+### Ambiguous dispatch: what GitHub offers, and what stays ambiguous
+
+The nonce burns before the connector call (§3), so a dispatch that fails
+after GitHub may have accepted it is never retried. Checked against the
+API documentation rather than assumed: **GitHub offers no idempotency key
+for `merge_pull_request`.** It offers two adjacent mechanisms, and the
+connector uses both:
+
+- **A conditional guard.** The merge endpoint's `sha` parameter — "SHA
+  that pull request head must match to allow merge" (HTTP 409 on
+  mismatch). Tickets may carry `expectedHeadSha` (full 40- or 64-hex
+  commit id, validated at parse), and the owner's approval then binds to
+  the exact head they reviewed: a branch that gains commits after
+  approval draws a refusal, not a merge of unreviewed code. This does not
+  make the operation idempotent — it makes it precise.
+- **Verification after the fact.** Merges are readable ground truth:
+  `merged` and `merge_commit_sha` on `GET /repos/{owner}/{repo}/pulls/{n}`
+  (and the dedicated 204/404 merged-check endpoint). After an ambiguous
+  dispatch — the PUT died on the wire, timed out, or drew a 5xx — the
+  client performs **one verification read**:
+  - the read shows **merged** → the operation succeeded; the agent gets
+    a normal result whose `message` says it was confirmed by a
+    post-dispatch verification read, with the real `merge_commit_sha`;
+  - the read shows **not merged** → still reported as failed with
+    outcome UNKNOWN, and the error says why plainly: a request that died
+    on the wire can still complete after the read, so the answer is a
+    snapshot, not proof;
+  - the read itself fails → outcome UNKNOWN, with the same instruction.
+
+What the operator sees in the residual case: an `ExecutionFailed`
+(`-32057`) whose message names the double failure and instructs "check
+`owner/repo#n` directly before re-approving — a re-approved merge could
+run the action twice." Failures the API definitively rejected (any 4xx:
+404, 403/rate limit, 405 not-mergeable, 409 head-moved, 422) are NOT
+ambiguous: the connector classifies them "not-performed"
+(`ConnectorCallError`), and the agent-facing error says the action did
+NOT run instead of the blanket "may or may not have completed"
+(`packages/mcp/src/errors.ts`).
+
+### What the test suite proves, and what only a live run can
+
+Unit tests (`src/github-client.test.ts`, `src/github-app-auth.test.ts`)
+run against scripted responses only — success, 404, 403, 405, 409, 422,
+primary and secondary rate limits, credential-echoing errors, wire
+deaths, and every verification branch. **Nothing in the test suite
+performs a live merge.** The one live run is a documented manual
+procedure against a throwaway repository — `MANUAL-VERIFICATION.md`
+states the steps, what the run proves, and what it deliberately does not.
+
+## 7. Wired / still stubbed
 
 **Wired:** this document; `ActionTicket` (including source tool, verdict
 decision and rule id for the audit trail); the pure refusal core (kill /
@@ -307,22 +453,27 @@ alias-coherence gate (§1), the authorization hash covering policy AND
 routes, ticket minting on yes, `executor.run()` instead of `forward()` for
 routed operations, result relayed to the agent
 (`packages/mcp/src/executor-route.ts`, `proxy.ts`, `config.ts`);
-credential scrubbing in the GitHub backend; end-to-end tests over a fake
-backend proving the claim as stated in §3 — a kill observed by the
-pre-dispatch check refuses the ticket and the backend is never called
-(engaged, kill-then-restore epoch mismatch, and a spent veto release),
-expired ticket refused, replayed nonce refused, unreachable control plane
-refused, a happy path where the backend runs exactly once and the agent
-receives the result, never a token — and a leak test where the backend
-genuinely holds the credential and an upstream error that echoes it
-reaches the agent scrubbed.
+end-to-end tests over a fake backend proving the claim as stated in §3 — a
+kill observed by the pre-dispatch check refuses the ticket and the backend
+is never called (engaged, kill-then-restore epoch mismatch, and a spent
+veto release), expired ticket refused, replayed nonce refused, unreachable
+control plane refused, a happy path where the backend runs exactly once
+and the agent receives the result, never a token — and a leak test where
+the backend genuinely holds the credential and an upstream error that
+echoes it reaches the agent scrubbed.
 
-**Still stubbed / not yet:** the live GitHub call —
-`GitHubMergePrExecutor`'s HTTP call stays behind its injectable
-`GitHubMergeClient`, and the CLI wires the backend with no client (the
-`OWNERSWITCH_GITHUB_TOKEN` credential seam exists and only arms
-scrubbing), so a routed call that clears every check fails with an
-explicit "not implemented" (`ExecutionFailed`, `-32057`) rather than
-silently forwarding. Also not yet: ticket signing; a shared nonce store —
-until one exists the deployment constraint in §5 stands (one gateway
-process, no remote executor); any connector beyond `merge_pull_request`.
+**And now wired (this PR): the live GitHub call.** `merge_pull_request`
+moves from "stubbed" to **shipped**: `createGitHubMergeClient` performs
+the merge with a GitHub App installation token minted per repository
+(§6), the CLI wires it from the `OWNERSWITCH_GITHUB_APP_*` environment,
+tickets may pin `expectedHeadSha`, ambiguous dispatches get one
+verification read, definitive rejections reach the agent as "did NOT
+run", and the SecretLedger's redaction backs both the client (first line)
+and the executor's scrub (second line). The injectable
+`GitHubMergeClient` seam remains — tests never hit GitHub.
+
+**Still stubbed / not yet:** ticket signing; a shared nonce store — until
+one exists the deployment constraint in §5 stands (one gateway process,
+no remote executor); revoking live installation tokens on kill
+(`DELETE /installation/token`, §6); any connector beyond
+`merge_pull_request`.

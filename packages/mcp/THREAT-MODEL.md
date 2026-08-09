@@ -409,6 +409,60 @@ The control plane is deliberately one small, framework-free process — a
 surface auditable in one sitting. That concentration is the design: one
 place to defend, and the place most worth defending.
 
+## 5. What changes now that a real downstream credential exists
+
+"There is little to steal" (§4) was written for the proxy-only
+deployment, and it stops being true the moment the executor's GitHub
+connector is configured: the gateway process now holds a **GitHub App
+private key** and mints **installation tokens** with it
+(`packages/executor/DESIGN.md` §6). This section is what that changes.
+
+- **The gateway process is now worth compromising for theft, not just
+  for policy manipulation.** Whoever reads the App's private key holds a
+  standing merge capability — no ticket, no owner, no kill check — over
+  every repository the App is installed on. That is the deliberate
+  trade: the credential moved OFF the agent's side (where it was the
+  product) to OwnerSwitch's side (where it is the prize), because a
+  prize can be guarded and a product cannot.
+- **The blast radius is configured, not coded.** An installation token
+  is scoped at mint to ONE repository and
+  `{ contents: write, pull_requests: read }`, and dies within an hour.
+  The key itself is bounded by the App's installation list and
+  permissions. Deployment requirements, restated as requirements:
+  install the App on exactly the repositories the executor may merge
+  in, grant it Contents read/write + Pull requests read-only and
+  nothing else, and never install it org-wide out of convenience —
+  every extra repository in the installation list is a wider key.
+- **The key's placement is the same class of requirement as the
+  kill-state file.** Absolute path, outside the agent's workspace,
+  owned by the gateway's user, mode 0600. The loader enforces what a
+  process can check (symlink refusal, mode, ownership, size, "not under
+  my cwd") and refuses to start otherwise; whether the agent has some
+  OTHER route to that path is a property of the deployment, and no
+  Node-level check can prove a negative about host access.
+- **Credentials appear on the wire to exactly one host.** Tokens ride
+  in an `Authorization` header to `api.github.com` and nowhere else; no
+  code path logs them, thrown errors are assembled from status codes
+  and a redacted, bounded `message` field, and everything the backend
+  emits crosses a second redaction (the SecretLedger) before an error
+  can reach the agent. The residual leak surface is a compromised
+  gateway process itself — which is §4's scenario, now with something
+  real to exfiltrate.
+- **Kill does not revoke a minted installation token.** Same boundary
+  as ever, one new instance: KILL stops new executions (and new
+  mints — every ticket re-checks live state), but a token minted before
+  the kill remains valid to GitHub for the remainder of its ≤ 1 h life
+  IF an attacker has already exfiltrated it. GitHub exposes
+  `DELETE /installation/token`; wiring token revocation into the kill
+  path is future hardening, not shipped. Until then the honest bound on
+  a stolen token is one hour and one repository.
+- **The agent-side containments carry unchanged weight.** The upstream
+  child's environment is built explicitly with every credential
+  stripped by name and value, a credential in `upstream.args` is a
+  startup refusal, and `OWNERSWITCH_GITHUB_TOKEN` — the PAT seam the
+  App model replaces — is no longer accepted as a credential at all; if
+  set, it only arms scrubbing and the env-strip.
+
 ---
 
 **Rule of thumb.** Treat the gateway as where decisions are made and

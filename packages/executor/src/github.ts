@@ -1,12 +1,13 @@
+import { ConnectorCallError } from "./connector-error.js";
 import type { ExecutionResult, ExecutorBackend } from "./executor.js";
 import type { ActionTicket } from "./ticket.js";
 
 /**
- * GitHub PR merge — the first (and so far only) executor operation.
- * The live HTTP call is deliberately NOT implemented in this PR: the
- * client is injectable so tests never hit GitHub, and without one the
- * backend throws. The shape is the point; the integration comes after
- * the design is agreed. See DESIGN.md §6.
+ * GitHub PR merge — the first (and so far only) executor operation. The
+ * client stays injectable so tests never hit GitHub; the LIVE client is
+ * createGitHubMergeClient (github-client.ts), authenticated as a GitHub App
+ * with short-lived, per-repository installation tokens
+ * (github-app-auth.ts). See DESIGN.md §6.
  */
 
 export const GITHUB_CONNECTOR = "github";
@@ -18,6 +19,13 @@ export interface MergePrArgs {
   repo: string;
   pullNumber: number;
   mergeMethod?: "merge" | "squash" | "rebase";
+  /**
+   * When present, forwarded as the merge API's `sha` parameter — "SHA that
+   * pull request head must match to allow merge". This binds the owner's
+   * approval to the exact head they saw: a branch that gains commits after
+   * approval draws HTTP 409 instead of merging code nobody reviewed.
+   */
+  expectedHeadSha?: string;
 }
 
 /** The one HTTP call this connector makes, injectable for tests. */
@@ -52,7 +60,10 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("canonicalArgs must be a JSON object");
   }
-  const { owner, repo, pullNumber, mergeMethod } = parsed as Record<string, unknown>;
+  const { owner, repo, pullNumber, mergeMethod, expectedHeadSha } = parsed as Record<
+    string,
+    unknown
+  >;
   if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
   if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
   if (typeof pullNumber !== "number" || !Number.isInteger(pullNumber) || pullNumber <= 0) {
@@ -66,26 +77,46 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
   ) {
     throw new Error(`unknown mergeMethod "${String(mergeMethod)}"`);
   }
-  return { owner, repo, pullNumber, ...(mergeMethod !== undefined ? { mergeMethod } : {}) };
+  // a full commit id (40-hex SHA-1 or 64-hex SHA-256), never an abbreviation:
+  // an approval must bind to exactly one head, and a prefix can be ambiguous
+  if (
+    expectedHeadSha !== undefined &&
+    (typeof expectedHeadSha !== "string" || !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(expectedHeadSha))
+  ) {
+    throw new Error("expectedHeadSha must be a full 40- or 64-character hex commit id");
+  }
+  return {
+    owner,
+    repo,
+    pullNumber,
+    ...(mergeMethod !== undefined ? { mergeMethod } : {}),
+    ...(expectedHeadSha !== undefined ? { expectedHeadSha } : {}),
+  };
 }
 
 export class GitHubMergePrExecutor implements ExecutorBackend {
   /**
-   * `credential` is the config path a real connector uses: the live client
-   * will authenticate with it, and even while the HTTP call is stubbed, the
-   * backend already scrubs the token from every string it emits — so wiring
-   * a credential in can never widen what the agent sees.
+   * The live client (createGitHubMergeClient) is written to never emit a
+   * credential in the first place; the scrubbing here is the SECOND line of
+   * defence, applied to everything this backend emits — results AND errors.
+   * `credential` scrubs a single static token (the legacy seam, still
+   * honored so a token set in the environment can never widen what the
+   * agent sees); `redact` is the SecretLedger's redaction covering every
+   * secret the live client has ever held — private key, App JWTs, every
+   * installation token.
    */
   constructor(
     private readonly client?: GitHubMergeClient,
     private readonly credential?: GitHubCredential,
+    private readonly redact?: (text: string) => string,
   ) {}
 
-  /** The one secret this backend holds never leaves it, even quoted back. */
+  /** No secret this backend's side holds leaves it, even quoted back. */
   private scrub(text: string): string {
     const token = this.credential?.token;
-    if (token === undefined || token === "") return text;
-    return text.split(token).join("[REDACTED]");
+    const afterToken =
+      token === undefined || token === "" ? text : text.split(token).join("[REDACTED]");
+    return this.redact === undefined ? afterToken : this.redact(afterToken);
   }
 
   async execute(ticket: ActionTicket): Promise<ExecutionResult> {
@@ -96,8 +127,10 @@ export class GitHubMergePrExecutor implements ExecutorBackend {
     }
     const args = parseMergePrArgs(ticket.canonicalArgs);
     if (!this.client) {
-      throw new Error(
-        "not implemented: the live GitHub call lands in a later PR — inject a GitHubMergeClient",
+      throw new ConnectorCallError(
+        "the GitHub connector is not configured — the gateway holds no GitHub App credential " +
+          "(see packages/executor/DESIGN.md §6); the merge was not attempted",
+        "not-performed",
       );
     }
     let outcome;
@@ -105,8 +138,13 @@ export class GitHubMergePrExecutor implements ExecutorBackend {
       outcome = await this.client.mergePullRequest(args);
     } catch (err) {
       // GitHub quotes credentials back in auth errors; the scrubbed message
-      // is what may ride an ExecutionFailed refusal to the agent
-      throw new Error(this.scrub(err instanceof Error ? err.message : String(err)));
+      // is what may ride an ExecutionFailed refusal to the agent. The
+      // outcome classification (definitively-not-performed vs unknown)
+      // survives the rewrap — the agent-facing error depends on it.
+      const scrubbed = this.scrub(err instanceof Error ? err.message : String(err));
+      throw err instanceof ConnectorCallError
+        ? new ConnectorCallError(scrubbed, err.outcome)
+        : new Error(scrubbed);
     }
     return {
       resourceId: githubPrResourceId(args.owner, args.repo, args.pullNumber),
