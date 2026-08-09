@@ -1,11 +1,12 @@
 /*
  * Service worker STUB — static design scaffold only (see ../DESIGN.md §6).
  *
- * Registration is exercised so the scaffold shows the shape; nothing
- * serves this app, so nothing installs it. It performs NO push handling,
- * NO caching, NO network interception. The handlers below exist to
- * document the flow the real implementation must follow — each body is a
- * no-op.
+ * Registration is exercised so the scaffold shows the shape. The
+ * repository provides no supported install path; manually serving the
+ * scaffold may register this no-op worker, but no functional OwnerSwitch
+ * app results. It performs NO push handling, NO caching, NO network
+ * interception. The handlers below exist to document the flow the real
+ * implementation must follow — each body is a no-op.
  */
 
 self.addEventListener("install", () => {

@@ -68,34 +68,42 @@ export interface EnrollmentRequest {
   /**
    * SPKI public key of the SECOND, non-exportable WebCrypto keypair
    * (ECDSA P-256, extractable: false) the device generated for the cheap
-   * lane — the REQUIRED mode: the server then holds only public keys and
-   * there is no raw key material for an origin compromise to steal
-   * (DESIGN.md §4). Omitted only on platforms that cannot hold a
-   * non-exportable key, which puts the device in HMAC-fallback mode.
+   * lane. REQUIRED — there is no HMAC fallback and no client-selectable
+   * mode: an optional field here would let an origin that is already
+   * hostile at enrolment time pick its own downgrade (DESIGN.md §2).
+   * A platform that cannot hold a non-exportable key fails closed at
+   * enrolment rather than silently becoming the weakest device.
    */
-  cheapLaneKey?: Base64Url;
+  cheapLaneKey: Base64Url;
+  /**
+   * Proof of possession of cheapLaneKey's private half: an ECDSA P-256
+   * signature, under the new key, over the domain-separated enrolment
+   * transcript — the protocol label "ownerswitch/enroll-cheap-lane/v1",
+   * inviteId, ownerId, the WebAuthn credentialId, and the SPKI key bytes,
+   * each field length-prefixed so the encoding is injective. Verified
+   * with the submitted key BEFORE the invite is consumed: a key the
+   * client cannot sign with is refused and the invite survives — a
+   * root-of-trust ceremony must not accept a dead credential
+   * (DESIGN.md §2).
+   */
+  cheapLaneKeyProof: Base64Url;
 }
 
 /**
- * Returned exactly once, on successful enrolment. `deviceSecret` exists
- * ONLY for HMAC-fallback devices (no cheapLaneKey in the request): the
- * shared secret verified by packages/control-plane/src/auth.ts, kept by
- * the server too, stored on-device, never returned again — and readable
- * by whatever JavaScript the origin serves, which is why fallback mode
- * is priced as permanently-impersonable on origin compromise
- * (DESIGN.md §4). In the required (cheapLaneKey) mode it is absent.
+ * Returned exactly once, on successful enrolment. Deliberately carries no
+ * secret: both lanes register PUBLIC keys, so nothing on this wire — or
+ * in the app's storage, or in the control plane's — is worth stealing
+ * (DESIGN.md §2, §4).
  */
 export interface EnrollmentResponse {
   deviceId: string;
-  deviceSecret?: string;
 }
 
 /**
  * What the control plane stores per enrolled device. Everything downstream
  * — ack, veto, approve, GO 2 — reduces to "is there a live record here".
- * The passkey half is asymmetric (server holds only the public key); the
- * cheap-lane secret is symmetric and lives on both ends — the trade-off is
- * stated in DESIGN.md §4.
+ * Both lanes are asymmetric: the server holds only public keys, so a
+ * control-plane compromise can deny and lie but cannot sign (DESIGN.md §4).
  */
 export interface EnrolledDevice {
   deviceId: string;
@@ -105,11 +113,11 @@ export interface EnrolledDevice {
   /** COSE public key — verifies every future assertion */
   publicKey: Base64Url;
   /**
-   * SPKI public key verifying cheap-lane signatures (required mode).
-   * null = HMAC-fallback device; the shared secret is held server-side,
-   * off this record, and the trade-off is stated in DESIGN.md §4.
+   * SPKI public key verifying cheap-lane signatures. Always present —
+   * enrolment refuses a device without one (proof of possession included;
+   * DESIGN.md §2). There is no HMAC-fallback device class.
    */
-  cheapLaneKey: Base64Url | null;
+  cheapLaneKey: Base64Url;
   /**
    * last accepted authenticator signature counter. A regression flags
    * cloning; synced passkeys legitimately report 0 or a frozen counter,
@@ -171,13 +179,27 @@ export interface OwnerAlertPush {
 }
 
 /**
+ * The shared veto wire vocabulary — the five VetoWindow states plus
+ * "spent", introduced by #28 (packages/control-plane/src/veto.ts,
+ * VetoWireStatus): the status a would-be release reports when the
+ * window's recorded kill epoch is no longer current. "spent" is TERMINAL
+ * on this surface — not ackable (the ack rule accepts only pending/
+ * extended), not a release, not reusable; the app renders "this review
+ * expired after a kill" and the action needs a fresh owner review
+ * (DESIGN.md §5). This file is deliberately import-free, so the union is
+ * mirrored here by name and must stay identical to the canonical export —
+ * alias it (and pin with a contract test) once #28 lands on main.
+ */
+export type VetoWireStatus = "pending" | "vetoed" | "released" | "extended" | "held" | "spent";
+
+/**
  * Device-signed GET /veto/:id — the renderable truth about a held window.
  * The existing open (unauthenticated) read stays status-only; this shape
  * is for enrolled devices.
  */
 export interface HeldWindowDetail {
   windowId: string;
-  status: "pending" | "vetoed" | "released" | "extended" | "held";
+  status: VetoWireStatus;
   /** who is acting and what they asked for — rendered verbatim to the owner */
   agentId: string;
   tool: string;
@@ -196,6 +218,7 @@ export interface HeldWindowDetail {
  * Accepted only while the window is still pending/extended on the
  * SERVER's clock and only from a device enrolled to the window's owner;
  * after the deadline an ack is recorded in the audit trail and ignored.
+ * A "spent" window is past both states — never ackable.
  */
 export interface SeenAck {
   windowId: string;
@@ -243,7 +266,12 @@ export interface AssertionChallengeRequest {
  * binding lives server-side keyed by challengeId — the phone repeating it
  * back is convenience, never trusted. A challenge also records the
  * minting device's revocation generation and dies with it: revoking the
- * device voids its outstanding challenges (DESIGN.md §2).
+ * device voids its outstanding challenges (DESIGN.md §2). For
+ * purpose "approve", the server additionally binds the approval record's
+ * canonical action hash into the challenge record, and the record itself
+ * is immutable once created — the passkey signs the exact action the
+ * owner was shown, and confirm re-verifies record and kill epoch
+ * (DESIGN.md §5).
  */
 export interface AssertionChallenge {
   challengeId: string;
@@ -322,7 +350,8 @@ export const OWNER_APP_ENDPOINTS = [
     path: "/veto/:id",
     auth: "device-signed for detail; open read stays status-only",
     status: "extension",
-    purpose: "deadline + delivered + call summary, for enrolled devices only",
+    purpose:
+      "deadline + delivered + call summary, for enrolled devices only; status speaks VetoWireStatus (#28) including terminal 'spent'",
   },
   {
     method: "POST",
@@ -338,7 +367,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "invite-token",
     status: "addition",
     purpose:
-      "verify registration, register both lane keys (cheap-lane public key preferred; HMAC secret only for fallback devices, returned once), store EnrolledDevice; the invite burns atomically and only on success",
+      "verify the WebAuthn registration AND the cheap-lane proof of possession (before the invite is consumed), register both lanes' public keys, store EnrolledDevice; cheapLaneKey required — no HMAC fallback exists; the invite burns atomically and only on success",
   },
   {
     method: "GET",

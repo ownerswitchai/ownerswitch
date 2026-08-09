@@ -12,76 +12,14 @@
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#14171B">
 <!-- iOS install requires an apple-touch-icon (PNG) before push can work
-     there at all — placeholder SVG only in this scaffold; see DESIGN.md §4. -->
+     there at all — placeholder SVG only in this scaffold; see DESIGN.md §6. -->
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<style>
-  /* Same palette and voice as apps/web — this is the same product,
-     shrunk to one hand. */
-  :root{
-    --paper:#EFF1F4; --panel:#FFFFFF; --ink:#14171B; --ink-dim:#5B6470;
-    --red:#E02323; --red-deep:#8F0F0F; --yellow:#F5B800; --green:#1E9E4B;
-    --line:#D8DCE1;
-    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
-  }
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
-  .wrap{max-width:480px;margin:0 auto;padding:0 16px 32px}
-  .hazard{height:8px;background:repeating-linear-gradient(-45deg,var(--yellow) 0 12px,var(--ink) 12px 24px)}
-
-  nav{display:flex;align-items:center;justify-content:space-between;padding:14px 0}
-  .logo{display:flex;align-items:center;gap:1px;color:var(--ink);text-decoration:none}
-  .logo span{font-family:var(--mono);font-weight:600;font-size:15px;letter-spacing:-.01em}
-  .nav-tag{font-family:var(--mono);font-size:10px;color:var(--ink-dim);letter-spacing:.12em}
-
-  .scaffold-note{background:var(--panel);border:1px dashed var(--line);border-radius:10px;
-    font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.6;padding:10px 12px;margin:4px 0 14px}
-
-  .tabs{display:flex;gap:6px;margin-bottom:14px}
-  .tabs a{flex:1;text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.08em;
-    color:var(--ink-dim);text-decoration:none;text-transform:uppercase;
-    border:1px solid var(--line);border-radius:9px;padding:8px 2px;background:var(--panel)}
-  .tabs a.active{color:var(--ink);border-color:var(--ink)}
-
-  section{display:none}
-  section:target{display:block}
-  section.default{display:block}
-  section:target ~ section.default{display:none}
-  /* The default section sits LAST in the DOM so `section:target ~` can
-     hide it whenever any other section is targeted. Only one section is
-     visible at a time, so DOM order costs nothing visually. */
-
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
-  .card h2{font-size:15px;font-weight:700;letter-spacing:-.01em;margin-bottom:8px}
-  .kv{display:grid;grid-template-columns:92px 1fr;gap:4px 10px;font-size:13px;line-height:1.5}
-  .kv b{font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--ink-dim);text-transform:uppercase;padding-top:2px}
-  .kv code{font-family:var(--mono);font-size:12px}
-  .lane{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--red);text-transform:uppercase}
-  .countdown{font-family:var(--mono);font-size:13px;color:var(--ink);margin-top:10px}
-  .countdown i{color:var(--ink-dim);font-style:normal}
-
-  .veto-btn{display:block;width:100%;margin-top:14px;border:none;border-radius:16px;cursor:pointer;
-    background:var(--red);color:#fff;font-family:var(--mono);font-weight:700;font-size:18px;
-    letter-spacing:.18em;padding:18px 0;box-shadow:0 6px 0 var(--red-deep)}
-  .veto-btn:active{transform:translateY(4px);box-shadow:0 2px 0 var(--red-deep)}
-  .veto-sub{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--ink-dim);
-    text-align:center;margin-top:10px;text-transform:uppercase}
-
-  .passkey-btn{display:block;width:100%;margin-top:14px;border:1px solid var(--ink);border-radius:12px;
-    background:var(--panel);color:var(--ink);font-family:var(--mono);font-weight:600;font-size:13px;
-    letter-spacing:.1em;padding:14px 0;cursor:not-allowed;opacity:.45}
-  .muted{color:var(--ink-dim);font-size:13px;line-height:1.55}
-  .muted a{color:var(--ink-dim)}
-  .ok{color:var(--green)}
-  .device{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
-  .device:first-of-type{border-top:none}
-  .device .name{font-size:14px;font-weight:600}
-  .device .meta{font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
-  .device .revoke{font-family:var(--mono);font-size:11px;color:var(--red);background:none;border:1px solid var(--line);
-    border-radius:8px;padding:6px 10px;cursor:not-allowed;opacity:.45}
-
-  footer{text-align:center;font-family:var(--mono);font-size:11px;color:var(--ink-dim);padding:20px 0 8px}
-</style>
+<!-- Styles and script are external files, no inline blocks or style=""
+     attributes: the strict CSP the design requires (script-src 'self';
+     style-src 'self', no unsafe-inline) must be achievable without
+     rework. See DESIGN.md §4 and §6. -->
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
 </head>
 <body>
   <div class="hazard"></div>
@@ -98,10 +36,12 @@
     </nav>
 
     <div class="scaffold-note">
-      STATIC DESIGN SCAFFOLD — nothing here is wired, served, or
-      installable. No push, no WebAuthn, no network calls. Placeholder
-      data throughout; every live control is disabled. The contract this
-      will implement is DESIGN.md.
+      STATIC DESIGN SCAFFOLD — nothing here is wired: no push, no
+      WebAuthn, no network calls. Placeholder data throughout; every
+      live control is disabled. The repository provides no supported
+      install path — serving this manually may register the no-op
+      service worker, but no functional OwnerSwitch app results. The
+      contract this will implement is DESIGN.md.
     </div>
 
     <div class="tabs" id="tabs">
@@ -112,11 +52,12 @@
     </div>
 
     <!-- THE EXPENSIVE LANE, half one: approve-lane confirmation. Will
-         require a fresh WebAuthn assertion bound to this approval id. -->
+         require a fresh WebAuthn assertion bound to this approval id —
+         and to the immutable record's canonical action hash (DESIGN.md §5). -->
     <section id="approve">
       <div class="card">
         <span class="lane">APPROVE LANE · DEFAULT-DENY</span>
-        <h2 style="margin-top:6px">Waiting for your passkey</h2>
+        <h2 class="pad-top">Waiting for your passkey</h2>
         <div class="kv">
           <b>agent</b><code>ops-bot</code>
           <b>tool</b><code>stripe.payout</code>
@@ -134,7 +75,7 @@
     <section id="restore">
       <div class="card">
         <span class="lane">RESTORE · GO 2/2</span>
-        <h2 style="margin-top:6px">System is killed</h2>
+        <h2 class="pad-top">System is killed</h2>
         <div class="kv">
           <b>ceremony</b><code>cer_c0ffee…</code>
           <b>cooldown</b><span>ready — the pause is behind you</span>
@@ -163,20 +104,23 @@
         </div>
       </div>
       <p class="muted">A device enrolls by spending a single-use invite and
-      minting a passkey. Everything this app claims traces back to that
-      moment — guard invites accordingly. Lost your only phone? Recovery
-      goes through the control-plane host, on purpose.</p>
+      minting its keys — a passkey and a cheap-lane signing key it proves
+      it holds. Everything this app claims traces back to that moment —
+      guard invites accordingly. Lost your only phone? Recovery goes
+      through the control-plane host, on purpose.</p>
     </section>
 
     <!-- THE STOP PATH: a held veto window, rendered. Tapping VETO will be
          a device-signed POST /veto/:id — cheap, no biometric, no session.
          Rendering this view (or its notification) is what will send the
-         device-signed POST /veto/:id/seen ack. Last in the DOM because it
-         is the :target-fallback default; see the CSS note above. -->
+         device-signed POST /veto/:id/seen ack. A window whose status is
+         "spent" (kill epoch moved — DESIGN.md §5) renders as "this review
+         expired after a kill" instead. Last in the DOM because it is the
+         :target-fallback default; see the CSS note in app.css. -->
     <section id="alert" class="default">
       <div class="card">
         <span class="lane">VETO LANE · HELD</span>
-        <h2 style="margin-top:6px">An agent wants to act</h2>
+        <h2 class="pad-top">An agent wants to act</h2>
         <div class="kv">
           <b>agent</b><code>deploy-bot</code>
           <b>tool</b><code>github.merge_pr</code>
@@ -194,27 +138,5 @@
     <footer>ownerswitch.ai — owner app scaffold · see DESIGN.md</footer>
   </div>
   <div class="hazard"></div>
-
-<script>
-(function(){
-  // Static shell: tab highlighting off location.hash, nothing else.
-  var tabs = document.getElementById('tabs').querySelectorAll('a');
-  function sync(){
-    var current = (location.hash || '#alert').slice(1);
-    tabs.forEach(function(a){
-      a.classList.toggle('active', a.dataset.tab === current);
-    });
-  }
-  window.addEventListener('hashchange', sync);
-  sync();
-
-  // Register the service-worker STUB so the scaffold exercises the shape.
-  // This is a design scaffold, not a served app — nothing installs from
-  // here (DESIGN.md §6). Guarded: file:// or ancient browsers just skip it.
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(function(){ /* scaffold: non-fatal */ });
-  }
-})();
-</script>
 </body>
 </html>

@@ -13,6 +13,7 @@ export type {
   EnrollmentResponse,
   EnrolledDevice,
   PushSubscriptionRecord,
+  VetoWireStatus,
   OwnerAlertPush,
   HeldWindowDetail,
   SeenAck,
