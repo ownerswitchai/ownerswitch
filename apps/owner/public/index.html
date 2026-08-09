@@ -88,7 +88,10 @@
       the first.</p>
     </section>
 
-    <!-- ENROLMENT — the root of trust (DESIGN.md §2). -->
+    <!-- ENROLMENT — the root of trust (DESIGN.md §2). This list comes
+         from GET /devices, which returns a REDACTED DeviceSummary:
+         the push endpoint, p256dh, and auth secret never leave the
+         server (DESIGN.md §5, row 6). -->
     <section id="devices">
       <div class="card">
         <h2>Enrolled devices</h2>
@@ -112,22 +115,25 @@
 
     <!-- THE STOP PATH: an OPEN veto window (pending/extended — the only
          statuses that get a countdown, a VETO control, and an
-         ack-on-render; DESIGN.md §5). Tapping VETO will be a
-         device-signed POST /veto/:id — or, on the iOS cold path, the
-         payload's single-use veto capability (DESIGN.md §3). A "spent"
-         window renders "this review expired after a kill"; a terminal
-         "held" window renders the approval-required card below —
-         no countdown, no veto, no ack. Last in the DOM because it is
-         the :target-fallback default; see the CSS note in app.css. -->
+         ack-on-render; DESIGN.md §5). Tapping VETO will always be a
+         device-signed POST /veto/:id — on iOS the notification tap
+         opens this view and the veto is the deliberate second tap
+         (DESIGN.md §3). A "spent" window renders "this review expired
+         after a kill"; a terminal "held" window renders the
+         approval-required card below — no countdown, no veto, no ack.
+         The agent/tool/action values are assigned by app.js via
+         textContent — agent-supplied strings are TEXT, never markup
+         (DESIGN.md §4). Last in the DOM because it is the
+         :target-fallback default; see the CSS note in app.css. -->
     <section id="alert" class="default">
       <div class="card">
         <span class="lane">VETO LANE · PENDING</span>
         <h2 class="pad-top">An agent wants to act</h2>
         <div class="kv">
-          <b>agent</b><code>deploy-bot</code>
-          <b>tool</b><code>github.merge_pr</code>
-          <b>action</b><span>Merge pull request ownerswitchai/ownerswitch#7</span>
-          <b>window</b><code>veto_3f9a21c04b7d</code>
+          <b>agent</b><code id="kv-agent"></code>
+          <b>tool</b><code id="kv-tool"></code>
+          <b>action</b><span id="kv-action"></span>
+          <b>window</b><code id="kv-window"></code>
         </div>
         <div class="countdown">03:41 <i>— silence releases it. One tap stops it.</i></div>
         <button class="veto-btn" disabled aria-disabled="true">VETO</button>

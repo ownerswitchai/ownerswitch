@@ -23,26 +23,35 @@ self.addEventListener("push", (event) => {
    * this PR). Designed for the iOS cold-start defect (WebKit 283793):
    * a cold-woken worker may find indexedDB undefined, so the key store
    * — and with it every device signature — can be unreachable. The
-   * payload therefore carries everything a keyless worker needs
-   * (DESIGN.md §3, "The iOS cold-push path"):
+   * payload carries the renderable summary and delivery coordinates,
+   * and NO authority of any kind (DESIGN.md §3):
    *
    *  1. Parse the encrypted payload as OwnerAlertPush (src/types.ts):
-   *     windowId, status, the renderable summary, deadline, and a
-   *     single-use VETO-ONLY capability.
-   *  2. showNotification() with the CONCRETE summary FROM THE PAYLOAD —
-   *     no fetch required. Add a VETO action button only where
-   *     Notification.maxActions > 0 (Safari does not reliably honour
-   *     action buttons — DESIGN.md §3).
-   *  3. Ack only if the key is reachable: feature-detect indexedDB,
-   *     retrieve the cheap-lane key, and device-sign
-   *     POST /veto/:id/seen (SeenAck) — only after the render resolved.
-   *     The capability NEVER acks: the ack is the permissive direction
-   *     and never rides in a payload. A cold worker that cannot reach
-   *     its key renders without acking — fail closed; the ack comes
-   *     later from a warm context or the opened app if the window is
-   *     still live (DESIGN.md §3, §4).
-   *  4. If the payload is unreadable: show a generic "an action is
-   *     waiting for review" and DO NOT ack.
+   *     windowId, revision, deliveryId, status, the renderable
+   *     summary, deadline. Oversized/truncated/unparseable payload →
+   *     show a generic "an action is waiting for review" and DO NOT
+   *     ack.
+   *  2. WARM (key reachable): prefer the authoritative fetch — the
+   *     device-signed GET /veto/:id returns the CURRENT revision and
+   *     mints the Delivery this render belongs to; render THAT, then —
+   *     only after the render resolved — device-sign
+   *     POST /veto/:id/seen with {windowId, revision, deliveryId,
+   *     renderedPayloadHash, renderedAt, surface}. Rendering the
+   *     fetched truth and acking its own delivery is what stops a
+   *     forged or stale push from turning this worker into an
+   *     ack-signing oracle (DESIGN.md §3, "Versioned delivery").
+   *  3. COLD (indexedDB undefined): render from the payload — that is
+   *     what it is for — and DO NOT ack; there is no key to sign with
+   *     and no substitute for it. The ack happens later, signed, from
+   *     the opened app if the window is still live. Every summary
+   *     string renders as TEXT (title/body), never markup.
+   *  4. Copy {windowId, revision, deliveryId, expiry} into
+   *     NotificationOptions.data — PushEvent.data does NOT survive to
+   *     notificationclick, and nothing may ride in a navigation URL
+   *     (DESIGN.md §3). Add a VETO action button only where
+   *     Notification.maxActions > 0; set the notification tag to the
+   *     windowId so a superseding revision replaces the display
+   *     (best-effort).
    *
    * All of it inside event.waitUntil(), or the OS may kill the worker
    * between render and ack.
@@ -52,24 +61,27 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   /*
-   * REAL FLOW (not implemented here):
-   *  - action === "veto" (platforms with action buttons): the ENTIRE
-   *    send lives inside event.waitUntil() — the OS may kill the worker
-   *    the moment this handler returns, and a veto lost in flight is a
-   *    stop that never happened. Sign with the device key if the store
-   *    is reachable; otherwise present the payload's single-use veto
-   *    capability (VetoTap.capability — veto only, DESIGN.md §3). The
-   *    notification stays OPEN until the server confirms: close() only
-   *    on a confirmed response, so a failed send remains visible and
-   *    tappable. The relay is idempotent server-side (re-vetoing a
-   *    vetoed window succeeds as a no-op — DESIGN.md §5 row 2), so the
-   *    worker retries blindly and never double-stops.
-   *  - plain notification tap (the Safari path, and the default
-   *    everywhere): focus or open the app on #alert for this window,
-   *    inside event.waitUntil(). The tap itself is NEVER the veto —
-   *    a veto is irreversible and notification taps are accidental too
-   *    often; the veto is a deliberate second tap in the app
-   *    (DESIGN.md §3).
+   * REAL FLOW (not implemented here). Reads windowId/revision/
+   * deliveryId from event.notification.data — never from a URL.
+   *  - action === "veto" (platforms with action buttons — where the
+   *    key IS reachable): the ENTIRE send lives inside
+   *    event.waitUntil() — the OS may kill the worker the moment this
+   *    handler returns, and a veto lost in flight is a stop that never
+   *    happened. Device-sign POST /veto/:id. The notification stays
+   *    OPEN until the server confirms: close() only on a confirmed
+   *    response, so a failed send remains visible and tappable. The
+   *    relay is idempotent server-side (re-vetoing a vetoed window
+   *    succeeds as a no-op — DESIGN.md §5 row 2), so the worker
+   *    retries blindly and never double-stops.
+   *  - plain notification tap (the iOS path, and the default
+   *    everywhere): focus or open the app on the alert view, inside
+   *    event.waitUntil(); the foreground app signs the veto — and the
+   *    ack, if the window is still open. The tap itself is NEVER the
+   *    veto — a veto is irreversible and notification taps are
+   *    accidental too often (DESIGN.md §3). If iOS loses the handoff
+   *    and launches the manifest root, the app reconciles via the
+   *    device-signed GET /veto inbox and acks only the ONE window it
+   *    actually renders.
    *
    * Deliberately NOT calling event.notification.close() here: closing
    * before the server confirms would make a killed-in-flight veto look
@@ -80,10 +92,12 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("pushsubscriptionchange", (event) => {
   /*
-   * REAL FLOW (not implemented here): re-subscribe and upsert via the
-   * device-signed PUT /devices/:id/push-subscription — a subscription
-   * that silently rotted is an unreachable owner, and the veto lane
-   * would quietly run extend→held on every window until it's fixed.
+   * REAL FLOW (not implemented here): re-subscribe with the configured
+   * VAPID applicationServerKey (RFC 8292 — the server refuses an
+   * unrestricted subscription) and upsert via the device-signed
+   * PUT /devices/:id/push-subscription — a subscription that silently
+   * rotted is an unreachable owner, and the veto lane would quietly
+   * run extend→held on every window until it's fixed.
    */
   void event;
 });

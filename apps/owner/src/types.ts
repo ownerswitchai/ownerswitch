@@ -84,13 +84,18 @@ export interface EnrollmentInvite {
   /** human-readable RP name shown by the platform's create() UI */
   rpName: string;
   /**
-   * WebAuthn user.id: an opaque CSPRNG handle, stable per owner, never
-   * PII — the spec forbids personal data here, and this design forbids
-   * reusing the ownerId string
+   * The complete WebAuthn user entity. `id` is an opaque CSPRNG handle,
+   * stable per owner, never PII — the spec forbids personal data there,
+   * and this design forbids reusing the ownerId string. `name` and
+   * `displayName` are display-only labels for the platform's UI.
    */
-  userId: Base64Url;
-  /** COSE algorithm allow-list for create(); pinned to ES256 only */
-  pubKeyCredParams: readonly [-7];
+  user: {
+    id: Base64Url;
+    name: string;
+    displayName: string;
+  };
+  /** credential parameter descriptors for create(); pinned to ES256 only */
+  pubKeyCredParams: ReadonlyArray<{ type: "public-key"; alg: -7 }>;
   /** the authenticator-selection contract, verbatim for create() */
   authenticatorSelection: {
     authenticatorAttachment: "platform";
@@ -190,11 +195,11 @@ export interface EnrolledDevice {
   enrolledAt: UnixMs;
   /**
    * bumped atomically by revocation. Sessions, assertion challenges,
-   * unspent invites this device issued, cold-push capabilities minted
-   * for it, and its ack evidence all record the generation they were
-   * minted under and are re-checked against it at use — so revoking a
-   * device kills everything it minted at the next decision point, not
-   * at token expiry (DESIGN.md §2, §3, §4).
+   * unspent invites this device issued, deliveries minted for it, and
+   * its ack evidence all record the generation they were minted under
+   * and are re-checked against it at use — so revoking a device kills
+   * everything it minted at the next decision point, not at token
+   * expiry (DESIGN.md §2, §3, §4).
    */
   revocationGeneration: number;
   /**
@@ -214,7 +219,12 @@ export interface EnrolledDevice {
  * at send time: HTTPS only, known push-service endpoint shapes, rejection
  * of localhost/private/link-local/metadata addresses both before and
  * after DNS resolution, no redirect following, hard size and timeout
- * caps (DESIGN.md §5, rows 7 and 11).
+ * caps (DESIGN.md §5, rows 7 and 11). The subscription must be
+ * restricted to the configured VAPID public key (`applicationServerKey`,
+ * RFC 8292) — an unrestricted subscription is refused at upsert. This
+ * record NEVER leaves the server: `auth` in particular is the secret
+ * that lets a holder generate push messages the user agent accepts
+ * (RFC 8291) — clients see DeviceSummary, not this.
  */
 export interface PushSubscriptionRecord {
   endpoint: string;
@@ -224,41 +234,90 @@ export interface PushSubscriptionRecord {
   };
 }
 
+/**
+ * What GET /devices actually returns — a REDACTED projection of
+ * EnrolledDevice. No push endpoint, no p256dh, no auth secret, no keys:
+ * returning the full record to a bearer session would hand out the push
+ * `auth` secret (RFC 8291 §8.2 — its holder can mint pushes the user
+ * agent accepts) and the subscription endpoint. A boolean is all the UI
+ * needs (DESIGN.md §5, row 6).
+ */
+export interface DeviceSummary {
+  deviceId: string;
+  name: string;
+  enrolledAt: UnixMs;
+  revokedAt: UnixMs | null;
+  /** whether a push subscription is registered — the fact, never the contents */
+  pushRegistered: boolean;
+}
+
 /* ------------------------------------------------------------------ */
 /* The alert — an open veto window reaches the phone (DESIGN.md §1, §3) */
 /* ------------------------------------------------------------------ */
 
 /**
- * The encrypted push payload. It carries the renderable summary AND a
- * one-time veto capability, because on the iOS cold-start path
- * (WebKit bug 283793) the service worker may wake with indexedDB
- * undefined — the key store unreachable — and must still be able to
- * render and to stop (DESIGN.md §3, "The iOS cold-push path"). The
- * payload is encrypted end-to-end (RFC 8291); what its capture gains an
- * attacker — one window's summary and one single-use, veto-only stop —
- * is analysed and accepted in DESIGN.md §3.
+ * A showing of a veto window — the versioned-delivery contract's unit
+ * of truth (DESIGN.md §3, "Versioned delivery"). `revision` increments
+ * on every status or deadline change; `immutableActionHash` (the same
+ * canonicalization vocabulary as the approval hash, DESIGN.md §5) never
+ * changes across revisions — one window, one action, many showings.
+ */
+export interface WindowRevision {
+  windowId: string;
+  revision: number;
+  status: "pending" | "extended";
+  deadline: UnixMs;
+  immutableActionHash: Base64Url;
+}
+
+/**
+ * Server-side record minted every time renderable content is handed to
+ * a device — a push dispatch, a device-signed detail read, an inbox
+ * render. `payloadHash` is the SHA-256 of the exact bytes issued. An
+ * ack counts only by naming a live Delivery and matching its hash — so
+ * a forged or replayed push cannot turn the device into an ack-signing
+ * oracle (DESIGN.md §3). Dies with the window's terminal state, its
+ * own expiry, or the device's revocation generation.
+ */
+export interface Delivery {
+  deliveryId: string;
+  windowId: string;
+  revision: number;
+  deviceId: string;
+  deviceGeneration: number;
+  payloadHash: Base64Url;
+  expiresAt: UnixMs;
+}
+
+/**
+ * The encrypted push payload. It carries the renderable summary and the
+ * delivery coordinates, because on the iOS cold-start path (WebKit bug
+ * 283793) the service worker may wake with indexedDB undefined — the
+ * key store unreachable — and must still render something useful
+ * without a fetch (DESIGN.md §3, "The iOS cold path"). It deliberately
+ * carries NO capability and NO authority of any kind: the v0.3
+ * cold-push veto capability was dropped — it had no consumer, since the
+ * only iOS gesture is the tap that opens the app where the key is
+ * foreground-accessible (DESIGN.md §3). Payload capture gains one
+ * window's summary — nothing actionable. The dispatcher keeps the whole
+ * plaintext under RFC 8291's 3993-byte ceiling or degrades to a generic
+ * alert, which never acks.
  */
 export interface OwnerAlertPush {
   kind: "veto-window";
   windowId: string;
+  /** the WindowRevision this payload shows */
+  revision: number;
+  /** the server-minted Delivery this payload IS — echoed by the ack */
+  deliveryId: string;
   /** pushes are dispatched only for open windows */
   status: "pending" | "extended";
-  /** who is acting and what they asked for — rendered verbatim */
+  /** who is acting and what they asked for — rendered as TEXT, never markup */
   agentId: string;
   tool: string;
   summary: string;
   /** when silence releases (delivered) or extends/holds (not delivered) */
   deadline: UnixMs;
-  /**
-   * Single-use, server-minted, VETO-ONLY capability for the cold path.
-   * Its server-side record binds {deviceId, revocationGeneration,
-   * windowId, allowedOperation: "veto", expiresAt ≤ the window's
-   * deadline}; it dies with the window's terminal state or the device's
-   * revocation, and it can never ack — the ack is the permissive
-   * direction and never rides in a payload (DESIGN.md §3).
-   */
-  vetoCapability: string;
-  capabilityExpiresAt: UnixMs;
 }
 
 /**
@@ -280,14 +339,20 @@ export type VetoWireStatus = "pending" | "vetoed" | "released" | "extended" | "h
  * window, whatever its status. (Renamed from HeldWindowDetail: "held" is
  * a specific TERMINAL state, and this shape covers all of them.) The
  * existing open (unauthenticated) read stays status-only; this shape is
- * for enrolled devices. Rendering rules per status live in DESIGN.md §5:
- * only pending/extended get a countdown and a VETO control; held renders
+ * for enrolled devices. The read itself mints a Delivery — the warm
+ * path renders THIS and acks the revision and delivery the fetch minted
+ * (DESIGN.md §3). Rendering rules per status live in DESIGN.md §5: only
+ * pending/extended get a countdown and a VETO control; held renders
  * "approval required" with neither.
  */
 export interface VetoWindowDetail {
   windowId: string;
   status: VetoWireStatus;
-  /** who is acting and what they asked for — rendered verbatim to the owner */
+  /** current revision of this window's showing (open statuses) */
+  revision: number;
+  /** the Delivery this read minted — echoed by the ack */
+  deliveryId: string;
+  /** who is acting and what they asked for — rendered as TEXT, never markup */
   agentId: string;
   tool: string;
   /** short server-produced summary of the args */
@@ -299,25 +364,34 @@ export interface VetoWindowDetail {
 
 /**
  * POST /veto/:id/seen — the ack; the production caller of markDelivered().
- * Sent device-signed, only after a notification carrying the CONCRETE
- * action summary rendered (a generic fallback render must not ack —
- * DESIGN.md §4). Proves rendered-on-enrolled-device; nothing more.
- * Accepted only while the window is still pending/extended on the
- * SERVER's clock and only from a device enrolled to the window's owner;
- * after the deadline an ack is recorded in the audit trail and ignored.
- * A "spent" window is past both states — never ackable, and the
- * cold-push capability can never ack (DESIGN.md §3). An accepted ack is
- * stored as EVIDENCE {deviceId, revocationGeneration, receivedAt}, and
+ * Sent device-signed, only after content carrying the CONCRETE action
+ * summary rendered (a generic, oversized, or truncated render must not
+ * ack — DESIGN.md §4). Proves rendered-on-enrolled-device; nothing more.
+ * Counts ONLY under the full versioned-delivery rule, judged on the
+ * server's clock and records (DESIGN.md §3): `revision` is still the
+ * window's current open revision; `renderedPayloadHash` equals the hash
+ * the server recorded for `deliveryId`; that Delivery belongs to the
+ * signing device at its current generation; the window is still
+ * pending/extended; server time is before that revision's deadline.
+ * Anything else — late, stale-revision, wrong-hash, forged-delivery —
+ * is recorded in the audit trail and ignored. An accepted ack is stored
+ * as EVIDENCE {deviceId, revocationGeneration, receivedAt}, and
  * release-on-silence requires at least one piece of evidence from a
  * device still active at the same generation at the moment of the
  * release decision — an ack does not outlive its device (DESIGN.md §4).
  */
 export interface SeenAck {
   windowId: string;
+  /** the WindowRevision the device actually rendered */
+  revision: number;
+  /** the server-minted Delivery that carried it */
+  deliveryId: string;
+  /** SHA-256 of the exact payload bytes as received and rendered */
+  renderedPayloadHash: Base64Url;
   /**
    * when the summary was rendered on this device — AUDIT DATA ONLY. The
-   * server's own receive time and the window's live state decide whether
-   * the ack counts; nothing the phone asserts moves the deadline.
+   * server's own receive time and records decide whether the ack
+   * counts; nothing the phone asserts moves the deadline.
    */
   renderedAt: UnixMs;
   /** where it rendered */
@@ -325,19 +399,17 @@ export interface SeenAck {
 }
 
 /**
- * POST /veto/:id — the one-tap stop. Cheap forever, and IDEMPOTENT:
+ * POST /veto/:id — the one-tap stop. Always device-signed (on iOS the
+ * tap opens the app, where the key is foreground-accessible and the
+ * veto goes out signed — DESIGN.md §3; the v0.3 payload capability was
+ * dropped for having no consumer). Cheap forever, and IDEMPOTENT:
  * re-vetoing an already-vetoed window succeeds as a no-op, so the
  * service worker can blind-retry a send it cannot prove arrived
- * (DESIGN.md §3). Normally device-signed; on the iOS cold path, where
- * the key store may be unreachable, `capability` carries the payload's
- * single-use veto capability instead — veto only, never any other
- * operation (DESIGN.md §3).
+ * (DESIGN.md §3).
  */
 export interface VetoTap {
   windowId: string;
   tappedAt: UnixMs;
-  /** cold-path only: the single-use veto capability from OwnerAlertPush */
-  capability?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -345,49 +417,54 @@ export interface VetoTap {
 /* ------------------------------------------------------------------ */
 
 /**
- * What a fresh assertion is FOR. The challenge binds to one purpose and
- * one subject; an assertion minted for ceremony A is useless for
- * ceremony B, for an approval, or for tomorrow. "device-invite" and
- * "device-revoke" exist so a stolen bearer session ALONE can never add
- * or remove a device (DESIGN.md §2, §3).
+ * What a fresh assertion is FOR — a DISCRIMINATED union, so a subject
+ * is required exactly where one exists and impossible where none does.
+ * The challenge binds to one purpose and one subject; an assertion
+ * minted for ceremony A is useless for ceremony B, for an approval, or
+ * for tomorrow. "device-invite" and "device-revoke" exist so a stolen
+ * bearer session ALONE can never add or remove a device (DESIGN.md §2,
+ * §3).
  */
-export type AssertionPurpose =
-  | "approve"
-  | "restore-go2"
-  | "session"
-  | "device-invite"
-  | "device-revoke";
+export type AssertionBinding =
+  | { purpose: "approve"; subjectId: string }
+  | { purpose: "restore-go2"; subjectId: string }
+  | { purpose: "device-revoke"; subjectId: string }
+  | { purpose: "session"; subjectId?: never }
+  | { purpose: "device-invite"; subjectId?: never };
+
+export type AssertionPurpose = AssertionBinding["purpose"];
 
 /** POST /assert/challenge — device-signed request for a bound challenge. */
-export interface AssertionChallengeRequest {
-  purpose: AssertionPurpose;
-  /**
-   * approvalId for "approve", ceremonyId for "restore-go2", the target
-   * deviceId for "device-revoke"; absent for "session" and
-   * "device-invite"
-   */
-  subjectId?: string;
-}
+export type AssertionChallengeRequest = AssertionBinding;
 
 /**
- * The minted challenge. Single-use, short TTL; the {purpose, subjectId}
- * binding lives server-side keyed by challengeId — the phone repeating it
- * back is convenience, never trusted. A challenge also records the
- * minting device's revocation generation and dies with it: revoking the
- * device voids its outstanding challenges (DESIGN.md §2). For
- * purpose "approve", the server additionally binds the approval record's
- * canonical action hash into the challenge record, and the record itself
- * is immutable once created — the passkey signs the exact action the
- * owner was shown, and confirm re-verifies record and kill epoch
- * (DESIGN.md §5).
+ * The minted challenge. Single-use, short TTL; the binding lives
+ * server-side keyed by challengeId — the phone repeating it back is
+ * convenience, never trusted. `rpId` and `allowCredentials` name the
+ * ISSUING device's paired WebAuthn credential, so the assertion must
+ * come from the same EnrolledDevice that requested the challenge — the
+ * identity-continuity line for device-invite, device-revoke, and GO 2
+ * (DESIGN.md §3); the platform cannot satisfy it with some other
+ * synced passkey. A challenge records the minting device's revocation
+ * generation and dies with it (DESIGN.md §2). Redemption is atomic:
+ * verify, consume the challenge, perform exactly ONE protected
+ * mutation — a raced assertion mints one invite, one session, one
+ * restore, one execution, never two (DESIGN.md §3). For purpose
+ * "approve", the server additionally binds the approval record's
+ * canonical action hash into the challenge record, and the record
+ * itself is immutable once created — the passkey signs the exact
+ * action the owner was shown, and confirm re-verifies record and kill
+ * epoch (DESIGN.md §5).
  */
-export interface AssertionChallenge {
+export type AssertionChallenge = AssertionBinding & {
   challengeId: string;
   challenge: Base64Url;
-  purpose: AssertionPurpose;
-  subjectId?: string;
+  /** rpId the assertion must be made under */
+  rpId: string;
+  /** the issuing device's paired credential — and only it */
+  allowCredentials: ReadonlyArray<{ type: "public-key"; id: Base64Url }>;
   expiresAt: UnixMs;
-}
+};
 
 /** The authenticator's answer, as produced by credentials.get(). */
 export interface WebAuthnAssertion {
@@ -449,15 +526,15 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "delivery ack — the production caller of markDelivered(); accepted only while the window is pending/extended on the SERVER's clock and only from a device enrolled to the window's owner; renderedAt is audit-only; late acks recorded and ignored; stores evidence {deviceId, revocationGeneration, receivedAt} — release requires evidence from a still-active device at the same generation",
+      "delivery ack — the production caller of markDelivered(); counts only under the versioned-delivery rule: current open revision, matching renderedPayloadHash for a server-minted Delivery owned by the signing device at its current generation, window still pending/extended, server time before that revision's deadline; renderedAt is audit-only; everything else recorded and ignored; stores evidence {deviceId, revocationGeneration, receivedAt} — release requires evidence from a still-active device at the same generation",
   },
   {
     method: "POST",
     path: "/veto/:id",
-    auth: "device-signed | owner-session | single-use cold-push veto capability",
+    auth: "device-signed | owner-session",
     status: "extension",
     purpose:
-      "one-tap veto; today owner-session only — the device-signed relay and the cold-path capability are the additions; idempotent (re-veto of a vetoed window is a successful no-op) so the worker can retry blindly",
+      "one-tap veto; today owner-session only — the device-signed relay is the addition; idempotent (re-veto of a vetoed window is a successful no-op) so the worker can retry blindly; the v0.3 cold-push capability is dropped — no consumer",
   },
   {
     method: "GET",
@@ -465,7 +542,15 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed for detail; open read stays status-only",
     status: "extension",
     purpose:
-      "deadline + delivered + call summary, for enrolled devices only; status speaks VetoWireStatus (#28) including terminal 'spent'",
+      "deadline + delivered + call summary + current revision, for enrolled devices only; the read mints the Delivery the ack must echo; status speaks VetoWireStatus (#28) including terminal 'spent'",
+  },
+  {
+    method: "GET",
+    path: "/veto",
+    auth: "device-signed (owner-device class only)",
+    status: "addition",
+    purpose:
+      "open-window reconciliation — the inbox a root-launched app renders when iOS loses the click handoff; lists open windows with current revisions; listing never acks — rendering ONE window's detail mints the delivery its ack must echo, so an inbox can never bulk-ack",
   },
   {
     method: "POST",
@@ -488,7 +573,8 @@ export const OWNER_APP_ENDPOINTS = [
     path: "/devices",
     auth: "owner-session",
     status: "addition",
-    purpose: "list enrolled devices",
+    purpose:
+      "list enrolled devices as REDACTED DeviceSummary — never EnrolledDevice: the push endpoint, p256dh, and auth secret stay server-side (RFC 8291: the auth secret's holder can mint pushes the user agent accepts)",
   },
   {
     method: "POST",
@@ -496,7 +582,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "owner-session + fresh UV assertion (purpose: device-revoke, subject: target deviceId); host CLI / Unix socket can always revoke",
     status: "addition",
     purpose:
-      "kill a device's standing: bump its revocation generation and atomically void credentials, push subscription, live sessions, outstanding challenges, unspent invites it issued, and its ack evidence",
+      "kill a device's standing: bump its revocation generation and atomically void credentials, push subscription, live sessions, outstanding challenges, unspent invites it issued, its deliveries, and its ack evidence",
   },
   {
     method: "PUT",
@@ -504,7 +590,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "store / refresh the Web Push subscription; :id derived from the authenticated identity — a mismatched path id is rejected; endpoint validated as an SSRF surface (HTTPS, known push-service shapes, no private/metadata addresses)",
+      "store / refresh the Web Push subscription; :id derived from the authenticated identity — a mismatched path id is rejected; subscription must be restricted to the configured VAPID public key (RFC 8292) or it is refused; endpoint validated as an SSRF surface (HTTPS, known push-service shapes, no private/metadata addresses)",
   },
   {
     method: "POST",
@@ -512,7 +598,7 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "device-signed (owner-device class only)",
     status: "addition",
     purpose:
-      "mint a single-use challenge bound to {purpose, subjectId} across all five purposes; dies with the minting device's revocation generation",
+      "mint a single-use challenge for a discriminated {purpose, subject} binding; response carries rpId + allowCredentials naming the issuing device's paired credential (identity continuity); dies with the minting device's revocation generation; redemption is atomic — verify, consume, exactly one protected mutation",
   },
   {
     method: "POST",
@@ -520,14 +606,15 @@ export const OWNER_APP_ENDPOINTS = [
     auth: "verified assertion (purpose: session)",
     status: "addition",
     purpose:
-      "passkey-gated session minting — closes TODO(passkey) in auth.ts; session binds to deviceId + revocation generation and is re-checked against the device on every use",
+      "passkey-gated session minting — closes TODO(passkey) in auth.ts; atomic redemption: one assertion, one session; session binds to deviceId + revocation generation and is re-checked against the device on every use",
   },
   {
     method: "POST",
     path: "/restore",
     auth: "owner-session + verified assertion (purpose: restore-go2, subject: ceremonyId)",
     status: "extension",
-    purpose: "GO 2 stops accepting the bearer token GO 1 already saw",
+    purpose:
+      "GO 2 stops accepting the bearer token GO 1 already saw; the ceremony stores GO 1 provenance {ownerId, go1SessionDeviceId, go1SessionGeneration, killEpoch}, re-checked atomically at GO 2 — revoking the GO 1 device kills the pending ceremony; ceremony + assertion consumed in one atomic spend",
   },
 ] as const;
 
