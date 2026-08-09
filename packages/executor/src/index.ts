@@ -6,6 +6,7 @@ export { canonicalizeArgs } from "./ticket.js";
 export type { ActionTicket } from "./ticket.js";
 
 export { Executor, refuseTicket } from "./executor.js";
+export { liveKillStateFromControlPlane } from "./live-kill-state.js";
 export type {
   ExecutionOutcome,
   ExecutionResult,
@@ -22,4 +23,4 @@ export {
   MERGE_PULL_REQUEST,
   parseMergePrArgs,
 } from "./github.js";
-export type { GitHubMergeClient, MergePrArgs } from "./github.js";
+export type { GitHubCredential, GitHubMergeClient, MergePrArgs } from "./github.js";

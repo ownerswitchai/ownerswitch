@@ -74,7 +74,8 @@ async function getStatus(
   fetchImpl: typeof fetch,
 ): Promise<{ ok: true; killed: boolean } | { ok: false; error: string }> {
   try {
-    const res = await fetchImpl(new URL("/status", baseUrl));
+    // /status is live security state — never accept a cached answer
+    const res = await fetchImpl(new URL("/status", baseUrl), { cache: "no-store" });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     const body = (await res.json()) as { killed?: unknown };
     if (typeof body.killed !== "boolean") return { ok: false, error: "malformed /status response" };

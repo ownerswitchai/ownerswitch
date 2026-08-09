@@ -48,8 +48,16 @@ export function createControlPlaneClient(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      // cache: "no-store" plus explicit request headers: a cached
+      // {killed:false, epoch:N} replayed after a kill would defeat every
+      // check this lookup exists for. The control plane also serves /status
+      // with Cache-Control: no-store — both ends refuse caching, and the
+      // deployment requirement (no cache in front of the control plane) is
+      // stated in packages/mcp/THREAT-MODEL.md.
       const res = await fetchImpl(new URL("/status", baseUrl), {
         signal: controller.signal,
+        cache: "no-store",
+        headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
       });
       if (!res.ok) return failClosed();
       const body: unknown = await res.json();

@@ -39,6 +39,24 @@ describe("createControlPlaneClient", () => {
     ).resolves.toEqual({ killed: false, epoch: 0 });
   });
 
+  it("requests /status with caching defeated — no-store, at the fetch layer and on the wire", async () => {
+    // a cached {killed:false, epoch:N} replayed after a kill would defeat
+    // every check this lookup exists for; the request must say so explicitly
+    let captured: RequestInit | undefined;
+    const capturing: typeof fetch = async (_input, init) => {
+      captured = init;
+      return new Response(JSON.stringify({ killed: false, epoch: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    await client(capturing).fetchKillState();
+    expect(captured?.cache).toBe("no-store");
+    const headers = new Headers(captured?.headers);
+    expect(headers.get("cache-control")).toContain("no-store");
+    expect(headers.get("pragma")).toBe("no-cache");
+  });
+
   it("passes a healthy killed:true through, reason and epoch intact", async () => {
     const state = await client(
       jsonResponse({ killed: true, reason: "honeytoken tripped", at: 1_000, epoch: 3 }),

@@ -16,6 +16,16 @@ import type { ToolCall } from "@ownerswitchai/shared";
  */
 export type VetoStatus = "pending" | "vetoed" | "released" | "extended" | "held";
 
+/**
+ * What the status surface (GET /veto/:id) may report, beyond the state
+ * machine's own states: "spent" is a would-be release from a window whose
+ * kill epoch is no longer current — a kill happened after the window was
+ * registered, so its release must not authorize anything, even after a
+ * restore. The window record itself never holds "spent"; the server derives
+ * it by comparing the window's recorded epoch to the live one (server.ts).
+ */
+export type VetoWireStatus = VetoStatus | "spent";
+
 export interface VetoOptions {
   /** initial window; default 4 min */
   windowMs?: number;
@@ -32,8 +42,19 @@ export class VetoWindow {
   private readonly now: () => number;
   vetoedBy: string | null = null;
 
+  /**
+   * `killEpoch` is the control plane's kill epoch in force when the window
+   * was CREATED, recorded server-side in the window record itself — so the
+   * binding survives a gateway restart and holds across multiple gateways.
+   * A release only authorizes while this epoch is still current: a kill
+   * after registration (even one later restored) makes the release "spent"
+   * on the status surface. Required, no default — an omitted epoch must be
+   * a compile error, not a window that silently survives kills (the same
+   * stance as evaluate()'s kill parameter).
+   */
   constructor(
     readonly call: ToolCall,
+    readonly killEpoch: number,
     opts: VetoOptions = {},
   ) {
     this.now = opts.now ?? Date.now;

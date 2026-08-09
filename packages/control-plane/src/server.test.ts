@@ -96,6 +96,17 @@ describe("control-plane HTTP API", () => {
     server = undefined;
   });
 
+  it("GET /status is served uncacheable — a stale killed:false must be impossible to replay", async () => {
+    const url = await start(ephemeral({ now: clock().now }));
+    const res = await fetch(`${url}/status`);
+    expect(res.headers.get("cache-control")).toBe("no-store, max-age=0");
+    expect(res.headers.get("pragma")).toBe("no-cache");
+    // the veto status surface carries the same live-state weight: a cached
+    // "released" would resurrect a spent release across a kill
+    const veto = await fetch(`${url}/veto/nope`);
+    expect(veto.headers.get("cache-control")).toBe("no-store, max-age=0");
+  });
+
   it("GET /status before and after kill", async () => {
     const c = clock(1_000);
     const url = await start(ephemeral({ now: c.now }));
@@ -329,7 +340,7 @@ describe("control-plane HTTP API", () => {
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
-    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
+    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, 0, { now: c.now });
     cp.vetoWindows.set("v-1", window);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -1057,7 +1068,7 @@ describe("control-plane HTTP API", () => {
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
-    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
+    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, 0, { now: c.now });
     cp.vetoWindows.set("v-1", window);
 
     const res = await fetch(`${url}/veto/v-1`, {
@@ -1079,7 +1090,7 @@ describe("control-plane HTTP API", () => {
     const cp = ephemeral({ now: c.now });
     const url = await start(cp);
 
-    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, { now: c.now });
+    const window = new VetoWindow({ agentId: "agent-1", tool: "stripe.payout" }, 0, { now: c.now });
     cp.vetoWindows.set("v-1", window);
     const session = createOwnerSession("adam", { now: c.now });
 
@@ -1103,6 +1114,7 @@ describe("control-plane HTTP API", () => {
 
     const window = new VetoWindow(
       { agentId: "agent-1", tool: "bash" },
+      0,
       { now: c.now, windowMs: 4 * 60_000 },
     );
     window.markDelivered();
@@ -1120,6 +1132,102 @@ describe("control-plane HTTP API", () => {
     });
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/released/);
+  });
+
+  it("a released window from a previous kill epoch reports spent — a veto release does not survive a kill", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "github.merge_pr" },
+      cp.killSwitch.epoch,
+      { now: c.now, windowMs: 1000 },
+    );
+    window.markDelivered();
+    cp.vetoWindows.set("v-1", window);
+    c.advance(1001); // silence with confirmed delivery: the window would release
+
+    // a kill lands after registration, and the owner completes a restore
+    // before the retry — killed is false again, but the epoch moved, and a
+    // pre-kill release must not authorize a post-kill run
+    cp.killSwitch.engage("button", "incident mid-window");
+    cp.killSwitch.restore({ ceremonyId: "cer-spent", ownerId: "adam", completedAt: c.now() });
+
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
+    // and it stays spent — the epoch never goes back
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
+  });
+
+  it("no endpoint reports 'released' for an epoch-dead window — the binding has no bypass", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow({ agentId: "agent-1", tool: "github.merge_pr" }, cp.killSwitch.epoch, {
+      now: c.now,
+      windowMs: 1000,
+    });
+    window.markDelivered();
+    cp.vetoWindows.set("v-1", window);
+    c.advance(1001);
+    cp.killSwitch.engage("api", "incident");
+    cp.killSwitch.restore({ ceremonyId: "cer-nobypass", ownerId: "adam", completedAt: c.now() });
+
+    // GET /veto/:id — the ONLY status surface the gateway reads — says spent
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "spent" });
+
+    // POST /veto/:id (the owner surface) cannot be used to read a release
+    // out of it either: the window is internally past pending/extended, so
+    // the veto attempt 409s — an error, not an authorization
+    const session = createOwnerSession("adam", { now: c.now });
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { status?: string };
+    expect(body.status).toBeUndefined(); // no status field at all on the error path
+  });
+
+  it("a vetoed window stays vetoed across a kill — 'no' survives everything", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow({ agentId: "agent-1", tool: "bash" }, cp.killSwitch.epoch, {
+      now: c.now,
+    });
+    window.veto("adam");
+    cp.vetoWindows.set("v-1", window);
+
+    cp.killSwitch.engage("api");
+    cp.killSwitch.restore({ ceremonyId: "cer-veto-holds", ownerId: "adam", completedAt: c.now() });
+
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "vetoed" });
+  });
+
+  it("POST /veto binds the window to the kill epoch in force at registration", async () => {
+    const c = clock(100_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    // two kill/restore cycles before registration: the record must bind to
+    // the CURRENT epoch, not to zero
+    cp.killSwitch.engage("api");
+    cp.killSwitch.restore({ ceremonyId: "cer-b1", ownerId: "adam", completedAt: c.now() });
+    cp.killSwitch.engage("api");
+    cp.killSwitch.restore({ ceremonyId: "cer-b2", ownerId: "adam", completedAt: c.now() });
+
+    const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
+    const res = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(201);
+    const { id } = (await res.json()) as { id: string };
+    expect(cp.vetoWindows.get(id)?.killEpoch).toBe(2);
   });
 
   it("POST /veto with a valid device signature registers a window the owner can veto", async () => {
