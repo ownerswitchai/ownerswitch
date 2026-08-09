@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>OwnerSwitch — owner app</title>
+<!-- No Referer on ANY outgoing request: the enrolment invite token rides
+     in the URL fragment (DESIGN.md §2), and while fragments are never
+     sent in Referer, this is the second fence — nothing this page loads
+     or links to learns where the owner came from. -->
+<meta name="referrer" content="no-referrer">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#14171B">
+<!-- iOS install requires an apple-touch-icon (PNG) before push can work
+     there at all — placeholder SVG only in this scaffold; see DESIGN.md §6. -->
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<!-- Styles and script are external files, no inline blocks or style=""
+     attributes: the strict CSP the design requires (script-src 'self';
+     style-src 'self', no unsafe-inline) must be achievable without
+     rework. The real deployment sends CSP as an HTTP HEADER including
+     frame-ancestors 'none' — a meta CSP cannot express frame-ancestors
+     — plus a restrictive Permissions-Policy scoping WebAuthn to self
+     (publickey-credentials-get/create), and the server independently
+     rejects crossOrigin/topOrigin ceremonies. See DESIGN.md §4. -->
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+  <div class="hazard"></div>
+  <div class="wrap">
+    <nav>
+      <a class="logo" href="#alert">
+        <svg viewBox="0 0 100 100" width="22" height="22" aria-hidden="true">
+          <circle cx="50" cy="56" r="32" fill="none" stroke="#E02323" stroke-width="13" stroke-linecap="round" stroke-dasharray="163 38" stroke-dashoffset="-119" transform="rotate(-90 50 56)"/>
+          <line x1="50" y1="8" x2="50" y2="46" stroke="#E02323" stroke-width="13" stroke-linecap="round"/>
+        </svg>
+        <span>wnerswitch</span>
+      </a>
+      <span class="nav-tag">OWNER · scaffold</span>
+    </nav>
+
+    <div class="scaffold-note">
+      STATIC DESIGN SCAFFOLD — nothing here is wired: no push, no
+      WebAuthn, no network calls. Placeholder data throughout; every
+      live control is disabled. The repository provides no supported
+      install path — serving this manually may register the no-op
+      service worker, but no functional OwnerSwitch app results. The
+      contract this will implement is DESIGN.md.
+    </div>
+
+    <div class="tabs" id="tabs">
+      <a href="#alert" data-tab="alert">Alert</a>
+      <a href="#approve" data-tab="approve">Approve</a>
+      <a href="#restore" data-tab="restore">Restore</a>
+      <a href="#devices" data-tab="devices">Devices</a>
+    </div>
+
+    <!-- THE EXPENSIVE LANE, half one: approve-lane confirmation. Will
+         require a fresh WebAuthn assertion bound to this approval id —
+         and to the immutable record's canonical action hash (DESIGN.md §5). -->
+    <section id="approve">
+      <div class="card">
+        <span class="lane">APPROVE LANE · DEFAULT-DENY</span>
+        <h2 class="pad-top">Waiting for your passkey</h2>
+        <div class="kv">
+          <b>agent</b><code>ops-bot</code>
+          <b>tool</b><code>stripe.payout</code>
+          <b>action</b><span>Pay out $4,200.00 to acct_1A2B3C</span>
+        </div>
+        <button class="passkey-btn" disabled aria-disabled="true">APPROVE WITH PASSKEY — not wired</button>
+      </div>
+      <p class="muted">A fresh assertion, user verification required, bound
+      to this specific approval — "the app is open" authorizes nothing.</p>
+    </section>
+
+    <!-- THE EXPENSIVE LANE, half two: GO 2 of the restore ceremony. Will
+         require a fresh assertion bound to this ceremony id, so GO 2 stops
+         accepting the bearer token GO 1 already saw. -->
+    <section id="restore">
+      <div class="card">
+        <span class="lane">RESTORE · GO 2/2</span>
+        <h2 class="pad-top">System is killed</h2>
+        <div class="kv">
+          <b>ceremony</b><code>cer_c0ffee…</code>
+          <b>cooldown</b><span>ready — the pause is behind you</span>
+          <b>expires</b><span>in 03:12</span>
+        </div>
+        <button class="passkey-btn" disabled aria-disabled="true">CONFIRM GO 2 WITH PASSKEY — not wired</button>
+      </div>
+      <p class="muted">One press to stop. Two GOs to start — and the second
+      GO is a passkey ceremony naming this exact restore, not a repeat of
+      the first.</p>
+    </section>
+
+    <!-- ENROLMENT — the root of trust (DESIGN.md §2). This list comes
+         from GET /devices, which returns a REDACTED DeviceSummary:
+         the push endpoint, p256dh, and auth secret never leave the
+         server (DESIGN.md §5, row 6). -->
+    <section id="devices">
+      <div class="card">
+        <h2>Enrolled devices</h2>
+        <div class="device">
+          <div><div class="name">Adam's phone</div>
+          <div class="meta">enrolled 2026-08-08 · push <span class="ok">on</span> · this device</div></div>
+          <button class="revoke" disabled aria-disabled="true">revoke</button>
+        </div>
+        <div class="device">
+          <div><div class="name">Old phone</div>
+          <div class="meta">enrolled 2026-07-30 · push off</div></div>
+          <button class="revoke" disabled aria-disabled="true">revoke</button>
+        </div>
+      </div>
+      <p class="muted">A device enrolls by spending a single-use invite and
+      minting its keys — a passkey and a cheap-lane signing key it proves
+      it holds. Everything this app claims traces back to that moment —
+      guard invites accordingly. Lost your only phone? Recovery goes
+      through the control-plane host, on purpose.</p>
+    </section>
+
+    <!-- THE STOP PATH: an OPEN veto window (pending/extended — the only
+         statuses that get a countdown, a VETO control, and an
+         ack-on-render; DESIGN.md §5). Tapping VETO will always be a
+         device-signed POST /veto/:id — on iOS the notification tap
+         opens this view and the veto is the deliberate second tap
+         (DESIGN.md §3). A "spent" window renders "this review expired
+         after a kill"; a terminal "held" window renders the
+         approval-required card below — no countdown, no veto, no ack.
+         The agent/tool/action values are assigned by app.js via
+         textContent — agent-supplied strings are TEXT, never markup
+         (DESIGN.md §4). Last in the DOM because it is the
+         :target-fallback default; see the CSS note in app.css. -->
+    <section id="alert" class="default">
+      <div class="card">
+        <span class="lane">VETO LANE · PENDING</span>
+        <h2 class="pad-top">An agent wants to act</h2>
+        <div class="kv">
+          <b>agent</b><code id="kv-agent"></code>
+          <b>tool</b><code id="kv-tool"></code>
+          <b>action</b><span id="kv-action"></span>
+          <b>window</b><code id="kv-window"></code>
+        </div>
+        <div class="countdown">03:41 <i>— silence releases it. One tap stops it.</i></div>
+        <button class="veto-btn" disabled aria-disabled="true">VETO</button>
+        <div class="veto-sub">one tap · device-signed · always cheap</div>
+      </div>
+      <!-- Terminal "held": delivery was never confirmed, the window
+           escalated to an approval. No countdown (nothing will release),
+           no veto control, no ack — DESIGN.md §5. -->
+      <div class="card">
+        <span class="lane">VETO LANE · HELD — APPROVAL REQUIRED</span>
+        <h2 class="pad-top">This action now needs your passkey</h2>
+        <div class="kv">
+          <b>agent</b><code>ops-bot</code>
+          <b>tool</b><code>k8s.scale</code>
+          <b>action</b><span>Scale prod deployment to 0 replicas</span>
+          <b>window</b><code>veto_9d2c11aa04e6</code>
+        </div>
+        <p class="muted">Delivery was never confirmed, so silence did not
+        release it. Review it in the Approve tab — it will not run on its
+        own.</p>
+      </div>
+      <p class="muted">No session, no fingerprint, no confirmation dialog.
+      Stopping never acquires meaningful friction.</p>
+    </section>
+
+    <footer>ownerswitch.ai — owner app scaffold · see DESIGN.md</footer>
+  </div>
+  <div class="hazard"></div>
+</body>
+</html>
