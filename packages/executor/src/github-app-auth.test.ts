@@ -17,6 +17,7 @@ interface Recorded {
   method: string;
   headers: Record<string, string>;
   body: unknown;
+  redirect: RequestRedirect | undefined;
 }
 
 /** A scripted GitHub: records every request, answers from a queue. */
@@ -33,6 +34,7 @@ function fakeGitHub(script: Array<(req: Recorded) => Response>) {
         ]),
       ),
       body: init?.body !== undefined ? JSON.parse(String(init.body)) : undefined,
+      redirect: init?.redirect,
     };
     requests.push(req);
     const next = script.shift();
@@ -45,8 +47,13 @@ function fakeGitHub(script: Array<(req: Recorded) => Response>) {
 const json = (body: unknown, status = 201) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-const tokenResponse = (token: string, expiresAtMs: number) => () =>
-  json({ token, expires_at: new Date(expiresAtMs).toISOString() });
+/** A well-behaved (repository-scoped) installation: echoes the one repo. */
+const tokenResponse = (token: string, expiresAtMs: number) => (req: Recorded) =>
+  json({
+    token,
+    expires_at: new Date(expiresAtMs).toISOString(),
+    repositories: (req.body as { repositories: string[] }).repositories.map((name) => ({ name })),
+  });
 
 function source(
   script: Array<(req: Recorded) => Response>,
@@ -142,7 +149,7 @@ describe("createInstallationTokenSource", () => {
 
   it("an unparseable expires_at is cached as already-expired: used once, re-minted next time", async () => {
     const { github, tokens } = source([
-      () => json({ token: "ghs_odd", expires_at: "not-a-date" }),
+      () => json({ token: "ghs_odd", expires_at: "not-a-date", repositories: [{ name: "repo" }] }),
       tokenResponse("ghs_fresh", NOW + HOUR),
     ]);
     expect(await tokens.tokenFor("repo")).toBe("ghs_odd");
@@ -178,7 +185,7 @@ describe("createInstallationTokenSource", () => {
     );
   });
 
-  it("a response with no token fails loudly, and the network path never leaks the key", async () => {
+  it("a response with no token fails loudly, and a transport failure surfaces as a FIXED sentence", async () => {
     const { tokens } = source([() => json({ expires_at: "2030-01-01T00:00:00Z" })]);
     await expect(tokens.tokenFor("repo")).rejects.toThrowError(/carried no token/);
 
@@ -186,10 +193,59 @@ describe("createInstallationTokenSource", () => {
       app: APP,
       ledger: createSecretLedger(),
       fetchImpl: async () => {
-        throw new Error("getaddrinfo ENOTFOUND api.github.com");
+        throw new Error("getaddrinfo ENOTFOUND api.github.com via proxy secret-internals");
       },
     });
-    await expect(dead.tokenFor("repo")).rejects.toThrowError(/cannot reach GitHub/);
+    // fixed sentence: the transport error's own text is never forwarded
+    const failure = await dead.tokenFor("repo").then(
+      () => undefined,
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+    expect(failure).toMatch(/cannot reach GitHub .*a network-level failure occurred/);
+    expect(failure).not.toContain("secret-internals");
+  });
+
+  it("refuses a token GitHub did not scope down — the enterprise-installation boundary, enforced by behavior", async () => {
+    // echo missing entirely (enterprise installations cannot be
+    // repository-downscoped, so no repositories list comes back)
+    const noEcho = source([() => json({ token: "ghs_broad_1", expires_at: "2030-01-01T00:00:00Z" })]);
+    await expect(noEcho.tokens.tokenFor("repo")).rejects.toThrowError(
+      /did not scope the installation token down .*repository-scoped installations only/,
+    );
+
+    // echo broader than the one requested repository
+    const broad = source([
+      () =>
+        json({
+          token: "ghs_broad_2",
+          expires_at: "2030-01-01T00:00:00Z",
+          repositories: [{ name: "repo" }, { name: "other-repo" }],
+        }),
+    ]);
+    await expect(broad.tokens.tokenFor("repo")).rejects.toThrowError(/refusing the broader token/);
+
+    // and the refused broad token is still redactable — it existed, so the
+    // ledger learned it before the refusal
+    let message = "";
+    try {
+      await source([
+        () =>
+          json({
+            token: "ghs_broad_token_that_must_not_leak",
+            expires_at: "2030-01-01T00:00:00Z",
+            repositories: [],
+          }),
+      ]).tokens.tokenFor("repo");
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).not.toContain("ghs_broad_token_that_must_not_leak");
+  });
+
+  it("every mint request refuses redirects", async () => {
+    const { github, tokens } = source([tokenResponse("ghs_x", NOW + HOUR)]);
+    await tokens.tokenFor("repo");
+    expect(github.requests[0]!.redirect).toBe("error");
   });
 
   it("refuses a repository name that could smuggle a path into the URL", async () => {

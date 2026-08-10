@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ConnectorCallError } from "./connector-error.js";
 import { createGitHubMergeClient } from "./github-client.js";
 import type { InstallationTokenSource } from "./github-app-auth.js";
+import type { MergePrArgs } from "./github.js";
 import { createSecretLedger } from "./secret-ledger.js";
 
 /**
@@ -9,22 +10,36 @@ import { createSecretLedger } from "./secret-ledger.js";
  * this file (or anywhere in the suite) performs a live merge; the one live
  * run is the documented manual procedure in MANUAL-VERIFICATION.md.
  *
- * The two claims under test, per the task the module exists for:
+ * The claims under test:
  *  1. no code path ever puts the credential into a result, an error, or a
- *     rejection — including a GitHub error that echoes the token back;
- *  2. every failure is classified honestly: 4xx = definitively
- *     not-performed; wire death / 5xx = verify after the fact, and only
- *     claim what the verification read can actually prove.
+ *     rejection — including a GitHub error echoing the token back and a
+ *     transport error carrying a token FRAGMENT (transport text is never
+ *     forwarded at all: fixed sentences only);
+ *  2. failure classification is a whitelist: only GitHub's documented
+ *     rejection statuses count as "did NOT run"; everything else — 5xx,
+ *     an intermediary 408, a 200 that doesn't confirm the merge — takes
+ *     the verification path and ends UNKNOWN at worst;
+ *  3. the verification read is worded for what it proves: the PR's merged
+ *     STATE, never that this dispatch performed the merge;
+ *  4. `sha` is mandatory on every merge, and every request refuses
+ *     redirects.
  */
 
 const TOKEN = "ghs_installation_token_0123456789abcdef";
-const ARGS = { owner: "ownerswitchai", repo: "throwaway", pullNumber: 7 };
+const HEAD_SHA = "a".repeat(40);
+const ARGS: MergePrArgs = {
+  owner: "ownerswitchai",
+  repo: "throwaway",
+  pullNumber: 7,
+  expectedHeadSha: HEAD_SHA,
+};
 
 interface Recorded {
   url: string;
   method: string;
   headers: Record<string, string>;
   body: unknown;
+  redirect: RequestRedirect | undefined;
 }
 
 function scripted(script: Array<(req: Recorded) => Response | never>) {
@@ -40,6 +55,7 @@ function scripted(script: Array<(req: Recorded) => Response | never>) {
         ]),
       ),
       body: init?.body !== undefined ? JSON.parse(String(init.body)) : undefined,
+      redirect: init?.redirect,
     };
     requests.push(req);
     const next = script.shift();
@@ -59,12 +75,17 @@ const wireDeath = (): never => {
   throw new TypeError("fetch failed: socket hang up");
 };
 
-function client(script: Array<(req: Recorded) => Response | never>) {
+function client(script: Array<(req: Recorded) => Response | never>, timeoutMs?: number) {
   const github = scripted(script);
   const ledger = createSecretLedger();
   ledger.add(TOKEN);
   const tokens: InstallationTokenSource = { tokenFor: async () => TOKEN };
-  const merge = createGitHubMergeClient({ tokens, ledger, fetchImpl: github.fetchImpl });
+  const merge = createGitHubMergeClient({
+    tokens,
+    ledger,
+    fetchImpl: github.fetchImpl,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  });
   return { github, merge };
 }
 
@@ -78,17 +99,13 @@ async function failureOf(promise: Promise<unknown>): Promise<ConnectorCallError>
   throw new Error("expected the merge to fail");
 }
 
-describe("createGitHubMergeClient", () => {
-  it("merges: authenticated PUT with method and sha guard, result carries data and never the token", async () => {
+describe("createGitHubMergeClient — mergePullRequest", () => {
+  it("merges: authenticated PUT always carrying the pinned sha, refusing redirects; result carries data, never the token", async () => {
     const { github, merge } = client([
       () => json({ sha: "abc123", merged: true, message: "Pull Request successfully merged" }),
     ]);
 
-    const outcome = await merge.mergePullRequest({
-      ...ARGS,
-      mergeMethod: "squash",
-      expectedHeadSha: "a".repeat(40),
-    });
+    const outcome = await merge.mergePullRequest({ ...ARGS, mergeMethod: "squash" });
 
     expect(outcome).toEqual({
       merged: true,
@@ -101,15 +118,27 @@ describe("createGitHubMergeClient", () => {
     expect(req.url).toBe("https://api.github.com/repos/ownerswitchai/throwaway/pulls/7/merge");
     expect(req.headers["authorization"]).toBe(`Bearer ${TOKEN}`);
     expect(req.headers["x-github-api-version"]).toBe("2022-11-28");
-    // the sha guard: "SHA that pull request head must match to allow merge"
-    expect(req.body).toEqual({ merge_method: "squash", sha: "a".repeat(40) });
+    // the sha guard is MANDATORY: "SHA that pull request head must match"
+    expect(req.body).toEqual({ merge_method: "squash", sha: HEAD_SHA });
+    // an authenticated request must never follow a redirect
+    expect(req.redirect).toBe("error");
     expect(JSON.stringify(outcome)).not.toContain(TOKEN);
   });
 
-  it("omits merge_method and sha when the ticket does not pin them", async () => {
+  it("omits merge_method when unset — but sha is always sent", async () => {
     const { github, merge } = client([() => json({ sha: "s", merged: true, message: "" })]);
     await merge.mergePullRequest(ARGS);
-    expect(github.requests[0]!.body).toEqual({});
+    expect(github.requests[0]!.body).toEqual({ sha: HEAD_SHA });
+  });
+
+  it("refuses to dispatch without expectedHeadSha — defense in depth under the parser", async () => {
+    const { github, merge } = client([]);
+    const err = await failureOf(
+      merge.mergePullRequest({ ...ARGS, expectedHeadSha: "" } as MergePrArgs),
+    );
+    expect(err.outcome).toBe("not-performed");
+    expect(err.message).toMatch(/expectedHeadSha is mandatory/);
+    expect(github.requests).toHaveLength(0);
   });
 
   it("404: definitively not performed, and the message explains GitHub's 404-for-invisible convention", async () => {
@@ -121,12 +150,18 @@ describe("createGitHubMergeClient", () => {
     expect(err.message).toMatch(/NOT performed/);
   });
 
-  it("403: definitively not performed", async () => {
-    const { merge } = client([() => json({ message: "Forbidden" }, 403)]);
-    const err = await failureOf(merge.mergePullRequest(ARGS));
-    expect(err.outcome).toBe("not-performed");
-    expect(err.message).toMatch(/HTTP 403/);
-    expect(err.message).toMatch(/NOT performed/);
+  it("403 and 401 and 422: documented rejections, definitively not performed", async () => {
+    for (const [status, pattern] of [
+      [403, /forbade the merge/],
+      [401, /rejected the executor's credential/],
+      [422, /HTTP 422/],
+    ] as const) {
+      const { merge } = client([() => json({ message: "nope" }, status)]);
+      const err = await failureOf(merge.mergePullRequest(ARGS));
+      expect(err.outcome).toBe("not-performed");
+      expect(err.message).toMatch(pattern);
+      expect(err.message).toMatch(/NOT performed/);
+    }
   });
 
   it("rate limiting (403 with exhausted quota, and 429) is named as such", async () => {
@@ -157,24 +192,38 @@ describe("createGitHubMergeClient", () => {
 
   it("409 (head changed): definitively not performed — the approval no longer matches the branch", async () => {
     const { merge } = client([() => json({ message: "Head branch was modified" }, 409)]);
-    const err = await failureOf(
-      merge.mergePullRequest({ ...ARGS, expectedHeadSha: "b".repeat(40) }),
-    );
+    const err = await failureOf(merge.mergePullRequest(ARGS));
     expect(err.outcome).toBe("not-performed");
     expect(err.message).toMatch(/409/);
     expect(err.message).toMatch(/commits the owner never saw/);
   });
 
-  it("401 and 422: definitively not performed", async () => {
-    const unauthorized = client([() => json({ message: "Bad credentials" }, 401)]);
-    const err401 = await failureOf(unauthorized.merge.mergePullRequest(ARGS));
-    expect(err401.outcome).toBe("not-performed");
-    expect(err401.message).toMatch(/rejected the executor's credential/);
+  it("an UNRECOGNIZED 4xx — an intermediary's 408 — is never trusted as 'did not run': verification path", async () => {
+    const verified = client([
+      () => json({ message: "Request Timeout" }, 408),
+      () => json({ merged: true, merge_commit_sha: "deadbeef" }),
+    ]);
+    const outcome = await verified.merge.mergePullRequest(ARGS);
+    expect(outcome.merged).toBe(true);
+    expect(outcome.sha).toBe("deadbeef");
+    expect(outcome.message).toMatch(/unrecognized HTTP 408/);
 
-    const invalid = client([() => json({ message: "Validation Failed" }, 422)]);
-    const err422 = await failureOf(invalid.merge.mergePullRequest(ARGS));
-    expect(err422.outcome).toBe("not-performed");
-    expect(err422.message).toMatch(/HTTP 422/);
+    const unverified = client([
+      () => json({ message: "Request Timeout" }, 408),
+      () => json({ merged: false }),
+    ]);
+    const err = await failureOf(unverified.merge.mergePullRequest(ARGS));
+    expect(err.outcome).toBe("unknown");
+  });
+
+  it("a 200 that does not confirm the merge is malformed, never success — verification decides", async () => {
+    const { merge } = client([
+      () => json({ merged: false, message: "odd" }),
+      () => json({ merged: false }),
+    ]);
+    const err = await failureOf(merge.mergePullRequest(ARGS));
+    expect(err.outcome).toBe("unknown");
+    expect(err.message).toMatch(/HTTP 200 without confirming the merge/);
   });
 
   it("a GitHub error that echoes the token back is redacted before it can ride anywhere", async () => {
@@ -186,22 +235,45 @@ describe("createGitHubMergeClient", () => {
     expect(err.message).not.toContain(TOKEN);
   });
 
-  it("a transport error whose text contains the token is redacted too", async () => {
+  it("transport error text is NEVER forwarded — a token FRAGMENT in it cannot leak because the channel does not exist", async () => {
+    const fragment = TOKEN.slice(0, 20); // a fragment defeats exact-match redaction
     const { merge } = client([
       () => {
-        // undici-style failures can serialize request details; simulate the
-        // worst case — the credential inside the thrown error's text — and
-        // one verification failure after it
-        throw new TypeError(`fetch failed: header authorization: Bearer ${TOKEN}`);
+        throw new TypeError(`fetch failed: header authorization: Bearer ${fragment}…`);
       },
-      wireDeath,
+      () => {
+        throw new TypeError(`verification also failed near ${fragment}`);
+      },
     ]);
     const err = await failureOf(merge.mergePullRequest(ARGS));
-    expect(err.message).toContain("[REDACTED]");
-    expect(err.message).not.toContain(TOKEN);
+    expect(err.outcome).toBe("unknown");
+    expect(err.message).toMatch(/a network-level failure occurred/);
+    expect(err.message).not.toContain(fragment);
+    expect(err.message).not.toContain("fetch failed");
   });
 
-  it("wire death, then verification finds the PR merged: returns success, marked as verified", async () => {
+  it("a timeout surfaces as the fixed timeout sentence, not the abort error's text", async () => {
+    const hang: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(Object.assign(new Error("secret-ish abort internals"), { name: "AbortError" })),
+        );
+      });
+    const ledger = createSecretLedger();
+    ledger.add(TOKEN);
+    const merge = createGitHubMergeClient({
+      tokens: { tokenFor: async () => TOKEN },
+      ledger,
+      fetchImpl: hang,
+      timeoutMs: 25,
+    });
+    const err = await failureOf(merge.mergePullRequest(ARGS));
+    expect(err.outcome).toBe("unknown");
+    expect(err.message).toMatch(/the request timed out/);
+    expect(err.message).not.toContain("secret-ish");
+  });
+
+  it("wire death, then verification finds the PR merged: success worded for what the read PROVES", async () => {
     const { github, merge } = client([
       wireDeath,
       () => json({ merged: true, merge_commit_sha: "deadbeef" }),
@@ -209,15 +281,17 @@ describe("createGitHubMergeClient", () => {
     const outcome = await merge.mergePullRequest(ARGS);
     expect(outcome.merged).toBe(true);
     expect(outcome.sha).toBe("deadbeef");
-    expect(outcome.message).toMatch(/verification read confirms/);
-    // the verification read is the PR GET, with the same scoped token
+    // the read proves the PR's merged STATE — not that THIS dispatch did it
+    expect(outcome.message).toMatch(/MERGED STATE/);
+    expect(outcome.message).toMatch(/whether THIS dispatch performed the merge cannot be determined/);
     expect(github.requests[1]!.method).toBe("GET");
     expect(github.requests[1]!.url).toBe(
       "https://api.github.com/repos/ownerswitchai/throwaway/pulls/7",
     );
+    expect(github.requests[1]!.redirect).toBe("error");
   });
 
-  it("wire death, verification says not merged: outcome UNKNOWN, message says a snapshot is not proof", async () => {
+  it("wire death, verification says not merged: outcome UNKNOWN, a snapshot is not proof", async () => {
     const { merge } = client([wireDeath, () => json({ merged: false, merge_commit_sha: null })]);
     const err = await failureOf(merge.mergePullRequest(ARGS));
     expect(err.outcome).toBe("unknown");
@@ -244,6 +318,15 @@ describe("createGitHubMergeClient", () => {
     expect(outcome.sha).toBe("cafe01");
   });
 
+  it("an oversized error body is dropped by the stream cap, never quoted", async () => {
+    const huge = JSON.stringify({ message: `big ${"x".repeat(5 * 1024 * 1024)}` });
+    const { merge } = client([() => new Response(huge, { status: 403 })]);
+    const err = await failureOf(merge.mergePullRequest(ARGS));
+    expect(err.outcome).toBe("not-performed");
+    expect(err.message).toMatch(/HTTP 403/);
+    expect(err.message.length).toBeLessThan(500);
+  });
+
   it("no installation token: definitively not dispatched", async () => {
     const github = scripted([]);
     const ledger = createSecretLedger();
@@ -262,12 +345,43 @@ describe("createGitHubMergeClient", () => {
     expect(github.requests).toHaveLength(0);
   });
 
-  it("refuses owner/repo values that could smuggle path segments into the URL — before any dispatch", async () => {
-    const { merge, github } = client([]);
-    const err = await failureOf(merge.mergePullRequest({ ...ARGS, owner: "a/../b" }));
-    expect(err.outcome).toBe("not-performed");
-    expect(err.message).toMatch(/not dispatched/);
-    expect(err.message).toMatch(/owner/);
-    expect(github.requests).toHaveLength(0);
+  it("refuses dot segments and unsafe names in owner/repo — before any dispatch", async () => {
+    for (const bad of [
+      { ...ARGS, repo: ".." },
+      { ...ARGS, repo: "." },
+      { ...ARGS, owner: "a/../b" },
+      { ...ARGS, owner: "a".repeat(40) },
+      { ...ARGS, repo: "r".repeat(101) },
+      { ...ARGS, pullNumber: 2 ** 53 },
+    ]) {
+      const { merge, github } = client([]);
+      const err = await failureOf(merge.mergePullRequest(bad));
+      expect(err.outcome).toBe("not-performed");
+      expect(err.message).toMatch(/not dispatched/);
+      expect(github.requests).toHaveLength(0);
+    }
+  });
+});
+
+describe("createGitHubMergeClient — getPullRequestHead (the review-time pin)", () => {
+  it("returns the PR's current head sha", async () => {
+    const { github, merge } = client([
+      () => json({ merged: false, head: { sha: HEAD_SHA } }),
+    ]);
+    expect(await merge.getPullRequestHead(ARGS)).toBe(HEAD_SHA);
+    expect(github.requests[0]!.method).toBe("GET");
+    expect(github.requests[0]!.url).toBe(
+      "https://api.github.com/repos/ownerswitchai/throwaway/pulls/7",
+    );
+  });
+
+  it("refuses to pin an already-merged PR", async () => {
+    const { merge } = client([() => json({ merged: true, head: { sha: HEAD_SHA } })]);
+    await expect(merge.getPullRequestHead(ARGS)).rejects.toThrowError(/already merged/);
+  });
+
+  it("refuses a head that is not a full commit id", async () => {
+    const { merge } = client([() => json({ merged: false, head: { sha: "abc123" } })]);
+    await expect(merge.getPullRequestHead(ARGS)).rejects.toThrowError(/no usable head sha/);
   });
 });

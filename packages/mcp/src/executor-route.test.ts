@@ -64,6 +64,11 @@ const MERGE_ARGS = { owner: "ownerswitchai", repo: "ownerswitch", pullNumber: 7 
 const MERGE = { name: "github.merge_pr", arguments: MERGE_ARGS };
 const RESOURCE_ID = "github:pr:ownerswitchai/ownerswitch#7";
 
+/** The head sha OwnerSwitch pins at review time — server-derived, never agent-supplied. */
+const PINNED_SHA = "f".repeat(40);
+/** What actually reaches the backend: the agent's args plus the pin. */
+const PINNED_MERGE_ARGS = { ...MERGE_ARGS, expectedHeadSha: PINNED_SHA };
+
 /**
  * OwnerSwitch's OWN credential. It is injected through the same config path
  * a real connector uses — the GitHubMergePrExecutor's credential — so the
@@ -72,18 +77,34 @@ const RESOURCE_ID = "github:pr:ownerswitchai/ownerswitch#7";
  */
 const OWNERSWITCH_TOKEN = "ghp_ownerswitch_own_credential_0123456789";
 
-/** The connector's HTTP seam: records merges; can be told to fail like GitHub would. */
+/** The connector's HTTP seam: records merges and head reads; can be told to
+ * fail like GitHub would, on either call. */
 function createFakeGitHub() {
   const merges: MergePrArgs[] = [];
+  const headReads: Array<{ owner: string; repo: string; pullNumber: number }> = [];
   let failure: Error | undefined;
+  let pinFailure: Error | undefined;
+  let headSha = PINNED_SHA;
   const client: GitHubMergeClient = {
     mergePullRequest: async (args) => {
       if (failure !== undefined) throw failure;
       merges.push(args);
       return { merged: true, sha: "abc123def456", message: "Pull Request successfully merged" };
     },
+    getPullRequestHead: async (args) => {
+      if (pinFailure !== undefined) throw pinFailure;
+      headReads.push(args);
+      return headSha;
+    },
   };
-  return { merges, client, failWith: (err: Error) => (failure = err) };
+  return {
+    merges,
+    headReads,
+    client,
+    failWith: (err: Error) => (failure = err),
+    failPinWith: (err: Error) => (pinFailure = err),
+    setHeadSha: (sha: string) => (headSha = sha),
+  };
 }
 
 function createFakeUpstream() {
@@ -92,7 +113,27 @@ function createFakeUpstream() {
     { name: "fake-upstream", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+  // the upstream advertises the routed tool WITH an expectedHeadSha field —
+  // exactly the schema the proxy must override so agents are not steered
+  // into supplying a sha the proxy will refuse
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "github.merge_pr",
+        description: "merge a pull request",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            owner: { type: "string" },
+            repo: { type: "string" },
+            pullNumber: { type: "integer" },
+            expectedHeadSha: { type: "string", description: "upstream says agents may pass this" },
+          },
+        },
+      },
+      { name: "read_file", inputSchema: { type: "object" as const } },
+    ],
+  }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     calls.push({ name: req.params.name, args: req.params.arguments });
     return { content: [{ type: "text" as const, text: `upstream ran ${req.params.name}` }] };
@@ -182,6 +223,8 @@ async function startRoutedProxy(opts?: {
   ticketTtlMs?: number;
   /** the executor's clock — skew it past expiresAt to age a ticket */
   executorNow?: () => number;
+  /** simulate a gateway whose GitHub connector is not configured */
+  withoutPin?: boolean;
 }) {
   const controlPlane = createFakeControlPlane();
   const github = createFakeGitHub();
@@ -218,6 +261,10 @@ async function startRoutedProxy(opts?: {
     executor: {
       routes: ROUTES,
       run: (ticket) => executorRunner.run(ticket),
+      // the review-time head pin, exactly as cli.ts wires it
+      ...(opts?.withoutPin === true
+        ? {}
+        : { pinHeadSha: (args: { owner: string; repo: string; pullNumber: number }) => github.client.getPullRequestHead(args) }),
       ...(opts?.ticketTtlMs !== undefined ? { ticketTtlMs: opts.ticketTtlMs } : {}),
     },
   });
@@ -446,7 +493,7 @@ describe("the other refusals at execution time", () => {
     const executor = new Executor(backend, {
       fetchLiveKillState: async () => ({ killed: false, epoch: 0 }),
     });
-    const call: ToolCall = { agentId: "test-agent", tool: "github.merge_pr", args: MERGE_ARGS };
+    const call: ToolCall = { agentId: "test-agent", tool: "github.merge_pr", args: PINNED_MERGE_ARGS };
     const verdict: Verdict = { decision: "veto", ruleId: "merge", reason: "merges are guarded" };
     const ticket = mintActionTicket(call, ROUTES["github.merge_pr"], verdict, {
       policyVersion: authorizationVersionOf(policyWithMergeLane("veto"), ROUTES),
@@ -518,8 +565,9 @@ describe("the happy path — and the credential that must never leak", () => {
       resourceId: RESOURCE_ID,
       detail: { merged: true, sha: "abc123def456", message: "Pull Request successfully merged" },
     });
-    // the backend ran exactly once, with the arguments the owner saw
-    expect(t.github.merges).toEqual([MERGE_ARGS]);
+    // the backend ran exactly once, with the arguments the owner saw —
+    // INCLUDING the head sha OwnerSwitch pinned before the window opened
+    expect(t.github.merges).toEqual([PINNED_MERGE_ARGS]);
     // the upstream MCP server was never involved — there is no credential on
     // the agent's side of the boundary to leak
     expect(t.upstream.calls).toEqual([]);
@@ -576,6 +624,111 @@ describe("the happy path — and the credential that must never leak", () => {
     });
     expect(t.upstream.calls).toEqual([{ name: "read_file", args: { path: "/tmp/a" } }]);
     expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+});
+
+describe("review-time head pinning — server-derived, before the owner sees the request", () => {
+  it("the veto window the owner reviews carries the PINNED sha — what the owner sees is what would merge", async () => {
+    const t = await startRoutedProxy();
+    await refusalOf(t.client.callTool(MERGE));
+    // the pin happened before the window was registered…
+    expect(t.github.headReads).toEqual([MERGE_ARGS]);
+    // …and the registered call (the owner-facing rendering) carries it
+    const registered = t.controlPlane.registrations[0]?.body as {
+      call?: { args?: Record<string, unknown> };
+      args?: Record<string, unknown>;
+    };
+    const registeredArgs = registered.call?.args ?? registered.args;
+    expect(registeredArgs).toMatchObject({ expectedHeadSha: PINNED_SHA });
+    expect(t.github.merges).toEqual([]); // held, not merged
+    await t.close();
+  });
+
+  it("an agent-supplied expectedHeadSha is refused outright — no window opens, nothing is spent", async () => {
+    const t = await startRoutedProxy();
+    const err = await refusalOf(
+      t.client.callTool({
+        name: "github.merge_pr",
+        arguments: { ...MERGE_ARGS, expectedHeadSha: "e".repeat(40) },
+      }),
+    );
+    expect(err.code).toBe(OwnerSwitchErrorCode.TicketRefused);
+    expect(err.data).toMatchObject({ refusalCode: "invalid-args" });
+    expect(err.message).toMatch(/cannot be supplied by the agent/);
+    expect(t.controlPlane.registrations).toHaveLength(0); // no owner review opened
+    expect(t.github.headReads).toEqual([]); // GitHub never contacted
+    expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+
+  it("a failed pin read fails CLOSED — refused before any window opens or ticket burns", async () => {
+    const t = await startRoutedProxy();
+    t.github.failPinWith(new Error("the pull request read answered HTTP 500"));
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.TicketRefused);
+    expect(err.data).toMatchObject({ refusalCode: "head-pin-failed" });
+    expect(t.controlPlane.registrations).toHaveLength(0);
+    expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+
+  it("unconfigured connector: routed merges refuse at the pin, deliberately, as 'not configured'", async () => {
+    // 0b, made deliberate: with no GitHub connector the OLD behavior was a
+    // post-mint ExecutionFailed; the pinning step now refuses EARLIER —
+    // before a veto window opens or a single-use ticket burns — and names
+    // the cause. (The backend's own not-configured ConnectorCallError stays
+    // pinned by the executor package's unit tests.)
+    const t = await startRoutedProxy({ withoutPin: true });
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.TicketRefused);
+    expect(err.data).toMatchObject({ refusalCode: "connector-unconfigured" });
+    expect(err.message).toMatch(/not configured/);
+    expect(t.controlPlane.registrations).toHaveLength(0);
+    expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+
+  it("a head that moves after release opens a FRESH owner review — the old approval never merges the new head", async () => {
+    const t = await startRoutedProxy();
+
+    // window opens for the head as pinned at review time
+    await refusalOf(t.client.callTool(MERGE));
+    expect(t.controlPlane.registrations).toHaveLength(1);
+    t.controlPlane.state.vetoStatus = "released";
+
+    // the branch moves before the retry: the pin now reads a different head,
+    // the call's identity changes, and the released window is left behind —
+    // a fresh review opens for the NEW head instead of executing the old one
+    t.github.setHeadSha("e".repeat(40));
+    const again = await refusalOf(t.client.callTool(MERGE));
+    expect(again.code).toBe(OwnerSwitchErrorCode.VetoPending);
+    expect(t.controlPlane.registrations).toHaveLength(2);
+    expect(t.github.merges).toEqual([]); // the moved head never merged
+    await t.close();
+  });
+
+  it("tools/list advertises OwnerSwitch's schema for routed merges — no expectedHeadSha, upstream schema overridden", async () => {
+    const t = await startRoutedProxy();
+    const { tools } = await t.client.listTools();
+
+    const merge = tools.find((tool) => tool.name === "github.merge_pr");
+    expect(merge).toBeDefined();
+    // the upstream advertised an expectedHeadSha property; the proxy replaced
+    // the whole schema with the agent-facing one
+    expect(merge!.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
+    expect(Object.keys(merge!.inputSchema.properties as Record<string, unknown>).sort()).toEqual([
+      "mergeMethod",
+      "owner",
+      "pullNumber",
+      "repo",
+    ]);
+    expect(merge!.description).toMatch(/pinned by OwnerSwitch at review time/);
+    expect(merge!.description).toMatch(/do not supply expectedHeadSha/);
+
+    // non-routed tools pass through untouched
+    const readFile = tools.find((tool) => tool.name === "read_file");
+    expect(readFile!.description).toBeUndefined();
     await t.close();
   });
 });
@@ -674,7 +827,7 @@ describe("minting", () => {
   });
 
   it("derives the github PR resource id, and a stable args-keyed id for unknown operations", () => {
-    const canonical = '{"owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}';
+    const canonical = `{"expectedHeadSha":"${PINNED_SHA}","owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}`;
     expect(deriveResourceId(ROUTES["github.merge_pr"], canonical)).toBe(RESOURCE_ID);
     const generic = deriveResourceId({ connector: "stripe", operation: "payout" }, '{"a":1}');
     expect(generic).toMatch(/^stripe:payout:args:[0-9a-f]{16}$/);
@@ -690,7 +843,7 @@ describe("minting", () => {
       nonce: "n",
     };
     const ticket = mintActionTicket(
-      { agentId: "a", tool: "github.merge_pr", args: MERGE_ARGS },
+      { agentId: "a", tool: "github.merge_pr", args: PINNED_MERGE_ARGS },
       ROUTES["github.merge_pr"],
       VERDICT,
       ctx,
@@ -716,13 +869,21 @@ describe("minting", () => {
       nonce: "n",
     };
     const a = mintActionTicket(
-      { agentId: "a", tool: "github.merge_pr", args: { repo: "r", owner: "o", pullNumber: 1 } },
+      {
+        agentId: "a",
+        tool: "github.merge_pr",
+        args: { repo: "r", owner: "o", pullNumber: 1, expectedHeadSha: PINNED_SHA },
+      },
       ROUTES["github.merge_pr"],
       VERDICT,
       ctx,
     );
     const b = mintActionTicket(
-      { agentId: "a", tool: "github.merge_pr", args: { pullNumber: 1, owner: "o", repo: "r" } },
+      {
+        agentId: "a",
+        tool: "github.merge_pr",
+        args: { expectedHeadSha: PINNED_SHA, pullNumber: 1, owner: "o", repo: "r" },
+      },
       ROUTES["github.merge_pr"],
       VERDICT,
       ctx,

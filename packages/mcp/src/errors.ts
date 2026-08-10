@@ -197,6 +197,26 @@ export function ticketRefused(
 }
 
 /**
+ * A routed call refused BEFORE any owner review opened or any ticket
+ * minted — invalid arguments for the route, or a review-time prerequisite
+ * (like pinning the pull request head) that could not be met. Unlike
+ * ticketRefused there is no approval to void: nothing was spent, nothing
+ * ran, and the agent may retry once the named cause is fixed.
+ */
+export function routedCallRefused(
+  tool: string,
+  refusalCode: string,
+  reason: string,
+): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.TicketRefused,
+    `OwnerSwitch refused "${tool}": ${reason}. The action did NOT run and no owner review ` +
+      `was opened; nothing was spent. Fix the named cause before calling again.`,
+    { decision: "refused", tool, reason, refusalCode },
+  );
+}
+
+/**
  * A veto window released, but a kill happened after the window was opened —
  * the control plane reports the release "spent" (its server-side record
  * binds every window to the kill epoch at registration). Approvals do not

@@ -9,7 +9,13 @@ import {
   ToolListChangedNotificationSchema,
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import { ConnectorCallError, type ActionTicket, type ExecutionOutcome } from "@ownerswitchai/executor";
+import {
+  ConnectorCallError,
+  GITHUB_CONNECTOR,
+  MERGE_PULL_REQUEST,
+  type ActionTicket,
+  type ExecutionOutcome,
+} from "@ownerswitchai/executor";
 import { evaluateRemote, type ControlPlaneClient, type KillState } from "@ownerswitchai/gateway";
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import { assertExecutorRoutesCoherent } from "./config.js";
@@ -21,6 +27,7 @@ import {
   lockdown,
   ownerVetoed,
   policyDenied,
+  routedCallRefused,
   ticketRefused,
   vetoHeld,
   vetoPending,
@@ -29,7 +36,9 @@ import {
 import {
   authorizationVersionOf,
   DEFAULT_TICKET_TTL_MS,
+  MERGE_PR_AGENT_INPUT_SCHEMA,
   mintActionTicket,
+  validateMergePrRequestArgs,
   type ExecutorWiring,
 } from "./executor-route.js";
 import { VetoClientError, type VetoClient } from "./veto-client.js";
@@ -162,7 +171,91 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    */
   const windows = new Map<string, Promise<string>>();
 
-  server.setRequestHandler(ListToolsRequestSchema, async (req) => upstream.listTools(req.params));
+  // The tool list flows through from upstream — with one deliberate
+  // override: a tool routed to github/merge_pull_request advertises
+  // OwnerSwitch's OWN input schema (no expectedHeadSha — the head sha is
+  // pinned server-side at review time) in place of whatever the upstream
+  // declares under that name, so agents cannot be steered by an upstream
+  // schema into supplying arguments the proxy will refuse. A routed tool
+  // the upstream does not advertise stays unadvertised (it remains
+  // callable; discovery is upstream's business), and the call-time
+  // refusal of agent-supplied expectedHeadSha is the enforcement either way.
+  server.setRequestHandler(ListToolsRequestSchema, async (req) => {
+    const result = await upstream.listTools(req.params);
+    if (executor !== undefined) {
+      for (const tool of result.tools) {
+        const route = executor.routes[tool.name];
+        if (route?.connector === GITHUB_CONNECTOR && route.operation === MERGE_PULL_REQUEST) {
+          tool.inputSchema = MERGE_PR_AGENT_INPUT_SCHEMA as unknown as typeof tool.inputSchema;
+          tool.description =
+            `${tool.description === undefined || tool.description === "" ? "" : `${tool.description} `}` +
+            `[OwnerSwitch: performed by the OwnerSwitch executor with its own credential after ` +
+            `the owner's decision. The pull request head SHA is pinned by OwnerSwitch at review ` +
+            `time — do not supply expectedHeadSha.]`;
+        }
+      }
+    }
+    return result;
+  });
+
+  /**
+   * The review-time head pin for routed merges (DESIGN.md §6). Runs after
+   * the verdict, BEFORE the owner-review lane — so the sha the owner sees
+   * in the veto window, the sha in the canonical ticket args, and the sha
+   * the merge sends are one and the same, and it came from GitHub, not
+   * from the agent. Pinning transmits owner/repo/pullNumber to GitHub —
+   * a boundary crossing — so the honeytoken kill-scan runs first, exactly
+   * as it does before forward/execute.
+   *
+   * Fail closed: no pin function (connector unconfigured), or a pin read
+   * that fails, refuses the call before any window opens or ticket burns.
+   */
+  async function pinIfRoutedMerge(call: ToolCall): Promise<ToolCall> {
+    const route = executor?.routes[call.tool];
+    if (
+      executor === undefined ||
+      route === undefined ||
+      route.connector !== GITHUB_CONNECTOR ||
+      route.operation !== MERGE_PULL_REQUEST
+    ) {
+      return call;
+    }
+    const canaryIds = decoyIds(call);
+    if (canaryIds.length > 0) {
+      options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
+      throw honeytokenTripped(call.tool, canaryIds);
+    }
+    let base: { owner: string; repo: string; pullNumber: number };
+    try {
+      base = validateMergePrRequestArgs(call.args ?? {});
+    } catch (err) {
+      throw routedCallRefused(
+        call.tool,
+        "invalid-args",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    if (executor.pinHeadSha === undefined) {
+      throw routedCallRefused(
+        call.tool,
+        "connector-unconfigured",
+        "OwnerSwitch cannot pin the pull request head — the GitHub connector is not configured " +
+          "on this gateway (see packages/executor/DESIGN.md §6)",
+      );
+    }
+    let headSha: string;
+    try {
+      headSha = await executor.pinHeadSha(base);
+    } catch (err) {
+      throw routedCallRefused(
+        call.tool,
+        "head-pin-failed",
+        `cannot pin the pull request head at review time: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return { ...call, args: { ...(call.args ?? {}), expectedHeadSha: headSha } };
+  }
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
     const call: ToolCall = { agentId, tool: req.params.name, args: req.params.arguments };
@@ -187,7 +280,8 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
 
     switch (verdict.decision) {
       case "allow":
-        return forwardOrKill(call, verdict, observedKill?.epoch);
+        // pinned before execution: the canonical args carry the head sha
+        return forwardOrKill(await pinIfRoutedMerge(call), verdict, observedKill?.epoch);
       case "deny":
         alertIfDecoy(call, "policy denied");
         throw policyDenied(call.tool, verdict);
@@ -195,7 +289,12 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         alertIfDecoy(call, "held for owner approval");
         throw approvalRequired(call.tool, verdict);
       case "veto":
-        return vetoLane(call, verdict, observedKill?.epoch);
+        // pinned before the owner sees it: the veto window registers the
+        // pinned args, so what the owner reviews is what would merge. The
+        // window's call identity includes the pinned sha — if the branch
+        // moves between polls, the old window is simply left behind and a
+        // FRESH owner review opens for the new head, which is the point.
+        return vetoLane(await pinIfRoutedMerge(call), verdict, observedKill?.epoch);
     }
   });
 

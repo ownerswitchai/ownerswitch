@@ -20,17 +20,26 @@ export interface MergePrArgs {
   pullNumber: number;
   mergeMethod?: "merge" | "squash" | "rebase";
   /**
-   * When present, forwarded as the merge API's `sha` parameter — "SHA that
-   * pull request head must match to allow merge". This binds the owner's
-   * approval to the exact head they saw: a branch that gains commits after
-   * approval draws HTTP 409 instead of merging code nobody reviewed.
+   * MANDATORY. Forwarded as the merge API's `sha` parameter — "SHA that
+   * pull request head must match to allow merge". The value is derived by
+   * OWNERSWITCH at review time (the proxy pins the PR's live head before
+   * the owner sees the request — never agent-supplied), so the owner's
+   * approval binds to the exact head they saw: a branch that gains commits
+   * after approval draws HTTP 409 instead of merging code nobody reviewed.
    */
-  expectedHeadSha?: string;
+  expectedHeadSha: string;
 }
 
-/** The one HTTP call this connector makes, injectable for tests. */
+/** The calls this connector makes, injectable for tests. */
 export interface GitHubMergeClient {
   mergePullRequest(args: MergePrArgs): Promise<{ merged: boolean; sha: string; message: string }>;
+  /**
+   * Read-only: the PR's current head sha, for the proxy's review-time pin.
+   * Throws when the PR is already merged or the head is unusable.
+   */
+  getPullRequestHead(
+    args: Pick<MergePrArgs, "owner" | "repo" | "pullNumber">,
+  ): Promise<string>;
 }
 
 /**
@@ -66,8 +75,8 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
   >;
   if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
   if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
-  if (typeof pullNumber !== "number" || !Number.isInteger(pullNumber) || pullNumber <= 0) {
-    throw new Error("merge_pull_request requires a positive integer pullNumber");
+  if (typeof pullNumber !== "number" || !Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+    throw new Error("merge_pull_request requires a safe positive integer pullNumber");
   }
   if (
     mergeMethod !== undefined &&
@@ -77,20 +86,25 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
   ) {
     throw new Error(`unknown mergeMethod "${String(mergeMethod)}"`);
   }
-  // a full commit id (40-hex SHA-1 or 64-hex SHA-256), never an abbreviation:
-  // an approval must bind to exactly one head, and a prefix can be ambiguous
+  // MANDATORY, and a full commit id (40-hex SHA-1 or 64-hex SHA-256), never
+  // an abbreviation: an approval must bind to exactly one head, and a
+  // prefix can be ambiguous. The proxy derives this server-side at review
+  // time; a ticket without it was minted by nothing this system ships.
   if (
-    expectedHeadSha !== undefined &&
-    (typeof expectedHeadSha !== "string" || !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(expectedHeadSha))
+    typeof expectedHeadSha !== "string" ||
+    !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(expectedHeadSha)
   ) {
-    throw new Error("expectedHeadSha must be a full 40- or 64-character hex commit id");
+    throw new Error(
+      "merge_pull_request requires expectedHeadSha: a full 40- or 64-character hex commit id, " +
+        "pinned by OwnerSwitch at review time",
+    );
   }
   return {
     owner,
     repo,
     pullNumber,
+    expectedHeadSha,
     ...(mergeMethod !== undefined ? { mergeMethod } : {}),
-    ...(expectedHeadSha !== undefined ? { expectedHeadSha } : {}),
   };
 }
 

@@ -31,11 +31,66 @@ export interface ExecutorWiring {
   routes: Record<string, ExecutorRouteConfig>;
   /** run an already-minted ticket — an Executor instance's run() */
   run: (ticket: ActionTicket) => Promise<ExecutionOutcome>;
+  /**
+   * The review-time head pin for github/merge_pull_request routes: the
+   * PR's CURRENT head sha, read with OwnerSwitch's own credential. The
+   * proxy calls this BEFORE the owner sees the request (before a veto
+   * window opens, before a ticket mints) and writes the result into the
+   * call's canonical arguments as `expectedHeadSha` — server-derived,
+   * never agent-supplied. Absent wiring fails routed merges closed.
+   */
+  pinHeadSha?: (args: { owner: string; repo: string; pullNumber: number }) => Promise<string>;
   /** ticket lifetime in ms; default DEFAULT_TICKET_TTL_MS */
   ticketTtlMs?: number;
   /** injectable for tests */
   now?: () => number;
   mintNonce?: () => string;
+}
+
+/**
+ * The agent-facing input schema for a routed merge tool, advertised by the
+ * proxy in tools/list IN PLACE OF whatever the upstream declares under the
+ * same name. Deliberately closed (`additionalProperties: false`) and
+ * deliberately WITHOUT `expectedHeadSha`: the head sha is pinned by
+ * OwnerSwitch at review time, and an agent-supplied value — stale or
+ * false — is refused at call time (validateMergePrRequestArgs), not merely
+ * undeclared.
+ */
+export const MERGE_PR_AGENT_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    owner: { type: "string", description: "repository owner (user or organization)" },
+    repo: { type: "string", description: "repository name" },
+    pullNumber: { type: "integer", minimum: 1, description: "pull request number" },
+    mergeMethod: { type: "string", enum: ["merge", "squash", "rebase"] },
+  },
+  required: ["owner", "repo", "pullNumber"],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Validates the AGENT's arguments for a routed merge — the shape before
+ * OwnerSwitch pins the head. Refuses `expectedHeadSha` outright: the pin
+ * is server-derived so the owner's approval binds to the head GITHUB
+ * reports at review time, and accepting an agent-supplied sha would let
+ * the agent bind the approval to a stale or false head instead.
+ */
+export function validateMergePrRequestArgs(
+  args: Record<string, unknown>,
+): { owner: string; repo: string; pullNumber: number } {
+  if ("expectedHeadSha" in args) {
+    throw new Error(
+      "expectedHeadSha is derived by OwnerSwitch at review time and cannot be supplied by " +
+        "the agent — remove it and call again",
+    );
+  }
+  const { owner, repo, pullNumber } = args;
+  if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
+  if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
+  if (typeof pullNumber !== "number" || !Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+    throw new Error("merge_pull_request requires a safe positive integer pullNumber");
+  }
+  return { owner, repo, pullNumber };
 }
 
 /**

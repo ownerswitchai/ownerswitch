@@ -1,11 +1,12 @@
 import { createSign, type KeyObject } from "node:crypto";
 import {
-  assertUrlSafeName,
-  boundedFetch,
-  errorText,
+  assertSafeInstallationId,
+  assertSafeRepoName,
+  boundedRequest,
+  fixedTransportMessage,
   GITHUB_API_BASE_URL,
   GITHUB_API_VERSION,
-  readGitHubErrorMessage,
+  githubErrorMessage,
   USER_AGENT,
 } from "./github-http.js";
 import type { SecretLedger } from "./secret-ledger.js";
@@ -19,6 +20,10 @@ import type { SecretLedger } from "./secret-ledger.js";
  * exactly one repository and exactly the permissions the one operation
  * needs.
  *
+ * In the recommended deployment this module runs inside the TOKEN BROKER
+ * process (token-broker.ts), under a uid the agent does not share — the
+ * gateway then never holds the private key at all (DESIGN.md §6).
+ *
  * The flow, per GitHub's documentation (verified against the REST API
  * description and the App JWT docs, 2026-08):
  *
@@ -31,19 +36,25 @@ import type { SecretLedger } from "./secret-ledger.js";
  *      an installation token is scoped DOWN at mint time, and a token this
  *      module mints can merge PRs in one named repository and read PR state
  *      there, nothing else. (The merge endpoint itself requires
- *      `contents: write`; `pull_requests: read` exists solely for the
- *      post-ambiguity verification read — see github-client.ts.)
- *   3. Installation tokens expire one hour after minting (GitHub's
+ *      `contents: write`; `pull_requests: read` covers the review-time head
+ *      pin and the post-ambiguity verification read — see github-client.ts.)
+ *   3. The response's `repositories` echo is VERIFIED: GitHub documents that
+ *      enterprise-owned installations cannot be repository-downscoped, and a
+ *      token that came back broader than the one repository requested is
+ *      refused outright — OwnerSwitch supports repository-scoped
+ *      installations only, and pretending otherwise would silently widen
+ *      every "one repo per token" claim in the threat model.
+ *   4. Installation tokens expire one hour after minting (GitHub's
  *      lifetime, not configurable). They are cached per repository and
  *      re-minted when within EXPIRY_MARGIN_MS of expiry, so a token is
  *      never knowingly presented near its deadline.
  *
  * No-leak rule, structural: the private key, every JWT, and every
  * installation token are registered with the SecretLedger the moment they
- * exist; no code path in this module logs, throws, or returns anything but
- * (a) the token to the caller that must present it, and (b) error messages
- * assembled from status codes and GitHub's bounded `message` field, passed
- * through the ledger's redaction.
+ * exist; no code path in this module logs, and every thrown error is
+ * assembled from fixed prose, status codes, and GitHub's bounded `message`
+ * field passed through the ledger's redaction. Transport failures surface
+ * as fixed sentences, never the transport error's own text.
  */
 
 export interface GitHubAppConfig {
@@ -59,8 +70,9 @@ export interface GitHubAppConfig {
  * The full permission set an installation token needs for
  * merge_pull_request: `contents: write` performs the merge (the documented
  * requirement of PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge);
- * `pull_requests: read` lets the client verify an ambiguous dispatch after
- * the fact via GET /repos/{owner}/{repo}/pulls/{pull_number}. Nothing else.
+ * `pull_requests: read` lets the proxy pin the head SHA at review time and
+ * the client verify an ambiguous dispatch after the fact via
+ * GET /repos/{owner}/{repo}/pulls/{pull_number}. Nothing else.
  */
 export const INSTALLATION_TOKEN_PERMISSIONS: Readonly<Record<string, string>> = Object.freeze({
   contents: "write",
@@ -74,6 +86,9 @@ const JWT_BACKDATE_SECONDS = 60;
 
 /** Re-mint when a cached token is within this margin of its expiry. */
 export const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
+
+/** Token-mint responses are small JSON; anything bigger is not GitHub. */
+const MAX_MINT_BODY_BYTES = 256 * 1024;
 
 export interface InstallationTokenSource {
   /**
@@ -127,11 +142,11 @@ export function createInstallationTokenSource(
   }
 
   async function mint(repo: string): Promise<string> {
-    assertUrlSafeName(app.installationId, "installation id");
-    const url = `${baseUrl}/app/installations/${app.installationId}/access_tokens`;
-    let res: Response;
+    assertSafeInstallationId(app.installationId);
+    const url = `${baseUrl}/app/installations/${encodeURIComponent(app.installationId)}/access_tokens`;
+    let res;
     try {
-      res = await boundedFetch(
+      res = await boundedRequest(
         fetchImpl,
         url,
         {
@@ -149,25 +164,49 @@ export function createInstallationTokenSource(
           }),
         },
         timeoutMs,
+        MAX_MINT_BODY_BYTES,
       );
     } catch (err) {
-      throw redacted(`cannot reach GitHub to mint an installation token: ${errorText(err)}`);
+      // fixed sentence — a transport error's own text is not forwarded
+      throw redacted(
+        `cannot reach GitHub to mint an installation token: ${fixedTransportMessage(err)}`,
+      );
     }
     if (res.status !== 201) {
-      throw redacted(await mintRefusalDetail(res, repo));
+      throw redacted(mintRefusalDetail(res.status, res.bodyText, repo));
+    }
+    if (res.bodyText === null) {
+      throw redacted("GitHub's installation-token response exceeded the size bound");
     }
     let body: unknown;
     try {
-      body = await res.json();
+      body = JSON.parse(res.bodyText);
     } catch {
       throw redacted("GitHub's installation-token response was not JSON");
     }
-    const { token, expires_at } = (body ?? {}) as { token?: unknown; expires_at?: unknown };
+    const { token, expires_at, repositories } = (body ?? {}) as {
+      token?: unknown;
+      expires_at?: unknown;
+      repositories?: unknown;
+    };
     if (typeof token !== "string" || token === "") {
       throw redacted("GitHub's installation-token response carried no token");
     }
     // FIRST thing that happens to a token that exists: it becomes redactable
     ledger.add(token);
+    // Enterprise boundary, enforced by behavior rather than configuration
+    // sniffing: the response echoes the repositories the token actually
+    // covers. GitHub documents that enterprise-owned installations cannot be
+    // repository-downscoped — a token that came back without exactly the one
+    // requested repository is broader than everything this design claims,
+    // so it is refused and never used or cached.
+    if (!repositoriesEchoIsExactly(repositories, repo)) {
+      throw redacted(
+        `GitHub did not scope the installation token down to "${repo}" — enterprise-owned ` +
+          `installations cannot be repository-scoped, and OwnerSwitch supports ` +
+          `repository-scoped installations only (DESIGN.md §6); refusing the broader token`,
+      );
+    }
     // An unparseable expires_at is cached as already-expired: the token is
     // used once and re-minted next time. Guessing a lifetime would risk
     // presenting a token past its real expiry; minting more often only
@@ -177,10 +216,10 @@ export function createInstallationTokenSource(
     return token;
   }
 
-  async function mintRefusalDetail(res: Response, repo: string): Promise<string> {
-    const message = await readGitHubErrorMessage(res, (text) => ledger.redact(text));
+  function mintRefusalDetail(status: number, bodyText: string | null, repo: string): string {
+    const message = githubErrorMessage(bodyText, (text) => ledger.redact(text));
     const quoted = message === "" ? "" : `: ${message}`;
-    switch (res.status) {
+    switch (status) {
       case 401:
         return (
           `GitHub rejected the App JWT (HTTP 401)${quoted} — check that the App id and the ` +
@@ -197,7 +236,7 @@ export function createInstallationTokenSource(
           `installation granted access to "${repo}" with contents:write and pull_requests:read?`
         );
       default:
-        return `minting an installation token failed (HTTP ${res.status})${quoted}`;
+        return `minting an installation token failed (HTTP ${status})${quoted}`;
     }
   }
 
@@ -207,7 +246,7 @@ export function createInstallationTokenSource(
 
   return {
     async tokenFor(repo: string): Promise<string> {
-      assertUrlSafeName(repo, "repository name");
+      assertSafeRepoName(repo);
       const cached = cache.get(repo);
       if (cached !== undefined && now() < cached.expiresAtMs - EXPIRY_MARGIN_MS) {
         return cached.token;
@@ -219,6 +258,17 @@ export function createInstallationTokenSource(
       return minting;
     },
   };
+}
+
+function repositoriesEchoIsExactly(repositories: unknown, repo: string): boolean {
+  if (!Array.isArray(repositories) || repositories.length !== 1) return false;
+  const entry = repositories[0] as { name?: unknown };
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    typeof entry.name === "string" &&
+    entry.name.toLowerCase() === repo.toLowerCase()
+  );
 }
 
 function b64url(text: string): string {

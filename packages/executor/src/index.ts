@@ -49,3 +49,9 @@ export { createGitHubMergeClient } from "./github-client.js";
 export type { GitHubMergeClientOptions } from "./github-client.js";
 
 export { GITHUB_API_BASE_URL } from "./github-http.js";
+
+export { createTokenBroker } from "./token-broker.js";
+export type { TokenBroker, TokenBrokerOptions } from "./token-broker.js";
+
+export { createBrokerTokenSource } from "./broker-client.js";
+export type { BrokerTokenSourceOptions } from "./broker-client.js";

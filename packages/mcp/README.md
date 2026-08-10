@@ -313,14 +313,30 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 `OWNERSWITCH_AGENT_ID`, `OWNERSWITCH_TIMEOUT_MS`, `OWNERSWITCH_EXECUTOR_ROUTES` (JSON).
 
 The GitHub connector's credential is environment-only (never the config
-file, never argv) and all-or-nothing: `OWNERSWITCH_GITHUB_APP_ID`,
-`OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
-`OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE` — a GitHub App, not a personal
-access token, minting hour-long installation tokens scoped per merge to
-one repository (`packages/executor/DESIGN.md` §6 for the model and the
-provisioning steps, including where the key file must live). A partial
-triple refuses at startup; none at all runs the gateway with routed
-merges refusing cleanly as not-configured.
+file, never argv), a GitHub App — not a personal access token — minting
+hour-long installation tokens scoped per merge to one repository. Two
+mutually exclusive modes (`packages/executor/DESIGN.md` §6 for the model
+and provisioning):
+
+- **`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`** (recommended): the UNIX
+  socket of `ownerswitch-token-broker`, a separate process under its own
+  uid that alone holds the App private key, kill-gates and allow-lists
+  every mint. The gateway never touches the key — the only shape that
+  actually isolates it, since in stdio deployments the gateway shares a
+  uid with the agent.
+- **`OWNERSWITCH_GITHUB_APP_ID` + `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`
+  + `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`** (degraded): loads the key
+  into the gateway process. Refused at startup unless
+  `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` explicitly accepts
+  that a same-uid agent can read it; starts with a loud warning. A
+  partial triple refuses naming what's missing.
+
+Neither configured runs the gateway with routed merges refusing cleanly
+as not-configured — at the review-time pin, before any owner window
+opens. Routed merges always carry a **mandatory, server-derived
+`expectedHeadSha`**: OwnerSwitch pins the PR's head at review time, the
+owner approves exactly that head, and an agent-supplied sha is refused
+(`-32056`, `refusalCode: "invalid-args"`).
 
 ## What the agent sees (error codes)
 

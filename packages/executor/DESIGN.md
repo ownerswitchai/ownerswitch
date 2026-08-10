@@ -321,9 +321,15 @@ model. It authenticates as a **GitHub App** (`src/github-app-auth.ts`):
    `repositories: [<the one repo in the ticket>]` and
    `permissions: { contents: "write", pull_requests: "read" }`.
    `contents: write` is the documented requirement of the merge endpoint;
-   `pull_requests: read` exists solely for the post-ambiguity verification
-   read below. Nothing else is ever requested.
-3. **Installation tokens expire one hour after minting** (GitHub's
+   `pull_requests: read` covers the review-time head pin and the
+   post-ambiguity verification read below. Nothing else is ever requested.
+3. The response's `repositories` echo is **verified**: GitHub documents
+   that **enterprise-owned installations cannot be repository-downscoped**,
+   so a token that comes back covering anything other than exactly the one
+   requested repository is refused and never used or cached. **OwnerSwitch
+   supports repository-scoped installations only** — the support boundary
+   is enforced by behavior, not stated and hoped for.
+4. **Installation tokens expire one hour after minting** (GitHub's
    lifetime, not configurable). The source caches one token per
    repository and re-mints when a cached token is within 5 minutes of
    expiry, so a token is never knowingly presented near its deadline.
@@ -336,30 +342,91 @@ JWT and token dies with its own short TTL). GitHub also exposes
 wiring that into the kill path is future hardening, not shipped; today
 the bound on a leaked token is its ≤ 1 h expiry and one-repo scope.
 
+### Where the key lives: the token broker, and the uid problem
+
+File modes defend against other USERS. They do nothing against a process
+under the **same uid** — and in the stdio MCP deployment the client spawns
+the gateway, so gateway and agent share a uid. A key file the gateway can
+read is a key file the AGENT can read; 0600 does not change that, and a
+same-uid agent that discovers the path could mint its own tokens forever.
+So the key does not live in the gateway.
+
+The recommended shape is the **token broker**
+(`src/token-broker.ts`, `ownerswitch-token-broker`): a separate small
+process **under its own uid** that alone reads the PEM, mints App JWTs and
+installation tokens, and serves TOKENS to the gateway over a UNIX domain
+socket. The gateway (`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`) never holds
+the key in memory at all.
+
+- **Peer verification, honestly.** Pure Node exposes no `SO_PEERCRED`, so
+  the allow-listed-uid check is expressed where the kernel enforces it for
+  UNIX sockets: connect(2) requires write permission on the socket inode
+  and traversal of its directory. The broker refuses to listen unless the
+  socket directory is broker-owned with **no world access** (deploy it
+  0750), and chmods the socket 0660 after listen — the directory's group
+  is the allow-list; put the gateway's uid in it.
+- **What this buys, precisely.** The agent (same uid as the gateway) can
+  never read the KEY. What a same-uid process that finds the socket CAN
+  do is request tokens — exactly what `SO_PEERCRED` would also permit,
+  since it cannot tell gateway from agent within one uid. Every such
+  token is ≤ 1 h, single-repository, minimally-permissioned; the broker
+  can be confined to an explicit repo allow-list
+  (`OWNERSWITCH_BROKER_ALLOWED_REPOS`); and every mint is checked against
+  **live kill state and logged** on the broker's side. Residual risk,
+  stated: a same-uid agent can obtain scoped short-lived tokens while the
+  system is alive and unkilled. The standing credential is out of reach.
+- **The broker and kill state.** The broker checks live kill state —
+  through the same fail-closed contract as every other check in the
+  system — **before every token response, cached tokens included**.
+  Killed, or control plane unreachable, means no tokens. This adds a
+  third gate in front of the executor's own two pre-dispatch re-checks;
+  what it does NOT do is revoke tokens already handed out (their ≤ 1 h
+  expiry is the bound, THREAT-MODEL.md §5).
+
+A **single-process mode** exists for deployments that genuinely separate
+the gateway's uid from the agent's by other means (or accept the risk):
+the `OWNERSWITCH_GITHUB_APP_*` triple loads the key into the gateway
+process — and **refuses to start** unless
+`OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` is set, then starts
+with a loud warning naming exactly the isolation it does not have. It
+never silently claims what it cannot deliver: in a stdio deployment this
+mode means the agent can read the key, full stop.
+
 ### Provisioning (once, by the operator)
 
 1. Create a GitHub App on the org (or user) that owns the target repos.
    Repository permissions: **Contents: Read & write** and **Pull
    requests: Read-only**. No webhooks, no other permissions.
 2. Install the App on **exactly the repositories** the executor may merge
-   in. The installation is itself a scope: a token minted here cannot
-   reach an uninstalled repo no matter what a ticket says.
+   in (repository-scoped — "All repositories" and enterprise-owned
+   installations are unsupported, see above). The installation is itself
+   a scope: a token minted here cannot reach an uninstalled repo no
+   matter what a ticket says.
 3. Generate a private key in the App's settings; a `.pem` downloads.
-4. Put the key where the **agent's side cannot read it — the same rule as
-   the kill-state file**: an absolute path outside the agent's workspace,
-   owned by the gateway's user, mode `0600`
-   (e.g. `/etc/ownerswitch/github-app.pem`). The loader
-   (`src/github-app-key.ts`) enforces what is checkable — absolute path,
-   not under the gateway's working directory, regular file behind no
-   symlink, ≤ 64 KiB, no group/world access, owned by the process's uid,
-   parses as an RSA key — and refuses to start otherwise. The placement
-   rule itself (a host path the agent has no route to) remains a
-   deployment requirement no process can self-verify.
-5. Configure the gateway by environment (never argv, never the config
-   file): `OWNERSWITCH_GITHUB_APP_ID`,
-   `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
-   `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`. All three or none —
-   a partial set is refused at startup, naming what is missing
+4. Create the broker's user (e.g. `oswitch-broker`) and a shared group
+   for the socket (e.g. `oswitch`). Put the key at an absolute path owned
+   by the BROKER's user, mode `0600`, **outside the agent's workspace**
+   (e.g. `/etc/ownerswitch/github-app.pem`) — the same placement rule as
+   the kill-state file. The loader (`src/github-app-key.ts`) enforces
+   what is checkable — absolute path, not under the AGENT WORKSPACE it is
+   given explicitly (never implied from `process.cwd()`), regular file
+   behind no symlink, ≤ 64 KiB, no group/world access, owned by the
+   loading process's uid, parses as an RSA key — and refuses to start
+   otherwise. The placement rule itself (a host path the agent has no
+   route to) remains a deployment requirement no process can self-verify.
+5. Run the broker under its own uid:
+   `OWNERSWITCH_GITHUB_APP_ID`, `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
+   `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`,
+   `OWNERSWITCH_AGENT_WORKSPACE` (the agent's workspace, explicitly),
+   `OWNERSWITCH_BROKER_SOCKET` (e.g. `/run/ownerswitch/broker.sock`, in a
+   0750 broker-owned dir with the gateway's user in its group),
+   `OWNERSWITCH_CONTROL_PLANE_URL`, and ideally
+   `OWNERSWITCH_BROKER_ALLOWED_REPOS`.
+6. Point the gateway at it by environment (never argv, never the config
+   file): `OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET=/run/ownerswitch/broker.sock`.
+   Setting both the broker socket AND the `OWNERSWITCH_GITHUB_APP_*`
+   triple is refused — the credential lives in exactly one place. A
+   partial triple is refused naming what is missing
    (`packages/mcp/src/github-app-env.ts`). `OWNERSWITCH_GITHUB_TOKEN` is
    NOT an accepted credential; if set anyway it only arms scrubbing and
    the upstream env-strip.
@@ -381,6 +448,19 @@ error, a thrown object or a rejection in the first place:
   first and a long echoed credential is cut mid-way, leaving a fragment
   exact-match redaction can no longer recognize; a unit test pinned
   exactly that failure with an echoed App JWT), bounded to 300 chars;
+- **transport failures surface as FIXED sentences** ("the request timed
+  out" / "a network-level failure occurred") — a transport stack is free
+  to serialize half an Authorization header into its error text, and
+  exact full-secret replacement cannot redact a token FRAGMENT, so the
+  channel is removed entirely instead of filtered (pinned by a unit test
+  that plants a token fragment in the transport error);
+- **response bodies are capped while streaming** (`boundedRequest`) — a
+  hostile or broken peer cannot make the process buffer an unbounded body
+  just to truncate it later, and one timeout covers the connection AND
+  the body read;
+- **every request refuses redirects** (`redirect: "error"`): an
+  authenticated request following a redirect hands its Bearer token to
+  whoever controls the Location header;
 - every error message passes through the ledger's redaction at
   construction, because GitHub's own auth errors quote credentials back
   ("Bad credentials: ghs_…") — simulated in the unit tests with responses
@@ -390,54 +470,95 @@ error, a thrown object or a rejection in the first place:
   escaped the client's own discipline crosses a second redaction before
   an `ExecutionFailed` refusal can carry it to the agent.
 
+### The head pin: every approval binds to the exact head the owner saw
+
+`expectedHeadSha` is **mandatory and server-derived**. Before the owner
+sees a routed merge — before a veto window opens, before a ticket mints —
+the proxy reads the PR's CURRENT head from GitHub with OwnerSwitch's own
+credential (`getPullRequestHead`, `pull_requests: read`) and writes it
+into the call's arguments (`packages/mcp/src/proxy.ts`,
+`pinIfRoutedMerge`). From there the pinned sha is in the canonical
+arguments, therefore in the ticket, the veto window the owner reviews,
+the audit trail, and the merge call's `sha` parameter — "SHA that pull
+request head must match to allow merge". One value, one origin, end to
+end.
+
+- **A branch that moved after review draws HTTP 409 — that is the
+  point.** Commits pushed after the owner's review never merge under the
+  old approval; the operator re-approves against the new head. The veto
+  window's call identity includes the pinned sha, so a head that moves
+  between release and retry doesn't even burn a ticket on the 409 — a
+  FRESH owner review opens for the new head.
+- **Agent-supplied shas are refused, not ignored.** An agent that sends
+  `expectedHeadSha` gets a refusal naming why (the pin is derived at
+  review time), before any owner review opens. The tool schema agents see
+  says so too: for routed merge tools, `tools/list` advertises
+  OwnerSwitch's OWN input schema (owner, repo, pullNumber, mergeMethod —
+  `additionalProperties: false`) IN PLACE of whatever the upstream
+  declares under that name, with a description stating the pin. A routed
+  tool the upstream doesn't advertise stays unadvertised; the call-time
+  refusal is the enforcement either way.
+- A ticket without `expectedHeadSha` does not even parse
+  (`parseMergePrArgs`) — defense in depth beneath the proxy.
+- The pin read refusing (PR already merged, unusable head, GitHub down)
+  fails CLOSED: the call is refused before anything opens or burns.
+
 ### Ambiguous dispatch: what GitHub offers, and what stays ambiguous
 
 The nonce burns before the connector call (§3), so a dispatch that fails
 after GitHub may have accepted it is never retried. Checked against the
 API documentation rather than assumed: **GitHub offers no idempotency key
-for `merge_pull_request`.** It offers two adjacent mechanisms, and the
-connector uses both:
+for `merge_pull_request`.** It offers the conditional head-match guard
+(the mandatory pin above) and one adjacent property the connector uses:
 
-- **A conditional guard.** The merge endpoint's `sha` parameter — "SHA
-  that pull request head must match to allow merge" (HTTP 409 on
-  mismatch). Tickets may carry `expectedHeadSha` (full 40- or 64-hex
-  commit id, validated at parse), and the owner's approval then binds to
-  the exact head they reviewed: a branch that gains commits after
-  approval draws a refusal, not a merge of unreviewed code. This does not
-  make the operation idempotent — it makes it precise.
-- **Verification after the fact.** Merges are readable ground truth:
-  `merged` and `merge_commit_sha` on `GET /repos/{owner}/{repo}/pulls/{n}`
-  (and the dedicated 204/404 merged-check endpoint). After an ambiguous
-  dispatch — the PUT died on the wire, timed out, or drew a 5xx — the
-  client performs **one verification read**:
-  - the read shows **merged** → the operation succeeded; the agent gets
-    a normal result whose `message` says it was confirmed by a
-    post-dispatch verification read, with the real `merge_commit_sha`;
-  - the read shows **not merged** → still reported as failed with
-    outcome UNKNOWN, and the error says why plainly: a request that died
-    on the wire can still complete after the read, so the answer is a
-    snapshot, not proof;
-  - the read itself fails → outcome UNKNOWN, with the same instruction.
+**Verification after the fact.** Merges are readable ground truth:
+`merged` and `merge_commit_sha` on `GET /repos/{owner}/{repo}/pulls/{n}`
+(and the dedicated 204/404 merged-check endpoint). After an ambiguous
+dispatch — the PUT died on the wire, timed out, drew a 5xx, drew a status
+the merge endpoint does not document, or answered 200 without confirming
+the merge — the client performs **one verification read**. Precision
+about what that read proves, everywhere the answer travels (result
+fields, the audit trail, this document): **the read proves the pull
+request IS merged; it cannot prove THIS dispatch performed the merge.**
+
+- the read shows **merged** → reported as success, with the
+  `merge_commit_sha`, and a `message` that states exactly the above —
+  merged state confirmed, attribution undeterminable;
+- the read shows **not merged** → reported failed with outcome UNKNOWN,
+  and the error says why plainly: a request that died on the wire can
+  still complete after the read, so the answer is a snapshot, not proof;
+- the read itself fails → outcome UNKNOWN, with the same instruction.
+
+**Failure classification is a whitelist, not a guess.** Only the statuses
+GitHub documents for the merge endpoint — 403, 404, 405, 409, 422 — plus
+401 (auth) and 429 (rate limiting) are trusted to mean "GitHub received
+and refused this; the merge did not happen", reported as "not-performed"
+(`ConnectorCallError`) so the agent hears "did NOT run"
+(`packages/mcp/src/errors.ts`). **Any unrecognized status — including an
+intermediary-generated 408 — is treated as UNKNOWN and takes the
+verification path**, never a false "did NOT run": an intermediary's
+status line says nothing about what reached GitHub behind it.
 
 What the operator sees in the residual case: an `ExecutionFailed`
 (`-32057`) whose message names the double failure and instructs "check
 `owner/repo#n` directly before re-approving — a re-approved merge could
-run the action twice." Failures the API definitively rejected (any 4xx:
-404, 403/rate limit, 405 not-mergeable, 409 head-moved, 422) are NOT
-ambiguous: the connector classifies them "not-performed"
-(`ConnectorCallError`), and the agent-facing error says the action did
-NOT run instead of the blanket "may or may not have completed"
-(`packages/mcp/src/errors.ts`).
+run the action twice."
 
 ### What the test suite proves, and what only a live run can
 
-Unit tests (`src/github-client.test.ts`, `src/github-app-auth.test.ts`)
-run against scripted responses only — success, 404, 403, 405, 409, 422,
-primary and secondary rate limits, credential-echoing errors, wire
-deaths, and every verification branch. **Nothing in the test suite
-performs a live merge.** The one live run is a documented manual
-procedure against a throwaway repository — `MANUAL-VERIFICATION.md`
-states the steps, what the run proves, and what it deliberately does not.
+Unit tests (`src/github-client.test.ts`, `src/github-app-auth.test.ts`,
+`src/token-broker.test.ts`) run against scripted responses only —
+success, 404, 403, 405, 409, 422, primary and secondary rate limits, an
+unrecognized 408 taking the verification path, a 200 that fails to
+confirm the merge, credential-echoing errors, token FRAGMENTS in
+transport errors, stream-cap enforcement, redirect refusal, dot-segment
+and length rejection, the enterprise down-scoping refusal, the mandatory
+pin end to end, and the broker over a real UNIX socket (directory
+hardening, socket mode, kill gate, allow-list, protocol bounds, error
+redaction). **Nothing in the test suite performs a live merge.** The one
+live run is a documented manual procedure against a throwaway repository
+— `MANUAL-VERIFICATION.md` states the steps, what the run proves, and
+what it deliberately does not.
 
 ## 7. Wired / still stubbed
 
@@ -462,18 +583,28 @@ and the agent receives the result, never a token — and a leak test where
 the backend genuinely holds the credential and an upstream error that
 echoes it reaches the agent scrubbed.
 
-**And now wired (this PR): the live GitHub call.** `merge_pull_request`
-moves from "stubbed" to **shipped**: `createGitHubMergeClient` performs
-the merge with a GitHub App installation token minted per repository
-(§6), the CLI wires it from the `OWNERSWITCH_GITHUB_APP_*` environment,
-tickets may pin `expectedHeadSha`, ambiguous dispatches get one
-verification read, definitive rejections reach the agent as "did NOT
-run", and the SecretLedger's redaction backs both the client (first line)
-and the executor's scrub (second line). The injectable
-`GitHubMergeClient` seam remains — tests never hit GitHub.
+**And now wired: the live GitHub call.** `merge_pull_request` moves from
+"stubbed" to **shipped**: `createGitHubMergeClient` performs the merge
+with a GitHub App installation token minted per repository (§6); the
+**token broker** (`ownerswitch-token-broker`) holds the private key under
+its own uid, kill-gates and allow-lists every mint, and the gateway
+(`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`) never touches the key — the
+same-process triple survives only behind an explicit same-uid risk
+acknowledgment; every ticket carries a **mandatory, server-derived
+`expectedHeadSha`** pinned at review time, so the owner approves exactly
+one head and a moved branch draws 409 (or a fresh review); ambiguous
+dispatches get one verification read worded for what it proves; rejection
+classification is a documented-status whitelist; and the SecretLedger's
+redaction backs both the client (first line, with fixed transport
+sentences and stream-capped bodies) and the executor's scrub (second
+line). The injectable `GitHubMergeClient` seam remains — tests never hit
+GitHub.
 
 **Still stubbed / not yet:** ticket signing; a shared nonce store — until
 one exists the deployment constraint in §5 stands (one gateway process,
 no remote executor); revoking live installation tokens on kill
-(`DELETE /installation/token`, §6); any connector beyond
+(`DELETE /installation/token`, §6); `SO_PEERCRED`-grade peer
+identification on the broker socket (needs a native module or a
+socket-activation supervisor; today the kernel-enforced check is the
+socket directory's ownership and mode, §6); any connector beyond
 `merge_pull_request`.

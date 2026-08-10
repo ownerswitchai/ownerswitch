@@ -2,13 +2,16 @@ import { ConnectorCallError } from "./connector-error.js";
 import type { GitHubMergeClient, MergePrArgs } from "./github.js";
 import type { InstallationTokenSource } from "./github-app-auth.js";
 import {
-  assertUrlSafeName,
-  boundedFetch,
-  errorText,
+  assertSafeOwner,
+  assertSafePullNumber,
+  assertSafeRepoName,
+  boundedRequest,
+  fixedTransportMessage,
   GITHUB_API_BASE_URL,
   GITHUB_API_VERSION,
-  readGitHubErrorMessage,
+  githubErrorMessage,
   USER_AGENT,
+  type BoundedResponse,
 } from "./github-http.js";
 import type { SecretLedger } from "./secret-ledger.js";
 
@@ -20,34 +23,46 @@ import type { SecretLedger } from "./secret-ledger.js";
  *
  * No-leak, structurally: no code path here logs, and no thrown error is
  * built from anything but (a) fixed prose, (b) HTTP status codes, (c) the
- * ticket's own args, and (d) GitHub's bounded JSON `message` — with every
- * message passed through the SecretLedger's redaction before the Error is
- * constructed, because GitHub's own auth errors quote credentials back.
- * The token exists only in a local variable and the request header; the
- * executor's scrub (github.ts) remains the second line of defence.
+ * ticket's own args, and (d) GitHub's bounded JSON `message` — redacted
+ * then truncated. Transport failures surface as one of two FIXED sentences
+ * (fixedTransportMessage), never the transport error's own text: exact
+ * full-secret replacement cannot redact a token FRAGMENT, so the channel is
+ * removed rather than filtered. Response bodies are capped while streaming;
+ * every request refuses redirects (an authenticated request following a
+ * redirect hands its token to whoever controls the Location).
+ *
+ * `sha` is MANDATORY: every merge sends the head SHA the owner's approval
+ * was pinned to (server-derived at review time — see the proxy's pinning
+ * step and getPullRequestHead below). A branch that moved after review
+ * draws HTTP 409 instead of merging commits nobody reviewed. That is the
+ * point, not an error to engineer away.
  *
  * Ambiguity, per the API documentation (not assumption): GitHub offers no
- * idempotency key for merges. It offers two adjacent things, and this
- * client uses both:
+ * idempotency key for merges. Merges ARE verifiable after the fact
+ * (`merged` / `merge_commit_sha` on GET /pulls/{n}), and a dispatch whose
+ * outcome is ambiguous — the request died on the wire, timed out, drew a
+ * 5xx, an unrecognized status, or a 200 that did not confirm the merge —
+ * is followed by ONE verification read. What that read proves is stated
+ * precisely: "merged" is a fact about the PULL REQUEST's state, not about
+ * WHICH request merged it; "not merged" is only a snapshot, since a
+ * request that died on the wire can still complete after the read.
  *
- *   - `sha` — "SHA that pull request head must match to allow merge"
- *     (HTTP 409 on mismatch). When the ticket carries `expectedHeadSha`,
- *     the merge binds to the exact head the owner approved: a branch that
- *     moved after approval refuses instead of merging unreviewed commits.
- *   - Merges are VERIFIABLE after the fact: `merged` /`merge_commit_sha`
- *     on GET /repos/{owner}/{repo}/pulls/{n} (and the dedicated 204/404
- *     merged-check endpoint) give ground truth on whether the merge
- *     happened. A dispatch whose outcome is ambiguous — the request died
- *     on the wire, timed out, or drew a 5xx — is followed by one
- *     verification read: "merged" is conclusive (merges don't un-happen);
- *     "not merged" is only a snapshot, since a timed-out request can still
- *     land after the read, and the error says exactly that.
- *
- * Every 4xx is a rejection: GitHub received the request and refused it, so
- * the merge definitively did not happen — reported as
- * ConnectorCallError("not-performed"), which the proxy relays to the agent
- * as "did NOT run" instead of the blanket "may or may not have completed".
+ * Failure classification is a WHITELIST: only the statuses GitHub
+ * documents for the merge endpoint (plus 401 auth and 429 rate limiting)
+ * are treated as definitive rejections — "not-performed". Anything
+ * unrecognized — including an intermediary-generated 408 — takes the
+ * verification path and ends UNKNOWN at worst, never a false "did NOT
+ * run".
  */
+
+/** The statuses GitHub documents as merge rejections — nothing else is
+ * trusted to mean "the merge did not happen". */
+const DOCUMENTED_REJECTION_STATUSES: ReadonlySet<number> = new Set([
+  401, 403, 404, 405, 409, 422, 429,
+]);
+
+/** Merge/PR JSON responses are modest; cap far above them. */
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 export interface GitHubMergeClientOptions {
   tokens: InstallationTokenSource;
@@ -81,16 +96,63 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     "user-agent": USER_AGENT,
   });
 
-  function prPath(args: MergePrArgs): string {
-    assertUrlSafeName(args.owner, "owner");
-    assertUrlSafeName(args.repo, "repository name");
-    return `${baseUrl}/repos/${args.owner}/${args.repo}/pulls/${args.pullNumber}`;
+  function prPath(args: Pick<MergePrArgs, "owner" | "repo" | "pullNumber">): string {
+    assertSafeOwner(args.owner);
+    assertSafeRepoName(args.repo);
+    assertSafePullNumber(args.pullNumber);
+    return (
+      `${baseUrl}/repos/${encodeURIComponent(args.owner)}/${encodeURIComponent(args.repo)}` +
+      `/pulls/${args.pullNumber}`
+    );
+  }
+
+  /** GET the PR with a scoped token; shared by the head pin and the
+   * verification read. Throws plain Errors with fixed/bounded text. */
+  async function fetchPullRequest(
+    prUrl: string,
+    token: string,
+  ): Promise<{ merged: boolean; mergeCommitSha: string | undefined; headSha: string | undefined }> {
+    let res: BoundedResponse;
+    try {
+      res = await boundedRequest(
+        fetchImpl,
+        prUrl,
+        { headers: headers(token) },
+        timeoutMs,
+        MAX_BODY_BYTES,
+      );
+    } catch (err) {
+      throw new Error(`the pull request read failed: ${fixedTransportMessage(err)}`);
+    }
+    if (res.status !== 200) {
+      throw new Error(`the pull request read answered HTTP ${res.status}`);
+    }
+    if (res.bodyText === null) {
+      throw new Error("the pull request read exceeded the response size bound");
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(res.bodyText);
+    } catch {
+      throw new Error("the pull request read returned an unreadable body");
+    }
+    const { merged, merge_commit_sha, head } = (body ?? {}) as {
+      merged?: unknown;
+      merge_commit_sha?: unknown;
+      head?: unknown;
+    };
+    const headSha = (head as { sha?: unknown } | null | undefined)?.sha;
+    return {
+      merged: merged === true,
+      mergeCommitSha: typeof merge_commit_sha === "string" ? merge_commit_sha : undefined,
+      headSha: typeof headSha === "string" ? headSha : undefined,
+    };
   }
 
   /**
-   * The one verification read after an ambiguous dispatch. GET the PR and
-   * trust only `merged: true` — that is conclusive, and `merge_commit_sha`
-   * is the merge commit once merged. Anything else stays honestly unknown.
+   * The one verification read after an ambiguous dispatch. Wording is
+   * deliberate and everywhere the result travels: the read proves the pull
+   * request IS merged — it cannot prove THIS dispatch performed the merge.
    */
   async function verifyAfterAmbiguousDispatch(
     args: MergePrArgs,
@@ -101,41 +163,24 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     const checkYourself =
       `Check ${args.owner}/${args.repo}#${args.pullNumber} directly before re-approving — ` +
       `a re-approved merge could run the action twice.`;
-    let res: Response;
+    let pr;
     try {
-      res = await boundedFetch(fetchImpl, prUrl, { headers: headers(token) }, timeoutMs);
+      pr = await fetchPullRequest(prUrl, token);
     } catch (err) {
       throw unknownOutcome(
-        `${cause}; the post-dispatch verification read also failed (${errorText(err)}), so the ` +
-          `outcome is UNKNOWN. ${checkYourself}`,
+        `${cause}; the post-dispatch verification read also failed ` +
+          `(${err instanceof Error ? err.message : "unreadable"}), so the outcome is UNKNOWN. ` +
+          checkYourself,
       );
     }
-    if (!res.ok) {
-      throw unknownOutcome(
-        `${cause}; the post-dispatch verification read answered HTTP ${res.status}, so the ` +
-          `outcome is UNKNOWN. ${checkYourself}`,
-      );
-    }
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch {
-      throw unknownOutcome(
-        `${cause}; the post-dispatch verification read returned an unreadable body, so the ` +
-          `outcome is UNKNOWN. ${checkYourself}`,
-      );
-    }
-    const { merged, merge_commit_sha } = (body ?? {}) as {
-      merged?: unknown;
-      merge_commit_sha?: unknown;
-    };
-    if (merged === true) {
+    if (pr.merged) {
       return {
         merged: true,
-        sha: typeof merge_commit_sha === "string" ? ledger.redact(merge_commit_sha) : "",
+        sha: pr.mergeCommitSha !== undefined ? ledger.redact(pr.mergeCommitSha) : "",
         message: ledger.redact(
-          `merged — ${cause}, but a post-dispatch verification read confirms the pull request ` +
-            `is merged`,
+          `the pull request is merged — ${cause}, and a post-dispatch verification read ` +
+            `confirms the pull request's MERGED STATE. Note precisely what that proves: the PR ` +
+            `is merged; whether THIS dispatch performed the merge cannot be determined.`,
         ),
       };
     }
@@ -146,8 +191,8 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     );
   }
 
-  async function rejectionDetail(res: Response, args: MergePrArgs): Promise<string> {
-    const message = await readGitHubErrorMessage(res, (text) => ledger.redact(text));
+  function rejectionDetail(res: BoundedResponse, args: MergePrArgs): string {
+    const message = githubErrorMessage(res.bodyText, (text) => ledger.redact(text));
     const quoted = message === "" ? "" : `: ${message}`;
     const suffix = " The merge was NOT performed by this request.";
     const rateLimited =
@@ -184,6 +229,8 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
         );
       case 422:
         return `GitHub refused the merge request as invalid (HTTP 422)${quoted}.${suffix}`;
+      case 429:
+        return `GitHub rate-limited the executor's credential (HTTP 429)${quoted}.${suffix}`;
       default:
         return `GitHub refused the merge (HTTP ${res.status})${quoted}.${suffix}`;
     }
@@ -198,20 +245,30 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
       try {
         prUrl = prPath(args);
       } catch (err) {
-        throw notPerformed(`the merge was not dispatched: ${errorText(err)}`);
+        throw notPerformed(
+          `the merge was not dispatched: ${err instanceof Error ? err.message : "invalid arguments"}`,
+        );
+      }
+      if (typeof args.expectedHeadSha !== "string" || args.expectedHeadSha === "") {
+        // defense in depth — parseMergePrArgs already requires it
+        throw notPerformed(
+          "the merge was not dispatched: expectedHeadSha is mandatory — every merge is pinned " +
+            "to the head the owner approved",
+        );
       }
       let token: string;
       try {
         token = await tokens.tokenFor(args.repo);
       } catch (err) {
         throw notPerformed(
-          `the merge was not dispatched — no installation token: ${errorText(err)}`,
+          `the merge was not dispatched — no installation token: ` +
+            `${err instanceof Error ? err.message : "token minting failed"}`,
         );
       }
 
-      let res: Response;
+      let res: BoundedResponse;
       try {
-        res = await boundedFetch(
+        res = await boundedRequest(
           fetchImpl,
           `${prUrl}/merge`,
           {
@@ -219,53 +276,82 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
             headers: { ...headers(token), "content-type": "application/json" },
             body: JSON.stringify({
               ...(args.mergeMethod !== undefined ? { merge_method: args.mergeMethod } : {}),
-              ...(args.expectedHeadSha !== undefined ? { sha: args.expectedHeadSha } : {}),
+              sha: args.expectedHeadSha,
             }),
           },
           timeoutMs,
+          MAX_BODY_BYTES,
         );
       } catch (err) {
-        // dispatched but died on the wire — GitHub may have performed it
+        // dispatched but died on the wire — GitHub may have performed it.
+        // Fixed sentence only: transport error text is never forwarded.
         return verifyAfterAmbiguousDispatch(
           args,
           prUrl,
           token,
-          `the merge request failed on the wire (${errorText(err)})`,
+          `the merge request failed on the wire (${fixedTransportMessage(err)})`,
         );
       }
 
       if (res.status === 200) {
         let body: unknown;
         try {
-          body = await res.json();
+          body = res.bodyText === null ? undefined : JSON.parse(res.bodyText);
         } catch {
-          return verifyAfterAmbiguousDispatch(
-            args,
-            prUrl,
-            token,
-            "GitHub answered HTTP 200 with an unreadable body",
-          );
+          body = undefined;
         }
         const { sha, merged, message } = (body ?? {}) as {
           sha?: unknown;
           merged?: unknown;
           message?: unknown;
         };
+        if (merged !== true) {
+          // a 200 that does not confirm the merge is malformed, not success
+          return verifyAfterAmbiguousDispatch(
+            args,
+            prUrl,
+            token,
+            "GitHub answered HTTP 200 without confirming the merge",
+          );
+        }
         return {
-          merged: merged === true,
+          merged: true,
           sha: typeof sha === "string" ? ledger.redact(sha) : "",
           // redact THEN truncate — same load-bearing order as
-          // readGitHubErrorMessage: cutting first could leave an
-          // unrecognizable fragment of an echoed credential
+          // githubErrorMessage: cutting first could leave an unrecognizable
+          // fragment of an echoed credential
           message: typeof message === "string" ? ledger.redact(message).slice(0, 300) : "",
         };
       }
-      if (res.status >= 500) {
-        // a gateway error can land after the backend applied the merge
-        return verifyAfterAmbiguousDispatch(args, prUrl, token, `GitHub answered HTTP ${res.status}`);
+      if (DOCUMENTED_REJECTION_STATUSES.has(res.status)) {
+        // received and refused by GitHub itself: definitively not merged
+        throw notPerformed(rejectionDetail(res, args));
       }
-      // every remaining status is a rejection: received, refused, not merged
-      throw notPerformed(await rejectionDetail(res, args));
+      // Everything else — 5xx, an intermediary's 408, any status the merge
+      // endpoint does not document — is NOT trusted to mean "did not run".
+      return verifyAfterAmbiguousDispatch(
+        args,
+        prUrl,
+        token,
+        `GitHub answered an unrecognized HTTP ${res.status}`,
+      );
+    },
+
+    async getPullRequestHead(args) {
+      // read-only, nothing dispatched — failures are plain errors for the
+      // proxy's fail-closed pinning step
+      const prUrl = prPath(args);
+      const token = await tokens.tokenFor(args.repo);
+      const pr = await fetchPullRequest(prUrl, token);
+      if (pr.merged) {
+        throw new Error(
+          `${args.owner}/${args.repo}#${args.pullNumber} is already merged — nothing to pin`,
+        );
+      }
+      if (pr.headSha === undefined || !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(pr.headSha)) {
+        throw new Error("GitHub's pull request response carried no usable head sha");
+      }
+      return ledger.redact(pr.headSha);
     },
   };
 }
