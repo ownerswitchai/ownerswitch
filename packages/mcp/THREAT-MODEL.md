@@ -435,10 +435,21 @@ private key** and mints **installation tokens** with it
   or the key**, and instead PERFORMS the merge itself after validating a
   control-plane-signed, single-use grant. It is the theft target now, and
   it is small, credential-only, and auditable in one sitting.
-- **The merge is authorized by evidence the gateway cannot forge.** A
+- **A merge needs the owner's ACTIVE approval, not their silence.** The
+  party that registers an owner-review window is the gateway, which shares
+  the agent's uid and whose device secret the agent can therefore forge —
+  so a window's mere existence proves nothing, and silence-approval would
+  let an agent's own registration release itself into a merge. The control
+  plane mints a merge grant ONLY when the owner actively approves the exact
+  pinned call through an owner SESSION (`POST /veto/:id decision=approve`) —
+  a token on the owner's device the agent cannot reach. Silence leaves a
+  merge pending forever; only a real "yes" moves it, and the grant binds
+  the kill epoch at approval so a window opened during a kill cannot outlive
+  it. This is the difference between the CP verifying an owner assertion and
+  the CP signing whatever the gateway claims.
+- **The merge is authorized by evidence the gateway cannot forge.** That
   **MergeGrant** (`packages/shared/src/merge-grant.ts`) is minted by the
-  CONTROL PLANE at owner-approval time (a veto window the owner saw
-  releasing in a live kill epoch), signed with a key
+  CONTROL PLANE at the owner's active approval, signed with a key
   (`OWNERSWITCH_GRANT_KEY`) shared ONLY with the broker — never in the
   gateway/agent environment, and that is ENFORCED, not assumed: the
   gateway refuses to start if the variable is present in its environment,
@@ -462,13 +473,16 @@ private key** and mints **installation tokens** with it
   plainly.** A read-only head sha (`pin-head` — public-ish, low value),
   and a merge ONLY if it also presents a currently-valid, unburned,
   owner-approved grant it cannot mint (the signing key is not in its
-  reach). It can never obtain a token or the key. Neither filesystem
-  permissions nor SO_PEERCRED would help — they cannot tell gateway from
-  agent within one uid — which is why the executing design removes the
-  thing worth stealing rather than trying to identify the caller. The
-  residual: a same-uid agent racing the gateway for a freshly-issued grant
-  could present it first, but the double single-use burn caps that at the
-  one merge the owner approved, with the args the owner approved. The
+  reach — and which is now minted only when the OWNER actively approves,
+  never on silence). It can never obtain a token or the key. Neither
+  filesystem permissions nor SO_PEERCRED would help — they cannot tell
+  gateway from agent within one uid — which is why the executing design
+  removes the thing worth stealing rather than trying to identify the
+  caller. The residual: a same-uid agent racing the gateway for a
+  freshly-issued grant could present it first, but that grant exists only
+  because the owner actively approved THAT exact call, and the double
+  single-use burn caps it at the one merge the owner approved, with the
+  args the owner approved. The
   **same-process mode** (key in the gateway, merges direct, no grant)
   still exists behind an explicit
   `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` acknowledgment — it
@@ -481,7 +495,27 @@ private key** and mints **installation tokens** with it
   gid after bind and refuses to serve on a mismatch with
   `OWNERSWITCH_BROKER_SOCKET_GID`; the deployment makes them agree with a
   setgid (02750) socket directory and/or by running the broker with that
-  gid.
+  gid. The socket directory must also be neither world- nor group-writable
+  (a group member that can write it could unlink the socket and bind its
+  own), which the broker enforces.
+- **The kill-state channel is authenticated, so fail-closed means closed
+  against an impostor.** The broker's live kill check does not trust the
+  unauthenticated loopback `/status`: it calls `GET /kill-state?nonce=…`
+  and requires an HMAC-signed, nonce-bound envelope (shared
+  `OWNERSWITCH_KILL_STATE_KEY`). If the isolated control plane stops, a
+  hostile local process can bind the unprivileged port and answer
+  "not killed" — but it cannot sign, and a replayed real answer carries a
+  stale nonce, so the broker reads KILLED. Without this, "unreachable ⇒
+  fail closed" is defeated by an impostor that makes the plane look
+  reachable while lying.
+- **The grant and kill-state keys are isolated three ways, and enforced.**
+  Each is ≥256 bits (short keys refused at startup), lives only in the
+  broker and a control plane running under its OWN uid (distinct from the
+  gateway/agent AND from the broker uid that owns the App PEM), is read
+  from a file into the process environment rather than passed on any
+  command line (argv is world-readable via `/proc`), and the gateway
+  REFUSES to start if it ever finds `OWNERSWITCH_GRANT_KEY` in its own
+  environment.
 - **The blast radius is configured, not coded.** An installation token
   is scoped at mint to ONE repository and
   `{ contents: write, pull_requests: read }`, and dies within an hour —

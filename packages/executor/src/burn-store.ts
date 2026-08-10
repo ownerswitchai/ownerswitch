@@ -2,15 +2,17 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 /**
  * JtiBurnStore — the broker's DURABLE, ATOMIC single-use ledger.
@@ -78,16 +80,56 @@ export interface BurnStoreOptions {
   now?: () => number;
   /** how long past a grant's expiry its record stays queryable; default 6h */
   retentionMs?: number;
+  /**
+   * The agent-reachable workspace the store must NOT live under — same rule
+   * as the App private key. When set, an (absolute) burnDir inside it is
+   * refused. A symlinked burnDir is refused regardless: a retargetable
+   * symlink could switch the store's namespace and resurrect spent grants.
+   */
+  workspaceDir?: string;
 }
 
 /** Records are tiny JSON; anything bigger is corruption, not a record. */
 const MAX_RECORD_BYTES = 16 * 1024;
 
-export function createJtiBurnStore(dir: string, opts: BurnStoreOptions = {}): JtiBurnStore {
+export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}): JtiBurnStore {
   const now = opts.now ?? Date.now;
   const retentionMs = opts.retentionMs ?? 6 * 60 * 60_000;
 
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Path stability BEFORE creating anything: a relative path addresses a
+  // different directory per cwd, and a store inside the agent's workspace is
+  // agent-writable — either lets the adversary delete records and replay
+  // spent grants. Same placement rule as the App private key.
+  if (!isAbsolute(rawDir)) {
+    throw new Error(
+      `burn store directory must be an absolute path, got "${rawDir}" — a relative path ` +
+        `silently addresses a different directory per working directory`,
+    );
+  }
+  if (opts.workspaceDir !== undefined) {
+    const workspace = resolve(opts.workspaceDir);
+    const rel = relative(workspace, resolve(rawDir));
+    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+      throw new Error(
+        `burn store directory "${rawDir}" is inside the agent workspace "${workspace}" — the ` +
+          `agent could delete burns and replay spent grants; place it outside the workspace`,
+      );
+    }
+  }
+  mkdirSync(rawDir, { recursive: true, mode: 0o700 });
+  // Refuse a symlinked final component: statSync would follow it, so a
+  // retargetable link could move the store's namespace after this check.
+  const linkStat = lstatSync(rawDir);
+  if (linkStat.isSymbolicLink()) {
+    throw new Error(
+      `burn store directory "${rawDir}" is a symlink — refusing to follow it; a retargetable ` +
+        `link could switch the store's namespace and un-burn grants`,
+    );
+  }
+  // Canonicalize and RETAIN the resolved real path; every later operation
+  // uses this, not the caller's string, so an ancestor swapped afterward
+  // cannot redirect reads/writes within a single run.
+  const dir = realpathSync(rawDir);
   assertBurnDirHardened(dir);
 
   // jti values come from VERIFIED grants (control-plane-authored), but the
@@ -95,20 +137,34 @@ export function createJtiBurnStore(dir: string, opts: BurnStoreOptions = {}): Jt
   const recordPath = (jti: string): string =>
     join(dir, `${createHash("sha256").update(jti, "utf8").digest("hex")}.json`);
 
-  function fsyncDirBestEffort(): void {
-    // Linux supports fsync on a directory fd (and the deployment doc says
-    // Linux); elsewhere this may throw — the file's own fsync already
-    // happened, so a directory-entry sync failure downgrades durability
-    // rather than correctness, and is tolerated.
+  // errnos that mean "this platform/fd cannot fsync a directory" — tolerated
+  // (the record file's own fsync is the primary barrier). Any OTHER failure
+  // is a real durability failure and must NOT be swallowed.
+  const DIR_FSYNC_UNSUPPORTED = new Set(["EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EBADF", "EPERM"]);
+
+  /**
+   * Fsync the directory so the newly-created record's ENTRY is durable — a
+   * file's own fsync does not commit its parent directory entry, so without
+   * this a crash could lose the burn and resurrect the jti. On Linux (the
+   * documented deployment) this succeeds; a genuine failure THROWS (the
+   * caller turns it into a refusal), because a burn that a crash could
+   * forget is not a burn. Only the specific "not supported on this fd type"
+   * errnos are tolerated, for non-Linux dev hosts.
+   */
+  function fsyncDir(): void {
+    let fd: number;
     try {
-      const fd = openSync(dir, "r");
-      try {
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-    } catch {
-      /* tolerated — see above */
+      fd = openSync(dir, "r");
+    } catch (err) {
+      if (DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) return;
+      throw err;
+    }
+    try {
+      fsyncSync(fd);
+    } catch (err) {
+      if (!DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
+    } finally {
+      closeSync(fd);
     }
   }
 
@@ -126,8 +182,13 @@ export function createJtiBurnStore(dir: string, opts: BurnStoreOptions = {}): Jt
     let text: string;
     try {
       text = readFileSync(path, { encoding: "utf8" });
-    } catch {
-      return undefined;
+    } catch (err) {
+      // A genuinely absent record is `undefined` (never burned here); a
+      // record that EXISTS but cannot be read is NOT "never presented" — it
+      // is a burn whose outcome is unknown, and must read that way, never as
+      // a clean miss.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      return { jti: "", expiresAt: 0, state: "unreadable", burnedAt: 0 };
     }
     if (text.length > MAX_RECORD_BYTES) return { jti: "", expiresAt: 0, state: "unreadable", burnedAt: 0 };
     try {
@@ -154,7 +215,15 @@ export function createJtiBurnStore(dir: string, opts: BurnStoreOptions = {}): Jt
           `the burn store could not persist the single-use burn (${err instanceof Error ? err.message : "write failed"}) — refusing to dispatch on a burn that a restart would forget`,
         );
       }
-      fsyncDirBestEffort();
+      // The record file is fsynced (writeRecord); now commit its directory
+      // ENTRY too, or the burn is not durable. A failure here refuses.
+      try {
+        fsyncDir();
+      } catch (err) {
+        throw new Error(
+          `the burn store could not durably commit the single-use burn (${err instanceof Error ? err.message : "dir fsync failed"}) — refusing to dispatch on a burn a crash could forget`,
+        );
+      }
       return "burned";
     },
 

@@ -26,6 +26,10 @@ const killStateFile =
 // (matching the broker's OWNERSWITCH_GRANT_KEY) to exercise the broker path;
 // unset, the control plane mints no grants and the broker deployment cannot run.
 const grantKey = process.env.OWNERSWITCH_GRANT_KEY;
+// The kill-state key that authenticates the broker's live kill-state channel
+// (matching the broker's OWNERSWITCH_KILL_STATE_KEY). Unset, /kill-state is
+// 501 and the broker cannot use its authenticated channel.
+const killStateKey = process.env.OWNERSWITCH_KILL_STATE_KEY;
 
 // dev: true — this is the quickstart instance; the kill-state path safety
 // checks that production enforces (absolute path, protected directory) are
@@ -35,6 +39,7 @@ const controlPlane = createControlPlane({
   killStateFile,
   dev: true,
   ...(grantKey !== undefined && grantKey !== "" ? { grantKey } : {}),
+  ...(killStateKey !== undefined && killStateKey !== "" ? { killStateKey } : {}),
 });
 const owner = createOwnerSession("owner-dev");
 

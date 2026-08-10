@@ -794,7 +794,7 @@ describe("review-time head pinning — server-derived, before the owner sees the
 });
 
 describe("the executing-broker grant flow", () => {
-  const GRANT_KEY = "grant-key-cp-and-broker";
+  const GRANT_KEY = "grant-key-cp-and-broker-padded-256bit";
 
   it("a released window's single-use signed grant reaches run() bound to the pinned args", async () => {
     const t = await startRoutedProxy({ grantKey: GRANT_KEY });

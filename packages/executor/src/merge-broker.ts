@@ -103,6 +103,14 @@ export interface MergeBrokerOptions {
    */
   burnDir: string;
   /**
+   * The agent-reachable workspace the burn directory must NOT live under —
+   * same rule as the App private key (github-app-key.ts). Passed EXPLICITLY
+   * so the boundary is checked against the real workspace, not this
+   * process's cwd. When set, an absolute burnDir inside it is refused at
+   * startup; a retargetable symlink is refused regardless.
+   */
+  agentWorkspace?: string;
+  /**
    * Repositories the broker will act on. undefined = any the installation
    * covers; set it in production so a compromised same-uid requester cannot
    * even ask about repos outside the deployment's intent.
@@ -157,6 +165,15 @@ type WireResponse =
 interface RequestPhase {
   /** true once the PUT is (about to be) in flight — outcome no longer "refused" */
   dispatched: boolean;
+  /**
+   * Set when the connection is abandoned (the per-connection timer fired)
+   * BEFORE dispatch. The merge() coroutine is not cancellable by the timer
+   * directly, so it checks this latch immediately before sending the PUT and
+   * aborts — otherwise a slow token mint could complete AFTER a "refused"
+   * timeout answer and still dispatch, exactly the false "not performed"
+   * this whole phase machinery exists to prevent.
+   */
+  abandoned: boolean;
   /** the burned grant's jti, for the in-doubt pointer in timeout messages */
   jti?: string;
 }
@@ -181,11 +198,20 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   if (grantKey === "") {
     throw new Error("merge broker requires a grant key (OWNERSWITCH_GRANT_KEY) — it trusts nothing without one");
   }
+  if (Buffer.byteLength(grantKey, "utf8") < 32) {
+    throw new Error(
+      "the merge broker's grant key is under 32 bytes — a merge-authorizing HMAC key must carry " +
+        "at least 256 bits of secret; generate one with `openssl rand -hex 32`",
+    );
+  }
 
-  // the durable single-use ledger — created (and its ownership/mode
+  // the durable single-use ledger — created (and its path/ownership/mode
   // verified) at construction so a misconfigured store refuses at startup,
   // not on the first merge
-  const burns: JtiBurnStore = createJtiBurnStore(options.burnDir, { now });
+  const burns: JtiBurnStore = createJtiBurnStore(options.burnDir, {
+    now,
+    ...(options.agentWorkspace !== undefined ? { workspaceDir: options.agentWorkspace } : {}),
+  });
 
   /** Fail-closed live kill state — an unreadable control plane reads as killed. */
   async function live(): Promise<LiveKillState> {
@@ -275,12 +301,20 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
       }
 
       // recheck ACROSS the mint (beforeDispatch): the token mint can take
-      // seconds; a kill, epoch change, or the grant's own EXPIRY landing
-      // during it aborts before anything is sent. The last statement flips
-      // the phase to dispatched — from that point a timeout is "unknown",
-      // never "refused", because the very next thing the client does is
-      // send the PUT.
+      // seconds; a kill, epoch change, the grant's own EXPIRY, or the
+      // CONNECTION BEING ABANDONED (the per-connection timer fired) landing
+      // during it aborts before anything is sent. The abandoned check is the
+      // cancellation latch: without it a timeout could answer "refused" and
+      // the mint could then complete and dispatch anyway. The last statement
+      // flips the phase to dispatched — from that point a timeout is
+      // "unknown", never "refused", because the very next thing the client
+      // does is send the PUT.
       const client = mergeClient(async () => {
+        if (phase.abandoned) {
+          throw new Error(
+            "the connection was abandoned before dispatch (client timed out) — not dispatched",
+          );
+        }
         const after = await live();
         if (after.killed || after.epoch !== before.epoch) {
           throw new Error("kill state changed during token minting");
@@ -359,14 +393,18 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   function handleConnection(socket: Socket): void {
     let buffer = "";
     let done = false;
-    const phase: RequestPhase = { dispatched: false };
-    // Phase-aware: before dispatch a timeout refuses (nothing was sent);
-    // once the PUT is in flight the honest answer is UNKNOWN — the merge
-    // may still land after this response, and the caller must never hear
-    // "safe to retry" while GitHub is executing. The dispatch itself is NOT
-    // cancelled: it runs to completion and records its outcome, so an
-    // {op:"outcome"} query with the jti below resolves the doubt.
+    const phase: RequestPhase = { dispatched: false, abandoned: false };
+    // Phase-aware: before dispatch a timeout refuses (nothing was sent) AND
+    // latches `abandoned` so the merge() coroutine aborts at its
+    // pre-dispatch check rather than sending a PUT after we already
+    // answered. Once the PUT is in flight the honest answer is UNKNOWN — the
+    // merge may still land after this response, and the caller must never
+    // hear "safe to retry" while GitHub is executing; that dispatch is NOT
+    // cancelled (it is already gone), it runs to completion and records its
+    // outcome, so an {op:"outcome"} query with the jti below resolves the
+    // doubt.
     const timer = setTimeout(() => {
+      phase.abandoned = true;
       if (phase.dispatched) {
         finish({
           ok: false,
@@ -548,6 +586,18 @@ function assertSocketDirHardened(socketPath: string): void {
     throw new Error(
       `merge broker socket directory "${dir}" grants world access (mode ` +
         `${(stat.mode & 0o777).toString(8)}) — chmod 02750 it; world access would let any uid request merges`,
+    );
+  }
+  // Group access is the deployment's allow-list knob, but GROUP WRITE is
+  // not: a group member that can write the directory can unlink the socket
+  // and bind its own in its place (the connect-time boundary is the
+  // directory's write permission, not the socket inode's). The intended
+  // mode is 02750 — group r-x, no group write.
+  if ((stat.mode & 0o020) !== 0) {
+    throw new Error(
+      `merge broker socket directory "${dir}" is group-writable (mode ` +
+        `${(stat.mode & 0o777).toString(8)}) — chmod 02750 it; a group member that can write the ` +
+        `directory could replace the socket with its own and impersonate the broker`,
     );
   }
 }

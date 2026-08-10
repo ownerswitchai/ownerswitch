@@ -39,66 +39,92 @@ The point of doing this properly in a test run is that the run rehearses
 the deployment rule: the key belongs to a uid the gateway and agent do
 NOT share, and the broker performs the merge — it never hands out a token.
 
-Create the broker user and the shared socket group (the GATEWAY's user
-joins the group so it can connect; the broker runs WITH that group as its
-effective gid so the socket inherits it):
+Create **three** distinct uids and two groups. The broker owns the App PEM
+and the burn store; the control plane runs as a SEPARATE uid (it must not
+be able to read the App PEM); the gateway is your own user. A secrets
+group lets the broker and the control plane — and ONLY those two — read the
+shared HMAC keys.
 
 ```sh
 sudo useradd --system --shell /usr/sbin/nologin oswitch-broker
-sudo groupadd oswitch && sudo usermod -aG oswitch "$(id -un)"   # gateway's user in the socket group
+sudo useradd --system --shell /usr/sbin/nologin oswitch-cp       # control plane: its OWN uid
+sudo groupadd oswitch && sudo usermod -aG oswitch "$(id -un)"    # gateway's user in the socket group
 sudo usermod -aG oswitch oswitch-broker                          # broker in it too, for its egid
+sudo groupadd oswitch-secrets                                    # holds the shared HMAC keys
+sudo usermod -aG oswitch-secrets oswitch-broker
+sudo usermod -aG oswitch-secrets oswitch-cp                      # NOT the gateway/agent user
+
 sudo mkdir -p /etc/ownerswitch
 sudo mv ~/Downloads/<app-name>.*.private-key.pem /etc/ownerswitch/github-app.pem
-sudo chown oswitch-broker /etc/ownerswitch/github-app.pem
+sudo chown oswitch-broker /etc/ownerswitch/github-app.pem        # broker only — CP cannot read it
 sudo chmod 600 /etc/ownerswitch/github-app.pem
 # setgid (02750) socket dir so the socket inode inherits the oswitch group:
 sudo install -d -o oswitch-broker -g oswitch -m 02750 /run/ownerswitch
 OSWITCH_GID=$(getent group oswitch | cut -d: -f3)
-```
-
-Pick a strong random **grant key** — the control plane and the broker
-share it, and NOTHING else may: `GRANT_KEY=$(openssl rand -hex 32)`.
-Handle it accordingly: never `export` it in a shell that will also start
-the gateway (the gateway REFUSES to start when it sees
-`OWNERSWITCH_GRANT_KEY` — that refusal is one of the checks below), and
-give the control-plane process the SAME uid/host isolation from the agent
-as the broker — a control plane the agent's uid can read defeats the key.
-
-Create the broker's durable single-use burn directory (burns must survive
-a broker restart, so they live on disk, broker-owned, mode 0700):
-
-```sh
+# durable burn store — broker-owned, 0700, OUTSIDE the agent workspace:
 sudo install -d -o oswitch-broker -g oswitch-broker -m 0700 /var/lib/ownerswitch/burns
 ```
 
-Start the broker under its own uid, with the shared group as its egid
-(`sg oswitch`), so the socket ends up gid `oswitch`:
+Two shared **HMAC keys**, each ≥256 bits — the `grant` key authorizes
+merges, the `kill-state` key authenticates the broker's live kill check.
+Both belong to the broker AND the control plane and to NOTHING else. Write
+them to root-owned, `oswitch-secrets`-readable files (mode 0640) — never to
+a shell the gateway shares, and never onto any command line:
+
+```sh
+umask 077
+openssl rand -hex 32 | sudo tee /etc/ownerswitch/grant.key      >/dev/null
+openssl rand -hex 32 | sudo tee /etc/ownerswitch/kill-state.key  >/dev/null
+sudo chgrp oswitch-secrets /etc/ownerswitch/grant.key /etc/ownerswitch/kill-state.key
+sudo chmod 0640           /etc/ownerswitch/grant.key /etc/ownerswitch/kill-state.key
+```
+
+Why files, not `-e KEY=…`/argv: a command line is world-readable through
+`/proc/<pid>/cmdline` and `ps`, so a secret in argv leaks to the same uid
+the whole design is defending against. The service reads each key from its
+file into its OWN environment at launch — the secret lands in
+`/proc/<pid>/environ` (readable only by that service's uid), and the only
+argument any process sees is the file PATH:
 
 ```sh
 sudo -u oswitch-broker sg oswitch -c '
-  OWNERSWITCH_GITHUB_APP_ID=<app id> \
-  OWNERSWITCH_GITHUB_APP_INSTALLATION_ID=<installation id> \
-  OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ownerswitch/github-app.pem \
-  OWNERSWITCH_AGENT_WORKSPACE=<the agent'"'"'s workspace dir> \
-  OWNERSWITCH_GRANT_KEY='"$GRANT_KEY"' \
-  OWNERSWITCH_BROKER_SOCKET=/run/ownerswitch/broker.sock \
-  OWNERSWITCH_BROKER_SOCKET_GID='"$OSWITCH_GID"' \
-  OWNERSWITCH_BROKER_BURN_DIR=/var/lib/ownerswitch/burns \
-  OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test \
-  OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:8787 \
-  ownerswitch-merge-broker'
+  set -a
+  OWNERSWITCH_GRANT_KEY="$(cat /etc/ownerswitch/grant.key)"
+  OWNERSWITCH_KILL_STATE_KEY="$(cat /etc/ownerswitch/kill-state.key)"
+  OWNERSWITCH_GITHUB_APP_ID=<app id>
+  OWNERSWITCH_GITHUB_APP_INSTALLATION_ID=<installation id>
+  OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ownerswitch/github-app.pem
+  OWNERSWITCH_AGENT_WORKSPACE=<the agent workspace dir>
+  OWNERSWITCH_BROKER_SOCKET=/run/ownerswitch/broker.sock
+  OWNERSWITCH_BROKER_SOCKET_GID='"$OSWITCH_GID"'
+  OWNERSWITCH_BROKER_BURN_DIR=/var/lib/ownerswitch/burns
+  OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test
+  OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:8787
+  set +a
+  exec ownerswitch-merge-broker'
 ```
 
-The loader refuses a relative key path, a path under the given agent
-workspace, a symlink, group/world-readable modes, another user's file,
-and non-RSA content; the broker refuses a world-accessible socket
-directory AND refuses to serve if the socket's gid is not
-`OWNERSWITCH_BROKER_SOCKET_GID`. If it won't start, the error names the
-failing check.
+(In production this is a systemd unit with `User=oswitch-broker`,
+`SupplementaryGroups=oswitch`, and `LoadCredential=`/`EnvironmentFile=` for
+the keys — same property: keys in the environment, never in argv.)
 
-Sanity-check the isolation while you're here (BOTH must hold):
-- `sudo -u "$(id -un)" cat /etc/ownerswitch/github-app.pem` must FAIL
-  (permission denied) — the gateway's uid cannot read the key.
+The loader refuses a relative key path, a path under the given agent
+workspace, a symlink, group/world-readable modes, another user's file, and
+non-RSA content; the broker refuses a short (<256-bit) grant key, a
+world- or group-writable socket directory, and refuses to serve if the
+socket's gid is not `OWNERSWITCH_BROKER_SOCKET_GID`; the burn store refuses
+a relative path, a symlink, or a path inside the agent workspace. If it
+won't start, the error names the failing check.
+
+Sanity-check the isolation while you're here (ALL must hold):
+- `sudo -u "$(id -un)" cat /etc/ownerswitch/github-app.pem` must FAIL —
+  the gateway's uid cannot read the App key.
+- `sudo -u "$(id -un)" cat /etc/ownerswitch/grant.key` must FAIL — the
+  gateway's uid cannot read the HMAC keys (so it cannot forge a grant even
+  if it wanted to; the gateway also refuses to START if the key is in its
+  env).
+- `sudo -u oswitch-cp cat /etc/ownerswitch/github-app.pem` must FAIL — the
+  control plane's uid cannot read the App PEM (distinct-uid isolation).
 - `stat -c '%G %a' /run/ownerswitch/broker.sock` should show `oswitch
   660` — the gateway's user reaches it via the group, no wider.
 
@@ -117,28 +143,48 @@ OwnerSwitch pins it server-side.
 
 ## 4. Run the control plane and the gateway
 
-Start the dev control plane **with the same grant key** the broker has,
-passed inline to THAT process only
-(`OWNERSWITCH_GRANT_KEY="$GRANT_KEY" pnpm --filter @ownerswitchai/mcp
-dev:control-plane`), so it mints signed grants the broker will accept. In
-this live run the control plane MUST get the same isolation as the
-broker: run it under a uid the gateway/agent does not share (e.g. `sudo
--u oswitch-broker …` or a fourth dedicated user) — the grant key is
-exactly as sensitive as the App private key, because whoever reads it can
-mint approvals. Then launch the gateway with a config whose policy puts
-`github.merge_pr` in the **`veto` lane** (an owner-gated lane is required
-in broker mode) and whose `executorRoutes` maps it to
-`{ "connector": "github", "operation": "merge_pull_request" }`
-(see `packages/mcp/README.md`), plus:
+Start the dev control plane as its OWN uid (`oswitch-cp`), reading BOTH
+shared keys from their files into its environment — never argv. It uses
+the grant key to sign approvals and the kill-state key to sign the
+broker's kill-state channel:
+
+```sh
+sudo -u oswitch-cp sg oswitch-secrets -c '
+  set -a
+  OWNERSWITCH_GRANT_KEY="$(cat /etc/ownerswitch/grant.key)"
+  OWNERSWITCH_KILL_STATE_KEY="$(cat /etc/ownerswitch/kill-state.key)"
+  set +a
+  exec pnpm --filter @ownerswitchai/mcp dev:control-plane'
+```
+
+The control plane runs where the agent's uid cannot read its environment,
+so the keys it holds are out of the agent's reach — the same isolation the
+broker gets, and the reason it is a distinct uid from both the gateway and
+(so it cannot read the App PEM) the broker.
+
+Then launch the gateway with a config whose policy puts `github.merge_pr`
+in an **owner-gated lane** and whose `executorRoutes` maps it to
+`{ "connector": "github", "operation": "merge_pull_request" }` (see
+`packages/mcp/README.md`), plus:
 
 ```sh
 export OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET=/run/ownerswitch/broker.sock
 ```
 
-The gateway needs NO GitHub credential and NO grant key. Its startup line
-must say
+The gateway needs NO GitHub credential and NO HMAC key — and REFUSES to
+start if `OWNERSWITCH_GRANT_KEY` is present in its environment (a key the
+gateway can read, the same-uid agent can read, and with it forge grants).
+Its startup line must say
 `github connector: live via EXECUTING merge broker at /run/ownerswitch/broker.sock` —
 `not configured` means the variable didn't resolve.
+
+**A merge is authorized by the owner's ACTIVE approval, not by silence.**
+The grant-eligible lane no longer releases a merge on a quiet timeout: the
+control plane mints the signed grant only when the owner actively approves
+the exact pinned call through an owner SESSION (the phone app / an owner
+bearer token), which the same-uid agent cannot forge. Silence leaves the
+call pending indefinitely; only a real owner "yes" — or a "no" (veto) —
+moves it.
 
 ## 5. The live merge
 
@@ -151,10 +197,14 @@ NO sha argument; the pin is OwnerSwitch's job:
     "mergeMethod": "squash" } }
 ```
 
-1. First call → refused `-32052` (veto window open). **Inspect the
+1. First call → refused `-32052` (owner-review window open). **Inspect the
    window the owner sees**: its arguments must carry `expectedHeadSha`
    equal to the head SHA you noted — server-derived, agent-untouched.
-2. Release the window the way the owner would.
+2. **Actively approve** the exact window as the owner would — an
+   owner-session-authenticated approval (POST `/veto/<id>` with
+   `{"decision":"approve"}` and the owner bearer token). Confirm that
+   letting it sit WITHOUT approving never merges: a quiet poll stays
+   `pending`, no grant is minted.
 3. Call again → the merge runs. Expect a result like
    `{ "resourceId": "github:pr:<you>/ownerswitch-live-test#1",
       "detail": { "merged": true, "sha": "<merge commit>", "message": "…" } }`.
@@ -180,6 +230,20 @@ NO sha argument; the pin is OwnerSwitch's job:
   `sudo -u nobody sh -c 'printf "{}\n" | nc -U /run/ownerswitch/broker.sock'`
   must FAIL with a permission error — connect(2) is denied by the socket's
   0660/group. (This is the peer boundary the kernel actually enforces.)
+- **An impostor kill-state server cannot fool the broker.** Stop the real
+  control plane, then, as any local uid, bind `127.0.0.1:8787` with a
+  process that answers `GET /kill-state` with
+  `{"killed":false,"epoch":<the epoch a captured grant needs>}` and a
+  bogus `sig`. Present a still-live grant to the broker → it must REFUSE
+  ("kill switch engaged (or control plane unreachable)"): the signature
+  does not verify under the shared kill-state key, so the impostor's
+  "not killed" is rejected and the broker fails closed. Restart the real
+  control plane afterward.
+- **A merge cannot be approved while killed, and the approval does not
+  survive restore.** Engage the kill, then attempt the owner approval →
+  `409` ("cannot approve while the kill switch is engaged"). Restore, and
+  confirm the window must be approved AGAIN (its pre-restore state carried
+  no grant): a kill always forces fresh post-restore review.
 - **Agent-supplied sha refused:** call the tool with an added
   `"expectedHeadSha": "<any 40-hex>"` → refused `-32056` with
   `refusalCode: "invalid-args"`, no veto window opened, GitHub never
@@ -192,14 +256,14 @@ NO sha argument; the pin is OwnerSwitch's job:
   (`head-pin-failed`, "already merged — nothing to pin") before any
   owner review opens. Nothing merges twice.
 - **Moved head:** open a second PR, let its window open, note the pinned
-  sha, then push another commit to its branch. Release the window and
-  call again → a FRESH veto window opens for the new head (the released
-  approval never merges the moved branch). Veto the fresh window to
+  sha, then push another commit to its branch. Approve the window and
+  call again → a FRESH owner-review window opens for the new head (the
+  approved grant never merges the moved branch). Veto the fresh window to
   finish without merging.
 - **Allow lane refused:** temporarily move `github.merge_pr` to the
   `allow` lane and call it → refused `-32056`
   `refusalCode: "owner-grant-required"`, nothing runs. Put it back in the
-  veto lane.
+  owner-gated lane.
 - **Kill gate at the broker:** engage the kill switch, then call the
   tool → the pin read fails closed (`head-pin-failed` — the broker
   refuses: "kill switch engaged"). Restore afterwards.
@@ -222,22 +286,31 @@ Then delete the throwaway repo, or leave it for the next run.
 ## What a green run proves
 
 - The end-to-end path is real: agent call → policy lane → review-time
-  head pin → owner decision over the pinned args → control-plane-signed
-  grant → broker validates it independently and PERFORMS the merge with a
-  token that never crossed the socket.
-- The uid isolation holds as deployed: the gateway's uid cannot read the
-  key file (step 2's sanity check), yet merges work — the key never
-  entered the gateway, and neither did a token.
+  head pin → the owner's ACTIVE approval over the pinned args →
+  control-plane-signed grant → broker validates it independently and
+  PERFORMS the merge with a token that never crossed the socket.
+- Silence never merges: a grant-eligible window left unapproved stayed
+  pending and minted nothing; only the owner's session-authenticated "yes"
+  produced a grant.
+- The uid isolation holds as deployed, three ways: the gateway's uid
+  cannot read the App PEM or the HMAC keys, and the control plane's uid
+  cannot read the App PEM — yet merges work, with no key and no token ever
+  entering the gateway.
 - The socket hands out results, never authority: a direct client asking
   for a token gets nothing, a forged grant is refused, and a non-group
   uid cannot even connect.
-- The provisioning recipe works as written: broker user, setgid socket
-  directory, verified socket gid, key placement checks, repo allow-list,
-  the agent-workspace placement argument, the shared grant key.
+- The kill channel is authenticated: an impostor that binds the loopback
+  port after the control plane stops cannot fake "not killed" — its
+  unsigned answer is rejected and the broker fails closed.
+- The provisioning recipe works as written: three uids, the secrets group,
+  setgid socket directory, verified socket gid, keys read from files (never
+  argv), key placement checks, the durable burn directory, repo allow-list.
 - The pin is server-derived end to end and the schema is enforced: the
   owner-facing window carried the real head sha, an agent-supplied sha
   and an unknown field were both refused, and a moved head re-opened
   review instead of merging.
+- Single-use is durable: the burn survived a broker restart, so one
+  approval yielded exactly one merge even across a restart.
 - The agent-visible surface (results, refusals, logs) carried no
   credential during a real run with real errors.
 

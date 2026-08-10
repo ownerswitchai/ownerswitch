@@ -381,13 +381,22 @@ authority. It hands out a *result*.
 **How a merge is authorized — the broker validates independently, trusting
 nothing the gateway says.** The evidence is a **MergeGrant**
 (`packages/shared/src/merge-grant.ts`):
-- **Who mints it:** the CONTROL PLANE, at owner-approval time — the moment
-  a veto window the owner was shown releases while its kill epoch is
-  current (`server.ts` `getVeto`). Not the gateway: within one uid the
-  gateway can hold no secret the agent cannot read, so nothing the gateway
-  knows can authorize a merge. The grant is signed with a key
-  (`OWNERSWITCH_GRANT_KEY`) the control plane shares ONLY with the broker
-  — never in the gateway/agent environment.
+- **Who mints it:** the CONTROL PLANE, at the moment the owner ACTIVELY
+  APPROVES the exact call — an owner-session-authenticated approval of the
+  window (`POST /veto/:id` `decision=approve`), NOT a quiet timeout
+  (`server.ts` `getVeto`). This is the round-3 fix: a merge is
+  grant-eligible only through a positive owner "yes", because the party
+  that REGISTERS a window is untrusted under the same-uid model (it can
+  forge the gateway's device secret), so silence-approval would let the
+  agent's own registration release itself. An owner session is a token on
+  the owner's device the agent cannot reach; requiring it is what makes the
+  grant a real owner decision rather than a laundered gateway assertion.
+  Not the gateway: within one uid the gateway can hold no secret the agent
+  cannot read, so nothing the gateway knows can authorize a merge. The
+  grant is signed with a key (`OWNERSWITCH_GRANT_KEY`) the control plane
+  shares ONLY with the broker — never in the gateway/agent environment, and
+  its `killEpoch` is the epoch AT APPROVAL, so a window registered during a
+  kill cannot become authority that outlives the kill.
 - **What is inside it:** the exact tool call the owner reviewed (tool,
   agentId, canonical args), the SIGNED PURPOSE the window was registered
   under (`connector` + `operation`, plus the gateway's authorization-world
@@ -463,6 +472,17 @@ anything is sent). Killed, or control plane unreachable, means nothing acts.
 What a kill does NOT do is revoke a token already on GitHub's side of a
 dispatched call (there is none held anywhere else) — the in-flight boundary
 is unchanged.
+
+That kill check is only as trustworthy as the channel it runs over, so the
+channel is AUTHENTICATED (`signed-kill-state.ts`). The broker does not poll
+the unauthenticated `/status`; it calls `GET /kill-state?nonce=<fresh>` and
+requires an HMAC-signed envelope (shared `OWNERSWITCH_KILL_STATE_KEY`) over
+{killed, epoch, nonce, expiresAt}. This closes an impersonation hole: if
+the isolated control plane stops, a hostile local process can bind the
+unprivileged loopback port and answer `{killed:false}` — but it cannot
+sign, and a replayed real answer carries a stale nonce, so every unforged
+or stale answer reads as KILLED. Fail-closed means "closed against an
+impostor," not merely "closed when the socket refuses."
 
 A **single-process mode** exists for deployments that genuinely separate
 the gateway's uid from the agent's by other means (or accept the risk):

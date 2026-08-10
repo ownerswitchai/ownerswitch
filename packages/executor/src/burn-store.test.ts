@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -61,5 +61,29 @@ describe("createJtiBurnStore", () => {
     createJtiBurnStore(dir, { now: () => NOW }); // creates 0700
     chmodSync(dir, 0o770);
     expect(() => createJtiBurnStore(dir, { now: () => NOW })).toThrowError(/group or world access/);
+  });
+
+  it("refuses a relative path — a per-cwd namespace is not a durable boundary", () => {
+    expect(() => createJtiBurnStore("relative/burns", { now: () => NOW })).toThrowError(/absolute/);
+  });
+
+  it("refuses a burn dir inside the agent workspace — the agent could delete burns", () => {
+    const workspace = join(root, "ws");
+    mkdirSync(workspace, { recursive: true });
+    const inside = join(workspace, "burns");
+    expect(() =>
+      createJtiBurnStore(inside, { now: () => NOW, workspaceDir: workspace }),
+    ).toThrowError(/inside the agent workspace/);
+    // a sibling of the workspace is fine
+    const outside = join(root, "outside-burns");
+    expect(() => createJtiBurnStore(outside, { now: () => NOW, workspaceDir: workspace })).not.toThrow();
+  });
+
+  it("refuses a symlinked burn directory — a retargetable link could un-burn grants", () => {
+    const real = join(root, "real-burns");
+    mkdirSync(real, { recursive: true, mode: 0o700 });
+    const link = join(root, "linked-burns");
+    symlinkSync(real, link);
+    expect(() => createJtiBurnStore(link, { now: () => NOW })).toThrowError(/symlink/);
   });
 });

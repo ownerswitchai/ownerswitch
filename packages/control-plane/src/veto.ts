@@ -58,6 +58,9 @@ export class VetoWindow {
   private delivered = false;
   private deadline: number;
   private releasedAtMs: number | null = null;
+  private approvedByOwner: string | null = null;
+  private approvedAtMs: number | null = null;
+  private approvalEpochValue: number | null = null;
   private readonly extensionMs: number;
   private readonly now: () => number;
   readonly purpose: VetoPurpose | undefined;
@@ -103,6 +106,26 @@ export class VetoWindow {
     this.vetoedBy = by;
   }
 
+  /**
+   * The owner ACTIVELY approves this call — the CP-verifiable assertion the
+   * merge lane requires (see server.ts). Unlike a veto, this is a positive
+   * "yes" the agent cannot manufacture: it rides an owner SESSION (a token
+   * on the owner's device), not the gateway's device secret, so a same-uid
+   * agent that can forge a registration still cannot forge THIS. Silence
+   * never produces it; a merge grant is minted only after it. `epoch` is
+   * the kill epoch in force AT APPROVAL, captured here and signed into the
+   * grant — a window registered during a kill cannot be approved (the
+   * server refuses while killed), so an approval always binds a live,
+   * post-restore epoch, never a stale killed one.
+   */
+  approve(by: string, epoch: number): void {
+    if (this.status === "vetoed") throw new Error("cannot approve a vetoed window");
+    if (this.approvedByOwner !== null) throw new Error("window already approved");
+    this.approvedByOwner = by;
+    this.approvedAtMs = this.now();
+    this.approvalEpochValue = epoch;
+  }
+
   /** Advance the state machine; call on a timer or before executing. */
   tick(): VetoStatus {
     if (this.status !== "pending" && this.status !== "extended") return this.status;
@@ -132,5 +155,20 @@ export class VetoWindow {
   /** When silence became approval (the deadline), or null while unreleased. */
   get releasedAt(): number | null {
     return this.releasedAtMs;
+  }
+
+  /** The owner who actively approved, or null. */
+  get approvedBy(): string | null {
+    return this.approvedByOwner;
+  }
+
+  /** When the owner actively approved (ms), or null. Anchors grant expiry. */
+  get approvedAt(): number | null {
+    return this.approvedAtMs;
+  }
+
+  /** The kill epoch in force when the owner approved, or null. */
+  get approvalEpoch(): number | null {
+    return this.approvalEpochValue;
   }
 }

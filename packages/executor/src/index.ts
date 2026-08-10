@@ -7,6 +7,8 @@ export type { ActionTicket } from "./ticket.js";
 
 export { Executor, refuseTicket } from "./executor.js";
 export { liveKillStateFromControlPlane } from "./live-kill-state.js";
+export { signedLiveKillStateFromControlPlane } from "./signed-kill-state.js";
+export type { SignedKillStateOptions } from "./signed-kill-state.js";
 export type {
   ExecutionContext,
   ExecutionOutcome,

@@ -29,7 +29,7 @@ import { createSecretLedger } from "./secret-ledger.js";
  * call anywhere.
  */
 
-const GRANT_KEY = "grant-key-shared-cp-and-broker";
+const GRANT_KEY = "grant-key-shared-cp-and-broker-256b";
 const TOKEN = "ghs_installation_token_never_leaves_the_broker";
 const HEAD_SHA = "a".repeat(40);
 const NOW = 1_800_000_000_000;
@@ -415,16 +415,20 @@ describe("createMergeBroker — the executing broker", () => {
     expect(outcome).toMatchObject({ ok: true, record: { state: "performed", merged: true } });
   });
 
-  it("before dispatch its timeout is still a refusal — nothing was sent", async () => {
-    // the token mint hangs past the budget; dispatch never starts
+  it("CANCELLATION LATCH: a pre-dispatch timeout refuses AND no PUT is sent after the mint finishes", async () => {
+    // the token mint hangs past the budget; the timer fires "refused" while
+    // the mint is still running. The bug this guards: when the mint then
+    // completes, beforeDispatch must see the connection was abandoned and
+    // NOT send the PUT. Assert both the refusal AND — after the mint has had
+    // ample time to finish — that ZERO merges ever went out.
     const tokens: InstallationTokenSource = {
       tokenFor: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        await new Promise((resolve) => setTimeout(resolve, 800));
         return TOKEN;
       },
     };
     const github = fakeGitHub();
-    const socketPath = await startBroker({ github, tokens, requestTimeoutMs: 300 });
+    const socketPath = await startBroker({ github, tokens, requestTimeoutMs: 200 });
     const res = JSON.parse(
       await rawExchange(socketPath, `${JSON.stringify({ op: "merge", grant: grant(), args: MERGE_ARGS })}\n`),
     );
@@ -433,7 +437,10 @@ describe("createMergeBroker — the executing broker", () => {
       kind: "refused",
       error: expect.stringContaining("before dispatch"),
     });
-    await new Promise((resolve) => setTimeout(resolve, 1_400)); // let the mint finish before teardown
+    // wait well past the mint's completion, then prove the dispatch was
+    // cancelled — the merge PUT must never have been sent
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
   });
 
   it("answers {op:'outcome'} from the burn record — and refuses an unknown jti", async () => {
@@ -549,6 +556,32 @@ describe("createMergeBroker — the executing broker", () => {
         fetchLiveKillState: alive,
       }),
     ).toThrowError(/grant key/);
+  });
+
+  it("refuses a grant key under 256 bits — a weak merge-authorizing key is refused at startup", () => {
+    expect(() =>
+      createMergeBroker({
+        tokens: { tokenFor: async () => TOKEN },
+        ledger: createSecretLedger(),
+        grantKey: "too-short-key", // < 32 bytes
+        burnDir: join(dir, "burns"),
+        fetchLiveKillState: alive,
+      }),
+    ).toThrowError(/256 bits|32 bytes/);
+  });
+
+  it("refuses a GROUP-WRITABLE socket directory — a group member could replace the socket", async () => {
+    chmodSync(dir, 0o770); // group write, no world access
+    broker = createMergeBroker({
+      tokens: { tokenFor: async () => TOKEN },
+      ledger: createSecretLedger(),
+      grantKey: GRANT_KEY,
+      burnDir: join(dir, "burns"),
+      fetchLiveKillState: alive,
+    });
+    await expect(broker.listen(join(dir, "b.sock"))).rejects.toThrowError(/group-writable/);
+    broker = undefined;
+    chmodSync(dir, 0o750);
   });
 });
 

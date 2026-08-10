@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -122,13 +122,25 @@ export interface ControlPlaneOptions {
    */
   grantKey?: string;
   /**
-   * MergeGrant lifetime in ms, measured FROM THE RELEASE MOMENT (the veto
-   * deadline that silence turned into approval), not from whenever the
-   * grant is first fetched; default 2 min (minutes, not hours). A release
-   * that sits unread past this window is served "spent" — it never becomes
-   * a fresh capability later.
+   * MergeGrant lifetime in ms, measured FROM THE APPROVAL MOMENT (the
+   * owner's active approval), not from whenever the grant is first
+   * fetched; default 2 min (minutes, not hours). An approval that sits
+   * unread past this window is served "spent" — it never becomes a fresh
+   * capability later.
    */
   grantTtlMs?: number;
+  /**
+   * The HMAC key that AUTHENTICATES the broker's live kill-state channel
+   * (`GET /kill-state`). When set, the control plane answers a
+   * nonce-carrying kill-state request with a SIGNED envelope the broker
+   * verifies against the same key — so a hostile local process that binds
+   * this port after the real control plane stops cannot answer
+   * `{killed:false}` and defeat the broker's fail-closed check. Distinct
+   * from the grant key (different job, different blast radius) and shared
+   * ONLY with the broker. Absent → `/kill-state` is 501 and the broker
+   * must fall back to `/status`, which is unauthenticated.
+   */
+  killStateKey?: string;
 }
 
 /** Default kill-state location IN DEV MODE, resolved against the working directory. */
@@ -308,6 +320,25 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   } else {
     killStateFile = guardKillStatePath(opts.killStateFile);
   }
+  // A merge-authorizing HMAC key must carry real entropy: whoever holds it
+  // mints owner approvals. Refuse a weak one at startup rather than sign
+  // with it. (The kill-state key gets the same floor.)
+  if (opts.grantKey !== undefined && opts.grantKey !== "" && Buffer.byteLength(opts.grantKey, "utf8") < 32) {
+    throw new Error(
+      "OWNERSWITCH_GRANT_KEY is under 32 bytes — a merge-authorizing HMAC key must carry at " +
+        "least 256 bits of secret; generate one with `openssl rand -hex 32`",
+    );
+  }
+  if (
+    opts.killStateKey !== undefined &&
+    opts.killStateKey !== "" &&
+    Buffer.byteLength(opts.killStateKey, "utf8") < 32
+  ) {
+    throw new Error(
+      "OWNERSWITCH_KILL_STATE_KEY is under 32 bytes — it authenticates the kill-state channel " +
+        "and must carry at least 256 bits of secret; generate one with `openssl rand -hex 32`",
+    );
+  }
   const killSwitch = new KillSwitch(
     now,
     killStateFile === undefined ? {} : { store: new KillStateFileStore(killStateFile) },
@@ -372,6 +403,42 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * that its approval predates a kill even after the system has since been
    * restored, and only a value that never resets can do that.
    */
+  // How long a signed kill-state envelope is valid — short, since the broker
+  // and control plane share a host (loopback) and thus a clock. The nonce
+  // already defeats replay; this bounds it further.
+  const KILL_STATE_TTL_MS = 5_000;
+
+  /**
+   * The AUTHENTICATED kill-state channel for the broker (blocker: an
+   * unauthenticated loopback `/status` can be impersonated by a hostile
+   * local process that binds the port after the real control plane stops,
+   * answering `{killed:false}` and defeating fail-closed). The caller sends
+   * a fresh `nonce`; the response echoes it and is HMAC-signed over
+   * {killed, epoch, nonce, expiresAt} with the shared kill-state key. An
+   * impostor without the key cannot forge the signature, and a replayed
+   * real response carries a stale nonce the caller will reject. `epoch` is
+   * always included (killed or not), same as `/status`.
+   */
+  function getSignedKillState(reqUrl: URL, res: ServerResponse): void {
+    if (opts.killStateKey === undefined || opts.killStateKey === "") {
+      sendJson(res, 501, { error: "signed kill-state channel is not configured" });
+      return;
+    }
+    const nonce = reqUrl.searchParams.get("nonce");
+    if (nonce === null || nonce === "" || nonce.length > 128) {
+      sendJson(res, 400, { error: "kill-state requires a nonce (1–128 chars)" });
+      return;
+    }
+    const payload = {
+      killed: killSwitch.killed,
+      epoch: killSwitch.epoch,
+      nonce,
+      expiresAt: now() + KILL_STATE_TTL_MS,
+    };
+    const sig = createHmac("sha256", opts.killStateKey).update(canonicalJson(payload)).digest("hex");
+    sendJson(res, 200, { ...payload, sig, ...degradedFields() });
+  }
+
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
       sendJson(res, 200, { killed: false, epoch: killSwitch.epoch, ...degradedFields() });
@@ -573,8 +640,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   async function postVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
-    // A veto is a stop, but it names an owner — so it stays authenticated,
-    // and the session (not the body) says who vetoed.
+    // Both a veto (stop) and an approval (the merge lane's active "yes") name
+    // an owner, so both stay authenticated by an owner SESSION — a token on
+    // the owner's device, NOT the gateway's device secret. That is exactly
+    // why an approval is a boundary a same-uid agent cannot cross: it can
+    // forge a registration (device secret), but not the owner's session.
+    // The session, not the body, says who acted; the body carries only the
+    // decision.
     const session = ownerSessionFrom(req);
     if (session === null) {
       sendUnauthorized(res);
@@ -585,7 +657,45 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    parseJsonBody(await readRawBody(req)); // drain and validate; `by` comes from the session
+    const body = parseJsonBody(await readRawBody(req));
+    const decision = body.decision ?? "veto";
+    if (decision !== "veto" && decision !== "approve") {
+      sendJson(res, 400, { error: 'decision must be "veto" or "approve"' });
+      return;
+    }
+    if (decision === "approve") {
+      // Active approval is the merge lane's authorizing event. It is only
+      // meaningful for a grant-eligible window (a github/merge_pull_request
+      // call whose args pass the closed schema) — nothing else mints a
+      // grant, so approving anything else is a category error, refused.
+      if (grantEligibleArgs(window) === null) {
+        sendJson(res, 400, {
+          error:
+            "this window is not grant-eligible (only a github/merge_pull_request call with " +
+            "valid closed arguments can be actively approved); it releases on the veto lane's " +
+            "own terms, not by approval",
+        });
+        return;
+      }
+      // Fail closed: no approval may be minted while killed, and the approval
+      // binds the CURRENT (live, post-restore) epoch — so a window that was
+      // registered during a kill cannot be turned into authority that
+      // outlives the kill. A kill after this approval moves the epoch and the
+      // grant is spent.
+      if (killSwitch.killed) {
+        sendJson(res, 409, {
+          error: "cannot approve while the kill switch is engaged — restore first, then re-approve",
+        });
+        return;
+      }
+      try {
+        window.approve(session.ownerId, killSwitch.epoch);
+        sendJson(res, 200, { status: "approved" });
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     try {
       window.veto(session.ownerId);
       sendJson(res, 200, { status: window.state });
@@ -696,35 +806,58 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // here: "no" survives everything.
     if (status === "released" && window.killEpoch !== killSwitch.epoch) status = "spent";
 
-    // The executing-broker path: a live release, in a live epoch, mints the
-    // single-use signed grant the broker requires to perform the merge — but
-    // ONLY for a window registered under the grant-eligible purpose, with
-    // arguments the closed merge schema accepts, and at most once per
-    // window. A window whose grant was already issued is served "spent", so
-    // a replayed poll (or a second gateway) cannot obtain a second grant
-    // for one owner approval. Freshness is anchored to the RELEASE moment:
-    // a release fetched after its grant window has already elapsed is
-    // served "spent" too — sitting unread does not mint a later, fresher
-    // capability.
-    if (status === "released" && opts.grantKey !== undefined && opts.grantKey !== "") {
-      const canonicalArgs = grantEligibleArgs(window);
-      if (canonicalArgs !== null) {
-        if (grantedWindows.has(id)) {
-          sendJson(res, 200, { status: "spent" });
-          return;
-        }
-        const releasedAt = window.releasedAt ?? now();
-        const expiresAt = releasedAt + grantTtlMs;
-        if (now() >= expiresAt) {
-          sendJson(res, 200, { status: "spent" });
-          return;
-        }
-        grantedWindows.add(id);
-        sendJson(res, 200, { status, grant: mintGrant(id, window, canonicalArgs, expiresAt) });
+    const grantsConfigured = opts.grantKey !== undefined && opts.grantKey !== "";
+    const canonicalArgs = grantsConfigured ? grantEligibleArgs(window) : null;
+
+    // A GRANT-ELIGIBLE window (a real merge) is authorized by ONE thing and
+    // one thing only: the owner's ACTIVE approval (POST /veto/:id
+    // decision=approve, owner-session authenticated). Silence never mints a
+    // merge grant — the veto lane's "released-by-silence" is deliberately
+    // NOT honored here, because the party that registered the window is
+    // untrusted under the same-uid model (it can forge the gateway's device
+    // secret), so signing its say-so would launder an unauthenticated
+    // request into merge authority. An owner session is a token on the
+    // owner's device, which the agent cannot reach; requiring it is what
+    // makes the grant a real owner decision. See THREAT-MODEL.md.
+    if (canonicalArgs !== null) {
+      if (window.state === "vetoed") {
+        sendJson(res, 200, { status: "vetoed" });
         return;
       }
-      // released, but not grant-eligible: plain status, no signed authority
+      if (window.approvedBy === null) {
+        // registered and shown to the owner, but not yet actively approved —
+        // keep the gateway waiting; a merge never proceeds on silence
+        sendJson(res, 200, { status: "pending" });
+        return;
+      }
+      // Actively approved. Mint at most once, bound to the epoch in force AT
+      // APPROVAL, with expiry anchored to the approval moment. A kill since
+      // approval (or right now) makes it spent; a grant already issued makes
+      // it spent; a late first read past the grant window makes it spent.
+      if (grantedWindows.has(id)) {
+        sendJson(res, 200, { status: "spent" });
+        return;
+      }
+      const approvalEpoch = window.approvalEpoch ?? -1;
+      if (killSwitch.killed || approvalEpoch !== killSwitch.epoch) {
+        sendJson(res, 200, { status: "spent" });
+        return;
+      }
+      const expiresAt = (window.approvedAt ?? now()) + grantTtlMs;
+      if (now() >= expiresAt) {
+        sendJson(res, 200, { status: "spent" });
+        return;
+      }
+      grantedWindows.add(id);
+      sendJson(res, 200, {
+        status: "released",
+        grant: mintGrant(id, window, canonicalArgs, approvalEpoch, expiresAt),
+      });
+      return;
     }
+
+    // Not grant-eligible: the plain veto lane, unchanged — silence-release is
+    // fine and mints no signed authority (no grant is ever minted here).
     sendJson(res, 200, { status });
   }
 
@@ -754,11 +887,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     return canonicalArgs;
   }
 
-  /** Sign a single-use MergeGrant over the exact call the owner reviewed. */
+  /** Sign a single-use MergeGrant over the exact call the owner APPROVED.
+   * `killEpoch` is the epoch at approval (not registration), so a kill
+   * between registration and approval — or a window registered during a
+   * kill — cannot produce authority that outlives the kill. */
   function mintGrant(
     windowId: string,
     window: VetoWindow,
     canonicalArgs: string,
+    approvalEpoch: number,
     expiresAt: number,
   ): SignedMergeGrant {
     const purpose = window.purpose as VetoPurpose; // grantEligibleArgs guaranteed it
@@ -773,7 +910,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         policyVersion: purpose.policyVersion,
         canonicalArgs,
         callHash: sha256Hex(canonicalArgs),
-        killEpoch: window.killEpoch,
+        killEpoch: approvalEpoch,
         expiresAt,
       },
       opts.grantKey as string,
@@ -791,11 +928,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    const reqUrl = new URL(req.url ?? "/", "http://localhost");
+    const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
+    if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);

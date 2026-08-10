@@ -17,6 +17,11 @@
  *                                            workspace, not this process's cwd
  *   OWNERSWITCH_GRANT_KEY                    HMAC key shared ONLY with the
  *                                            control plane; verifies grants
+ *   OWNERSWITCH_KILL_STATE_KEY               HMAC key shared ONLY with the
+ *                                            control plane; AUTHENTICATES the
+ *                                            live kill-state channel so an
+ *                                            impostor that binds the port
+ *                                            cannot answer "not killed"
  *   OWNERSWITCH_BROKER_SOCKET                socket path; parent dir must be
  *                                            broker-owned, setgid 02750, with
  *                                            the gateway's user in its group
@@ -33,12 +38,11 @@
  *   OWNERSWITCH_BROKER_ALLOWED_REPOS         optional comma-separated repos
  *   OWNERSWITCH_TIMEOUT_MS                   optional control-plane timeout
  */
-import { createControlPlaneClient } from "@ownerswitchai/gateway";
 import { createInstallationTokenSource } from "./github-app-auth.js";
 import { loadGitHubAppPrivateKey } from "./github-app-key.js";
-import { liveKillStateFromControlPlane } from "./live-kill-state.js";
 import { createMergeBroker } from "./merge-broker.js";
 import { createSecretLedger } from "./secret-ledger.js";
+import { signedLiveKillStateFromControlPlane } from "./signed-kill-state.js";
 
 function required(env: Record<string, string | undefined>, name: string): string {
   const value = env[name]?.trim();
@@ -53,6 +57,7 @@ async function main(): Promise<void> {
   const keyFile = required(env, "OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE");
   const agentWorkspace = required(env, "OWNERSWITCH_AGENT_WORKSPACE");
   const grantKey = required(env, "OWNERSWITCH_GRANT_KEY");
+  const killStateKey = required(env, "OWNERSWITCH_KILL_STATE_KEY");
   const socketPath = required(env, "OWNERSWITCH_BROKER_SOCKET");
   const burnDir = required(env, "OWNERSWITCH_BROKER_BURN_DIR");
   const controlPlaneUrl = required(env, "OWNERSWITCH_CONTROL_PLANE_URL");
@@ -69,6 +74,7 @@ async function main(): Promise<void> {
   const key = loadGitHubAppPrivateKey(keyFile, { workspaceDir: agentWorkspace });
   ledger.add(key.pem);
   ledger.add(grantKey);
+  ledger.add(killStateKey);
 
   const broker = createMergeBroker({
     tokens: createInstallationTokenSource({
@@ -78,9 +84,15 @@ async function main(): Promise<void> {
     ledger,
     grantKey,
     burnDir,
-    fetchLiveKillState: liveKillStateFromControlPlane(
-      createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs }),
-    ),
+    agentWorkspace,
+    // AUTHENTICATED kill-state: the broker verifies a signed, nonce-bound
+    // envelope, so a process impersonating a stopped control plane on the
+    // loopback port cannot answer "not killed".
+    fetchLiveKillState: signedLiveKillStateFromControlPlane({
+      baseUrl: controlPlaneUrl,
+      killStateKey,
+      timeoutMs,
+    }),
     ...(allowedRepos !== undefined ? { allowedRepos } : {}),
     ...(socketGid !== undefined ? { socketGid } : {}),
     log: (line) => console.error(line),
