@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { signDeviceRequest, type VetoWireStatus } from "@ownerswitchai/control-plane";
+import {
+  signDeviceRequest,
+  type VetoPurpose,
+  type VetoWireStatus,
+} from "@ownerswitchai/control-plane";
 import type { ToolCall } from "@ownerswitchai/shared";
 
 /**
@@ -51,7 +55,14 @@ export interface VetoStatusResult {
 }
 
 export interface VetoClient {
-  register(call: ToolCall): Promise<{ id: string }>;
+  /**
+   * `purpose` is the canonical (connector, operation, policyVersion) the
+   * gateway resolved for an executor-routed call — the control plane
+   * records it on the window, signs it into any grant, and mints grants
+   * ONLY for purposes it knows to be grant-eligible. Omit it for plain
+   * forwarded tools; such windows release but never carry signed authority.
+   */
+  register(call: ToolCall, purpose?: VetoPurpose): Promise<{ id: string }>;
   status(id: string): Promise<VetoStatusResult>;
 }
 
@@ -92,8 +103,8 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
     }
   }
 
-  async function register(call: ToolCall): Promise<{ id: string }> {
-    const body = JSON.stringify({ call });
+  async function register(call: ToolCall, purpose?: VetoPurpose): Promise<{ id: string }> {
+    const body = JSON.stringify({ call, ...(purpose !== undefined ? { purpose } : {}) });
     const timestamp = now();
     const nonce = randomBytes(12).toString("hex");
     const res = await request(new URL("/veto", baseUrl), {

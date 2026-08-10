@@ -55,6 +55,7 @@ const TRIPLE = [
 
 const BROKER_VAR = "OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET";
 const ACK_VAR = "OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK";
+const GRANT_KEY_VAR = "OWNERSWITCH_GRANT_KEY";
 
 export function resolveGitHubConnectorEnv(
   env: Record<string, string | undefined>,
@@ -63,6 +64,25 @@ export function resolveGitHubConnectorEnv(
     const raw = env[name]?.trim();
     return raw === "" ? undefined : raw;
   };
+  // The grant-signing key belongs to the control plane and the merge broker
+  // ONLY — the gateway has no use for it, and in the stdio deployment the
+  // gateway shares a uid with the agent, so a key visible here is a key the
+  // agent can read, and with it MergeGrants can be FORGED: the entire
+  // owner-approval boundary would rest on a secret the adversary holds.
+  // This is not a warning; the isolation claim is enforced at startup. The
+  // usual way to trip it is exporting the key in a shell that then starts
+  // both the control plane and the gateway — scope it to the control-plane
+  // (and broker) process instead, e.g. `OWNERSWITCH_GRANT_KEY=… pnpm
+  // dev:control-plane`.
+  if (clean(GRANT_KEY_VAR) !== undefined) {
+    throw new ConfigError(
+      `${GRANT_KEY_VAR} is set in the gateway's environment. That key signs MergeGrants and ` +
+        `must exist ONLY in the control plane and the merge broker — in the stdio deployment ` +
+        `the gateway shares a uid with the agent, so a key the gateway can read, the agent can ` +
+        `read, and with it owner-approval grants can be forged. Unset it here and provision it ` +
+        `only into the control-plane and broker processes (each isolated from the agent's uid).`,
+    );
+  }
   const brokerSocket = clean(BROKER_VAR);
   const values = TRIPLE.map((name) => clean(name));
   const present = TRIPLE.filter((_, i) => values[i] !== undefined);

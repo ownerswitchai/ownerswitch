@@ -26,11 +26,30 @@ export type VetoStatus = "pending" | "vetoed" | "released" | "extended" | "held"
  */
 export type VetoWireStatus = VetoStatus | "spent";
 
+/**
+ * The canonical purpose a window was registered under — which backend
+ * (`connector`) and which action within it (`operation`) a release would
+ * authorize, plus the authorization-world hash (`policyVersion`) the
+ * registering gateway computed. The control plane signs these into any
+ * MergeGrant it mints for the window, and mints ONLY for purposes it knows
+ * to be grant-eligible — so an approval registered for one purpose can
+ * never be spent as another, no matter what its arguments look like.
+ * Windows registered without a purpose (plain forwarded tools) release
+ * normally but are never grant-eligible.
+ */
+export interface VetoPurpose {
+  connector: string;
+  operation: string;
+  policyVersion: string;
+}
+
 export interface VetoOptions {
   /** initial window; default 4 min */
   windowMs?: number;
   /** extension when delivery unconfirmed; default 6 min */
   extensionMs?: number;
+  /** the canonical purpose the registering gateway declared, if any */
+  purpose?: VetoPurpose;
   now?: () => number;
 }
 
@@ -38,8 +57,10 @@ export class VetoWindow {
   private status: VetoStatus = "pending";
   private delivered = false;
   private deadline: number;
+  private releasedAtMs: number | null = null;
   private readonly extensionMs: number;
   private readonly now: () => number;
+  readonly purpose: VetoPurpose | undefined;
   vetoedBy: string | null = null;
 
   /**
@@ -60,6 +81,7 @@ export class VetoWindow {
     this.now = opts.now ?? Date.now;
     this.extensionMs = opts.extensionMs ?? 6 * 60_000;
     this.deadline = this.now() + (opts.windowMs ?? 4 * 60_000);
+    this.purpose = opts.purpose;
   }
 
   /**
@@ -88,6 +110,12 @@ export class VetoWindow {
 
     if (this.delivered) {
       this.status = "released";
+      // The release happened at the DEADLINE — the moment silence became
+      // approval — not at whatever later moment a poll finally ran tick().
+      // Grant freshness anchors here (server.ts): recording now() instead
+      // would let a release that sat unread for days mint a brand-new
+      // capability on its first late read.
+      this.releasedAtMs = this.deadline;
     } else if (this.status === "pending") {
       this.status = "extended";
       this.deadline += this.extensionMs;
@@ -99,5 +127,10 @@ export class VetoWindow {
 
   get state(): VetoStatus {
     return this.status;
+  }
+
+  /** When silence became approval (the deadline), or null while unreleased. */
+  get releasedAt(): number | null {
+    return this.releasedAtMs;
   }
 }

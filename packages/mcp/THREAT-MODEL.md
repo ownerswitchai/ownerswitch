@@ -440,12 +440,24 @@ private key** and mints **installation tokens** with it
   CONTROL PLANE at owner-approval time (a veto window the owner saw
   releasing in a live kill epoch), signed with a key
   (`OWNERSWITCH_GRANT_KEY`) shared ONLY with the broker — never in the
-  gateway/agent environment. It carries the exact owner-reviewed call
-  (including the pinned `expectedHeadSha`), a single-use id, the approval's
-  kill epoch, and a short expiry. The broker verifies it independently and
-  merges only the signed args. Single-use burns twice, both out of the
-  agent's reach: the control plane issues each window's grant once, and the
-  broker burns the jti before dispatch.
+  gateway/agent environment, and that is ENFORCED, not assumed: the
+  gateway refuses to start if the variable is present in its environment,
+  and the control plane requires the same uid/host isolation from the
+  agent as the broker (whoever reads the key mints approvals). The grant
+  carries the exact owner-reviewed call (including the pinned
+  `expectedHeadSha`), its SIGNED PURPOSE (connector + operation — the
+  broker refuses any purpose but `github`/`merge_pull_request`, so an
+  approval registered for another tool can never be spent as a merge, and
+  the control plane mints only for that purpose in the first place), the
+  authorization-world hash, a single-use id, the approval's kill epoch,
+  and a short expiry anchored to the RELEASE moment — a release that sits
+  unread past the grant window is `spent`, never a later fresh
+  capability. The broker verifies all of it independently and merges only
+  the signed args. Single-use burns twice, both out of the agent's reach
+  and neither in volatile memory alone: the control plane issues each
+  window's grant once, and the broker burns the jti in a durable, atomic
+  on-disk store that survives restarts and arbitrates between broker
+  processes — a burn it cannot persist is a refusal.
 - **What a same-uid agent that finds the socket can obtain NOW, stated
   plainly.** A read-only head sha (`pin-head` — public-ish, low value),
   and a merge ONLY if it also presents a currently-valid, unburned,

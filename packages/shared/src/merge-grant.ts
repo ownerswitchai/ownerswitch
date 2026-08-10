@@ -16,13 +16,19 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
  * gateway relays the grant but cannot forge one.
  *
  * What is inside it, and why: the exact tool call the owner reviewed
- * (`tool`, `agentId`, canonical `args`), the content hash of those bytes
- * (`callHash`), the kill epoch in force at approval (`killEpoch`), a
- * single-use id (`jti`), and a short expiry. The broker refuses a merge
- * whose arguments do not re-canonicalize to the signed bytes — so the pinned
- * `expectedHeadSha` inside the args is covered by the signature, and a
- * gateway (or agent) cannot swap in a different head, repo, or PR after the
- * owner approved.
+ * (`tool`, `agentId`, canonical `args`), the SIGNED PURPOSE that call was
+ * registered under (`connector` + `operation` — the broker refuses any
+ * purpose it does not itself serve, so an approval obtained for some other
+ * tool can never authorize a merge, even if its arguments happen to be
+ * merge-shaped), the authorization world it was decided in
+ * (`policyVersion`), the content hash of the canonical args (`callHash`),
+ * the kill epoch in force at approval (`killEpoch`), a single-use id
+ * (`jti`), and a short expiry ANCHORED TO THE RELEASE MOMENT — a release
+ * that sat unread does not become a fresh capability when finally fetched.
+ * The broker refuses a merge whose arguments do not re-canonicalize to the
+ * signed bytes — so the pinned `expectedHeadSha` inside the args is covered
+ * by the signature, and a gateway (or agent) cannot swap in a different
+ * head, repo, or PR after the owner approved.
  *
  * Single-use burns in two places the agent cannot reach: the control plane
  * issues each window's grant at most once (a second read is served `spent`),
@@ -30,14 +36,31 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
  * nonce store is defense in depth, not the boundary.
  */
 export interface MergeGrant {
-  /** grant format version, so a future change is explicit */
-  v: 1;
+  /** grant format version, so a future change is explicit (v2: signed purpose) */
+  v: 2;
   /** single-use id; the broker burns it before dispatch, agent-inaccessible */
   jti: string;
   /** who the action was authorized for — echoed into the audit trail */
   agentId: string;
   /** the MCP tool name the owner's decision was about, e.g. "github.merge_pr" */
   tool: string;
+  /**
+   * The signed PURPOSE: which backend (`connector`) and which action within
+   * it (`operation`) the owner's approval was registered for. The broker
+   * enforces these against the one purpose it serves — a grant whose
+   * purpose is anything but a GitHub merge is refused before it is even
+   * burned. MCP tool names are deployment-configurable, so purpose is bound
+   * here, in canonical terms, not via the tool name.
+   */
+  connector: string;
+  operation: string;
+  /**
+   * Content hash of the authorization semantics (policy + executor routes)
+   * the gateway registered the window under — audit identity binding the
+   * approval to the authorization world it was made in. Empty string when
+   * the registering surface predates route hashing.
+   */
+  policyVersion: string;
   /**
    * the owner-reviewed arguments, canonicalized (canonicalJson). The broker
    * merges exactly these bytes and refuses any other args — the pinned
@@ -93,6 +116,9 @@ const grantMessage = (g: MergeGrant): string =>
     jti: g.jti,
     agentId: g.agentId,
     tool: g.tool,
+    connector: g.connector,
+    operation: g.operation,
+    policyVersion: g.policyVersion,
     canonicalArgs: g.canonicalArgs,
     callHash: g.callHash,
     killEpoch: g.killEpoch,
@@ -130,11 +156,16 @@ export function verifyMergeGrant(
   if (grantKey === "") return { ok: false, reason: "no grant key configured" };
   if (typeof signed !== "object" || signed === null) return { ok: false, reason: "grant is not an object" };
   const s = signed as Record<string, unknown>;
-  if (s.v !== 1) return { ok: false, reason: "unsupported grant version" };
+  if (s.v !== 2) return { ok: false, reason: "unsupported grant version" };
   if (
     typeof s.jti !== "string" ||
     typeof s.agentId !== "string" ||
     typeof s.tool !== "string" ||
+    typeof s.connector !== "string" ||
+    s.connector === "" ||
+    typeof s.operation !== "string" ||
+    s.operation === "" ||
+    typeof s.policyVersion !== "string" ||
     typeof s.canonicalArgs !== "string" ||
     typeof s.callHash !== "string" ||
     typeof s.killEpoch !== "number" ||
@@ -147,10 +178,13 @@ export function verifyMergeGrant(
     return { ok: false, reason: "grant is missing or malformed fields" };
   }
   const grant: MergeGrant = {
-    v: 1,
+    v: 2,
     jti: s.jti,
     agentId: s.agentId,
     tool: s.tool,
+    connector: s.connector,
+    operation: s.operation,
+    policyVersion: s.policyVersion,
     canonicalArgs: s.canonicalArgs,
     callHash: s.callHash,
     killEpoch: s.killEpoch,

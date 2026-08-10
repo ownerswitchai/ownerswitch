@@ -20,6 +20,11 @@
  *   OWNERSWITCH_BROKER_SOCKET                socket path; parent dir must be
  *                                            broker-owned, setgid 02750, with
  *                                            the gateway's user in its group
+ *   OWNERSWITCH_BROKER_BURN_DIR              directory for the DURABLE
+ *                                            single-use burn store —
+ *                                            broker-owned, mode 0700, outside
+ *                                            the agent workspace; burns must
+ *                                            survive a broker restart
  *   OWNERSWITCH_BROKER_SOCKET_GID            optional: the gid the socket must
  *                                            end up owned by; refuses to serve
  *                                            on a mismatch
@@ -49,6 +54,7 @@ async function main(): Promise<void> {
   const agentWorkspace = required(env, "OWNERSWITCH_AGENT_WORKSPACE");
   const grantKey = required(env, "OWNERSWITCH_GRANT_KEY");
   const socketPath = required(env, "OWNERSWITCH_BROKER_SOCKET");
+  const burnDir = required(env, "OWNERSWITCH_BROKER_BURN_DIR");
   const controlPlaneUrl = required(env, "OWNERSWITCH_CONTROL_PLANE_URL");
   const allowedRaw = env.OWNERSWITCH_BROKER_ALLOWED_REPOS?.trim();
   const allowedRepos =
@@ -71,6 +77,7 @@ async function main(): Promise<void> {
     }),
     ledger,
     grantKey,
+    burnDir,
     fetchLiveKillState: liveKillStateFromControlPlane(
       createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs }),
     ),

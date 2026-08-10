@@ -58,6 +58,18 @@ OSWITCH_GID=$(getent group oswitch | cut -d: -f3)
 
 Pick a strong random **grant key** — the control plane and the broker
 share it, and NOTHING else may: `GRANT_KEY=$(openssl rand -hex 32)`.
+Handle it accordingly: never `export` it in a shell that will also start
+the gateway (the gateway REFUSES to start when it sees
+`OWNERSWITCH_GRANT_KEY` — that refusal is one of the checks below), and
+give the control-plane process the SAME uid/host isolation from the agent
+as the broker — a control plane the agent's uid can read defeats the key.
+
+Create the broker's durable single-use burn directory (burns must survive
+a broker restart, so they live on disk, broker-owned, mode 0700):
+
+```sh
+sudo install -d -o oswitch-broker -g oswitch-broker -m 0700 /var/lib/ownerswitch/burns
+```
 
 Start the broker under its own uid, with the shared group as its egid
 (`sg oswitch`), so the socket ends up gid `oswitch`:
@@ -71,6 +83,7 @@ sudo -u oswitch-broker sg oswitch -c '
   OWNERSWITCH_GRANT_KEY='"$GRANT_KEY"' \
   OWNERSWITCH_BROKER_SOCKET=/run/ownerswitch/broker.sock \
   OWNERSWITCH_BROKER_SOCKET_GID='"$OSWITCH_GID"' \
+  OWNERSWITCH_BROKER_BURN_DIR=/var/lib/ownerswitch/burns \
   OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test \
   OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:8787 \
   ownerswitch-merge-broker'
@@ -104,9 +117,15 @@ OwnerSwitch pins it server-side.
 
 ## 4. Run the control plane and the gateway
 
-Start the dev control plane **with the same grant key** the broker has
-(`OWNERSWITCH_GRANT_KEY=$GRANT_KEY`), so it mints signed grants the broker
-will accept. Then launch the gateway with a config whose policy puts
+Start the dev control plane **with the same grant key** the broker has,
+passed inline to THAT process only
+(`OWNERSWITCH_GRANT_KEY="$GRANT_KEY" pnpm --filter @ownerswitchai/mcp
+dev:control-plane`), so it mints signed grants the broker will accept. In
+this live run the control plane MUST get the same isolation as the
+broker: run it under a uid the gateway/agent does not share (e.g. `sudo
+-u oswitch-broker …` or a fourth dedicated user) — the grant key is
+exactly as sensitive as the App private key, because whoever reads it can
+mint approvals. Then launch the gateway with a config whose policy puts
 `github.merge_pr` in the **`veto` lane** (an owner-gated lane is required
 in broker mode) and whose `executorRoutes` maps it to
 `{ "connector": "github", "operation": "merge_pull_request" }`
@@ -184,6 +203,16 @@ NO sha argument; the pin is OwnerSwitch's job:
 - **Kill gate at the broker:** engage the kill switch, then call the
   tool → the pin read fails closed (`head-pin-failed` — the broker
   refuses: "kill switch engaged"). Restore afterwards.
+- **The gateway refuses a leaked grant key:** start the gateway once from
+  a shell with `OWNERSWITCH_GRANT_KEY=anything` exported → it must refuse
+  to start, naming the variable and why (the agent shares its uid; a key
+  it can see is a key that forges grants). Unset and restart normally.
+- **The burn survives a broker restart:** after the successful merge,
+  restart the broker (same `OWNERSWITCH_BROKER_BURN_DIR`) and replay the
+  same grant bytes at the socket by hand → refused
+  ("grant already used"), and `{op:"outcome","args":{"jti":"<jti>"}}`
+  reports the recorded `performed` outcome. One approval, one merge, even
+  across a restart.
 - **No leak:** grep everything the agent-side client printed (its logs
   and the tool results) for `ghs_`, and for the first 20 characters of
   the key file's base64 body. Both greps must come back empty.

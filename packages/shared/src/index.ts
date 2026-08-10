@@ -54,6 +54,8 @@ export {
   signMergeGrant,
   verifyMergeGrant,
 } from "./merge-grant.js";
+export { GITHUB_CONNECTOR, MERGE_PULL_REQUEST, parseMergePrArgs } from "./merge-args.js";
+export type { MergePrArgs } from "./merge-args.js";
 export type {
   GrantVerifyResult,
   MergeGrant,

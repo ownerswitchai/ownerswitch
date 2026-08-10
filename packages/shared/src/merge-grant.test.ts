@@ -18,10 +18,13 @@ function grant(overrides: Partial<MergeGrant> = {}): MergeGrant {
     expectedHeadSha: "a".repeat(40),
   });
   return {
-    v: 1,
+    v: 2,
     jti: "jti-1",
     agentId: "agent-1",
     tool: "github.merge_pr",
+    connector: "github",
+    operation: "merge_pull_request",
+    policyVersion: "sha256:abc",
     canonicalArgs,
     callHash: sha256Hex(canonicalArgs),
     killEpoch: 3,
@@ -74,6 +77,36 @@ describe("signMergeGrant / verifyMergeGrant", () => {
   it("rejects malformed and missing input without throwing", () => {
     for (const bad of [null, 42, {}, { v: 2 }, { ...signMergeGrant(grant(), KEY), sig: "" }]) {
       expect(verifyMergeGrant(bad, KEY, { now: () => NOW }).ok).toBe(false);
+    }
+  });
+
+  it("rejects the retired v1 format — a purpose-less grant no longer verifies", () => {
+    const { connector: _c, operation: _o, policyVersion: _p, ...v1 } = grant();
+    const signed = signMergeGrant(grant(), KEY);
+    expect(verifyMergeGrant({ ...v1, v: 1, sig: signed.sig }, KEY, { now: () => NOW })).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining("version"),
+    });
+  });
+
+  it("rejects a grant with an empty connector or operation — purpose is mandatory", () => {
+    for (const overrides of [{ connector: "" }, { operation: "" }]) {
+      const signed = signMergeGrant(grant(overrides as Partial<MergeGrant>), KEY);
+      expect(verifyMergeGrant(signed, KEY, { now: () => NOW }).ok).toBe(false);
+    }
+  });
+
+  it("covers the purpose fields with the signature — tampering the connector breaks it", () => {
+    const signed = signMergeGrant(grant(), KEY);
+    for (const tampered of [
+      { ...signed, connector: "slack" },
+      { ...signed, operation: "post_message" },
+      { ...signed, policyVersion: "sha256:other" },
+    ]) {
+      expect(verifyMergeGrant(tampered, KEY, { now: () => NOW })).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining("signature"),
+      });
     }
   });
 

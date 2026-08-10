@@ -344,7 +344,10 @@ also requires an **owner-gated lane** (veto or approve) — an `allow`-lane
 routed merge is refused (`-32056`, `refusalCode: "owner-grant-required"`),
 because the merge is authorized by a control-plane grant minted only when
 the owner approves. The control plane and broker share an
-`OWNERSWITCH_GRANT_KEY` the gateway never sees.
+`OWNERSWITCH_GRANT_KEY` the gateway never sees — enforced at startup: a
+gateway that finds `OWNERSWITCH_GRANT_KEY` in its environment refuses to
+run, because in stdio deployments anything the gateway can read, the
+agent can read, and with that key grants could be forged.
 
 ## What the agent sees (error codes)
 

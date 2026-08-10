@@ -17,12 +17,32 @@ import type { SecretLedger } from "./secret-ledger.js";
  * ConnectorCallError carrying the broker's not-performed/unknown
  * classification).
  *
+ * OUTCOME HONESTY is the load-bearing property of that mapping. Once the
+ * merge request has been WRITTEN to the broker's socket, this client cannot
+ * distinguish "the broker refused before dispatch" from "the broker is
+ * mid-PUT and my socket died" — so every post-send transport failure
+ * (timeout, connection loss, unparseable or unrecognizable response) maps
+ * to outcome UNKNOWN, never "not-performed": a false "did not run" invites
+ * a retry that merges twice on one approval. Only failures that provably
+ * precede transmission — the socket never connected, the broker refused
+ * with kind:"refused" (its refusals all precede dispatch) — are
+ * "not-performed". The broker records the true outcome by jti
+ * ({op:"outcome"}) for resolving the in-doubt cases.
+ *
  * No-leak: the broker already redacted its error strings; this client
  * re-redacts with its own ledger and bounds them, and transport failures
  * surface as fixed sentences — a socket error's own text is never forwarded.
  */
 
 const MAX_RESPONSE_BYTES = 64 * 1024;
+
+/**
+ * Must exceed the broker's own requestTimeoutMs (default 120s) with slack:
+ * the broker's phase-aware answer ("unknown, still in flight") is strictly
+ * more useful than this client's own timeout, so this client should always
+ * lose that race.
+ */
+const DEFAULT_TIMEOUT_MS = 130_000;
 
 export interface BrokerMergeClientOptions {
   socketPath: string;
@@ -41,19 +61,32 @@ interface BrokerResponse {
   message?: unknown;
 }
 
+/** A transport failure, tagged with whether the request had been sent —
+ * the fact the outcome mapping pivots on. */
+class BrokerTransportError extends Error {
+  constructor(
+    message: string,
+    readonly sent: boolean,
+  ) {
+    super(message);
+    this.name = "BrokerTransportError";
+  }
+}
+
 export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitHubMergeClient {
-  const { socketPath, ledger, timeoutMs = 45_000 } = options;
+  const { socketPath, ledger, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
 
   function exchange(request: unknown): Promise<BrokerResponse> {
     return new Promise<BrokerResponse>((resolve, reject) => {
       let settled = false;
+      let sent = false;
       let buffer = "";
       const socket = connect(socketPath);
       const fail = (message: string): void => {
         if (settled) return;
         settled = true;
         socket.destroy();
-        reject(new Error(message));
+        reject(new BrokerTransportError(message, sent));
       };
       const timer = setTimeout(
         () => fail(`the merge broker did not answer within ${timeoutMs}ms`),
@@ -64,7 +97,12 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
         // fixed sentence: a socket error's own text is not forwarded
         fail(`cannot reach the merge broker at "${socketPath}" — is it running?`);
       });
-      socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+      socket.on("connect", () => {
+        // conservatively "sent" from the moment transmission is attempted:
+        // a write that buffered locally and died may still have arrived
+        sent = true;
+        socket.write(`${JSON.stringify(request)}\n`);
+      });
       socket.on("data", (chunk) => {
         if (settled) return;
         buffer += chunk.toString("utf8");
@@ -81,7 +119,7 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
         try {
           resolve((JSON.parse(buffer.slice(0, newline)) ?? {}) as BrokerResponse);
         } catch {
-          reject(new Error("the merge broker's response was not JSON"));
+          reject(new BrokerTransportError("the merge broker's response was not JSON", sent));
         }
       });
       socket.on("close", () => {
@@ -99,6 +137,9 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
   return {
     async mergePullRequest(args: MergePrArgs, grant?: unknown) {
       assertSafeRepoName(args.repo);
+      const checkYourself =
+        `Check ${args.owner}/${args.repo}#${args.pullNumber} directly (or query the broker's ` +
+        `{op:"outcome"} surface) before re-approving — a re-approved merge could run twice.`;
       if (grant === undefined) {
         // the broker path is owner-gated: no grant means no owner approval
         throw new ConnectorCallError(
@@ -111,10 +152,18 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
       try {
         res = await exchange({ op: "merge", grant, args });
       } catch (err) {
-        // could not reach the broker at all — nothing was dispatched
+        const sent = err instanceof BrokerTransportError && err.sent;
+        const detail = err instanceof Error ? err.message : "broker transport failed";
+        if (!sent) {
+          // the request never left this process — nothing was dispatched
+          throw new ConnectorCallError(`the merge was not dispatched: ${detail}`, "not-performed");
+        }
+        // the request reached (or may have reached) the broker and no
+        // answer came back — the broker may be mid-merge RIGHT NOW
         throw new ConnectorCallError(
-          `the merge was not dispatched: ${err instanceof Error ? err.message : "broker unreachable"}`,
-          "not-performed",
+          `the merge request was sent to the broker but no answer arrived (${detail}) — the ` +
+            `broker may still be performing it, so the outcome is UNKNOWN. ${checkYourself}`,
+          "unknown",
         );
       }
       if (res.ok === true && res.merged !== undefined) {
@@ -125,20 +174,39 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
         };
       }
       if (res.kind === "connector") {
-        const outcome = res.outcome === "unknown" ? "unknown" : "not-performed";
+        // a malformed classification fails toward uncertainty, never toward
+        // "did not run"
+        const outcome = res.outcome === "not-performed" ? "not-performed" : "unknown";
         throw new ConnectorCallError(redactedError(res, "the merge failed at the broker"), outcome);
       }
-      // a refusal (bad/expired/replayed grant, kill engaged, args mismatch):
-      // nothing merged, definitively not performed
+      if (res.kind === "refused") {
+        // a refusal (bad/expired/replayed grant, wrong purpose, kill
+        // engaged, args mismatch): every broker refusal precedes dispatch —
+        // nothing merged, definitively not performed
+        throw new ConnectorCallError(
+          redactedError(res, "the merge broker refused the request"),
+          "not-performed",
+        );
+      }
+      // an answer this client does not recognize proves nothing about what
+      // the broker did — after a sent request that is UNKNOWN, not a refusal
       throw new ConnectorCallError(
-        redactedError(res, "the merge broker refused the request"),
-        "not-performed",
+        `the merge broker's answer was unrecognizable ` +
+          `(${redactedError(res, "no detail")}) — the outcome is UNKNOWN. ${checkYourself}`,
+        "unknown",
       );
     },
 
     async getPullRequestHead(args) {
       assertSafeRepoName(args.repo);
-      const res = await exchange({ op: "pin-head", args });
+      // read-only: transport failures are plain errors for the proxy's
+      // fail-closed pinning step — no dispatch ambiguity to classify
+      let res: BrokerResponse;
+      try {
+        res = await exchange({ op: "pin-head", args });
+      } catch (err) {
+        throw new Error(err instanceof Error ? err.message : "the merge broker was unreachable");
+      }
       if (res.ok === true && typeof res.headSha === "string" && res.headSha !== "") {
         return ledger.redact(res.headSha);
       }

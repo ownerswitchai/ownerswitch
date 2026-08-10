@@ -389,21 +389,43 @@ nothing the gateway says.** The evidence is a **MergeGrant**
   (`OWNERSWITCH_GRANT_KEY`) the control plane shares ONLY with the broker
   — never in the gateway/agent environment.
 - **What is inside it:** the exact tool call the owner reviewed (tool,
-  agentId, canonical args), the content hash of those bytes, the kill
-  epoch at approval, a single-use id (`jti`), and a short expiry. The
-  pinned `expectedHeadSha` lives inside the canonical args, so it is
-  covered by the signature — the gateway cannot swap the head, repo, or PR
-  after approval.
+  agentId, canonical args), the SIGNED PURPOSE the window was registered
+  under (`connector` + `operation`, plus the gateway's authorization-world
+  hash `policyVersion`), the content hash of the canonical args, the kill
+  epoch at approval, a single-use id (`jti`), and a short expiry —
+  **anchored to the release moment**, not to whichever read finally
+  fetched the grant: a release that sits unread past the grant window is
+  served `spent`, never a later fresh capability.
 - **Who verifies it:** the BROKER, independently — signature under the
-  shared key, version, expiry, hash↔args. The gateway relays the grant but
-  cannot forge one.
-- **Where single-use burns — twice, both agent-inaccessible:** the control
-  plane issues each window's grant at most once (a second read is served
-  `spent`), and the broker burns the `jti` locally before dispatch. The
-  gateway's own in-process nonce store is now only defense in depth, not
-  the boundary.
-- **Args must match:** the broker merges the SIGNED args and refuses any
-  wire args that do not re-canonicalize to them.
+  shared key, version, expiry, hash↔args, **and purpose**: the broker
+  serves exactly one purpose (`github`/`merge_pull_request`) and refuses
+  any other before even burning the jti. An owner approval registered for
+  some other tool can never be spent as a merge, however merge-shaped its
+  arguments — and the control plane will not mint a grant for such a
+  window in the first place (`grantEligibleArgs`). The gateway relays the
+  grant but cannot forge one.
+- **Where single-use burns — twice, both agent-inaccessible, neither in
+  volatile memory alone:** the control plane issues each window's grant at
+  most once (a second read is served `spent`), and the broker burns the
+  `jti` in a DURABLE, atomic store (`burn-store.ts` — an O_CREAT|O_EXCL
+  record create, fsynced, that survives broker restarts and arbitrates
+  between broker processes sharing the directory; a burn the store cannot
+  persist is a refusal, never a memory-only pass). The gateway's own
+  in-process nonce store is now only defense in depth, not the boundary.
+- **Args must match:** the broker merges the SIGNED args — parsed under
+  the CLOSED merge schema, unknown fields refused — and refuses any wire
+  args that do not re-canonicalize to them.
+- **The broker's answers stay honest under pathology:** its
+  per-connection timeout is PHASE-AWARE — before dispatch it refuses
+  (nothing was sent); once the PUT is in flight it answers
+  `connector`/`unknown`, never "refused", because the merge may still
+  land after the response and the caller must not hear "safe to retry"
+  while GitHub is executing. Each burned grant's outcome is recorded in
+  its burn record, and `{op:"outcome", jti}` (read-only, grants nothing,
+  deliberately not kill-gated) resolves an in-doubt dispatch after the
+  fact. The gateway-side client mirrors the same stance: any transport
+  failure after the request was written to the socket maps to `unknown`,
+  never `not-performed`.
 
 **Peer verification of the socket, honestly.** Pure Node exposes no
 `SO_PEERCRED`, so the kernel-enforced part of the allow-list is the socket

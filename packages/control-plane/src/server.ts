@@ -4,6 +4,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   canonicalJson,
+  GITHUB_CONNECTOR,
+  MERGE_PULL_REQUEST,
+  parseMergePrArgs,
   sha256Hex,
   signMergeGrant,
   type SignedMergeGrant,
@@ -19,7 +22,7 @@ import {
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { RestoreCeremony } from "./twogo.js";
-import { VetoWindow, type VetoWireStatus } from "./veto.js";
+import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
 
 /**
  * HTTP layer of the control plane. One process, one KillSwitch, one map of
@@ -102,17 +105,29 @@ export interface ControlPlaneOptions {
    * The HMAC key the control plane and the executing merge broker share to
    * authorize merges (`packages/shared/src/merge-grant.ts`,
    * `packages/executor/src/merge-broker.ts`). When set, a veto window that
-   * RELEASES while its kill epoch is still current mints a single-use,
-   * signed MergeGrant over the exact call the owner reviewed — the broker's
-   * only proof that a merge was approved by the owner and not merely
-   * requested by an agent sharing the gateway's uid. Provision it ONLY to
-   * the control plane and the broker, never to the gateway/agent
-   * environment (that is the whole point). Absent → no grants are minted and
-   * the executing-broker path cannot be used (the proxy-only and
+   * RELEASES while its kill epoch is still current — and that was
+   * REGISTERED under the grant-eligible purpose (github/merge_pull_request,
+   * with arguments that parse under the closed merge schema) — mints a
+   * single-use, signed MergeGrant over the exact call the owner reviewed:
+   * the broker's only proof that a merge was approved by the owner and not
+   * merely requested by an agent sharing the gateway's uid. A window
+   * registered under any other purpose (or none) releases normally but is
+   * never grant-eligible. Provision the key ONLY to the control plane and
+   * the broker, never to the gateway/agent environment (that is the whole
+   * point — the gateway REFUSES to start if it sees the key, and this
+   * process needs the same uid/host isolation from the agent as the broker,
+   * or the key is readable and grants forgeable). Absent → no grants are
+   * minted and the executing-broker path cannot be used (the proxy-only and
    * same-process deployments are unaffected).
    */
   grantKey?: string;
-  /** MergeGrant lifetime in ms once minted; default 2 min (minutes, not hours). */
+  /**
+   * MergeGrant lifetime in ms, measured FROM THE RELEASE MOMENT (the veto
+   * deadline that silence turned into approval), not from whenever the
+   * grant is first fetched; default 2 min (minutes, not hours). A release
+   * that sits unread past this window is served "spent" — it never becomes
+   * a fresh capability later.
+   */
   grantTtlMs?: number;
 }
 
@@ -591,6 +606,48 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     return { agentId, tool, args: args as Record<string, unknown> | undefined };
   }
 
+  /**
+   * The registered purpose, validated with the same closed-schema stance as
+   * everything else on this surface: exactly {connector, operation,
+   * policyVersion?}, nothing more. When the purpose is the grant-eligible
+   * pair, the call's arguments must ALSO parse under the closed merge
+   * schema — a "merge-purpose" window whose arguments are not exactly one
+   * merge must never be put in front of the owner, let alone signed later.
+   * Throws with the message to serve as a 400.
+   */
+  function vetoPurposeFrom(value: unknown, call: ToolCall): VetoPurpose | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("purpose must be an object with string connector and operation");
+    }
+    for (const key of Object.keys(value)) {
+      if (key !== "connector" && key !== "operation" && key !== "policyVersion") {
+        throw new Error(`unknown purpose field "${key}" — allowed: connector, operation, policyVersion`);
+      }
+    }
+    const { connector, operation, policyVersion } = value as Record<string, unknown>;
+    if (typeof connector !== "string" || connector === "") {
+      throw new Error("purpose.connector must be a non-empty string");
+    }
+    if (typeof operation !== "string" || operation === "") {
+      throw new Error("purpose.operation must be a non-empty string");
+    }
+    if (policyVersion !== undefined && typeof policyVersion !== "string") {
+      throw new Error("purpose.policyVersion must be a string when present");
+    }
+    if (connector === GITHUB_CONNECTOR && operation === MERGE_PULL_REQUEST) {
+      try {
+        parseMergePrArgs(canonicalJson(call.args ?? {}));
+      } catch (err) {
+        throw new Error(
+          `a ${GITHUB_CONNECTOR}/${MERGE_PULL_REQUEST} window requires arguments that parse ` +
+            `under the closed merge schema: ${err instanceof Error ? err.message : "invalid"}`,
+        );
+      }
+    }
+    return { connector, operation, policyVersion: policyVersion ?? "" };
+  }
+
   async function postRegisterVeto(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Strictly device-authenticated: whoever registers decides what the owner
     // gets asked about. Unauthenticated callers must not reach the owner.
@@ -599,16 +656,27 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendUnauthorized(res);
       return;
     }
-    const call = toolCallFrom(parseJsonBody(raw).call);
+    const body = parseJsonBody(raw);
+    const call = toolCallFrom(body.call);
     if (call === null) {
       sendJson(res, 400, { error: "call must be an object with string agentId and tool" });
+      return;
+    }
+    let purpose: VetoPurpose | undefined;
+    try {
+      purpose = vetoPurposeFrom(body.purpose, call);
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : "invalid purpose" });
       return;
     }
     const id = `veto_${randomBytes(6).toString("hex")}`;
     // The window binds to the kill epoch in force NOW, in the server-side
     // record — a release from a dead epoch is refused below regardless of
     // which gateway retries it or whether that gateway restarted meanwhile.
-    const window = new VetoWindow(call, killSwitch.epoch, { now });
+    const window = new VetoWindow(call, killSwitch.epoch, {
+      now,
+      ...(purpose !== undefined ? { purpose } : {}),
+    });
     vetoWindows.set(id, window);
     sendJson(res, 201, { id, status: window.state });
   }
@@ -630,34 +698,83 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
     // The executing-broker path: a live release, in a live epoch, mints the
     // single-use signed grant the broker requires to perform the merge — but
-    // at most once per window. A window whose grant was already issued is
-    // served "spent", so a replayed poll (or a second gateway) cannot obtain
-    // a second grant for one owner approval.
+    // ONLY for a window registered under the grant-eligible purpose, with
+    // arguments the closed merge schema accepts, and at most once per
+    // window. A window whose grant was already issued is served "spent", so
+    // a replayed poll (or a second gateway) cannot obtain a second grant
+    // for one owner approval. Freshness is anchored to the RELEASE moment:
+    // a release fetched after its grant window has already elapsed is
+    // served "spent" too — sitting unread does not mint a later, fresher
+    // capability.
     if (status === "released" && opts.grantKey !== undefined && opts.grantKey !== "") {
-      if (grantedWindows.has(id)) {
-        sendJson(res, 200, { status: "spent" });
+      const canonicalArgs = grantEligibleArgs(window);
+      if (canonicalArgs !== null) {
+        if (grantedWindows.has(id)) {
+          sendJson(res, 200, { status: "spent" });
+          return;
+        }
+        const releasedAt = window.releasedAt ?? now();
+        const expiresAt = releasedAt + grantTtlMs;
+        if (now() >= expiresAt) {
+          sendJson(res, 200, { status: "spent" });
+          return;
+        }
+        grantedWindows.add(id);
+        sendJson(res, 200, { status, grant: mintGrant(id, window, canonicalArgs, expiresAt) });
         return;
       }
-      grantedWindows.add(id);
-      sendJson(res, 200, { status, grant: mintGrant(id, window) });
-      return;
+      // released, but not grant-eligible: plain status, no signed authority
     }
     sendJson(res, 200, { status });
   }
 
-  /** Sign a single-use MergeGrant over the exact call the owner reviewed. */
-  function mintGrant(windowId: string, window: VetoWindow): SignedMergeGrant {
+  /**
+   * The window's canonical args IFF the window may mint a MergeGrant: it
+   * must have been REGISTERED under the one grant-eligible purpose, and its
+   * arguments must parse under the closed merge schema. Everything else —
+   * no purpose, a different purpose, arguments the schema refuses — returns
+   * null and never mints, however merge-shaped the call may look. Purpose
+   * is what the owner's approval was ABOUT; a signature must not outrun it.
+   */
+  function grantEligibleArgs(window: VetoWindow): string | null {
+    const purpose = window.purpose;
+    if (
+      purpose === undefined ||
+      purpose.connector !== GITHUB_CONNECTOR ||
+      purpose.operation !== MERGE_PULL_REQUEST
+    ) {
+      return null;
+    }
     const canonicalArgs = canonicalJson(window.call.args ?? {});
+    try {
+      parseMergePrArgs(canonicalArgs);
+    } catch {
+      return null;
+    }
+    return canonicalArgs;
+  }
+
+  /** Sign a single-use MergeGrant over the exact call the owner reviewed. */
+  function mintGrant(
+    windowId: string,
+    window: VetoWindow,
+    canonicalArgs: string,
+    expiresAt: number,
+  ): SignedMergeGrant {
+    const purpose = window.purpose as VetoPurpose; // grantEligibleArgs guaranteed it
     return signMergeGrant(
       {
-        v: 1,
+        v: 2,
         jti: `grant_${windowId}_${randomBytes(8).toString("hex")}`,
         agentId: window.call.agentId,
         tool: window.call.tool,
+        connector: purpose.connector,
+        operation: purpose.operation,
+        policyVersion: purpose.policyVersion,
         canonicalArgs,
         callHash: sha256Hex(canonicalArgs),
         killEpoch: window.killEpoch,
-        expiresAt: now() + grantTtlMs,
+        expiresAt,
       },
       opts.grantKey as string,
     );

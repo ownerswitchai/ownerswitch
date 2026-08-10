@@ -442,10 +442,21 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     mintEpoch: number | undefined,
   ): Promise<CallToolResult> {
     const key = callKey(call);
+    // Executor-routed calls register under their canonical PURPOSE — the
+    // route's (connector, operation) plus this gateway's authorization-world
+    // hash. The control plane signs that purpose into any grant it mints and
+    // refuses to mint for anything else, and the broker enforces it again —
+    // so an owner approval can only ever be spent as the thing the window
+    // said it was. Non-routed tools register without one.
+    const route = executor?.routes[call.tool];
+    const purpose =
+      route === undefined
+        ? undefined
+        : { connector: route.connector, operation: route.operation, policyVersion };
     for (;;) {
       const tracked = windows.get(key);
       if (tracked === undefined) {
-        const registration = options.vetoClient.register(call).then((r) => r.id);
+        const registration = options.vetoClient.register(call, purpose).then((r) => r.id);
         windows.set(key, registration);
         const id = await settle(key, registration, call);
         // The call is HELD, not forwarded — a decoy in it flags, never kills.

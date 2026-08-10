@@ -1,3 +1,4 @@
+import { GITHUB_CONNECTOR, MERGE_PULL_REQUEST, parseMergePrArgs, type MergePrArgs } from "@ownerswitchai/shared";
 import { ConnectorCallError } from "./connector-error.js";
 import type { ExecutionContext, ExecutionResult, ExecutorBackend } from "./executor.js";
 import type { ActionTicket } from "./ticket.js";
@@ -8,27 +9,16 @@ import type { ActionTicket } from "./ticket.js";
  * createGitHubMergeClient (github-client.ts), authenticated as a GitHub App
  * with short-lived, per-repository installation tokens
  * (github-app-auth.ts). See DESIGN.md §6.
+ *
+ * The connector/operation identifiers, the MergePrArgs shape, and the
+ * STRICT closed-schema parser live in @ownerswitchai/shared (merge-args.ts)
+ * so the control plane can enforce the same schema before signing a grant
+ * that this package's broker later re-parses — re-exported here so this
+ * package's public surface is unchanged.
  */
 
-export const GITHUB_CONNECTOR = "github";
-export const MERGE_PULL_REQUEST = "merge_pull_request";
-
-/** Parsed shape of a merge_pull_request ticket's canonicalArgs. */
-export interface MergePrArgs {
-  owner: string;
-  repo: string;
-  pullNumber: number;
-  mergeMethod?: "merge" | "squash" | "rebase";
-  /**
-   * MANDATORY. Forwarded as the merge API's `sha` parameter — "SHA that
-   * pull request head must match to allow merge". The value is derived by
-   * OWNERSWITCH at review time (the proxy pins the PR's live head before
-   * the owner sees the request — never agent-supplied), so the owner's
-   * approval binds to the exact head they saw: a branch that gains commits
-   * after approval draws HTTP 409 instead of merging code nobody reviewed.
-   */
-  expectedHeadSha: string;
-}
+export { GITHUB_CONNECTOR, MERGE_PULL_REQUEST, parseMergePrArgs };
+export type { MergePrArgs };
 
 /** The calls this connector makes, injectable for tests. */
 export interface GitHubMergeClient {
@@ -66,55 +56,6 @@ export interface GitHubCredential {
 /** e.g. "github:pr:ownerswitchai/ownerswitch#7" */
 export function githubPrResourceId(owner: string, repo: string, pullNumber: number): string {
   return `github:pr:${owner}/${repo}#${pullNumber}`;
-}
-
-export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(canonicalArgs);
-  } catch {
-    throw new Error("canonicalArgs is not valid JSON");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("canonicalArgs must be a JSON object");
-  }
-  const { owner, repo, pullNumber, mergeMethod, expectedHeadSha } = parsed as Record<
-    string,
-    unknown
-  >;
-  if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
-  if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
-  if (typeof pullNumber !== "number" || !Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
-    throw new Error("merge_pull_request requires a safe positive integer pullNumber");
-  }
-  if (
-    mergeMethod !== undefined &&
-    mergeMethod !== "merge" &&
-    mergeMethod !== "squash" &&
-    mergeMethod !== "rebase"
-  ) {
-    throw new Error(`unknown mergeMethod "${String(mergeMethod)}"`);
-  }
-  // MANDATORY, and a full commit id (40-hex SHA-1 or 64-hex SHA-256), never
-  // an abbreviation: an approval must bind to exactly one head, and a
-  // prefix can be ambiguous. The proxy derives this server-side at review
-  // time; a ticket without it was minted by nothing this system ships.
-  if (
-    typeof expectedHeadSha !== "string" ||
-    !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(expectedHeadSha)
-  ) {
-    throw new Error(
-      "merge_pull_request requires expectedHeadSha: a full 40- or 64-character hex commit id, " +
-        "pinned by OwnerSwitch at review time",
-    );
-  }
-  return {
-    owner,
-    repo,
-    pullNumber,
-    expectedHeadSha,
-    ...(mergeMethod !== undefined ? { mergeMethod } : {}),
-  };
 }
 
 export class GitHubMergePrExecutor implements ExecutorBackend {

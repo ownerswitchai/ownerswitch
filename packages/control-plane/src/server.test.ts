@@ -1267,6 +1267,70 @@ describe("control-plane HTTP API", () => {
     expect(window?.vetoedBy).toBe("adam");
   });
 
+  it("POST /veto records the declared PURPOSE and signs it into the grant on release", async () => {
+    const c = clock(100_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: "grant-key-cp-and-broker" });
+    const url = await start(cp);
+
+    const mergeArgs = { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40) };
+    const body = JSON.stringify({
+      call: { agentId: "mcp-proxy", tool: "github.merge_pr", args: mergeArgs },
+      purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" },
+    });
+    const res = await fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+    expect(res.status).toBe(201);
+    const { id } = (await res.json()) as { id: string };
+    expect(cp.vetoWindows.get(id)?.purpose).toEqual({
+      connector: "github",
+      operation: "merge_pull_request",
+      policyVersion: "sha256:pv",
+    });
+
+    cp.vetoWindows.get(id)!.markDelivered();
+    c.advance(4 * 60_000);
+    const released = (await (await fetch(`${url}/veto/${id}`)).json()) as {
+      status: string;
+      grant?: { connector: string; operation: string; policyVersion: string };
+    };
+    expect(released.status).toBe("released");
+    expect(released.grant).toMatchObject({
+      connector: "github",
+      operation: "merge_pull_request",
+      policyVersion: "sha256:pv",
+    });
+  });
+
+  it("POST /veto refuses a malformed purpose, and a merge purpose whose args fail the closed schema", async () => {
+    const c = clock(100_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const send = async (payload: unknown): Promise<Response> => {
+      const body = JSON.stringify(payload);
+      return fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+    };
+    const call = { agentId: "a", tool: "t", args: { owner: "o", repo: "r", pullNumber: 7 } };
+
+    // closed purpose schema: unknown field, missing/empty operation
+    for (const purpose of [
+      { connector: "github", operation: "merge_pull_request", extra: 1 },
+      { connector: "github" },
+      { connector: "github", operation: "" },
+    ]) {
+      const res = await send({ call, purpose });
+      expect(res.status).toBe(400);
+    }
+    // a merge-purpose window whose args are NOT exactly one merge
+    // (expectedHeadSha missing) must never be put in front of the owner
+    const res = await send({
+      call, // no expectedHeadSha in args
+      purpose: { connector: "github", operation: "merge_pull_request" },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toMatch(/closed merge schema/);
+    expect(cp.vetoWindows.size).toBe(0);
+  });
+
   it("POST /veto without a valid signature -> 401, even from loopback, nothing registered", async () => {
     const c = clock(100_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
@@ -1371,12 +1435,23 @@ describe("MergeGrant issuance on veto release", () => {
     expectedHeadSha: "a".repeat(40),
   };
 
-  /** A delivered window that has passed its deadline (→ released). */
-  const releasedWindow = (c: ReturnType<typeof clock>, killEpoch = 0) => {
+  const MERGE_PURPOSE = {
+    connector: "github",
+    operation: "merge_pull_request",
+    policyVersion: "sha256:authzworld",
+  };
+
+  /** A delivered window that has passed its deadline (→ released).
+   * `purpose: null` registers WITHOUT one (undefined would hit the default). */
+  const releasedWindow = (
+    c: ReturnType<typeof clock>,
+    killEpoch = 0,
+    purpose: { connector: string; operation: string; policyVersion: string } | null = MERGE_PURPOSE,
+  ) => {
     const window = new VetoWindow(
       { agentId: "agent-1", tool: "github.merge_pr", args: MERGE_ARGS },
       killEpoch,
-      { now: c.now, windowMs: 4 * 60_000 },
+      { now: c.now, windowMs: 4 * 60_000, ...(purpose !== null ? { purpose } : {}) },
     );
     window.markDelivered();
     return window;
@@ -1409,9 +1484,81 @@ describe("MergeGrant issuance on veto release", () => {
       expect(verified.grant.tool).toBe("github.merge_pr");
       expect(verified.grant.canonicalArgs).toBe(canonicalJson(MERGE_ARGS));
       expect(verified.grant.killEpoch).toBe(0);
+      // the SIGNED PURPOSE the window was registered under rides in the grant
+      expect(verified.grant.connector).toBe("github");
+      expect(verified.grant.operation).toBe("merge_pull_request");
+      expect(verified.grant.policyVersion).toBe("sha256:authzworld");
     }
     // and it does NOT verify under a different key — the gateway cannot forge one
     expect(verifyMergeGrant(body.grant, "wrong-key", { now: c.now }).ok).toBe(false);
+  });
+
+  it("anchors the grant's expiry to the RELEASE moment, not the read that fetched it", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    const deadlineAbs = c.now() + 4 * 60_000;
+    cp.vetoWindows.set("v-1", releasedWindow(c));
+    // first read 90s AFTER the release — the grant must NOT get a fresh 2min
+    c.advance(4 * 60_000 + 90_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as {
+      status: string;
+      grant?: { expiresAt: number };
+    };
+    expect(body.status).toBe("released");
+    expect(body.grant?.expiresAt).toBe(deadlineAbs + 2 * 60_000);
+  });
+
+  it("a release that sat unread past the grant window is SPENT — never a late fresh capability", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", releasedWindow(c));
+    // the release happened at +4min; grants live 2min from release; first
+    // read arrives at +7min — three minutes after release, one past expiry
+    c.advance(7 * 60_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body.status).toBe("spent");
+    expect(body.grant).toBeUndefined();
+  });
+
+  it("mints NO grant for a window without a purpose, or with a non-merge purpose — released, unsigned", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-none", releasedWindow(c, 0, null));
+    cp.vetoWindows.set(
+      "v-other",
+      releasedWindow(c, 0, { connector: "slack", operation: "post_message", policyVersion: "" }),
+    );
+    c.advance(4 * 60_000);
+
+    for (const id of ["v-none", "v-other"]) {
+      const body = (await (await fetch(`${url}/veto/${id}`)).json()) as { status: string; grant?: unknown };
+      expect(body.status).toBe("released");
+      expect(body.grant).toBeUndefined();
+    }
+  });
+
+  it("mints NO grant for a merge-purpose window whose args fail the closed schema", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      // planted directly (bypassing registration validation): extra key
+      { agentId: "a", tool: "t", args: { ...MERGE_ARGS, dryRun: true } },
+      0,
+      { now: c.now, windowMs: 4 * 60_000, purpose: MERGE_PURPOSE },
+    );
+    window.markDelivered();
+    cp.vetoWindows.set("v-bad", window);
+    c.advance(4 * 60_000);
+
+    const body = (await (await fetch(`${url}/veto/v-bad`)).json()) as { status: string; grant?: unknown };
+    expect(body.status).toBe("released");
+    expect(body.grant).toBeUndefined();
   });
 
   it("issues the grant AT MOST ONCE — a second read is 'spent', no second grant", async () => {

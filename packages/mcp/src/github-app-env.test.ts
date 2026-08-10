@@ -68,4 +68,28 @@ describe("resolveGitHubConnectorEnv", () => {
       }),
     ).toThrowError(/numeric installation id/);
   });
+
+  it("REFUSES to start when the grant-signing key is in the gateway environment — any mode", () => {
+    const leak = { OWNERSWITCH_GRANT_KEY: "cp-and-broker-only" };
+    // broker mode: the exact deployment whose isolation claim the key breaks
+    expect(() =>
+      resolveGitHubConnectorEnv({
+        OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET: "/run/oswitch/broker.sock",
+        ...leak,
+      }),
+    ).toThrowError(/OWNERSWITCH_GRANT_KEY .*gateway/);
+    // same-process mode and even a connector-less gateway: the gateway
+    // never legitimately holds the key, so seeing it is always a refusal
+    expect(() => resolveGitHubConnectorEnv({ ...TRIPLE, ...ACK, ...leak })).toThrowError(
+      /forged|OWNERSWITCH_GRANT_KEY/,
+    );
+    expect(() => resolveGitHubConnectorEnv(leak)).toThrowError(/OWNERSWITCH_GRANT_KEY/);
+    // an empty value is not a configuration — startup proceeds
+    expect(
+      resolveGitHubConnectorEnv({
+        OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET: "/run/oswitch/broker.sock",
+        OWNERSWITCH_GRANT_KEY: "  ",
+      }),
+    ).toEqual({ mode: "broker", socketPath: "/run/oswitch/broker.sock" });
+  });
 });

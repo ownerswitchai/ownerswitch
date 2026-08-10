@@ -24,6 +24,20 @@ describe("createVetoClient", () => {
     ).resolves.toEqual({ id: "veto_ab12" });
   });
 
+  it("register sends the declared purpose in the body — and omits the key entirely without one", async () => {
+    const bodies: unknown[] = [];
+    const capturing: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ id: "veto_ab12", status: "pending" }), { status: 201 });
+    };
+    const call = { agentId: "a1", tool: "merge_pull_request" };
+    const purpose = { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" };
+    await client(capturing).register(call, purpose);
+    await client(capturing).register({ agentId: "a1", tool: "write_file" });
+    expect(bodies[0]).toEqual({ call, purpose });
+    expect(bodies[1]).toEqual({ call: { agentId: "a1", tool: "write_file" } });
+  });
+
   it("register maps a 401 to a device-credentials message (quickstart's likely mistake)", async () => {
     const err = await client(jsonResponse({ error: "unauthorized" }, 401))
       .register({ agentId: "a1", tool: "write_file" })

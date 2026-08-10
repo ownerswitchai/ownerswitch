@@ -8,7 +8,7 @@ export { KillStateFileStore } from "./kill-state.js";
 export type { KillStateStore, KillStateLoad, PersistedKillState, SaveResult } from "./kill-state.js";
 
 export { VetoWindow } from "./veto.js";
-export type { VetoStatus, VetoOptions, VetoWireStatus } from "./veto.js";
+export type { VetoStatus, VetoOptions, VetoPurpose, VetoWireStatus } from "./veto.js";
 
 export { RestoreCeremony } from "./twogo.js";
 export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.js";

@@ -208,24 +208,34 @@ function createFakeControlPlane(opts?: { grantKey?: string }) {
       let status = state.vetoStatus;
       if (status === "released" && registration.killEpoch !== state.epoch) status = "spent";
       // the real control plane mints a single-use signed grant on a live
-      // release when a grant key is configured (server.ts getVeto)
+      // release when a grant key is configured — but ONLY for a window
+      // registered under the grant-eligible purpose (server.ts getVeto)
       if (status === "released" && opts?.grantKey !== undefined) {
-        const call = (registration.body as { call: { agentId: string; tool: string; args?: Record<string, unknown> } }).call;
-        const canonicalArgs = canonicalJson(call.args ?? {});
-        const grant = signMergeGrant(
-          {
-            v: 1,
-            jti: `grant_${match[1]}_${statusFetches}`,
-            agentId: call.agentId,
-            tool: call.tool,
-            canonicalArgs,
-            callHash: sha256Hex(canonicalArgs),
-            killEpoch: registration.killEpoch,
-            expiresAt: 9_999_999_999_999,
-          },
-          opts.grantKey,
-        );
-        return json({ status, grant });
+        const body = registration.body as {
+          call: { agentId: string; tool: string; args?: Record<string, unknown> };
+          purpose?: { connector: string; operation: string; policyVersion?: string };
+        };
+        const { call, purpose } = body;
+        if (purpose?.connector === "github" && purpose.operation === "merge_pull_request") {
+          const canonicalArgs = canonicalJson(call.args ?? {});
+          const grant = signMergeGrant(
+            {
+              v: 2,
+              jti: `grant_${match[1]}_${statusFetches}`,
+              agentId: call.agentId,
+              tool: call.tool,
+              connector: purpose.connector,
+              operation: purpose.operation,
+              policyVersion: purpose.policyVersion ?? "",
+              canonicalArgs,
+              callHash: sha256Hex(canonicalArgs),
+              killEpoch: registration.killEpoch,
+              expiresAt: 9_999_999_999_999,
+            },
+            opts.grantKey,
+          );
+          return json({ status, grant });
+        }
       }
       return json({ status });
     }
@@ -679,9 +689,18 @@ describe("review-time head pinning — server-derived, before the owner sees the
     const registered = t.controlPlane.registrations[0]?.body as {
       call?: { args?: Record<string, unknown> };
       args?: Record<string, unknown>;
+      purpose?: Record<string, unknown>;
     };
     const registeredArgs = registered.call?.args ?? registered.args;
     expect(registeredArgs).toMatchObject({ expectedHeadSha: PINNED_SHA });
+    // …and the window carries the canonical PURPOSE the route resolved to,
+    // which the control plane will sign into the grant and the broker will
+    // enforce — an approval can only be spent as what the window declared
+    expect(registered.purpose).toEqual({
+      connector: "github",
+      operation: "merge_pull_request",
+      policyVersion: expect.stringMatching(/^sha256:/) as unknown as string,
+    });
     expect(t.github.merges).toEqual([]); // held, not merged
     await t.close();
   });
