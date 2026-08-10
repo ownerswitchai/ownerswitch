@@ -225,7 +225,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
       throw honeytokenTripped(call.tool, canaryIds);
     }
-    let base: { owner: string; repo: string; pullNumber: number };
+    let base;
     try {
       base = validateMergePrRequestArgs(call.args ?? {});
     } catch (err) {
@@ -254,7 +254,13 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    return { ...call, args: { ...(call.args ?? {}), expectedHeadSha: headSha } };
+    // Build the pinned call from the NORMALIZED base (owner, repo,
+    // pullNumber, mergeMethod) plus the server-derived sha — NEVER by
+    // spreading the raw request args. This is what keeps approved-bytes ==
+    // executed-semantics: an unknown field the agent slipped in was already
+    // rejected by validateMergePrRequestArgs, and it cannot reach the
+    // canonical action here because we do not copy it.
+    return { ...call, args: { ...base, expectedHeadSha: headSha } };
   }
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
@@ -317,6 +323,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     call: ToolCall,
     verdict: Verdict,
     mintEpoch: number | undefined,
+    grant?: unknown,
   ): Promise<CallToolResult> {
     const canaryIds = decoyIds(call);
     if (canaryIds.length > 0) {
@@ -325,7 +332,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     }
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {
-      return runRouted(call, executor, route, verdict, mintEpoch);
+      return runRouted(call, executor, route, verdict, mintEpoch, grant);
     }
     // the client validated the result against CallToolResultSchema; the SDK's
     // return type is a union over every possible schema, so narrow it here
@@ -347,7 +354,22 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     route: { connector: string; operation: string },
     verdict: Verdict,
     mintEpoch: number | undefined,
+    grant?: unknown,
   ): Promise<CallToolResult> {
+    // Executing-broker deployment: a routed action MUST carry an owner-
+    // approval grant. No grant means no owner-gated approval reached this
+    // execution — the allow lane, or any path that did not clear a released
+    // veto window — and the broker would refuse it anyway. Refuse HERE,
+    // before minting or burning anything, with a message the agent can act on.
+    if (wiring.requiresGrant === true && grant === undefined) {
+      throw routedCallRefused(
+        call.tool,
+        "owner-grant-required",
+        "this action is performed by the OwnerSwitch executor with its own credential and " +
+          "requires an owner-gated decision (a veto or approval lane) — an 'allow' lane cannot " +
+          "authorize it. Nothing ran; ask the owner to put this tool in the veto lane",
+      );
+    }
     // The real control-plane client always carries an epoch on a live "not
     // killed" answer (or fails the lookup closed). No epoch means no way to
     // bind the ticket to the world that approved it — fail closed.
@@ -376,7 +398,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     }
     let outcome: ExecutionOutcome;
     try {
-      outcome = await wiring.run(ticket);
+      outcome = await wiring.run(ticket, grant);
     } catch (err) {
       // The nonce burned before the backend call, so the ticket is spent —
       // but the connector may still know whether the action definitively
@@ -434,8 +456,9 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       const id = await settle(key, tracked, call);
 
       let status;
+      let grant: unknown;
       try {
-        status = await options.vetoClient.status(id);
+        ({ status, grant } = await options.vetoClient.status(id));
       } catch (err) {
         throw controlPlaneUnavailable(call.tool, detail(err));
       }
@@ -469,9 +492,11 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           // window's registration-time kill epoch against the current one:
           // no kill has happened since the owner was shown this call, so the
           // epoch this attempt's evaluation observed is the same world the
-          // window was approved in, and the ticket may bind to it.
+          // window was approved in, and the ticket may bind to it. The
+          // control plane's single-use signed grant (when it runs the
+          // executing-broker deployment) rides through here to the broker.
           windows.delete(key);
-          return forwardOrKill(call, verdict, mintEpoch);
+          return forwardOrKill(call, verdict, mintEpoch, grant);
       }
     }
   }

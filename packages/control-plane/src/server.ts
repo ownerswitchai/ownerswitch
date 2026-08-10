@@ -2,7 +2,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { ToolCall } from "@ownerswitchai/shared";
+import {
+  canonicalJson,
+  sha256Hex,
+  signMergeGrant,
+  type SignedMergeGrant,
+  type ToolCall,
+} from "@ownerswitchai/shared";
 import {
   isLoopbackAddress,
   verifyDeviceSignature,
@@ -92,6 +98,22 @@ export interface ControlPlaneOptions {
    * a control plane that real agents depend on.
    */
   dev?: boolean;
+  /**
+   * The HMAC key the control plane and the executing merge broker share to
+   * authorize merges (`packages/shared/src/merge-grant.ts`,
+   * `packages/executor/src/merge-broker.ts`). When set, a veto window that
+   * RELEASES while its kill epoch is still current mints a single-use,
+   * signed MergeGrant over the exact call the owner reviewed — the broker's
+   * only proof that a merge was approved by the owner and not merely
+   * requested by an agent sharing the gateway's uid. Provision it ONLY to
+   * the control plane and the broker, never to the gateway/agent
+   * environment (that is the whole point). Absent → no grants are minted and
+   * the executing-broker path cannot be used (the proxy-only and
+   * same-process deployments are unaffected).
+   */
+  grantKey?: string;
+  /** MergeGrant lifetime in ms once minted; default 2 min (minutes, not hours). */
+  grantTtlMs?: number;
 }
 
 /** Default kill-state location IN DEV MODE, resolved against the working directory. */
@@ -277,6 +299,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   );
   const vetoWindows = new Map<string, VetoWindow>();
   const seenNonces = new Map<string, number>();
+  // Window ids whose single-use MergeGrant has already been minted. A window
+  // authorizes exactly ONE merge: the first releasing read mints the grant
+  // and records the id here; every later read of the same window is served
+  // "spent". This is where single-use burns on the control-plane side —
+  // outside the agent's reach, authoritative, and it survives whatever the
+  // window record survives.
+  const grantedWindows = new Set<string>();
+  const grantTtlMs = opts.grantTtlMs ?? 2 * 60_000;
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
   // this map (a restart) can only make restores harder, never easier — an id
   // that is not in here restores nothing, whatever its body claims.
@@ -597,7 +627,40 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // execute in the post-kill world. An owner's veto is NOT overridden
     // here: "no" survives everything.
     if (status === "released" && window.killEpoch !== killSwitch.epoch) status = "spent";
+
+    // The executing-broker path: a live release, in a live epoch, mints the
+    // single-use signed grant the broker requires to perform the merge — but
+    // at most once per window. A window whose grant was already issued is
+    // served "spent", so a replayed poll (or a second gateway) cannot obtain
+    // a second grant for one owner approval.
+    if (status === "released" && opts.grantKey !== undefined && opts.grantKey !== "") {
+      if (grantedWindows.has(id)) {
+        sendJson(res, 200, { status: "spent" });
+        return;
+      }
+      grantedWindows.add(id);
+      sendJson(res, 200, { status, grant: mintGrant(id, window) });
+      return;
+    }
     sendJson(res, 200, { status });
+  }
+
+  /** Sign a single-use MergeGrant over the exact call the owner reviewed. */
+  function mintGrant(windowId: string, window: VetoWindow): SignedMergeGrant {
+    const canonicalArgs = canonicalJson(window.call.args ?? {});
+    return signMergeGrant(
+      {
+        v: 1,
+        jti: `grant_${windowId}_${randomBytes(8).toString("hex")}`,
+        agentId: window.call.agentId,
+        tool: window.call.tool,
+        canonicalArgs,
+        callHash: sha256Hex(canonicalArgs),
+        killEpoch: window.killEpoch,
+        expiresAt: now() + grantTtlMs,
+      },
+      opts.grantKey as string,
+    );
   }
 
   function handler(req: IncomingMessage, res: ServerResponse): void {

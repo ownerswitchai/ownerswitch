@@ -17,7 +17,16 @@ import {
   type MergePrArgs,
 } from "@ownerswitchai/executor";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
-import type { Decision, Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
+import {
+  canonicalJson,
+  sha256Hex,
+  signMergeGrant,
+  verifyMergeGrant,
+  type Decision,
+  type Policy,
+  type ToolCall,
+  type Verdict,
+} from "@ownerswitchai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { assertExecutorRoutesCoherent, ConfigError } from "./config.js";
 import { OwnerSwitchErrorCode } from "./errors.js";
@@ -152,7 +161,7 @@ function createFakeUpstream() {
  * between the decision's kill-state fetch and the executor's re-checks,
  * which is exactly the race the ticket exists to lose safely.
  */
-function createFakeControlPlane() {
+function createFakeControlPlane(opts?: { grantKey?: string }) {
   const state = {
     killed: false as boolean,
     reason: undefined as string | undefined,
@@ -198,6 +207,26 @@ function createFakeControlPlane() {
       if (state.vetoRawBody !== undefined) return new Response(state.vetoRawBody, { status: 200 });
       let status = state.vetoStatus;
       if (status === "released" && registration.killEpoch !== state.epoch) status = "spent";
+      // the real control plane mints a single-use signed grant on a live
+      // release when a grant key is configured (server.ts getVeto)
+      if (status === "released" && opts?.grantKey !== undefined) {
+        const call = (registration.body as { call: { agentId: string; tool: string; args?: Record<string, unknown> } }).call;
+        const canonicalArgs = canonicalJson(call.args ?? {});
+        const grant = signMergeGrant(
+          {
+            v: 1,
+            jti: `grant_${match[1]}_${statusFetches}`,
+            agentId: call.agentId,
+            tool: call.tool,
+            canonicalArgs,
+            callHash: sha256Hex(canonicalArgs),
+            killEpoch: registration.killEpoch,
+            expiresAt: 9_999_999_999_999,
+          },
+          opts.grantKey,
+        );
+        return json({ status, grant });
+      }
       return json({ status });
     }
     return json({ error: "not found" }, 404);
@@ -225,10 +254,18 @@ async function startRoutedProxy(opts?: {
   executorNow?: () => number;
   /** simulate a gateway whose GitHub connector is not configured */
   withoutPin?: boolean;
+  /** when set, the fake control plane mints signed grants on release */
+  grantKey?: string;
+  /** the executing-broker deployment: routed merges require an owner grant */
+  requiresGrant?: boolean;
 }) {
-  const controlPlane = createFakeControlPlane();
+  const controlPlane = createFakeControlPlane(
+    opts?.grantKey !== undefined ? { grantKey: opts.grantKey } : undefined,
+  );
   const github = createFakeGitHub();
   const upstream = createFakeUpstream();
+  /** grants seen by run(), so tests can assert what the broker would receive */
+  const grantsSeen: unknown[] = [];
 
   const executorRunner = new Executor(
     opts?.backend ?? new GitHubMergePrExecutor(github.client, { token: OWNERSWITCH_TOKEN }),
@@ -260,7 +297,11 @@ async function startRoutedProxy(opts?: {
     }),
     executor: {
       routes: ROUTES,
-      run: (ticket) => executorRunner.run(ticket),
+      run: (ticket, grant) => {
+        grantsSeen.push(grant);
+        return executorRunner.run(ticket, { grant });
+      },
+      ...(opts?.requiresGrant === true ? { requiresGrant: true } : {}),
       // the review-time head pin, exactly as cli.ts wires it
       ...(opts?.withoutPin === true
         ? {}
@@ -283,7 +324,7 @@ async function startRoutedProxy(opts?: {
     await proxy.close();
     await upstream.server.close();
   };
-  return { client, upstream, controlPlane, github, close };
+  return { client, upstream, controlPlane, github, grantsSeen, close };
 }
 
 async function refusalOf(promise: Promise<unknown>): Promise<McpError> {
@@ -729,6 +770,97 @@ describe("review-time head pinning — server-derived, before the owner sees the
     // non-routed tools pass through untouched
     const readFile = tools.find((tool) => tool.name === "read_file");
     expect(readFile!.description).toBeUndefined();
+    await t.close();
+  });
+});
+
+describe("the executing-broker grant flow", () => {
+  const GRANT_KEY = "grant-key-cp-and-broker";
+
+  it("a released window's single-use signed grant reaches run() bound to the pinned args", async () => {
+    const t = await startRoutedProxy({ grantKey: GRANT_KEY });
+    await refusalOf(t.client.callTool(MERGE)); // opens the window
+    t.controlPlane.state.vetoStatus = "released";
+
+    const result = await t.client.callTool(MERGE);
+    expect(resultJson(result)).toMatchObject({ resourceId: RESOURCE_ID });
+
+    // exactly one grant reached run(), and it verifies + binds the pinned args
+    const grants = t.grantsSeen.filter((g) => g !== undefined);
+    expect(grants).toHaveLength(1);
+    const verified = verifyMergeGrant(grants[0], GRANT_KEY);
+    expect(verified.ok).toBe(true);
+    if (verified.ok) {
+      expect(verified.grant.tool).toBe("github.merge_pr");
+      expect(verified.grant.canonicalArgs).toBe(canonicalJson(PINNED_MERGE_ARGS));
+    }
+    // the gateway cannot forge one: it does not verify under a different key
+    expect(verifyMergeGrant(grants[0], "wrong-key").ok).toBe(false);
+    await t.close();
+  });
+
+  it("requiresGrant: the allow lane is refused — an owner-gated lane is mandatory", async () => {
+    const t = await startRoutedProxy({ lane: "allow", requiresGrant: true });
+    const err = await refusalOf(t.client.callTool(MERGE));
+    expect(err.code).toBe(OwnerSwitchErrorCode.TicketRefused);
+    expect(err.data).toMatchObject({ refusalCode: "owner-grant-required" });
+    expect(err.message).toMatch(/owner-gated decision/);
+    expect(t.github.merges).toEqual([]); // nothing ran
+    // no grant was ever produced, and none reached run()
+    expect(t.grantsSeen.filter((g) => g !== undefined)).toEqual([]);
+    await t.close();
+  });
+
+  it("requiresGrant: the veto lane still works — the grant carries it through", async () => {
+    const t = await startRoutedProxy({ lane: "veto", requiresGrant: true, grantKey: GRANT_KEY });
+    await refusalOf(t.client.callTool(MERGE));
+    t.controlPlane.state.vetoStatus = "released";
+    const result = await t.client.callTool(MERGE);
+    expect(resultJson(result)).toMatchObject({ resourceId: RESOURCE_ID });
+    expect(t.grantsSeen.filter((g) => g !== undefined)).toHaveLength(1);
+    await t.close();
+  });
+});
+
+describe("closed-schema enforcement — approved bytes == executed semantics", () => {
+  it("an unknown argument is refused BEFORE any head read, window, or ticket", async () => {
+    const t = await startRoutedProxy();
+    const err = await refusalOf(
+      t.client.callTool({
+        name: "github.merge_pr",
+        arguments: { ...MERGE_ARGS, dryRun: true },
+      }),
+    );
+    expect(err.code).toBe(OwnerSwitchErrorCode.TicketRefused);
+    expect(err.data).toMatchObject({ refusalCode: "invalid-args" });
+    expect(err.message).toMatch(/unknown argument "dryRun"/);
+    expect(t.controlPlane.registrations).toHaveLength(0); // no window
+    expect(t.github.headReads).toEqual([]); // no head read
+    expect(t.github.merges).toEqual([]);
+    await t.close();
+  });
+
+  it("an invalid mergeMethod is refused up front", async () => {
+    const t = await startRoutedProxy();
+    const err = await refusalOf(
+      t.client.callTool({
+        name: "github.merge_pr",
+        arguments: { ...MERGE_ARGS, mergeMethod: "fast-forward" },
+      }),
+    );
+    expect(err.data).toMatchObject({ refusalCode: "invalid-args" });
+    expect(err.message).toMatch(/mergeMethod/);
+    expect(t.github.headReads).toEqual([]);
+    await t.close();
+  });
+
+  it("only the normalized keys reach the canonical action — a valid mergeMethod is kept, nothing else added", async () => {
+    const t = await startRoutedProxy();
+    await refusalOf(t.client.callTool({ name: "github.merge_pr", arguments: { ...MERGE_ARGS, mergeMethod: "squash" } }));
+    const registered = t.controlPlane.registrations[0]?.body as {
+      call: { args: Record<string, unknown> };
+    };
+    expect(registered.call.args).toEqual({ ...MERGE_ARGS, mergeMethod: "squash", expectedHeadSha: PINNED_SHA });
     await t.close();
   });
 });

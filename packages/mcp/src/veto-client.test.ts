@@ -46,17 +46,32 @@ describe("createVetoClient", () => {
   });
 
   it("status returns the window state, 'missing' on 404, and rejects garbage", async () => {
-    await expect(client(jsonResponse({ status: "vetoed" })).status("veto_1")).resolves.toBe("vetoed");
-    await expect(client(jsonResponse({ error: "gone" }, 404)).status("veto_1")).resolves.toBe(
-      "missing",
-    );
+    await expect(client(jsonResponse({ status: "vetoed" })).status("veto_1")).resolves.toEqual({
+      status: "vetoed",
+    });
+    await expect(client(jsonResponse({ error: "gone" }, 404)).status("veto_1")).resolves.toEqual({
+      status: "missing",
+    });
     await expect(client(jsonResponse({ status: "sideways" })).status("veto_1")).rejects.toThrowError(
       VetoClientError,
     );
   });
 
   it("status passes 'spent' through — a release from a dead kill epoch must reach the proxy", async () => {
-    await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toBe("spent");
+    await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toEqual({
+      status: "spent",
+    });
+  });
+
+  it("status surfaces the control plane's grant on a released window, verbatim", async () => {
+    const grant = { v: 1, jti: "g1", sig: "abc" };
+    await expect(
+      client(jsonResponse({ status: "released", grant })).status("veto_1"),
+    ).resolves.toEqual({ status: "released", grant });
+    // no grant field when the control plane doesn't mint one
+    await expect(client(jsonResponse({ status: "released" })).status("veto_1")).resolves.toEqual({
+      status: "released",
+    });
   });
 
   it("status() requests /veto/:id with caching defeated — a cached 'released' is as dangerous as a cached killed:false", async () => {

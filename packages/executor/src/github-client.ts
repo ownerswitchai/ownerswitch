@@ -73,6 +73,15 @@ export interface GitHubMergeClientOptions {
   fetchImpl?: typeof fetch;
   /** per HTTP call; merges can be slow on large repos */
   timeoutMs?: number;
+  /**
+   * Invoked AFTER the installation token is acquired and immediately BEFORE
+   * the merge PUT is dispatched. The executing broker uses it to re-check
+   * live kill state across the token mint (which can take seconds) — a kill
+   * or epoch change landing during the mint throws here, and because nothing
+   * has been sent yet the outcome is definitively not-performed. It runs only
+   * on the merge path, never on the read-only head pin.
+   */
+  beforeDispatch?: () => Promise<void>;
 }
 
 export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitHubMergeClient {
@@ -82,6 +91,7 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     baseUrl = GITHUB_API_BASE_URL,
     fetchImpl = fetch,
     timeoutMs = 30_000,
+    beforeDispatch,
   } = options;
 
   const notPerformed = (message: string): ConnectorCallError =>
@@ -237,7 +247,10 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
   }
 
   return {
-    async mergePullRequest(args: MergePrArgs) {
+    // The live client authenticates directly (same-process mode); the grant
+    // is the executing broker's concern, so it is accepted and ignored here.
+    async mergePullRequest(args: MergePrArgs, _grant?: unknown) {
+      void _grant;
       // Failures before the PUT goes out — a name that can't form a URL, no
       // installation token — happen strictly BEFORE dispatch: nothing has
       // been sent, so the outcome is definitively not-performed.
@@ -264,6 +277,20 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
           `the merge was not dispatched — no installation token: ` +
             `${err instanceof Error ? err.message : "token minting failed"}`,
         );
+      }
+
+      // TOCTOU close: the token mint may have taken seconds. Re-check live
+      // kill state across it before anything is sent. A throw here is a
+      // definitively-not-performed refusal — nothing has crossed to GitHub.
+      if (beforeDispatch !== undefined) {
+        try {
+          await beforeDispatch();
+        } catch (err) {
+          throw notPerformed(
+            `the merge was not dispatched — ` +
+              `${err instanceof Error ? err.message : "pre-dispatch check refused"}`,
+          );
+        }
       }
 
       let res: BoundedResponse;

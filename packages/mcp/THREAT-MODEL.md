@@ -417,31 +417,59 @@ connector is configured: the deployment now contains a **GitHub App
 private key** and mints **installation tokens** with it
 (`packages/executor/DESIGN.md` §6). This section is what that changes.
 
-- **The key does not live in the gateway — because of the uid problem.**
-  File modes (0600, ownership) defend against other USERS; they defend
-  nothing against a process under the SAME uid, and in the stdio
-  deployment the MCP client spawns the gateway, so gateway and agent
-  share a uid. A key the gateway could read, the agent could read. The
-  shipped shape is therefore the **token broker**
-  (`ownerswitch-token-broker`): a separate process under its OWN uid
-  that alone reads the PEM and serves short-lived, single-repository
-  tokens over a UNIX socket whose directory permissions are the
-  kernel-enforced peer allow-list. The broker process — not the gateway
-  — is now the theft target, and it is small, credential-only, and
-  auditable in one sitting.
-- **What a same-uid agent can still do, stated plainly.** Neither
-  filesystem permissions nor SO_PEERCRED can tell the gateway apart
-  from the agent inside one uid. An agent that finds the broker socket
-  can REQUEST tokens: each ≤ 1 h, one repository, contents:write +
-  pull_requests:read, minted only while the kill switch is disengaged
-  (the broker checks live kill state before every response, fail
-  closed), bounded by the broker's repo allow-list, and logged per mint
-  on the broker's side. That residual is real and accepted; what it can
-  never reach is the standing key. The **same-process mode** (key in
-  the gateway) still exists behind an explicit
-  `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` acknowledgment —
-  it refuses to start without it and warns loudly with it, because in
-  stdio deployments it means the agent can read the key.
+- **Neither the key nor a token lives in the gateway — because of the
+  uid problem, and because a token is raw authority.** File modes (0600,
+  ownership) defend against other USERS; they defend nothing against a
+  process under the SAME uid, and in the stdio deployment the MCP client
+  spawns the gateway, so gateway and agent share a uid. A key the gateway
+  could read, the agent could read. An earlier design moved the key into
+  a separate-uid broker that VENDED tokens — but a `contents: write`
+  installation token authenticates git-over-HTTPS, so anything that
+  reached the broker socket held raw push authority, and within one uid
+  nothing distinguishes the gateway from the agent: a same-uid agent could
+  take the vended token and push directly, bypassing owner review, the
+  ticket, the head pin and policy. The separate uid protected the KEY; it
+  did not preserve the AUTHORIZATION BOUNDARY. The shipped shape is
+  therefore the **executing merge broker** (`ownerswitch-merge-broker`):
+  a separate-uid process that alone reads the PEM, **never returns a token
+  or the key**, and instead PERFORMS the merge itself after validating a
+  control-plane-signed, single-use grant. It is the theft target now, and
+  it is small, credential-only, and auditable in one sitting.
+- **The merge is authorized by evidence the gateway cannot forge.** A
+  **MergeGrant** (`packages/shared/src/merge-grant.ts`) is minted by the
+  CONTROL PLANE at owner-approval time (a veto window the owner saw
+  releasing in a live kill epoch), signed with a key
+  (`OWNERSWITCH_GRANT_KEY`) shared ONLY with the broker — never in the
+  gateway/agent environment. It carries the exact owner-reviewed call
+  (including the pinned `expectedHeadSha`), a single-use id, the approval's
+  kill epoch, and a short expiry. The broker verifies it independently and
+  merges only the signed args. Single-use burns twice, both out of the
+  agent's reach: the control plane issues each window's grant once, and the
+  broker burns the jti before dispatch.
+- **What a same-uid agent that finds the socket can obtain NOW, stated
+  plainly.** A read-only head sha (`pin-head` — public-ish, low value),
+  and a merge ONLY if it also presents a currently-valid, unburned,
+  owner-approved grant it cannot mint (the signing key is not in its
+  reach). It can never obtain a token or the key. Neither filesystem
+  permissions nor SO_PEERCRED would help — they cannot tell gateway from
+  agent within one uid — which is why the executing design removes the
+  thing worth stealing rather than trying to identify the caller. The
+  residual: a same-uid agent racing the gateway for a freshly-issued grant
+  could present it first, but the double single-use burn caps that at the
+  one merge the owner approved, with the args the owner approved. The
+  **same-process mode** (key in the gateway, merges direct, no grant)
+  still exists behind an explicit
+  `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` acknowledgment — it
+  refuses to start without it and warns loudly with it, because in stdio
+  deployments it means the agent can read the key.
+- **The socket's GID is verified, not assumed.** A unix socket inherits
+  the broker process's effective gid, not the directory's group, so a
+  documented "0750 dir + 0660 socket" can silently deny the intended
+  gateway user or admit a wider one. The broker checks the socket's actual
+  gid after bind and refuses to serve on a mismatch with
+  `OWNERSWITCH_BROKER_SOCKET_GID`; the deployment makes them agree with a
+  setgid (02750) socket directory and/or by running the broker with that
+  gid.
 - **The blast radius is configured, not coded.** An installation token
   is scoped at mint to ONE repository and
   `{ contents: write, pull_requests: read }`, and dies within an hour —
@@ -470,20 +498,25 @@ private key** and mints **installation tokens** with it
   the API's head-match guard. Commits pushed after the owner's review
   draw HTTP 409 (or a fresh review), never a merge under the old
   approval.
-- **Credentials appear on the wire to exactly one host.** Tokens ride
-  in an `Authorization` header to `api.github.com` and nowhere else; no
-  code path logs them, thrown errors are assembled from status codes
-  and a redacted, bounded `message` field, and everything the backend
-  emits crosses a second redaction (the SecretLedger) before an error
-  can reach the agent. The residual leak surface is a compromised
-  gateway process itself — which is §4's scenario, now with something
+- **Credentials appear on the wire to exactly one host, from exactly one
+  process.** Installation tokens exist only inside the broker and ride in
+  an `Authorization` header to `api.github.com` and nowhere else — never
+  across the broker socket, never in the gateway. No code path logs them,
+  thrown errors are assembled from status codes and a redacted, bounded
+  `message` field, transport failures collapse to fixed sentences (a token
+  FRAGMENT cannot be exact-match redacted, so the channel is removed), and
+  everything crosses a second SecretLedger redaction before an error can
+  reach the agent. The residual leak surface is a compromised broker
+  process itself — which is §4's scenario, now with something
   real to exfiltrate.
 - **Kill does not revoke a minted installation token.** Same boundary
-  as ever, one new instance: KILL stops new executions (the executor's
-  two live re-checks) AND new mints (the broker checks live kill state
-  before every token response, cached included), but a token minted
-  before the kill remains valid to GitHub for the remainder of its
-  ≤ 1 h life IF an attacker has already exfiltrated it. GitHub exposes
+  as ever: KILL stops new executions (the executor's live re-checks) AND
+  new merges at the broker (it checks live kill state before every merge,
+  requires the grant's kill epoch to match, and re-checks ACROSS the
+  token mint to catch a kill that lands during it). But a token exists
+  only inside the broker and never crosses the socket, so the only way a
+  token outlives a kill is a broker compromise — and a compromised broker
+  is §4's scenario regardless. GitHub exposes
   `DELETE /installation/token`; wiring token revocation into the kill
   path is future hardening, not shipped. Until then the honest bound on
   a stolen token is one hour and one repository.

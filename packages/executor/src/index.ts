@@ -8,6 +8,7 @@ export type { ActionTicket } from "./ticket.js";
 export { Executor, refuseTicket } from "./executor.js";
 export { liveKillStateFromControlPlane } from "./live-kill-state.js";
 export type {
+  ExecutionContext,
   ExecutionOutcome,
   ExecutionResult,
   ExecutorBackend,
@@ -50,8 +51,8 @@ export type { GitHubMergeClientOptions } from "./github-client.js";
 
 export { GITHUB_API_BASE_URL } from "./github-http.js";
 
-export { createTokenBroker } from "./token-broker.js";
-export type { TokenBroker, TokenBrokerOptions } from "./token-broker.js";
+export { createMergeBroker } from "./merge-broker.js";
+export type { MergeBroker, MergeBrokerOptions } from "./merge-broker.js";
 
-export { createBrokerTokenSource } from "./broker-client.js";
-export type { BrokerTokenSourceOptions } from "./broker-client.js";
+export { createBrokerMergeClient } from "./broker-client.js";
+export type { BrokerMergeClientOptions } from "./broker-client.js";

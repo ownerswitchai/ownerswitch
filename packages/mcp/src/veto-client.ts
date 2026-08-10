@@ -34,14 +34,25 @@ export interface VetoClientOptions {
   now?: () => number;
 }
 
-export interface VetoClient {
-  register(call: ToolCall): Promise<{ id: string }>;
+export interface VetoStatusResult {
   /**
    * The window's wire status; "spent" is a would-be release from a dead kill
    * epoch (the control plane's rule, see control-plane/src/veto.ts), and
    * "missing" is a 404 — drop the stale record and re-register.
    */
-  status(id: string): Promise<VetoWireStatus | "missing">;
+  status: VetoWireStatus | "missing";
+  /**
+   * On a "released" status, the control plane's single-use signed MergeGrant
+   * for this exact call (present only when the control plane has a grant key
+   * configured — the executing-broker deployment). Relayed verbatim to the
+   * broker, which verifies it independently; the gateway cannot forge one.
+   */
+  grant?: unknown;
+}
+
+export interface VetoClient {
+  register(call: ToolCall): Promise<{ id: string }>;
+  status(id: string): Promise<VetoStatusResult>;
 }
 
 /** Carries the fail-closed detail for the refusal message. Never a secret. */
@@ -116,7 +127,7 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
     return { id };
   }
 
-  async function status(id: string): Promise<VetoWireStatus | "missing"> {
+  async function status(id: string): Promise<VetoStatusResult> {
     // cache: "no-store" plus explicit request headers: a cached "released"
     // is exactly as dangerous as a cached killed:false — it would resurrect
     // a spent release. The control plane also serves /veto/:id with
@@ -127,14 +138,15 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
       cache: "no-store",
       headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
     });
-    if (res.status === 404) return "missing";
+    if (res.status === 404) return { status: "missing" };
     if (!res.ok) {
       throw new VetoClientError(`control plane refused veto status lookup (HTTP ${res.status})`, res.status);
     }
     const parsed: unknown = await res.json().catch(() => null);
     const status = (parsed as { status?: unknown } | null)?.status;
     if (!VETO_STATUSES.includes(status as VetoWireStatus)) throw new VetoClientError(UNREACHABLE);
-    return status as VetoWireStatus;
+    const grant = (parsed as { grant?: unknown } | null)?.grant;
+    return { status: status as VetoWireStatus, ...(grant !== undefined ? { grant } : {}) };
   }
 
   return { register, status };

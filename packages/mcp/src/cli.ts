@@ -10,7 +10,7 @@ import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotoc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "node:path";
 import {
-  createBrokerTokenSource,
+  createBrokerMergeClient,
   createGitHubMergeClient,
   createInstallationTokenSource,
   createSecretLedger,
@@ -96,19 +96,22 @@ async function runGateway(argv: string[]): Promise<void> {
   // exclusive modes resolved by resolveGitHubConnectorEnv:
   //
   //  - BROKER (recommended): OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET names
-  //    the UNIX socket of ownerswitch-token-broker running under its OWN
-  //    uid. The gateway never holds the App private key — it receives
-  //    short-lived, single-repository installation tokens. In the stdio
-  //    deployment the client spawns this gateway, so gateway and agent
-  //    share a uid; only a separate-uid broker actually isolates the key.
+  //    the UNIX socket of ownerswitch-merge-broker running under its OWN
+  //    uid. The gateway holds NO GitHub credential and NO grant key; it
+  //    relays a control-plane-signed grant to the broker, which VALIDATES it
+  //    and performs the merge itself, returning only the outcome — never a
+  //    token. In the stdio deployment the client spawns this gateway, so
+  //    gateway and agent share a uid; only the executing broker keeps the
+  //    authorization boundary an agent cannot cross. requiresGrant is set,
+  //    so routed merges must clear an owner-gated lane.
   //
   //  - SAME-PROCESS (degraded, explicit opt-in via
   //    OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1): the
-  //    OWNERSWITCH_GITHUB_APP_* triple loads the key into THIS process.
-  //    The key placement check runs against the UPSTREAM AGENT'S workspace
-  //    (config.upstream.cwd — when unset, the child inherits this
-  //    process's cwd, so that is the workspace), and the startup line
-  //    below says the isolation this mode does NOT have.
+  //    OWNERSWITCH_GITHUB_APP_* triple loads the key into THIS process and
+  //    merges directly (no grant). The key placement check runs against the
+  //    UPSTREAM AGENT'S workspace (config.upstream.cwd — when unset, the
+  //    child inherits this process's cwd, so that is the workspace), and the
+  //    startup line says the isolation this mode does NOT have.
   //
   // With neither configured the gateway still runs; routed merges refuse
   // cleanly as not-configured — at the review-time pin, before any owner
@@ -125,13 +128,12 @@ async function runGateway(argv: string[]): Promise<void> {
   const ledger = createSecretLedger();
   let githubClient: GitHubMergeClient | undefined;
   let githubAppKeyPem: string | undefined;
+  let requiresGrant = false;
   let connectorState = "github connector: not configured (routed merges will refuse)";
   if (connectorEnv?.mode === "broker") {
-    githubClient = createGitHubMergeClient({
-      tokens: createBrokerTokenSource({ socketPath: connectorEnv.socketPath, ledger }),
-      ledger,
-    });
-    connectorState = `github connector: live via token broker at ${connectorEnv.socketPath} (key isolated in the broker's uid)`;
+    githubClient = createBrokerMergeClient({ socketPath: connectorEnv.socketPath, ledger });
+    requiresGrant = true;
+    connectorState = `github connector: live via EXECUTING merge broker at ${connectorEnv.socketPath} (key + merge authority isolated in the broker's uid; owner-gated grants required)`;
   } else if (connectorEnv?.mode === "same-process") {
     const agentWorkspace = resolve(config.upstream.cwd ?? process.cwd());
     let key;
@@ -157,8 +159,9 @@ async function runGateway(argv: string[]): Promise<void> {
     console.error(
       "[ownerswitch-mcp] WARNING: same-process GitHub App key (explicitly acknowledged). " +
         "Any process under this uid — in stdio deployments, the agent — can read the key " +
-        "file. The token broker (ownerswitch-token-broker) is the deployment that actually " +
-        "isolates it. See packages/mcp/THREAT-MODEL.md §5.",
+        "file, and the gateway performs merges directly with no owner-gated grant. The " +
+        "executing merge broker (ownerswitch-merge-broker) is the deployment that actually " +
+        "isolates the credential and the merge authority. See packages/mcp/THREAT-MODEL.md §5.",
     );
   }
   const executor =
@@ -175,7 +178,8 @@ async function runGateway(argv: string[]): Promise<void> {
           });
           return {
             routes,
-            run: (ticket: ActionTicket) => runner.run(ticket),
+            requiresGrant,
+            run: (ticket: ActionTicket, grant?: unknown) => runner.run(ticket, { grant }),
             // review-time head pin: server-derived, before the owner sees
             // the request; absent client = routed merges fail closed at pin
             ...(client !== undefined

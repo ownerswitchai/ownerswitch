@@ -3,6 +3,7 @@ import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } f
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
 import {
@@ -1342,5 +1343,117 @@ describe("control-plane HTTP API", () => {
 
     // the server is still alive and well
     expect((await fetch(`${url}/status`)).status).toBe(200);
+  });
+});
+
+describe("MergeGrant issuance on veto release", () => {
+  let server: Server | undefined;
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  const GRANT_KEY = "grant-key-cp-and-broker";
+  const MERGE_ARGS = {
+    owner: "ownerswitchai",
+    repo: "ownerswitch",
+    pullNumber: 7,
+    expectedHeadSha: "a".repeat(40),
+  };
+
+  /** A delivered window that has passed its deadline (→ released). */
+  const releasedWindow = (c: ReturnType<typeof clock>, killEpoch = 0) => {
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "github.merge_pr", args: MERGE_ARGS },
+      killEpoch,
+      { now: c.now, windowMs: 4 * 60_000 },
+    );
+    window.markDelivered();
+    return window;
+  };
+
+  it("mints a single-use signed grant over the reviewed call when a window releases", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", releasedWindow(c));
+    c.advance(4 * 60_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as {
+      status: string;
+      grant?: {
+        v: number;
+        tool: string;
+        canonicalArgs: string;
+        callHash: string;
+        killEpoch: number;
+        sig: string;
+      };
+    };
+    expect(body.status).toBe("released");
+    expect(body.grant).toBeDefined();
+    // it verifies under the shared key and binds the exact reviewed args
+    const verified = verifyMergeGrant(body.grant, GRANT_KEY, { now: c.now });
+    expect(verified.ok).toBe(true);
+    if (verified.ok) {
+      expect(verified.grant.tool).toBe("github.merge_pr");
+      expect(verified.grant.canonicalArgs).toBe(canonicalJson(MERGE_ARGS));
+      expect(verified.grant.killEpoch).toBe(0);
+    }
+    // and it does NOT verify under a different key — the gateway cannot forge one
+    expect(verifyMergeGrant(body.grant, "wrong-key", { now: c.now }).ok).toBe(false);
+  });
+
+  it("issues the grant AT MOST ONCE — a second read is 'spent', no second grant", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", releasedWindow(c));
+    c.advance(4 * 60_000);
+
+    const first = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(first.status).toBe("released");
+    expect(first.grant).toBeDefined();
+
+    const second = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(second.status).toBe("spent");
+    expect(second.grant).toBeUndefined();
+  });
+
+  it("no grant key configured → releases with NO grant (backwards compatible)", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now }); // no grantKey
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", releasedWindow(c));
+    c.advance(4 * 60_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body).toEqual({ status: "released" });
+  });
+
+  it("a release in a DEAD kill epoch is spent and mints no grant", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", releasedWindow(c, 0)); // window bound to epoch 0
+    c.advance(4 * 60_000);
+
+    // a kill bumps the epoch to 1 — the window's release must not authorize
+    const killBody = JSON.stringify({ source: "button" });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now()), body: killBody });
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body.status).toBe("spent");
+    expect(body.grant).toBeUndefined();
   });
 });

@@ -13,8 +13,9 @@ does not.
 
 - A **throwaway repository** you own, e.g. `<you>/ownerswitch-live-test`.
   Nothing in it matters; it will receive one real merge.
-- A machine with the repo checked out, `pnpm install` done, and the
-  ability to create a second local user (the broker's uid).
+- A machine with the repo checked out, `pnpm install && pnpm -r build`
+  done, and the ability to create local users (the broker's uid, and a
+  third throwaway uid for the peer-boundary negative check).
 
 ## 1. Create and install the GitHub App (once)
 
@@ -32,44 +33,61 @@ does not.
    un-downscoped tokens — use a personal or ordinary org account.)
 4. Generate a **private key**; a `.pem` file downloads.
 
-## 2. Provision the broker like production
+## 2. Provision the executing broker like production
 
-The point of doing this properly in a test run is that the run also
-rehearses the deployment rule: the key belongs to a uid the gateway and
-agent do not share.
+The point of doing this properly in a test run is that the run rehearses
+the deployment rule: the key belongs to a uid the gateway and agent do
+NOT share, and the broker performs the merge — it never hands out a token.
+
+Create the broker user and the shared socket group (the GATEWAY's user
+joins the group so it can connect; the broker runs WITH that group as its
+effective gid so the socket inherits it):
 
 ```sh
 sudo useradd --system --shell /usr/sbin/nologin oswitch-broker
-sudo groupadd oswitch && sudo usermod -aG oswitch "$(id -un)"  # gateway's user joins the socket group
-sudo mkdir -p /etc/ownerswitch /run/ownerswitch
+sudo groupadd oswitch && sudo usermod -aG oswitch "$(id -un)"   # gateway's user in the socket group
+sudo usermod -aG oswitch oswitch-broker                          # broker in it too, for its egid
+sudo mkdir -p /etc/ownerswitch
 sudo mv ~/Downloads/<app-name>.*.private-key.pem /etc/ownerswitch/github-app.pem
 sudo chown oswitch-broker /etc/ownerswitch/github-app.pem
 sudo chmod 600 /etc/ownerswitch/github-app.pem
-sudo chown oswitch-broker:oswitch /run/ownerswitch && sudo chmod 750 /run/ownerswitch
+# setgid (02750) socket dir so the socket inode inherits the oswitch group:
+sudo install -d -o oswitch-broker -g oswitch -m 02750 /run/ownerswitch
+OSWITCH_GID=$(getent group oswitch | cut -d: -f3)
 ```
 
-Start the broker under its own uid (`sudo -u oswitch-broker …`):
+Pick a strong random **grant key** — the control plane and the broker
+share it, and NOTHING else may: `GRANT_KEY=$(openssl rand -hex 32)`.
+
+Start the broker under its own uid, with the shared group as its egid
+(`sg oswitch`), so the socket ends up gid `oswitch`:
 
 ```sh
-sudo -u oswitch-broker \
+sudo -u oswitch-broker sg oswitch -c '
   OWNERSWITCH_GITHUB_APP_ID=<app id> \
   OWNERSWITCH_GITHUB_APP_INSTALLATION_ID=<installation id> \
   OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE=/etc/ownerswitch/github-app.pem \
-  OWNERSWITCH_AGENT_WORKSPACE=<the agent's workspace dir> \
+  OWNERSWITCH_AGENT_WORKSPACE=<the agent'"'"'s workspace dir> \
+  OWNERSWITCH_GRANT_KEY='"$GRANT_KEY"' \
   OWNERSWITCH_BROKER_SOCKET=/run/ownerswitch/broker.sock \
+  OWNERSWITCH_BROKER_SOCKET_GID='"$OSWITCH_GID"' \
   OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test \
   OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:8787 \
-  pnpm --filter @ownerswitchai/executor exec tsx src/broker-cli.ts
+  ownerswitch-merge-broker'
 ```
 
 The loader refuses a relative key path, a path under the given agent
 workspace, a symlink, group/world-readable modes, another user's file,
 and non-RSA content; the broker refuses a world-accessible socket
-directory. If it won't start, the error names the failing check.
+directory AND refuses to serve if the socket's gid is not
+`OWNERSWITCH_BROKER_SOCKET_GID`. If it won't start, the error names the
+failing check.
 
-Sanity check the isolation while you're here:
-`sudo -u "$(id -un)" cat /etc/ownerswitch/github-app.pem` must fail
-(permission denied) — the gateway's uid cannot read the key.
+Sanity-check the isolation while you're here (BOTH must hold):
+- `sudo -u "$(id -un)" cat /etc/ownerswitch/github-app.pem` must FAIL
+  (permission denied) — the gateway's uid cannot read the key.
+- `stat -c '%G %a' /run/ownerswitch/broker.sock` should show `oswitch
+  660` — the gateway's user reaches it via the group, no wider.
 
 ## 3. Open a PR in the throwaway repo
 
@@ -84,11 +102,13 @@ Note the PR's **head SHA** (`git rev-parse HEAD`) — you will verify the
 owner-facing window shows exactly it. You will NOT pass it anywhere:
 OwnerSwitch pins it server-side.
 
-## 4. Run the gateway with the executor routed
+## 4. Run the control plane and the gateway
 
-Start the dev control plane, then launch the gateway with a config whose
-policy puts `github.merge_pr` in the `veto` lane and whose
-`executorRoutes` maps it to
+Start the dev control plane **with the same grant key** the broker has
+(`OWNERSWITCH_GRANT_KEY=$GRANT_KEY`), so it mints signed grants the broker
+will accept. Then launch the gateway with a config whose policy puts
+`github.merge_pr` in the **`veto` lane** (an owner-gated lane is required
+in broker mode) and whose `executorRoutes` maps it to
 `{ "connector": "github", "operation": "merge_pull_request" }`
 (see `packages/mcp/README.md`), plus:
 
@@ -96,8 +116,9 @@ policy puts `github.merge_pr` in the `veto` lane and whose
 export OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET=/run/ownerswitch/broker.sock
 ```
 
-The startup line must say
-`github connector: live via token broker at /run/ownerswitch/broker.sock` —
+The gateway needs NO GitHub credential and NO grant key. Its startup line
+must say
+`github connector: live via EXECUTING merge broker at /run/ownerswitch/broker.sock` —
 `not configured` means the variable didn't resolve.
 
 ## 5. The live merge
@@ -122,9 +143,31 @@ NO sha argument; the pin is OwnerSwitch's job:
 
 ## 6. Negative checks (same session, no second merge)
 
+- **A raw socket client with no valid evidence gets a refusal — never a
+  token, never a merge.** As the gateway's user, hit the broker socket
+  directly and confirm neither op yields authority:
+  ```sh
+  # asking for a token: there is no such op
+  printf '{"op":"token","repo":"ownerswitch-live-test"}\n' | nc -U /run/ownerswitch/broker.sock
+  #   → {"ok":false,...}  and NO ghs_ token anywhere in the reply
+  # asking to merge with a forged grant:
+  printf '{"op":"merge","grant":{"v":1,"sig":"00"},"args":{}}\n' | nc -U /run/ownerswitch/broker.sock
+  #   → {"ok":false,"kind":"refused",...}  and the PR is NOT merged
+  ```
+  Grep both replies for `ghs_` — nothing. This is the core property: the
+  socket hands out results, never authority.
+- **A distinct, non-group uid cannot even connect.** As a third user who
+  is NOT in the `oswitch` group:
+  `sudo -u nobody sh -c 'printf "{}\n" | nc -U /run/ownerswitch/broker.sock'`
+  must FAIL with a permission error — connect(2) is denied by the socket's
+  0660/group. (This is the peer boundary the kernel actually enforces.)
 - **Agent-supplied sha refused:** call the tool with an added
   `"expectedHeadSha": "<any 40-hex>"` → refused `-32056` with
-  `refusalCode: "invalid-args"`, no veto window opened.
+  `refusalCode: "invalid-args"`, no veto window opened, GitHub never
+  contacted.
+- **Unknown field refused:** call with `"dryRun": true` → refused
+  `-32056` `invalid-args` ("unknown argument"), before any head read —
+  proof the closed schema is enforced, not just advertised.
 - **Replay:** call the tool again with the original arguments — the pin
   read now finds the PR already merged and refuses
   (`head-pin-failed`, "already merged — nothing to pin") before any
@@ -134,6 +177,10 @@ NO sha argument; the pin is OwnerSwitch's job:
   call again → a FRESH veto window opens for the new head (the released
   approval never merges the moved branch). Veto the fresh window to
   finish without merging.
+- **Allow lane refused:** temporarily move `github.merge_pr` to the
+  `allow` lane and call it → refused `-32056`
+  `refusalCode: "owner-grant-required"`, nothing runs. Put it back in the
+  veto lane.
 - **Kill gate at the broker:** engage the kill switch, then call the
   tool → the pin read fails closed (`head-pin-failed` — the broker
   refuses: "kill switch engaged"). Restore afterwards.
@@ -146,18 +193,22 @@ Then delete the throwaway repo, or leave it for the next run.
 ## What a green run proves
 
 - The end-to-end path is real: agent call → policy lane → review-time
-  head pin → owner decision over the pinned args → ActionTicket →
-  executor re-checks → a genuine merge on GitHub, performed with an
-  installation token the broker minted.
+  head pin → owner decision over the pinned args → control-plane-signed
+  grant → broker validates it independently and PERFORMS the merge with a
+  token that never crossed the socket.
 - The uid isolation holds as deployed: the gateway's uid cannot read the
   key file (step 2's sanity check), yet merges work — the key never
-  entered the gateway.
-- The provisioning recipe works as written: broker user, socket
-  directory permissions, key placement checks, the repo allow-list, the
-  agent-workspace placement argument.
-- The pin is server-derived end to end: the owner-facing window carried
-  the real head sha, an agent-supplied sha was refused, and a moved head
-  re-opened review instead of merging.
+  entered the gateway, and neither did a token.
+- The socket hands out results, never authority: a direct client asking
+  for a token gets nothing, a forged grant is refused, and a non-group
+  uid cannot even connect.
+- The provisioning recipe works as written: broker user, setgid socket
+  directory, verified socket gid, key placement checks, repo allow-list,
+  the agent-workspace placement argument, the shared grant key.
+- The pin is server-derived end to end and the schema is enforced: the
+  owner-facing window carried the real head sha, an agent-supplied sha
+  and an unknown field were both refused, and a moved head re-opened
+  review instead of merging.
 - The agent-visible surface (results, refusals, logs) carried no
   credential during a real run with real errors.
 
@@ -170,16 +221,22 @@ Then delete the throwaway repo, or leave it for the next run.
   the evidence there. Remember what the verification read proves when it
   does fire: the PR's merged STATE — never that a particular dispatch
   performed the merge.
-- **The kill/epoch race guarantees.** §3's refusal ordering is pinned by
-  the executor's own tests; one live merge says nothing about races.
+- **The kill/epoch race guarantees, and the TOCTOU recheck across the
+  mint.** §3's refusal ordering and the broker's before/after-mint kill
+  recheck are pinned by unit tests; one live merge says nothing about
+  races.
 - **Scope enforcement against a hostile ticket.** That the App cannot
   reach other repos is GitHub's enforcement of the installation list —
   this run demonstrates the happy case (plus the broker's own
   allow-list), it does not adversarially probe GitHub's side.
-- **Peer identity on the broker socket beyond the kernel's file
-  permissions.** A same-uid-as-gateway process that finds the socket can
-  request scoped tokens; that residual is documented in
-  THREAT-MODEL.md §5 and no run of this procedure changes it.
+- **The grant-forgery boundary beyond this smoke test.** The negative
+  check shows a bad-signature grant is refused; the cryptographic
+  argument (the gateway lacks the signing key) is in the unit tests and
+  THREAT-MODEL.md §5, not something one run establishes.
+- **The same-uid grant-race residual.** A same-uid agent racing the
+  gateway for a freshly-issued grant is bounded by the double single-use
+  burn, not eliminated; documented in THREAT-MODEL.md §5, unchanged by
+  this run.
 - **Multi-gateway / restart nonce semantics.** The single-process nonce
   constraint (DESIGN.md §5) is unchanged and untested by this run.
 - **Rate-limit behavior.** One merge cannot trip primary or secondary

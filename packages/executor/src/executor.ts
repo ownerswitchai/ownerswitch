@@ -42,9 +42,22 @@ export type ExecutionOutcome =
   | { status: "executed"; result: ExecutionResult }
   | { status: "refused"; refusal: Refusal };
 
+/**
+ * Per-run context threaded to the backend. Carries the control-plane-minted
+ * MergeGrant (as an opaque signed object) for backends that execute behind
+ * an agent-inaccessible boundary — the executing merge broker. The in-process
+ * and same-process backends ignore it; the broker REQUIRES it, because within
+ * one uid the ticket alone is agent-forgeable and only the signed grant is
+ * not (packages/shared/src/merge-grant.ts).
+ */
+export interface ExecutionContext {
+  /** the signed grant, verbatim, to relay to an executing broker */
+  grant?: unknown;
+}
+
 /** A connector backend performs the call for an already-validated ticket. */
 export interface ExecutorBackend {
-  execute(ticket: ActionTicket): Promise<ExecutionResult>;
+  execute(ticket: ActionTicket, ctx?: ExecutionContext): Promise<ExecutionResult>;
 }
 
 /**
@@ -95,7 +108,7 @@ export class Executor {
     this.now = opts.now ?? Date.now;
   }
 
-  async run(ticket: ActionTicket): Promise<ExecutionOutcome> {
+  async run(ticket: ActionTicket, ctx?: ExecutionContext): Promise<ExecutionOutcome> {
     const live = await this.fetchLive();
     const refusal = refuseTicket(ticket, live, this.now(), this.consumedNonces);
     if (refusal) return { status: "refused", refusal };
@@ -119,7 +132,7 @@ export class Executor {
     const lateRefusal = refuseTicket(ticket, liveAtDispatch, this.now(), NO_BURNED_NONCES);
     if (lateRefusal) return { status: "refused", refusal: lateRefusal };
 
-    const result = await this.backend.execute(ticket);
+    const result = await this.backend.execute(ticket, ctx);
     return { status: "executed", result };
   }
 

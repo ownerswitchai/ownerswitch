@@ -47,3 +47,16 @@ export interface Verdict {
   ruleId: string | null;
   reason: string;
 }
+
+export {
+  canonicalJson,
+  sha256Hex,
+  signMergeGrant,
+  verifyMergeGrant,
+} from "./merge-grant.js";
+export type {
+  GrantVerifyResult,
+  MergeGrant,
+  SignedMergeGrant,
+  VerifyGrantOptions,
+} from "./merge-grant.js";

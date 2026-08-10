@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "bin": {
-    "ownerswitch-token-broker": "dist/broker-cli.js"
+    "ownerswitch-merge-broker": "dist/merge-broker-cli.js"
   },
   "dependencies": {
     "@ownerswitchai/gateway": "workspace:*",

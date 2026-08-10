@@ -1,5 +1,5 @@
 import { ConnectorCallError } from "./connector-error.js";
-import type { ExecutionResult, ExecutorBackend } from "./executor.js";
+import type { ExecutionContext, ExecutionResult, ExecutorBackend } from "./executor.js";
 import type { ActionTicket } from "./ticket.js";
 
 /**
@@ -32,7 +32,16 @@ export interface MergePrArgs {
 
 /** The calls this connector makes, injectable for tests. */
 export interface GitHubMergeClient {
-  mergePullRequest(args: MergePrArgs): Promise<{ merged: boolean; sha: string; message: string }>;
+  /**
+   * `grant` is the control-plane-signed MergeGrant, passed verbatim. The
+   * same-process/live client ignores it (it mints its own token and merges
+   * directly); the broker client REQUIRES it and relays it to the executing
+   * broker, which is where authorization is actually verified.
+   */
+  mergePullRequest(
+    args: MergePrArgs,
+    grant?: unknown,
+  ): Promise<{ merged: boolean; sha: string; message: string }>;
   /**
    * Read-only: the PR's current head sha, for the proxy's review-time pin.
    * Throws when the PR is already merged or the head is unusable.
@@ -133,7 +142,7 @@ export class GitHubMergePrExecutor implements ExecutorBackend {
     return this.redact === undefined ? afterToken : this.redact(afterToken);
   }
 
-  async execute(ticket: ActionTicket): Promise<ExecutionResult> {
+  async execute(ticket: ActionTicket, ctx?: ExecutionContext): Promise<ExecutionResult> {
     if (ticket.connector !== GITHUB_CONNECTOR || ticket.operation !== MERGE_PULL_REQUEST) {
       throw new Error(
         `GitHubMergePrExecutor cannot execute ${ticket.connector}.${ticket.operation}`,
@@ -149,7 +158,7 @@ export class GitHubMergePrExecutor implements ExecutorBackend {
     }
     let outcome;
     try {
-      outcome = await this.client.mergePullRequest(args);
+      outcome = await this.client.mergePullRequest(args, ctx?.grant);
     } catch (err) {
       // GitHub quotes credentials back in auth errors; the scrubbed message
       // is what may ride an ExecutionFailed refusal to the agent. The

@@ -21,7 +21,7 @@ import type { SecretLedger } from "./secret-ledger.js";
  * needs.
  *
  * In the recommended deployment this module runs inside the TOKEN BROKER
- * process (token-broker.ts), under a uid the agent does not share — the
+ * process (merge-broker.ts), under a uid the agent does not share — the
  * gateway then never holds the private key at all (DESIGN.md §6).
  *
  * The flow, per GitHub's documentation (verified against the REST API

@@ -10,7 +10,9 @@ import { ConfigError } from "./config.js";
  *
  *  - **broker** (recommended, and the only shape that isolates the key):
  *    `OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET` names the UNIX socket of a
- *    token broker running under its OWN uid (ownerswitch-token-broker).
+ *    executing merge broker running under its OWN uid
+ *    (ownerswitch-merge-broker), which validates a control-plane grant and
+ *    performs the merge itself — the gateway never holds the key or a token.
  *    The gateway never reads the private key at all. This is the mode the
  *    threat model's key-isolation claims are about: in the stdio MCP
  *    deployment the client spawns the gateway, so gateway and agent share
@@ -94,7 +96,7 @@ export function resolveGitHubConnectorEnv(
       `the OWNERSWITCH_GITHUB_APP_* triple loads the App PRIVATE KEY into the gateway process. ` +
         `In the stdio deployment the gateway shares a uid with the agent, so the agent could ` +
         `read the key — file modes do not protect against a same-uid process. Use the token ` +
-        `broker instead (ownerswitch-token-broker + ${BROKER_VAR}), or set ${ACK_VAR}=1 to ` +
+        `broker instead (ownerswitch-merge-broker + ${BROKER_VAR}), or set ${ACK_VAR}=1 to ` +
         `accept that risk explicitly.`,
     );
   }

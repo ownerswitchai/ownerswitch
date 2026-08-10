@@ -43,7 +43,7 @@ executor never reaches back into the gateway's memory.
 | `connector`     | `string`  | which backend performs it, e.g. `"github"` |
 | `operation`     | `string`  | which action within the connector, e.g. `"merge_pull_request"` |
 | `canonicalArgs` | `string`  | the arguments, canonicalized (below). The executor runs *these bytes* — not a re-supplied copy — so what runs is exactly what was evaluated and approved |
-| `resourceId`    | `string`  | stable id of the object acted on, e.g. `github:pr:ownerswitchai/ownerswitch#7` — audit and future per-resource rules key on this, independent of args shape |
+| `resourceId`    | `string`  | stable id of the object acted on, e.g. `github:pr:ownerswitchai/ownerswitch#7` — audit and future per-resource rules key on this, independent of args shape. **Deliberately sha-free:** it identifies the pull request, not the approved head; the pinned `expectedHeadSha` lives in `canonicalArgs` (and thus the grant and the action hash), never here |
 | `policyVersion` | `string`  | content hash of the **whole authorization semantics** the verdict came from: the policy *and* the executor-route mapping, as canonical JSON. Routes decide which real operation a tool name reaches, so a hash of the policy alone would identify only half of what was authorized — the same policy with a re-pointed route is a different authorization world |
 | `killEpoch`     | `number`  | `KillSwitch.epoch` at mint time (§3). Must still match at execution time |
 | `expiresAt`     | `number`  | unix ms. Tickets are short-lived (minutes, not hours) — a yes is not a standing grant |
@@ -241,15 +241,18 @@ Honesty about the boundary, in the same spirit as the threat model:
   boundary, nothing more. What the executor removes is the other half of
   that caveat: for actions routed through it, there are no credentials
   issued downstream to outlive the kill.
-- **OwnerSwitch's credential is now the prize.** The executor holds a
-  standing GitHub credential; whoever compromises the executor process
-  merges without any ticket. Least privilege shrinks the blast radius; it
-  does not eliminate it. That least privilege is now shipped, not
-  aspirational: the connector authenticates as a GitHub App whose private
-  key mints installation tokens that live at most an hour and are scoped,
-  per mint, to one named repository and two permissions — §6 has the full
-  model, including where the key must live and what a stolen artifact of
-  each kind is worth.
+- **OwnerSwitch's credential is now the prize — and it lives in the
+  broker, not the gateway.** Whoever holds the GitHub App private key can
+  merge without any ticket, so the key does not sit in the gateway (which
+  shares the agent's uid in stdio deployments). It lives in the executing
+  merge broker, under its own uid; the broker never returns the key or a
+  token, only the outcome of a merge it performed after validating a
+  control-plane-signed grant. Least privilege is shipped, not aspirational:
+  a GitHub App whose installation tokens live at most an hour and are
+  scoped, per mint, to one named repository and two permissions — §6 has
+  the full model, including where the key must live, why the broker
+  executes rather than vends, and what a stolen artifact of each kind is
+  worth.
   Two containments ship with the wiring. First, the upstream child process —
   the agent's side of the boundary — gets an EXPLICITLY built environment
   with every gateway/executor/connector credential stripped: by name
@@ -351,37 +354,93 @@ read is a key file the AGENT can read; 0600 does not change that, and a
 same-uid agent that discovers the path could mint its own tokens forever.
 So the key does not live in the gateway.
 
-The recommended shape is the **token broker**
-(`src/token-broker.ts`, `ownerswitch-token-broker`): a separate small
-process **under its own uid** that alone reads the PEM, mints App JWTs and
-installation tokens, and serves TOKENS to the gateway over a UNIX domain
-socket. The gateway (`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`) never holds
-the key in memory at all.
+The shape is the **executing merge broker**
+(`src/merge-broker.ts`, `ownerswitch-merge-broker`): a separate small
+process **under its own uid** that alone reads the PEM and mints
+installation tokens — and **never returns a token**. It performs the merge
+itself and returns only the outcome. The gateway
+(`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`) never holds the key, and never
+holds a token either.
 
-- **Peer verification, honestly.** Pure Node exposes no `SO_PEERCRED`, so
-  the allow-listed-uid check is expressed where the kernel enforces it for
-  UNIX sockets: connect(2) requires write permission on the socket inode
-  and traversal of its directory. The broker refuses to listen unless the
-  socket directory is broker-owned with **no world access** (deploy it
-  0750), and chmods the socket 0660 after listen — the directory's group
-  is the allow-list; put the gateway's uid in it.
-- **What this buys, precisely.** The agent (same uid as the gateway) can
-  never read the KEY. What a same-uid process that finds the socket CAN
-  do is request tokens — exactly what `SO_PEERCRED` would also permit,
-  since it cannot tell gateway from agent within one uid. Every such
-  token is ≤ 1 h, single-repository, minimally-permissioned; the broker
-  can be confined to an explicit repo allow-list
-  (`OWNERSWITCH_BROKER_ALLOWED_REPOS`); and every mint is checked against
-  **live kill state and logged** on the broker's side. Residual risk,
-  stated: a same-uid agent can obtain scoped short-lived tokens while the
-  system is alive and unkilled. The standing credential is out of reach.
-- **The broker and kill state.** The broker checks live kill state —
-  through the same fail-closed contract as every other check in the
-  system — **before every token response, cached tokens included**.
-  Killed, or control plane unreachable, means no tokens. This adds a
-  third gate in front of the executor's own two pre-dispatch re-checks;
-  what it does NOT do is revoke tokens already handed out (their ≤ 1 h
-  expiry is the bound, THREAT-MODEL.md §5).
+**Why the broker executes, instead of vending tokens.** An earlier design
+had the broker return a `contents: write` installation token. That was the
+wrong boundary: a `contents: write` token authenticates git-over-HTTPS, so
+anything that could reach the socket held raw push authority — and within
+one uid *nothing distinguishes the gateway from the agent*. A same-uid
+agent could take the token and push directly, bypassing owner review, the
+ticket, the nonce, the head pin and policy entirely. The separate uid
+protected the standing KEY; it did not preserve the AUTHORIZATION BOUNDARY,
+and the boundary is the whole product. So the broker never hands out raw
+authority. It hands out a *result*.
+
+**What crosses the socket** (`{op}` → response):
+- `pin-head` → the PR's current head sha (read-only, for the review-time
+  pin). Data, not authority.
+- `merge {grant, args}` → the outcome of the merge. Never a token.
+
+**How a merge is authorized — the broker validates independently, trusting
+nothing the gateway says.** The evidence is a **MergeGrant**
+(`packages/shared/src/merge-grant.ts`):
+- **Who mints it:** the CONTROL PLANE, at owner-approval time — the moment
+  a veto window the owner was shown releases while its kill epoch is
+  current (`server.ts` `getVeto`). Not the gateway: within one uid the
+  gateway can hold no secret the agent cannot read, so nothing the gateway
+  knows can authorize a merge. The grant is signed with a key
+  (`OWNERSWITCH_GRANT_KEY`) the control plane shares ONLY with the broker
+  — never in the gateway/agent environment.
+- **What is inside it:** the exact tool call the owner reviewed (tool,
+  agentId, canonical args), the content hash of those bytes, the kill
+  epoch at approval, a single-use id (`jti`), and a short expiry. The
+  pinned `expectedHeadSha` lives inside the canonical args, so it is
+  covered by the signature — the gateway cannot swap the head, repo, or PR
+  after approval.
+- **Who verifies it:** the BROKER, independently — signature under the
+  shared key, version, expiry, hash↔args. The gateway relays the grant but
+  cannot forge one.
+- **Where single-use burns — twice, both agent-inaccessible:** the control
+  plane issues each window's grant at most once (a second read is served
+  `spent`), and the broker burns the `jti` locally before dispatch. The
+  gateway's own in-process nonce store is now only defense in depth, not
+  the boundary.
+- **Args must match:** the broker merges the SIGNED args and refuses any
+  wire args that do not re-canonicalize to them.
+
+**Peer verification of the socket, honestly.** Pure Node exposes no
+`SO_PEERCRED`, so the kernel-enforced part of the allow-list is the socket
+inode's connect(2) permission: the broker refuses to listen unless the
+socket directory is broker-owned with **no world access** (deploy it
+**setgid `02750`** — see the GID note below), and chmods the socket 0660
+after listen. **A unix socket inherits the broker process's effective GID,
+not the directory's group**, so the broker also reads the socket's actual
+gid after bind and — when `OWNERSWITCH_BROKER_SOCKET_GID` is set — refuses
+to serve if it is not the intended group. The deployment makes the two
+agree with a setgid socket directory (so new inodes inherit the dir's
+group) and/or by running the broker with that gid (`sg <group>`). Without
+that, a directory whose group is the allow-list does *not* by itself make
+the socket connectable by that group.
+
+**What a same-uid agent that finds the socket can obtain NOW.** It can read
+a head sha (`pin-head` — public-ish, low value), and it can obtain a merge
+ONLY by also presenting a currently-valid, unburned, owner-approved grant —
+which it cannot mint, because the signing key is not in its reach. It can
+never obtain a token or the key. `SO_PEERCRED` would not improve this,
+because it cannot tell gateway from agent within one uid; the executing
+design removes the thing worth stealing instead. Residual risk, stated: a
+same-uid agent that races the gateway for a freshly-issued grant before the
+gateway consumes it could present it — but the control plane issues each
+grant once and the broker burns the jti, so at most one merge results from
+one owner approval, and it is exactly the merge the owner approved. Detail
+in THREAT-MODEL.md §5.
+
+**The broker and kill state.** The broker checks live kill state — same
+fail-closed contract as every other check — **before every pin and every
+merge**, and for a merge it additionally requires the grant's kill epoch to
+equal the live epoch AND re-checks across the token mint (the TOCTOU close:
+the mint can take seconds, so a kill landing during it aborts before
+anything is sent). Killed, or control plane unreachable, means nothing acts.
+What a kill does NOT do is revoke a token already on GitHub's side of a
+dispatched call (there is none held anywhere else) — the in-flight boundary
+is unchanged.
 
 A **single-process mode** exists for deployments that genuinely separate
 the gateway's uid from the agent's by other means (or accept the risk):
@@ -404,32 +463,47 @@ mode means the agent can read the key, full stop.
    matter what a ticket says.
 3. Generate a private key in the App's settings; a `.pem` downloads.
 4. Create the broker's user (e.g. `oswitch-broker`) and a shared group
-   for the socket (e.g. `oswitch`). Put the key at an absolute path owned
-   by the BROKER's user, mode `0600`, **outside the agent's workspace**
-   (e.g. `/etc/ownerswitch/github-app.pem`) — the same placement rule as
-   the kill-state file. The loader (`src/github-app-key.ts`) enforces
-   what is checkable — absolute path, not under the AGENT WORKSPACE it is
-   given explicitly (never implied from `process.cwd()`), regular file
-   behind no symlink, ≤ 64 KiB, no group/world access, owned by the
-   loading process's uid, parses as an RSA key — and refuses to start
-   otherwise. The placement rule itself (a host path the agent has no
-   route to) remains a deployment requirement no process can self-verify.
-5. Run the broker under its own uid:
+   for the socket (e.g. `oswitch`) with the gateway's user in it. Put the
+   key at an absolute path owned by the BROKER's user, mode `0600`,
+   **outside the agent's workspace** (e.g. `/etc/ownerswitch/github-app.pem`)
+   — the same placement rule as the kill-state file. The loader
+   (`src/github-app-key.ts`) enforces what is checkable — absolute path,
+   not under the AGENT WORKSPACE it is given explicitly (never implied
+   from `process.cwd()`), regular file behind no symlink, ≤ 64 KiB, no
+   group/world access, owned by the loading process's uid, parses as an
+   RSA key — and refuses to start otherwise. The placement rule itself (a
+   host path the agent has no route to) remains a deployment requirement
+   no process can self-verify.
+5. Generate a strong random **grant key** and give it to the control plane
+   (`ControlPlaneOptions.grantKey` / its `OWNERSWITCH_GRANT_KEY`) AND the
+   broker (`OWNERSWITCH_GRANT_KEY`) — and NOWHERE else. This is the key the
+   broker verifies MergeGrants with; the gateway must never see it.
+6. Create the socket directory **setgid** so inodes inherit the shared
+   group: `install -d -o oswitch-broker -g oswitch -m 02750
+   /run/ownerswitch`. Run the broker under its own uid with the shared
+   group as its effective gid (e.g. `sg oswitch -c '…'`):
    `OWNERSWITCH_GITHUB_APP_ID`, `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`,
    `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`,
    `OWNERSWITCH_AGENT_WORKSPACE` (the agent's workspace, explicitly),
-   `OWNERSWITCH_BROKER_SOCKET` (e.g. `/run/ownerswitch/broker.sock`, in a
-   0750 broker-owned dir with the gateway's user in its group),
+   `OWNERSWITCH_GRANT_KEY`,
+   `OWNERSWITCH_BROKER_SOCKET` (e.g. `/run/ownerswitch/broker.sock`),
+   `OWNERSWITCH_BROKER_SOCKET_GID` (the shared group's gid — the broker
+   refuses to serve if the socket does not end up owned by it),
    `OWNERSWITCH_CONTROL_PLANE_URL`, and ideally
    `OWNERSWITCH_BROKER_ALLOWED_REPOS`.
-6. Point the gateway at it by environment (never argv, never the config
+7. Point the gateway at it by environment (never argv, never the config
    file): `OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET=/run/ownerswitch/broker.sock`.
-   Setting both the broker socket AND the `OWNERSWITCH_GITHUB_APP_*`
-   triple is refused — the credential lives in exactly one place. A
-   partial triple is refused naming what is missing
-   (`packages/mcp/src/github-app-env.ts`). `OWNERSWITCH_GITHUB_TOKEN` is
-   NOT an accepted credential; if set anyway it only arms scrubbing and
-   the upstream env-strip.
+   The gateway needs NO GitHub credential and NO grant key. Setting both
+   the broker socket AND the `OWNERSWITCH_GITHUB_APP_*` triple is refused —
+   the credential lives in exactly one place. A partial triple is refused
+   naming what is missing (`packages/mcp/src/github-app-env.ts`).
+   `OWNERSWITCH_GITHUB_TOKEN` is NOT an accepted credential; if set anyway
+   it only arms scrubbing and the upstream env-strip.
+8. **Route the merge tool through an owner-gated lane** (veto or approve),
+   not `allow`: in broker mode a routed merge requires an owner-approval
+   grant, so an `allow`-lane routed merge is refused (`owner-grant-required`)
+   — an action that spends OwnerSwitch's own credential should never run
+   with no human in the loop.
 
 ### The connector never logs or returns the credential — structurally
 
@@ -547,12 +621,15 @@ run the action twice."
 ### What the test suite proves, and what only a live run can
 
 Unit tests (`src/github-client.test.ts`, `src/github-app-auth.test.ts`,
-`src/token-broker.test.ts`) run against scripted responses only —
-success, 404, 403, 405, 409, 422, primary and secondary rate limits, an
-unrecognized 408 taking the verification path, a 200 that fails to
-confirm the merge, credential-echoing errors, token FRAGMENTS in
-transport errors, stream-cap enforcement, redirect refusal, dot-segment
-and length rejection, the enterprise down-scoping refusal, the mandatory
+`src/merge-broker.test.ts`, and `packages/shared/src/merge-grant.test.ts`)
+run against scripted responses only — success, 404, 403, 405, 409, 422,
+primary and secondary rate limits, an unrecognized 408 taking the
+verification path, a 200 that fails to confirm the merge,
+credential-echoing errors, token FRAGMENTS in transport errors,
+stream-cap enforcement, redirect refusal, dot-segment and length
+rejection, the enterprise down-scoping refusal, grant signing/verify
+(bad signature, expiry, replay, args mismatch), the broker's kill/epoch
+gate and TOCTOU recheck, socket gid verification, and the mandatory
 pin end to end, and the broker over a real UNIX socket (directory
 hardening, socket mode, kill gate, allow-list, protocol bounds, error
 redaction). **Nothing in the test suite performs a live merge.** The one
@@ -583,28 +660,35 @@ and the agent receives the result, never a token — and a leak test where
 the backend genuinely holds the credential and an upstream error that
 echoes it reaches the agent scrubbed.
 
-**And now wired: the live GitHub call.** `merge_pull_request` moves from
-"stubbed" to **shipped**: `createGitHubMergeClient` performs the merge
-with a GitHub App installation token minted per repository (§6); the
-**token broker** (`ownerswitch-token-broker`) holds the private key under
-its own uid, kill-gates and allow-lists every mint, and the gateway
-(`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`) never touches the key — the
-same-process triple survives only behind an explicit same-uid risk
-acknowledgment; every ticket carries a **mandatory, server-derived
-`expectedHeadSha`** pinned at review time, so the owner approves exactly
-one head and a moved branch draws 409 (or a fresh review); ambiguous
-dispatches get one verification read worded for what it proves; rejection
+**And now wired: the live GitHub call, behind the executing broker.**
+`merge_pull_request` is **shipped**: `createGitHubMergeClient` performs the
+merge with a GitHub App installation token minted per repository (§6); the
+**executing merge broker** (`ownerswitch-merge-broker`) holds the private
+key under its own uid, **never returns a token**, validates a
+control-plane-signed single-use **MergeGrant** independently, and performs
+the merge itself — the gateway (`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`)
+holds neither the key nor a token. Signed grants (the shared
+`OWNERSWITCH_GRANT_KEY`) are minted by the control plane at owner-approval
+time and burned single-use on both the control-plane and broker sides —
+**ticket signing for this path has moved from future work to shipped**.
+Every merge carries a **mandatory, server-derived `expectedHeadSha`** pinned
+at review time (a moved branch draws 409 or a fresh review); the closed
+agent schema is ENFORCED, not just advertised (an unknown field or invalid
+`mergeMethod` refuses before any head read), and the canonical action is
+built from the normalized object, never spread from raw input; kill state
+is re-checked before the mint AND across it (TOCTOU); ambiguous dispatches
+get one verification read worded for what it proves; rejection
 classification is a documented-status whitelist; and the SecretLedger's
-redaction backs both the client (first line, with fixed transport
-sentences and stream-capped bodies) and the executor's scrub (second
-line). The injectable `GitHubMergeClient` seam remains — tests never hit
-GitHub.
+redaction backs the client (fixed transport sentences, stream-capped
+bodies, redirect refusal) and the executor's scrub. The same-process triple
+survives only behind an explicit same-uid risk acknowledgment. The
+injectable `GitHubMergeClient` seam remains — tests never hit GitHub.
 
-**Still stubbed / not yet:** ticket signing; a shared nonce store — until
-one exists the deployment constraint in §5 stands (one gateway process,
-no remote executor); revoking live installation tokens on kill
-(`DELETE /installation/token`, §6); `SO_PEERCRED`-grade peer
-identification on the broker socket (needs a native module or a
-socket-activation supervisor; today the kernel-enforced check is the
-socket directory's ownership and mode, §6); any connector beyond
-`merge_pull_request`.
+**Still stubbed / not yet:** a shared nonce store — until one exists the
+single-gateway constraint in §5 stands; a general signed-ticket scheme for
+connectors beyond this path (the MergeGrant covers the merge path today);
+revoking live installation tokens on kill (`DELETE /installation/token`,
+§6); `SO_PEERCRED`-grade peer identification on the broker socket (needs a
+native module or a socket-activation supervisor; today the kernel-enforced
+checks are the socket directory's ownership/mode and the verified socket
+gid, §6); any connector beyond `merge_pull_request`.
