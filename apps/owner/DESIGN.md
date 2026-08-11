@@ -13,14 +13,18 @@ Two of the control plane's promises currently end at a stub:
   unreachable-owner path: extend once, then `held`. The fail-closed half
   works; the *"owner reached, silence releases"* half has no way to
   happen, so the veto lane silently degrades into a second approval lane.
-- The approve lane and the restore ceremony both say "passkey", and no
-  passkey exists anywhere. `createOwnerSession()` mints bearer tokens for
-  whoever can call it in-process (`TODO(passkey)` in
-  `packages/control-plane/src/auth.ts`), and GO 1 and GO 2 of the restore
-  ceremony accept the *same* bearer token
-  (`packages/control-plane/src/server.ts`) — a stolen session performs
-  both GOs, and the 30 s cooldown is the only thing 2GO still adds
-  against it.
+- The approve lane and the restore ceremony both *demand* a passkey, and
+  no device exists to PRODUCE the assertion. The control-plane side is
+  built: production owner sessions are minted only by a verified WebAuthn
+  assertion (`POST /session/challenge` + `POST /session`), the approve
+  lane requires a fresh per-action assertion, and GO 2 of the restore
+  ceremony now requires its own fresh single-use assertion bound to
+  `{ceremonyId, killEpoch}` — a stolen owner session performs GO 1
+  (harmless alone) but cannot complete GO 2
+  (`packages/control-plane/src/server.ts`). What is missing is the phone:
+  `createOwnerSession()` still mints an in-process bearer for DEV seeding
+  (`TODO(passkey)` in `packages/control-plane/src/auth.ts`), and nothing
+  yet runs `navigator.credentials.get()` to answer any of those demands.
 
 The owner app is the missing device: an installable PWA on the owner's
 phone that (1) renders open veto windows and reports the render, (2)
@@ -912,18 +916,37 @@ will actually prove, and what it will not.
 - **One owner, 1-of-N devices, no quorum.** Any single enrolled
   device's passkey approves and restores. Multi-owner and N-of-M
   confirmation are future, visible design changes.
-- **Nothing in this PR delivers anything.** This is a design and a
-  static design scaffold — not a served, installable app (§6). Until
-  the control-plane additions in §5 and the push dispatcher exist,
-  `markDelivered()` still has no production caller and the
-  TODO(passkey) still stands. This document is the contract they will
-  be built against, not a claim that they work today.
+- **Nothing in THIS (owner-app) PR delivers anything.** This is a design
+  and a static design scaffold — not a served, installable app (§6). The
+  merge-connector PR (#31) has since landed the SERVER half of the passkey
+  additions — the assertion-VERIFYING side of rows 9 and 10 (see the note
+  under §5) — but this app, the assertion PRODUCER, does not exist yet:
+  until the remaining control-plane additions in §5 and the push
+  dispatcher exist, `markDelivered()` still has no production caller and
+  the `TODO(passkey)` at `createOwnerSession()` (the dev-seed bootstrap)
+  still stands. This document is the contract they will be built against,
+  not a claim that the phone works today.
 
 ## 5. Control-plane additions this requires
 
 Listed here so each can be scoped and reviewed separately — none are
-implemented in this PR. The app's `src/types.ts` carries the request
-and response shapes.
+implemented in THIS (owner-app) PR. The app's `src/types.ts` carries the
+request and response shapes.
+
+> **Landed early in the merge-connector PR (#31): the assertion-verifying
+> halves of rows 9 and 10.** So that a live merge deployment is not gated
+> on the whole owner app, #31 already ships the control-plane *verifier*
+> side: `POST /session/challenge` + `POST /session` mint an owner session
+> only against a verified WebAuthn assertion, and `POST /restore` (GO 2)
+> requires a fresh single-use assertion over a challenge bound to
+> `{ceremonyId, killEpoch}` (`POST /restore/ceremony/:id/challenge`),
+> consumed atomically with the restore. What those rows still add on top
+> — and what stays with this owner-app PR — is the **device-signature
+> layer and identity continuity**: co-signing each redemption with the
+> paired device key, the `allowCredentials` pinning, and GO 1→GO 2
+> provenance (`go1SessionDeviceId`, revocation generation). #31's session
+> is passkey-gated but not yet device-bound; the rows below are the target
+> the two PRs converge on, not a claim #31 reached all of it.
 
 **The serialization authority — stated once, meant everywhere.** Every
 "atomic", "compare-and-set", "transaction", "single-spend", and

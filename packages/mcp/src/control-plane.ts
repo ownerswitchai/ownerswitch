@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
 import { createControlPlane } from "@ownerswitchai/control-plane";
+import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
 
 /**
  * PRODUCTION control-plane launcher — `dev: false`, an enrolled owner
@@ -45,7 +45,14 @@ function main(): void {
   const publicKeyFile = required("OWNERSWITCH_OWNER_PASSKEY_PUBLIC_KEY_FILE");
   const rpId = required("OWNERSWITCH_OWNER_PASSKEY_RP_ID");
   const origin = required("OWNERSWITCH_OWNER_PASSKEY_ORIGIN");
-  const publicKeyPem = readFileSync(publicKeyFile, { encoding: "utf8" });
+  // The passkey PUBLIC key is the authorization ROOT for owner approval:
+  // whoever can rewrite it enrolls their own authenticator and self-approves
+  // a merge. Load it with the same integrity hardening as the App PEM —
+  // absolute/canonical path, trusted ancestry, O_NOFOLLOW, regular file,
+  // size-capped, no untrusted write bits — and require it to parse as the
+  // P-256 SPKI key the assertion verifier accepts, rather than plain
+  // readFileSync of an attacker-writable path.
+  const publicKeyPem = loadOwnerPasskeyPublicKey(publicKeyFile).pem;
 
   // dev:false — createControlPlane enforces the production kill-state path
   // guard, the >=256-bit key floors, and the https-origin requirement, and

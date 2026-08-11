@@ -81,6 +81,17 @@ describe("isSafeToDisplay + buildRenderableApproval — the owner-display contra
     ).toThrowError(/expectedBaseRef/);
   });
 
+  it("expectedBaseRef refuses a HOMOGLYPH branch (Cyrillic i U+0456 that resembles 'main')", () => {
+    const cyrillic = `ma${String.fromCodePoint(0x0456)}n`; // maіn — passes NFC + property checks
+    expect(isSafeToDisplay(cyrillic)).toBe(true); // property filter alone does NOT catch it
+    expect(() =>
+      parseMergePrArgs(canonicalJson({ ...VALID, expectedBaseRef: cyrillic })),
+    ).toThrowError(/expectedBaseRef/); // but the ASCII grammar does
+    // ordinary ASCII refs still pass
+    expect(parseMergePrArgs(canonicalJson({ ...VALID, expectedBaseRef: "release/1.2-rc_3" }))
+      .expectedBaseRef).toBe("release/1.2-rc_3");
+  });
+
   it("builds a typed per-field renderable, and refuses to render an unsafe field", () => {
     const r = buildRenderableApproval(
       parseMergePrArgs(canonicalJson({ ...VALID, mergeMethod: "squash" })),

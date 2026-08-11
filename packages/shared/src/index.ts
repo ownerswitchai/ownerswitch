@@ -57,6 +57,7 @@ export {
 export {
   buildRenderableApproval,
   GITHUB_CONNECTOR,
+  isAsciiDisplaySafeRef,
   isSafeToDisplay,
   MERGE_PULL_REQUEST,
   parseMergePrArgs,

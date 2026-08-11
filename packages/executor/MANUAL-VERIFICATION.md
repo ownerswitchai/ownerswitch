@@ -183,6 +183,26 @@ session alone is refused). Enroll the owner's approval passkey in the owner
 app first; that yields a credential id, an SPKI public-key PEM, an rpId and
 the app's exact https origin, provided here as configuration:
 
+The passkey's **public key** is the authorization ROOT for merge approval:
+whoever can rewrite that file enrolls their own authenticator, bootstraps a
+session, and self-approves a merge. It is not a secret (READ is fine), but it
+must be UNWRITABLE by the agent and by anyone but root — provision it exactly
+like the App PEM, root-owned under a root-owned ancestry, mode 0644:
+
+```sh
+sudo install -o root -g root -m 0644 owner-passkey.spki.pem /etc/ownerswitch/passkey.pub.pem
+```
+
+The launcher does not merely `readFileSync` this path: it loads the key
+through a hardened integrity loader (`loadOwnerPasskeyPublicKey`) that
+refuses a relative path, a symlinked leaf (`O_NOFOLLOW`), a non-regular or
+oversized file, an untrusted-owned or group/world-**writable** file, any
+group/world-writable **ancestor** (walked on the realpath, so an
+intermediate symlink cannot smuggle the file under a writable directory),
+and anything that is not a P-256 (`prime256v1`) SPKI key — the only curve the
+assertion verifier accepts. A misconfigured key file refuses startup with a
+named reason rather than trusting an attacker-writable authorization root.
+
 The control plane needs a WRITABLE home for its persisted kill state that
 its own uid owns — the root-owned `/var/lib/ownerswitch` parent is not
 writable by `oswitch-cp`, so give it a dedicated 0700 directory first:
@@ -246,6 +266,32 @@ the exact pinned call through an owner SESSION (the phone app / an owner
 bearer token), which the same-uid agent cannot forge. Silence leaves the
 call pending indefinitely; only a real owner "yes" — or a "no" (veto) —
 moves it.
+
+### What ships here, and what is a separate deliverable
+
+This PR ships the **control-plane side** of owner approval — the code that
+DEMANDS and VERIFIES a WebAuthn assertion: passkey-gated session minting
+(`/session/challenge` + `/session`), per-action approval
+(`/veto/:id/approval-challenge` + assertion), and passkey-gated GO 2/2
+restore (`/restore/ceremony/:id/challenge` + assertion). Two things it does
+NOT ship, and a live end-to-end merge depends on both:
+
+- **The owner phone app (assertion PRODUCER).** The installable PWA that
+  renders the typed `RenderableApprovalV1`, holds the platform
+  authenticator, and calls `navigator.credentials.get()` to answer the
+  challenges above is a SEPARATE deliverable (`apps/owner/DESIGN.md`, PR
+  #29). Until it exists, drive these endpoints from a script that signs
+  with a test authenticator (as the control-plane tests do) — that
+  exercises the same server boundary the phone will.
+- **The HTTPS transport.** WebAuthn binds each assertion to an EXACT
+  https origin (`OWNERSWITCH_OWNER_PASSKEY_ORIGIN`, e.g.
+  `https://owner.example`), but the control plane listens on loopback
+  **http**. Production therefore puts a TLS reverse proxy in front of it,
+  terminating the passkey's `rpId`/origin at that hostname and forwarding
+  to `127.0.0.1:4600` — same-origin as the PWA, TLS to the phone, plain
+  loopback on the host. The proxy adds transport only; every authorization
+  check still runs in the control plane behind it. (A dev run may use a
+  local `https://localhost` origin with a trusted dev cert.)
 
 ## 5. The live merge
 
@@ -313,6 +359,22 @@ NO sha argument; the pin is OwnerSwitch's job:
   `409` ("cannot approve while the kill switch is engaged"). Restore, and
   confirm the window must be approved AGAIN (its pre-restore state carried
   no grant): a kill always forces fresh post-restore review.
+- **Restore (GO 2/2) needs the owner's passkey, not just a session.** With
+  a passkey enrolled: engage the kill, start the ceremony (POST
+  `/restore/ceremony`), wait out the cooldown, then POST `/restore` with
+  ONLY the owner bearer (no assertion) → `401` ("no live GO 2/2 assertion
+  challenge"), and the kill still stands. Now request the GO 2/2 challenge
+  (POST `/restore/ceremony/<id>/challenge`), sign it with the passkey, and
+  POST `/restore` with the assertion → `200`, killed clears. A stolen owner
+  session alone cannot lift the kill.
+- **Login works WHILE KILLED, so a restart with persisted KILL still
+  recovers.** With the kill engaged (or after restarting the control plane
+  onto a persisted-killed state file, when every in-memory session is
+  gone): POST `/session/challenge` then `/session` with a fresh passkey
+  assertion → `200`, an owner session. That session drives the restore
+  ceremony above. Then confirm the epoch bind: mint a login challenge while
+  LIVE, engage a kill, and redeem it → `401` ("different kill epoch") — a
+  challenge never crosses the kill boundary.
 - **A veto REVOKES an issued grant.** On a fresh PR: approve, poll once so
   the grant is fetched, then VETO the same window (allowed after approval
   for merge windows), then present the held grant bytes at the broker

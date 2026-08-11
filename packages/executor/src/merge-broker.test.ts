@@ -207,18 +207,21 @@ describe("createMergeBroker — the executing broker", () => {
     expect(github.calls.filter((call) => call.method === "PUT")).toHaveLength(1);
   });
 
-  it("oversized data (valid line + huge trailing) is refused with ZERO PUTs — never a double dispatch", async () => {
+  it("oversized data (valid line + huge trailing) is refused with NO ADDITIONAL PUT — never a double dispatch", async () => {
     const github = fakeGitHub();
     const socketPath = await startBroker({ github });
     const g = grant();
-    // a valid line immediately followed by a huge blob: the size bound trips
-    // first and refuses the whole connection. The property that matters is
-    // that a refusal implies nothing was dispatched.
+    // a valid line immediately followed by a huge blob. Two guarantees stack:
+    // the one-request latch means the trailing blob can never launch a SECOND
+    // dispatch (the general split-data property: no ADDITIONAL PUT beyond the
+    // at-most-one the first line makes), and here the size bound additionally
+    // trips first and refuses the whole connection, so the count is a hard
+    // zero. Either way a refusal never coexists with an un-accounted dispatch.
     const payload = `${JSON.stringify({ op: "merge", grant: g, args: MERGE_ARGS })}\n${"x".repeat(20 * 1024)}`;
     const response = await rawExchange(socketPath, payload);
     expect(JSON.parse(response)).toMatchObject({ ok: false, kind: "refused" });
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+    expect(github.calls.filter((call) => call.method === "PUT")).toHaveLength(0);
   });
 
   it("POST-DISPATCH fault is UNKNOWN, never not-performed: the PUT lands, then building the result throws", async () => {

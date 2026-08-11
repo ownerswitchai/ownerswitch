@@ -59,12 +59,20 @@ import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
  *                     ceremony — the exact lockout idempotency closes.
  *  - GET  /restore/ceremony/:id — owner session required; the ceremony's
  *                     state, cooldown remaining, and expiry.
+ *  - POST /restore/ceremony/:id/challenge — owner session required; with a
+ *                     passkey enrolled, mints the single-use GO 2/2 assertion
+ *                     challenge (bound to {ceremonyId, killEpoch}) the owner
+ *                     signs to complete a restore. 501 in a dev instance with
+ *                     no passkey, where GO 2/2 stays session-only.
  *  - POST /restore  — owner session required plus a live server-side ceremony
  *                     (GO 2/2): owned by this owner, past its cooldown, inside
  *                     its TTL, bound to the current kill epoch, consumed
  *                     atomically (single-spend holds for this one process and
- *                     event loop — where all ceremony state lives). No
- *                     exceptions, no loopback bypass, no shape-only path.
+ *                     event loop — where all ceremony state lives). With a
+ *                     passkey enrolled it ALSO requires a fresh single-use
+ *                     WebAuthn assertion over that challenge — a stolen owner
+ *                     session alone cannot restore. No exceptions, no loopback
+ *                     bypass, no shape-only path.
  *  - POST /veto     — device signature required; a gateway registers a window
  *                     for a call it is holding. Registration puts text in
  *                     front of the owner and grows server state, so unlike
@@ -452,18 +460,37 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   const APPROVAL_CHALLENGE_TTL_MS = 2 * 60_000;
   // last accepted signature counter for the enrolled passkey (clone signal)
   let passkeySignCount = 0;
-  // Outstanding passkey LOGIN challenges (challenge → expiry), single-use.
-  // These bootstrap an owner SESSION: a fresh production process has no way
-  // to mint one otherwise, yet both approval endpoints need an owner
-  // session. The challenge is worthless without the enrolled passkey to
+  // Outstanding passkey LOGIN challenges (challenge → {expiry, kill epoch}),
+  // single-use. These bootstrap an owner SESSION: a fresh production process
+  // has no way to mint one otherwise, yet both approval endpoints need an
+  // owner session. The challenge is worthless without the enrolled passkey to
   // sign it, so minting one is a harmless open operation; the session is
-  // handed out only after a verified assertion.
-  const loginChallenges = new Map<string, number>();
+  // handed out only after a verified assertion. The kill epoch is stamped at
+  // mint time (after the body drains) and required to still match at
+  // redemption: a challenge that spanned a KILL is dead, so one stalled
+  // across the kill boundary cannot be redeemed into the post-restore world.
+  const loginChallenges = new Map<string, { expiresAt: number; killEpoch: number }>();
   const LOGIN_CHALLENGE_TTL_MS = 2 * 60_000;
+  // Cap on pending login challenges: minting one is unauthenticated (only a
+  // passkey holder can REDEEM one, but anyone can ask), so bound the map so a
+  // flood cannot exhaust memory. Well past any honest concurrent-login count.
+  const MAX_LOGIN_CHALLENGES = 256;
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
   // this map (a restart) can only make restores harder, never easier — an id
   // that is not in here restores nothing, whatever its body claims.
   const ceremonies = new Map<string, { ceremony: RestoreCeremony; epoch: number }>();
+  // Outstanding GO 2/2 restore assertion challenges, keyed by ceremony id: the
+  // server-minted challenge the owner's passkey must sign to complete a
+  // restore, bound to {ceremonyId, killEpoch}. A stolen owner SESSION alone
+  // (a reusable bearer) must not be able to restore the kill switch and
+  // reopen permissive lanes — GO 2/2 demands a FRESH, single-use user
+  // verification, redeemed atomically with the restore. Process-local for the
+  // same reason as the ceremonies: losing it only makes restore harder.
+  const restoreChallenges = new Map<
+    string,
+    { challenge: string; killEpoch: number; expiresAt: number }
+  >();
+  const RESTORE_CHALLENGE_TTL_MS = 2 * 60_000;
 
   function ownerSessionFrom(req: IncomingMessage): OwnerSession | null {
     const token = bearerToken(req);
@@ -696,8 +723,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // no longer matches, but clearing is the belt to that suspenders).
     approvalChallenges.clear();
     // ...and every outstanding login challenge, so a kill also stops a
-    // half-finished session bootstrap.
+    // half-finished session bootstrap. (Login challenges minted AFTER this
+    // kill, for the restore that follows, are stamped with the new epoch and
+    // survive; only pre-kill ones are cleared.)
     loginChallenges.clear();
+    // ...and every outstanding GO 2/2 restore challenge. A NEW kill landing
+    // while a restore ceremony for a PRIOR kill is in flight bumps the epoch,
+    // which already invalidates both the ceremony and its challenge; clearing
+    // is the belt to that suspenders and keeps the map from holding corpses.
+    restoreChallenges.clear();
     // The kill is in force in memory no matter what; the response only claims
     // durability when the persist actually succeeded.
     sendJson(res, 200, { killed: true, ...degradedFields() });
@@ -823,6 +857,87 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     });
   }
 
+  /**
+   * Mint the GO 2/2 restore assertion challenge for a live ceremony: a
+   * single-use, short-lived challenge the owner's passkey must sign to
+   * complete the restore, bound server-side to {ceremonyId, killEpoch}. This
+   * is what makes a stolen owner SESSION insufficient to restore — GO 2/2
+   * additionally demands a fresh user verification from the enrolled
+   * authenticator. Only meaningful with a passkey enrolled; in a dev instance
+   * without one, GO 2/2 stays session-only (and this endpoint reports 501).
+   */
+  async function postRestoreChallenge(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+  ): Promise<void> {
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    if (opts.ownerPasskey === undefined) {
+      sendJson(res, 501, {
+        error: "no owner approval passkey is enrolled — GO 2/2 is session-only on this control plane",
+      });
+      return;
+    }
+    // A failed quarantine keeps restore denied entirely (see postRestore);
+    // do not hand out a challenge for a restore that must not complete.
+    if (killSwitch.quarantineFailed) {
+      sendJson(res, 409, { error: "restore is unavailable — durable kill state is untrustworthy" });
+      return;
+    }
+    const record = ceremonies.get(id);
+    // Another owner's ceremony reads as absent — existence is not revealed.
+    if (record === undefined || record.ceremony.ownerId !== session.ownerId) {
+      sendJson(res, 404, { error: `no ceremony "${id}"` });
+      return;
+    }
+    if (!killSwitch.killed) {
+      sendJson(res, 409, { error: "not killed — nothing to restore" });
+      return;
+    }
+    if (record.epoch !== killSwitch.epoch) {
+      sendJson(res, 409, { error: "the ceremony is bound to a superseded kill epoch — start a fresh one" });
+      return;
+    }
+    await readRawBody(req); // drain
+    // RE-CHECK after the await: a kill can land while the body drains, bumping
+    // the epoch. A challenge minted into a moved epoch would be dead anyway
+    // (redemption checks equality), but never mint it in the first place.
+    if (!killSwitch.killed || record.epoch !== killSwitch.epoch) {
+      sendJson(res, 409, { error: "the kill epoch moved while starting GO 2/2 — start a fresh ceremony" });
+      return;
+    }
+    // GO 2/2 unlocks only past the cooldown. Minting the challenge only when
+    // the ceremony is READY keeps it inside its short TTL and refuses to hand
+    // out a challenge that confirm() would reject as premature anyway.
+    const ticked = record.ceremony.tick();
+    if (ticked !== "ready") {
+      sendJson(res, 409, {
+        error: `GO 2/2 is not yet available (ceremony state "${ticked}") — wait out the cooldown`,
+      });
+      return;
+    }
+    const challenge = randomBytes(32).toString("base64url");
+    restoreChallenges.set(id, {
+      challenge,
+      killEpoch: killSwitch.epoch,
+      expiresAt: now() + RESTORE_CHALLENGE_TTL_MS,
+    });
+    sendJson(res, 200, {
+      challenge,
+      rpId: opts.ownerPasskey.rpId,
+      credentialId: opts.ownerPasskey.credentialId,
+      // domain-separation: what this assertion authorizes, echoed for the app
+      purpose: "restore-go2",
+      ceremonyId: id,
+      killEpoch: killSwitch.epoch,
+      expiresAt: now() + RESTORE_CHALLENGE_TTL_MS,
+    });
+  }
+
   async function postRestore(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // GO 2/2. Owner session required — no exceptions, no loopback bypass.
     // Restoring is the expensive direction and stays that way.
@@ -849,6 +964,66 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (record.ceremony.ownerId !== session.ownerId) return rejected();
     if (record.epoch !== killSwitch.epoch) return rejected();
     if (!killSwitch.killed) return rejected();
+
+    // The owner SESSION is a REUSABLE bearer token; a stolen one must not be
+    // able to restore the kill switch and reopen permissive lanes. With a
+    // passkey enrolled, GO 2/2 additionally requires a FRESH single-use
+    // WebAuthn assertion over a challenge bound to THIS ceremony and THIS kill
+    // epoch — consumed atomically here, in the same synchronous tail as the
+    // ceremony's own single-use confirm(). A dev instance without a passkey
+    // stays session-only (and says so via the challenge endpoint's 501).
+    if (opts.ownerPasskey !== undefined) {
+      const chal = restoreChallenges.get(ceremonyId);
+      // atomic single-use: SPENT by this attempt, verified or not — a failed
+      // attempt needs a fresh challenge, exactly like an approval ceremony.
+      restoreChallenges.delete(ceremonyId);
+      if (chal === undefined || now() >= chal.expiresAt) {
+        sendJson(res, 401, {
+          error:
+            "no live GO 2/2 assertion challenge — request POST /restore/ceremony/:id/challenge " +
+            "and sign it with the enrolled passkey (challenges are single-use and short-lived)",
+        });
+        return;
+      }
+      // EPOCH binding: a challenge minted in one kill epoch must not authorize
+      // a restore in another. A kill between mint and redemption bumps the
+      // epoch (and clears the map); this is the belt to that suspenders.
+      if (chal.killEpoch !== killSwitch.epoch) {
+        sendJson(res, 401, {
+          error: "the GO 2/2 challenge was minted in a different kill epoch — request a fresh one",
+        });
+        return;
+      }
+      const assertion = assertionFrom(body.assertion);
+      if (assertion === null) {
+        sendJson(res, 400, {
+          error:
+            "restore requires assertion: {credentialId, clientDataJSON, authenticatorData, " +
+            "signature}, each base64url",
+        });
+        return;
+      }
+      const verdict = verifyOwnerAssertion(assertion, {
+        passkey: opts.ownerPasskey,
+        rpId: opts.ownerPasskey.rpId,
+        expectedOrigin: opts.ownerPasskey.origin,
+        expectedChallenge: chal.challenge,
+        lastSignCount: passkeySignCount,
+      });
+      if (!verdict.ok) {
+        sendJson(res, 401, { error: `passkey assertion rejected: ${verdict.reason}` });
+        return;
+      }
+      passkeySignCount = Math.max(passkeySignCount, verdict.signCount);
+    }
+    // No passkey enrolled: the 2GO ceremony (owner session + mandatory
+    // cooldown + single-use) is the restore boundary, exactly as before — a
+    // deployment with no authenticator has no second factor to assert with.
+    // A LIVE MERGE deployment always enrolls a passkey (the production
+    // launcher requires one), so its restore is always assertion-gated by the
+    // branch above; the session-only path here is the dev/quickstart and the
+    // pure kill-switch (no grant key), where it was already accepted.
+
     try {
       // confirm() is the atomic consume: it only succeeds in "ready" (past
       // the cooldown, inside the TTL) and transitions to "completed" before
@@ -1118,15 +1293,27 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 501, { error: "no owner approval passkey is enrolled on this control plane" });
       return;
     }
-    if (killSwitch.killed) {
-      sendJson(res, 409, { error: "cannot start a session while the kill switch is engaged" });
+    // Login is DELIBERATELY allowed while killed. After a control-plane
+    // restart with persisted KILL, every process-local session is gone, so
+    // refusing login here would deadlock recovery — nobody could authenticate
+    // to drive the restore ceremony. A login is safe while killed because it
+    // proves nothing but the owner's presence: the session it yields cannot
+    // approve a merge (refused while killed) and cannot by itself restore
+    // (GO 2/2 demands a second, fresh assertion), so a session minted while
+    // killed is effectively restore-scoped by the kill state itself.
+    await readRawBody(req); // drain
+    // sweep expired challenges so the map stays bounded, and cap the map as a
+    // backstop against an unauthenticated flood (these are open to mint).
+    for (const [ch, rec] of loginChallenges) if (now() >= rec.expiresAt) loginChallenges.delete(ch);
+    if (loginChallenges.size >= MAX_LOGIN_CHALLENGES) {
+      sendJson(res, 503, { error: "too many pending login challenges — retry shortly" });
       return;
     }
-    await readRawBody(req); // drain
-    // sweep expired challenges so the map stays bounded
-    for (const [ch, exp] of loginChallenges) if (now() >= exp) loginChallenges.delete(ch);
     const challenge = randomBytes(32).toString("base64url");
-    loginChallenges.set(challenge, now() + LOGIN_CHALLENGE_TTL_MS);
+    // Stamp the CURRENT (post-drain) kill epoch: read as late as possible so a
+    // kill that lands while the body drained is reflected here, and required
+    // to still match at redemption. A challenge cannot silently cross a kill.
+    loginChallenges.set(challenge, { expiresAt: now() + LOGIN_CHALLENGE_TTL_MS, killEpoch: killSwitch.epoch });
     sendJson(res, 200, {
       challenge,
       rpId: opts.ownerPasskey.rpId,
@@ -1148,20 +1335,28 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 501, { error: "no owner approval passkey is enrolled on this control plane" });
       return;
     }
-    if (killSwitch.killed) {
-      sendJson(res, 409, { error: "cannot start a session while the kill switch is engaged" });
-      return;
-    }
+    // Allowed while killed — see postSessionChallenge: the session is the only
+    // way to reach the restore ceremony after a restart, and it authorizes
+    // nothing destructive on its own.
     const body = parseJsonBody(await readRawBody(req));
     const challenge = body.challenge;
     if (typeof challenge !== "string" || challenge === "") {
       sendJson(res, 400, { error: "session requires the challenge and a passkey assertion" });
       return;
     }
-    const expiresAt = loginChallenges.get(challenge);
+    const record = loginChallenges.get(challenge);
     loginChallenges.delete(challenge); // single-use: spent by this attempt
-    if (expiresAt === undefined || now() >= expiresAt) {
+    if (record === undefined || now() >= record.expiresAt) {
       sendJson(res, 401, { error: "no live login challenge — request POST /session/challenge first" });
+      return;
+    }
+    // Epoch equality: a challenge minted in one kill epoch cannot be redeemed
+    // in another. A KILL between mint and redemption bumps the epoch and kills
+    // the challenge — it never crosses the kill boundary into a fresh session.
+    if (record.killEpoch !== killSwitch.epoch) {
+      sendJson(res, 401, {
+        error: "the login challenge was minted in a different kill epoch — request a fresh one",
+      });
       return;
     }
     const assertion = assertionFrom(body.assertion);
@@ -1419,6 +1614,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
     const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
+    const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
@@ -1432,6 +1628,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
+    if (method === "POST" && restoreChallengeMatch) {
+      return postRestoreChallenge(req, res, decodeURIComponent(restoreChallengeMatch[1]));
+    }
     if (method === "GET" && ceremonyMatch) {
       return getCeremony(req, res, decodeURIComponent(ceremonyMatch[1]));
     }

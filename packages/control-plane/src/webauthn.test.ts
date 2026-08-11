@@ -525,4 +525,148 @@ describe("assertion-gated approval over HTTP", () => {
         .status,
     ).toBe(400);
   });
+
+  // ── R8-1: GO 2/2 restore demands a fresh passkey assertion ──────────────
+  it("2GO restore requires a fresh passkey assertion at GO2 — a stolen session alone cannot restore", async () => {
+    const auth = authenticator();
+    const { url, bearer, cp, c } = await setup(auth); // passkey enrolled
+    // engage the kill (an owner session may trigger it)
+    await fetch(`${url}/kill`, { method: "POST", headers: bearer, body: JSON.stringify({ source: "button" }) });
+    expect(cp.killSwitch.killed).toBe(true);
+    // GO 1/2
+    const started = await fetch(`${url}/restore/ceremony`, { method: "POST", headers: bearer });
+    expect(started.status).toBe(201);
+    const { id } = (await started.json()) as { id: string };
+    c.advance(30_000); // past the cooldown
+
+    // session-only GO 2/2 (no assertion) is REFUSED, and the kill stands
+    const bare = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer,
+      body: JSON.stringify({ ceremonyId: id }),
+    });
+    expect(bare.status).toBe(401);
+    expect(((await bare.json()) as { error: string }).error).toMatch(/GO 2\/2 assertion challenge/);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // mint the GO2 challenge, sign it with the enrolled passkey → restore
+    const chRes = await fetch(`${url}/restore/ceremony/${id}/challenge`, { method: "POST", headers: bearer });
+    expect(chRes.status).toBe(200);
+    const ch = (await chRes.json()) as { challenge: string; purpose: string; killEpoch: number };
+    expect(ch.purpose).toBe("restore-go2");
+    const ok = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer,
+      body: JSON.stringify({ ceremonyId: id, assertion: auth.assert({ challenge: ch.challenge, signCount: 5 }) }),
+    });
+    expect(ok.status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("the GO2 restore challenge is SINGLE-USE — a failed attempt spends it, no replay restores", async () => {
+    const auth = authenticator();
+    const { url, bearer, cp, c } = await setup(auth);
+    await fetch(`${url}/kill`, { method: "POST", headers: bearer, body: JSON.stringify({ source: "button" }) });
+    const { id } = (await (
+      await fetch(`${url}/restore/ceremony`, { method: "POST", headers: bearer })
+    ).json()) as { id: string };
+    c.advance(30_000);
+    const ch = (await (
+      await fetch(`${url}/restore/ceremony/${id}/challenge`, { method: "POST", headers: bearer })
+    ).json()) as { challenge: string };
+
+    // a STRANGER's assertion over the real challenge → 401, and SPENDS it
+    const stranger = authenticator();
+    const bad = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer,
+      body: JSON.stringify({ ceremonyId: id, assertion: stranger.assert({ challenge: ch.challenge }) }),
+    });
+    expect(bad.status).toBe(401);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the challenge is now spent: even a VALID signature over it no longer restores
+    const replay = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer,
+      body: JSON.stringify({ ceremonyId: id, assertion: auth.assert({ challenge: ch.challenge, signCount: 7 }) }),
+    });
+    expect(replay.status).toBe(401);
+    expect(cp.killSwitch.killed).toBe(true);
+  });
+
+  // ── R8-2: login/KILL lifecycle ──────────────────────────────────────────
+  it("passkey login works WHILE KILLED, so a restart with persisted KILL can still recover", async () => {
+    const auth = authenticator();
+    const c = clock();
+    const cp = quiet({
+      now: c.now,
+      grantKey: GRANT_KEY,
+      ownerPasskey: { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem, rpId: RP_ID, origin: ORIGIN },
+    });
+    const url = await start(cp);
+    // a persisted KILL with no live process-local sessions (a fresh restart)
+    cp.killSwitch.engage("button");
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // login STILL works while killed — challenge + assertion → owner session
+    const login = (await (await fetch(`${url}/session/challenge`, { method: "POST" })).json()) as {
+      challenge: string;
+    };
+    const sess = await fetch(`${url}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: login.challenge,
+        assertion: auth.assert({ challenge: login.challenge, signCount: 1 }),
+      }),
+    });
+    expect(sess.status).toBe(200);
+    const { token } = (await sess.json()) as { token: string };
+    const bearer = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+    // ...and that session drives the restore ceremony to completion
+    const { id } = (await (
+      await fetch(`${url}/restore/ceremony`, { method: "POST", headers: bearer })
+    ).json()) as { id: string };
+    c.advance(30_000);
+    const ch = (await (
+      await fetch(`${url}/restore/ceremony/${id}/challenge`, { method: "POST", headers: bearer })
+    ).json()) as { challenge: string };
+    const ok = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer,
+      body: JSON.stringify({ ceremonyId: id, assertion: auth.assert({ challenge: ch.challenge, signCount: 2 }) }),
+    });
+    expect(ok.status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("a login challenge minted before a KILL cannot be redeemed after it (epoch binding)", async () => {
+    const auth = authenticator();
+    const c = clock();
+    const cp = quiet({
+      now: c.now,
+      grantKey: GRANT_KEY,
+      ownerPasskey: { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem, rpId: RP_ID, origin: ORIGIN },
+    });
+    const url = await start(cp);
+    // mint a login challenge while LIVE (epoch 0)
+    const login = (await (await fetch(`${url}/session/challenge`, { method: "POST" })).json()) as {
+      challenge: string;
+    };
+    // a kill bumps the epoch to 1 (engaged directly, so the map is NOT cleared —
+    // it is the EPOCH check, not the clear, that must reject the challenge)
+    cp.killSwitch.engage("button");
+    const sess = await fetch(`${url}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: login.challenge,
+        assertion: auth.assert({ challenge: login.challenge, signCount: 1 }),
+      }),
+    });
+    expect(sess.status).toBe(401);
+    expect(((await sess.json()) as { error: string }).error).toMatch(/different kill epoch/);
+  });
 });

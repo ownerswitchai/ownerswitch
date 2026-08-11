@@ -82,6 +82,23 @@ export function isSafeToDisplay(value: string): boolean {
 }
 
 /**
+ * The DECISION-CRITICAL identifier grammar: printable ASCII only, matching
+ * how a git ref is actually written. Property filtering (above) removes
+ * non-printing characters, but it cannot make identifiers UNSPOOFABLE — a
+ * Cyrillic "а"/U+0430 or the Latin-looking "і"/U+0456 pass NFC and every
+ * property check while resembling ASCII letters. For v0 we sidestep the
+ * whole confusables problem for the one field the owner's decision turns on
+ * (the merge DESTINATION): it must be printable ASCII, so what the owner
+ * reads is exactly the bytes that execute. GitHub allows non-ASCII branch
+ * names; OwnerSwitch refuses to pin/merge one rather than risk a homoglyph.
+ */
+const ASCII_REF = /^[\x21-\x7e]+$/;
+
+export function isAsciiDisplaySafeRef(value: string): boolean {
+  return ASCII_REF.test(value) && isSafeToDisplay(value);
+}
+
+/**
  * Parse canonical merge arguments STRICTLY: the closed key set above, the
  * allowed merge methods, a full-length head sha. An unknown key is a hard
  * error, never ignored — arguments that carry a field execution would not
@@ -142,12 +159,12 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
     typeof expectedBaseRef !== "string" ||
     expectedBaseRef === "" ||
     expectedBaseRef.length > MAX_BASE_REF_LENGTH ||
-    !isSafeToDisplay(expectedBaseRef)
+    !isAsciiDisplaySafeRef(expectedBaseRef)
   ) {
     throw new Error(
       "merge_pull_request requires expectedBaseRef: the destination branch pinned by " +
-        "OwnerSwitch at review time (non-empty, bounded, and free of control/bidi/format " +
-        "characters that could spoof the displayed branch)",
+        "OwnerSwitch at review time (non-empty, bounded, and PRINTABLE ASCII — a non-ASCII " +
+        "branch name is refused rather than risk a homoglyph the owner cannot distinguish)",
     );
   }
   return {

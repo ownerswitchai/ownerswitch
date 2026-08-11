@@ -511,7 +511,8 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
     socket.on("data", (chunk) => {
       // once a request is launched (or the connection is finished), every
       // further byte on this connection is ignored — a connection carries
-      // exactly one request
+      // exactly one request, so a later chunk or trailing bytes add ZERO
+      // ADDITIONAL dispatches beyond the at-most-one the first line may make.
       if (done || started) return;
       buffer += chunk.toString("utf8");
       if (buffer.length > MAX_REQUEST_BYTES) {
