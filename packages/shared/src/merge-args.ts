@@ -57,21 +57,22 @@ const MAX_BASE_REF_LENGTH = 300;
  * Rejects strings that would be UNSAFE TO DISPLAY to the owner: a signed
  * approval is worthless if the bytes the owner saw are not the bytes that
  * execute, and Unicode gives many ways to make "main" render as something
- * else. We refuse (not sanitize — sanitizing invites its own confusion):
- *  - C0/C1 control characters and DEL;
- *  - bidirectional formatting controls (LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI,
- *    LRM/RLM/ALM) — the classic "reorder the visible identifier" attack;
- *  - line/paragraph separators (U+2028/U+2029);
- *  - the zero-width joiners/non-joiner and BOM;
- *  - anything not in Unicode NFC form, so one code-point sequence has one
- *    representation both when hashed and when rendered.
- * Git itself permits many of these in ref names, so the pin cannot lean on
- * git's rules; OwnerSwitch's display contract is stricter than git on
- * purpose.
+ * else. Rather than enumerate code points (which misses cases like U+061C
+ * ARABIC LETTER MARK, U+00AD SOFT HYPHEN, U+180E, U+FFF9–FFFB and the astral
+ * default-ignorables), we refuse by Unicode PROPERTY — the categories that
+ * are by definition non-printing or reorder-the-render:
+ *  - `Cc` control, `Cf` format, `Zl`/`Zp` line/paragraph separators;
+ *  - `Bidi_Control` (the "reorder the visible identifier" attack);
+ *  - `Default_Ignorable_Code_Point` (soft hyphen, variation selectors, tag
+ *    characters, and other glyphs a renderer may drop entirely).
+ * We refuse rather than sanitize — sanitizing invites its own confusion —
+ * and additionally require NFC form so one code-point sequence has one
+ * representation both when hashed and when rendered. Git itself permits many
+ * of these in ref names, so the pin cannot lean on git's rules; OwnerSwitch's
+ * display contract is stricter than git on purpose.
  */
 const UNSAFE_DISPLAY_CHARS =
-  // eslint-disable-next-line no-control-regex -- refusing control chars is the point
-  /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u2028\u2029\ufeff]/u;
+  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Bidi_Control}\p{Default_Ignorable_Code_Point}]/u;
 
 export function isSafeToDisplay(value: string): boolean {
   if (UNSAFE_DISPLAY_CHARS.test(value)) return false;

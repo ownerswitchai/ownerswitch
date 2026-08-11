@@ -265,12 +265,18 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   }
 
   /** Best-effort outcome bookkeeping — the response already carries the
-   * truth; a bookkeeping write failure must not change it. */
+   * truth; a bookkeeping write failure must not change it, and must not
+   * escape (the audit logger itself could throw). Both the record and the
+   * log are fully swallowed. */
   function recordOutcome(jti: string, patch: Parameters<JtiBurnStore["record"]>[1]): void {
     try {
       burns.record(jti, patch);
     } catch (err) {
-      log(`[merge-broker] outcome record for ${jti} failed: ${errText(err)}`);
+      try {
+        log(`[merge-broker] outcome record for ${jti} failed: ${errText(err)}`);
+      } catch {
+        /* a throwing audit sink must never change the merge outcome */
+      }
     }
   }
 
@@ -532,8 +538,26 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
             finish({ ok: false, kind: "refused", error: "unknown operation" });
           }
         } catch (err) {
+          // Classification depends on WHEN the error escaped. A BrokerRefusal
+          // is always pre-dispatch by construction (every throw site is
+          // before the PUT). But an UNEXPECTED error can escape AFTER the PUT
+          // succeeded — e.g. a post-merge bookkeeping write, or a logger,
+          // throwing. Once phase.dispatched, the merge may have landed, so
+          // the honest answer is connector/UNKNOWN, never "refused" (which
+          // the client would map to not-performed — a false negative on a
+          // completed merge).
           if (err instanceof BrokerRefusal) {
             finish({ ok: false, kind: "refused", error: err.message });
+          } else if (phase.dispatched) {
+            finish({
+              ok: false,
+              kind: "connector",
+              outcome: "unknown",
+              error:
+                `the merge was dispatched, then an unexpected broker error occurred ` +
+                `(${errText(err)}); its outcome is UNKNOWN, not refused — query {op:"outcome"} ` +
+                `with jti "${phase.jti ?? ""}" to resolve it`,
+            });
           } else {
             finish({ ok: false, kind: "refused", error: errText(err) });
           }

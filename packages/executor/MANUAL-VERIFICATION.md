@@ -108,7 +108,10 @@ Why files, not `-e KEY=…`/argv: a command line is world-readable through
 the whole design is defending against. The service reads each key from its
 file into its OWN environment at launch — the secret lands in
 `/proc/<pid>/environ` (readable only by that service's uid), and the only
-argument any process sees is the file PATH:
+argument any process sees is the file PATH. Note the ABSOLUTE interpreter
+and ABSOLUTE script path (`/usr/bin/node /opt/ownerswitch/.../dist/*.js`) —
+never a bare `ownerswitch-merge-broker` off `$PATH`, which a same-uid agent
+could shadow with a writable directory earlier in the path:
 
 ```sh
 sudo -u oswitch-broker sg oswitch -c '
@@ -125,7 +128,7 @@ sudo -u oswitch-broker sg oswitch -c '
   OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test
   OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:4600
   set +a
-  exec ownerswitch-merge-broker'
+  exec /usr/bin/node /opt/ownerswitch/src/packages/executor/dist/merge-broker-cli.js'
 ```
 
 (The control-plane URL is `:4600` — the port the control plane listens on
@@ -180,12 +183,20 @@ session alone is refused). Enroll the owner's approval passkey in the owner
 app first; that yields a credential id, an SPKI public-key PEM, an rpId and
 the app's exact https origin, provided here as configuration:
 
+The control plane needs a WRITABLE home for its persisted kill state that
+its own uid owns — the root-owned `/var/lib/ownerswitch` parent is not
+writable by `oswitch-cp`, so give it a dedicated 0700 directory first:
+
+```sh
+sudo install -d -o oswitch-cp -g oswitch-cp -m 0700 /var/lib/ownerswitch/cp
+```
+
 ```sh
 sudo -u oswitch-cp sg oswitch-secrets -c '
   set -a
   OWNERSWITCH_CONTROL_PLANE_PORT=4600
   OWNERSWITCH_DEVICE_SECRET="$(cat /etc/ownerswitch/device.secret)"
-  OWNERSWITCH_KILL_STATE_FILE=/var/lib/ownerswitch/kill-state.json
+  OWNERSWITCH_KILL_STATE_FILE=/var/lib/ownerswitch/cp/kill-state.json
   OWNERSWITCH_GRANT_KEY="$(cat /etc/ownerswitch/grant.key)"
   OWNERSWITCH_KILL_STATE_KEY="$(cat /etc/ownerswitch/kill-state.key)"
   OWNERSWITCH_OWNER_PASSKEY_CREDENTIAL_ID="$(cat /etc/ownerswitch/passkey.credential-id)"
@@ -193,8 +204,15 @@ sudo -u oswitch-cp sg oswitch-secrets -c '
   OWNERSWITCH_OWNER_PASSKEY_RP_ID=owner.example
   OWNERSWITCH_OWNER_PASSKEY_ORIGIN=https://owner.example
   set +a
-  exec node /opt/ownerswitch/src/packages/mcp/dist/control-plane.js'
+  exec /usr/bin/node /opt/ownerswitch/src/packages/mcp/dist/control-plane.js'
 ```
+
+The owner authenticates to this control plane with the SAME passkey: the
+owner app calls `POST /session/challenge`, signs the returned challenge, and
+`POST /session` hands back an owner session token. That token is the first
+factor for the approval endpoints below; the per-merge WebAuthn assertion is
+the second. A fresh production process therefore needs no seeded session —
+the passkey bootstraps one.
 
 The control plane runs where the agent's uid cannot read its environment,
 from code the agent cannot rewrite, so the keys it holds are out of the
@@ -246,9 +264,11 @@ NO sha argument; the pin is OwnerSwitch's job:
 2. **Actively approve** the exact window as the owner would. With a
    passkey enrolled (production stance): request the ceremony
    (POST `/veto/<id>/approval-challenge`, owner bearer token) — its
-   response names the exact `canonicalArgs`/`callHash` being approved,
-   including the pinned head AND base — then complete it from the owner
-   app with the passkey (POST `/veto/<id>`
+   response returns a TYPED, per-field `renderable` (RenderableApprovalV1)
+   plus its `renderHash` and the `callHash`, not raw canonical JSON; the
+   owner app displays those fields (owner, repo, PR, head, **base**) and
+   the passkey signs the challenge bound to them. Complete it from the
+   owner app with the passkey (POST `/veto/<id>`
    `{"decision":"approve","assertion":{…}}`). In a dev run without an
    enrolled passkey, session-only approve works and SAYS so. Confirm that
    letting the window sit WITHOUT approving never merges: a quiet poll
@@ -280,8 +300,8 @@ NO sha argument; the pin is OwnerSwitch's job:
   must FAIL with a permission error — connect(2) is denied by the socket's
   0660/group. (This is the peer boundary the kernel actually enforces.)
 - **An impostor kill-state server cannot fool the broker.** Stop the real
-  control plane, then, as any local uid, bind `127.0.0.1:8787` with a
-  process that answers `GET /kill-state` with
+  control plane, then, as any local uid, bind `127.0.0.1:4600` (the control
+  plane's port) with a process that answers `GET /kill-state` with
   `{"killed":false,"epoch":<the epoch a captured grant needs>}` and a
   bogus `sig`. Present a still-live grant to the broker → it must REFUSE
   ("kill switch engaged (or control plane unreachable)"): the signature

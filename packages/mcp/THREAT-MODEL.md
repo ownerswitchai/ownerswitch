@@ -473,9 +473,14 @@ private key** and mints **installation tokens** with it
   in and is cleared on any kill, so a challenge created before a kill can
   never be redeemed after a restore. The ceremony returns a typed,
   per-field `RenderableApprovalV1` — never raw canonical JSON — with every
-  string field (owner, repo, base ref, head) proven safe to display (NFC
-  form; no bidi, format, or control characters), and binds that render's
-  hash to the challenge. WebAuthn assertion verification requires an exact
+  string field (owner, repo, base ref, head) proven safe to display: NFC
+  form, and rejected by Unicode PROPERTY (`Cc`/`Cf`/`Zl`/`Zp`/`Bidi_Control`/
+  `Default_Ignorable_Code_Point`) rather than an enumerated range, so
+  U+061C, U+00AD, U+180E, U+FFF9–FFFB and astral default-ignorables are all
+  refused. The render's hash is bound to the challenge. In production the
+  owner obtains the session that opens the ceremony by a passkey login
+  (`POST /session/challenge` → `POST /session`), so a fresh process needs no
+  seeded credential. WebAuthn assertion verification requires an exact
   https origin, rejects cross-origin (embedded) ceremonies, and rejects an
   unexpected `topOrigin`. So "the owner tapped yes" means the owner saw an
   unspoofable transaction, at the real origin, in the world the approval

@@ -63,11 +63,14 @@ describe("isSafeToDisplay + buildRenderableApproval — the owner-display contra
     expect(isSafeToDisplay("main")).toBe(true);
     expect(isSafeToDisplay("release-1.2")).toBe(true);
     expect(isSafeToDisplay(`ma${RTL_OVERRIDE}in`)).toBe(false);
-    // zero-width space, BOM, line/paragraph separator, LTR isolate, word
-    // joiner, DEL, and a C1 control
-    for (const cp of [0x200b, 0xfeff, 0x2028, 0x2029, 0x2066, 0x2060, 0x7f, 0x85]) {
-      expect(isSafeToDisplay(`x${String.fromCharCode(cp)}y`)).toBe(false);
+    // property-based rejection catches what an enumerated range missed:
+    // ARABIC LETTER MARK, SOFT HYPHEN, MONGOLIAN VOWEL SEPARATOR, interlinear
+    // annotation anchors, plus the classics (ZWSP, BOM, separators, isolate)
+    for (const cp of [0x061c, 0x00ad, 0x180e, 0xfff9, 0xfffb, 0x200b, 0xfeff, 0x2028, 0x2029, 0x2066, 0x2060, 0x7f, 0x85]) {
+      expect(isSafeToDisplay(`x${String.fromCodePoint(cp)}y`)).toBe(false);
     }
+    // an ASTRAL default-ignorable (a TAG character, U+E0041) is rejected too
+    expect(isSafeToDisplay(`x${String.fromCodePoint(0xe0041)}y`)).toBe(false);
     // a decomposed form (NFD "e"+combining acute) is not NFC-idempotent
     expect(isSafeToDisplay("café")).toBe(false);
   });

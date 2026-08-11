@@ -221,6 +221,41 @@ describe("createMergeBroker — the executing broker", () => {
     expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
   });
 
+  it("POST-DISPATCH fault is UNKNOWN, never not-performed: the PUT lands, then building the result throws", async () => {
+    // A ledger whose redact throws ONLY on the success sha: the PUT succeeds
+    // (dispatched), then the client throws while building the success result.
+    // That non-ConnectorCallError escapes after dispatch — it must classify
+    // as unknown (the merge may have landed), never refused/not-performed.
+    const github = fakeGitHub();
+    const socketPath = join(dir, "broker.sock");
+    const brittleLedger = {
+      add: () => undefined,
+      redact: (t: string) => {
+        if (t.includes("mergecommit01")) throw new Error("redact fault after the PUT");
+        return t;
+      },
+    };
+    broker = createMergeBroker({
+      tokens: { tokenFor: async () => TOKEN },
+      ledger: brittleLedger,
+      grantKey: GRANT_KEY,
+      burnDir: join(dir, "burns"),
+      unsafeBurnAncestryForTests: true,
+      fetchLiveKillState: alive,
+      fetchImpl: github.fetchImpl,
+      baseUrl: "https://api.github.com",
+      now: () => NOW,
+    });
+    await broker.listen(socketPath);
+    const raw = JSON.parse(
+      await rawExchange(socketPath, `${JSON.stringify({ op: "merge", grant: grant(), args: MERGE_ARGS })}\n`),
+    ) as { ok: boolean; kind?: string; outcome?: string };
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(true); // it DID dispatch
+    expect(raw.ok).toBe(false);
+    expect(raw.kind).toBe("connector");
+    expect(raw.outcome).toBe("unknown"); // never "refused" / not-performed
+  });
+
   it("PERFORMS the merge with a valid grant and returns only the outcome — never a token", async () => {
     const github = fakeGitHub();
     const socketPath = await startBroker({ github });

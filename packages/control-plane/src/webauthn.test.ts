@@ -437,6 +437,81 @@ describe("assertion-gated approval over HTTP", () => {
     expect(cp.vetoWindows.get("v-1")?.approvedBy).toBeNull();
   });
 
+  it("passkey login: challenge → assertion → owner session, usable to run the ceremony", async () => {
+    const auth = authenticator();
+    const c = clock();
+    const cp = quiet({
+      now: c.now,
+      grantKey: GRANT_KEY,
+      ownerPasskey: { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem, rpId: RP_ID, origin: ORIGIN },
+    });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", mergeWindow(c.now));
+
+    // step 1: get a login challenge (no session needed — bootstraps one)
+    const login = (await (
+      await fetch(`${url}/session/challenge`, { method: "POST" })
+    ).json()) as { challenge: string; credentialId: string };
+    expect(login.credentialId).toBe(CRED_ID);
+
+    // step 2: sign it with the passkey → an owner session token
+    const sess = await fetch(`${url}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: login.challenge,
+        assertion: auth.assert({ challenge: login.challenge, signCount: 1 }),
+      }),
+    });
+    expect(sess.status).toBe(200);
+    const { token } = (await sess.json()) as { token: string };
+    expect(typeof token).toBe("string");
+
+    // the bootstrapped session actually works — it can open the approval
+    // ceremony (which requires an owner session)
+    const bearer = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const ch = await fetch(`${url}/veto/v-1/approval-challenge`, { method: "POST", headers: bearer });
+    expect(ch.status).toBe(200);
+  });
+
+  it("passkey login refuses a wrong-key assertion and a spent/expired challenge", async () => {
+    const auth = authenticator();
+    const c = clock();
+    const cp = quiet({
+      now: c.now,
+      grantKey: GRANT_KEY,
+      ownerPasskey: { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem, rpId: RP_ID, origin: ORIGIN },
+    });
+    const url = await start(cp);
+
+    const login = (await (
+      await fetch(`${url}/session/challenge`, { method: "POST" })
+    ).json()) as { challenge: string };
+
+    // a stranger's assertion over the real challenge → 401 (and spends it)
+    const stranger = authenticator();
+    const bad = await fetch(`${url}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: login.challenge,
+        assertion: stranger.assert({ challenge: login.challenge }),
+      }),
+    });
+    expect(bad.status).toBe(401);
+
+    // replaying the now-spent challenge, even with a valid signature → 401
+    const replay = await fetch(`${url}/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: login.challenge,
+        assertion: auth.assert({ challenge: login.challenge, signCount: 2 }),
+      }),
+    });
+    expect(replay.status).toBe(401);
+  });
+
   it("the challenge endpoint is owner-authenticated and grant-eligible-only", async () => {
     const auth = authenticator();
     const { url, bearer, cp, c } = await setup(auth);

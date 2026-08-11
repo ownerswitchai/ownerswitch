@@ -14,6 +14,7 @@ import {
   type ToolCall,
 } from "@ownerswitchai/shared";
 import {
+  createOwnerSession,
   isLoopbackAddress,
   verifyDeviceSignature,
   verifyOwnerSession,
@@ -451,6 +452,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   const APPROVAL_CHALLENGE_TTL_MS = 2 * 60_000;
   // last accepted signature counter for the enrolled passkey (clone signal)
   let passkeySignCount = 0;
+  // Outstanding passkey LOGIN challenges (challenge → expiry), single-use.
+  // These bootstrap an owner SESSION: a fresh production process has no way
+  // to mint one otherwise, yet both approval endpoints need an owner
+  // session. The challenge is worthless without the enrolled passkey to
+  // sign it, so minting one is a harmless open operation; the session is
+  // handed out only after a verified assertion.
+  const loginChallenges = new Map<string, number>();
+  const LOGIN_CHALLENGE_TTL_MS = 2 * 60_000;
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
   // this map (a restart) can only make restores harder, never easier — an id
   // that is not in here restores nothing, whatever its body claims.
@@ -686,6 +695,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // before the kill must never be redeemable after a restore (its epoch
     // no longer matches, but clearing is the belt to that suspenders).
     approvalChallenges.clear();
+    // ...and every outstanding login challenge, so a kill also stops a
+    // half-finished session bootstrap.
+    loginChallenges.clear();
     // The kill is in force in memory no matter what; the response only claims
     // durability when the persist actually succeeded.
     sendJson(res, 200, { killed: true, ...degradedFields() });
@@ -1096,6 +1108,83 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     });
   }
 
+  /**
+   * Passkey login — step 1: mint a single-use challenge the owner's
+   * authenticator will sign to prove it is present. Requires a passkey to be
+   * enrolled; the challenge grants nothing on its own.
+   */
+  async function postSessionChallenge(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (opts.ownerPasskey === undefined) {
+      sendJson(res, 501, { error: "no owner approval passkey is enrolled on this control plane" });
+      return;
+    }
+    if (killSwitch.killed) {
+      sendJson(res, 409, { error: "cannot start a session while the kill switch is engaged" });
+      return;
+    }
+    await readRawBody(req); // drain
+    // sweep expired challenges so the map stays bounded
+    for (const [ch, exp] of loginChallenges) if (now() >= exp) loginChallenges.delete(ch);
+    const challenge = randomBytes(32).toString("base64url");
+    loginChallenges.set(challenge, now() + LOGIN_CHALLENGE_TTL_MS);
+    sendJson(res, 200, {
+      challenge,
+      rpId: opts.ownerPasskey.rpId,
+      credentialId: opts.ownerPasskey.credentialId,
+      expiresAt: now() + LOGIN_CHALLENGE_TTL_MS,
+    });
+  }
+
+  /**
+   * Passkey login — step 2: redeem a signed assertion for an owner SESSION.
+   * The challenge is spent atomically (deleted before verification), the
+   * assertion is verified against the enrolled passkey (origin, UP+UV,
+   * counter), and only then is a session minted. This is what lets a fresh
+   * PRODUCTION process begin the approval flow — the alternative (no way to
+   * get a session) leaves the passkey approval endpoints unreachable.
+   */
+  async function postSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (opts.ownerPasskey === undefined) {
+      sendJson(res, 501, { error: "no owner approval passkey is enrolled on this control plane" });
+      return;
+    }
+    if (killSwitch.killed) {
+      sendJson(res, 409, { error: "cannot start a session while the kill switch is engaged" });
+      return;
+    }
+    const body = parseJsonBody(await readRawBody(req));
+    const challenge = body.challenge;
+    if (typeof challenge !== "string" || challenge === "") {
+      sendJson(res, 400, { error: "session requires the challenge and a passkey assertion" });
+      return;
+    }
+    const expiresAt = loginChallenges.get(challenge);
+    loginChallenges.delete(challenge); // single-use: spent by this attempt
+    if (expiresAt === undefined || now() >= expiresAt) {
+      sendJson(res, 401, { error: "no live login challenge — request POST /session/challenge first" });
+      return;
+    }
+    const assertion = assertionFrom(body.assertion);
+    if (assertion === null) {
+      sendJson(res, 400, { error: "session requires a well-formed passkey assertion" });
+      return;
+    }
+    const verdict = verifyOwnerAssertion(assertion, {
+      passkey: opts.ownerPasskey,
+      rpId: opts.ownerPasskey.rpId,
+      expectedOrigin: opts.ownerPasskey.origin,
+      expectedChallenge: challenge,
+      lastSignCount: passkeySignCount,
+    });
+    if (!verdict.ok) {
+      sendJson(res, 401, { error: `passkey assertion rejected: ${verdict.reason}` });
+      return;
+    }
+    passkeySignCount = Math.max(passkeySignCount, verdict.signCount);
+    const session = createOwnerSession("owner", { now });
+    sendJson(res, 200, { token: session.token, expiresAt: session.expiresAt });
+  }
+
   /** The registered call, or null when the body doesn't describe one. */
   function toolCallFrom(value: unknown): ToolCall | null {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -1335,6 +1424,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
     if (method === "POST" && path === "/kill-state/commit") return postGrantCommit(req, res);
+    if (method === "POST" && path === "/session/challenge") return postSessionChallenge(req, res);
+    if (method === "POST" && path === "/session") return postSession(req, res);
     if (method === "POST" && approvalChallengeMatch) {
       return postApprovalChallenge(req, res, decodeURIComponent(approvalChallengeMatch[1]));
     }
