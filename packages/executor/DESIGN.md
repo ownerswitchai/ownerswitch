@@ -382,21 +382,49 @@ authority. It hands out a *result*.
 nothing the gateway says.** The evidence is a **MergeGrant**
 (`packages/shared/src/merge-grant.ts`):
 - **Who mints it:** the CONTROL PLANE, at the moment the owner ACTIVELY
-  APPROVES the exact call — an owner-session-authenticated approval of the
-  window (`POST /veto/:id` `decision=approve`), NOT a quiet timeout
-  (`server.ts` `getVeto`). This is the round-3 fix: a merge is
-  grant-eligible only through a positive owner "yes", because the party
-  that REGISTERS a window is untrusted under the same-uid model (it can
-  forge the gateway's device secret), so silence-approval would let the
-  agent's own registration release itself. An owner session is a token on
-  the owner's device the agent cannot reach; requiring it is what makes the
-  grant a real owner decision rather than a laundered gateway assertion.
-  Not the gateway: within one uid the gateway can hold no secret the agent
-  cannot read, so nothing the gateway knows can authorize a merge. The
-  grant is signed with a key (`OWNERSWITCH_GRANT_KEY`) the control plane
-  shares ONLY with the broker — never in the gateway/agent environment, and
-  its `killEpoch` is the epoch AT APPROVAL, so a window registered during a
-  kill cannot become authority that outlives the kill.
+  APPROVES the exact call — never a quiet timeout (`server.ts` `getVeto`):
+  a merge is grant-eligible only through a positive owner "yes", because
+  the party that REGISTERS a window is untrusted under the same-uid model
+  (it can forge the gateway's device secret), so silence-approval would let
+  the agent's own registration release itself. And the "yes" is not a
+  bearer token: with a passkey enrolled (`ownerPasskey`), approval demands
+  a FRESH WebAuthn ASSERTION (`webauthn.ts`) — a server-minted, single-use,
+  short-lived challenge bound to {windowId, callHash}, signed by the
+  owner's authenticator with user presence AND user verification, counter
+  checked against cloning, redeemed atomically (spent by its first
+  presentation, valid or not). A stolen owner SESSION therefore cannot
+  approve anything: the session only opens the ceremony; the authenticator
+  in the owner's hand completes it. Session-only approval survives solely
+  in dev mode; a non-dev control plane without an enrolled passkey refuses
+  approvals outright. Not the gateway: within one uid the gateway can hold
+  no secret the agent cannot read, so nothing the gateway knows can
+  authorize a merge. The grant is signed with a key
+  (`OWNERSWITCH_GRANT_KEY`) the control plane shares ONLY with the broker —
+  never in the gateway/agent environment, and its `killEpoch` is the epoch
+  AT APPROVAL, so a window registered during a kill cannot become authority
+  that outlives the kill.
+- **The owner's "no" outranks an issued grant.** A grant in flight is
+  revocable until dispatch: the control plane remembers every jti it
+  minted, a purposed window accepts a VETO even after approval, and the
+  broker's signed kill-state probe (`/kill-state?nonce=…&jti=…`) answers
+  `grantLive` — false the moment the window is vetoed, unknown, or the
+  control plane restarted. The broker requires `grantLive === true` both
+  before the token mint and again immediately before the PUT, so
+  approve → grant fetched → owner vetoes → the merge still refuses. The
+  liveness answer rides inside the same HMAC-signed, nonce-bound envelope
+  as the kill state, so an impostor cannot vouch for a grant any more than
+  it can fake "not killed".
+- **Both pins, head AND base.** The review-time pin records the PR's head
+  sha and its DESTINATION (`expectedBaseRef`), both server-derived, both in
+  the owner-reviewed canonical args, both signed. GitHub enforces the head
+  atomically at merge time (`sha`); it offers NO base guard and allows
+  retargeting a PR after approval — so the executor re-reads the PR's base
+  immediately before the PUT and refuses on mismatch. Stated honestly: that
+  read-then-PUT pair is not atomic, so a retarget landing in the
+  milliseconds between them can still slip through; the pin shrinks the
+  window from "any time since approval" to that gap, and the veto/kill
+  paths remain the owner's recourse. (GitHub's API docs describe both
+  behaviors; there is nothing stronger to build on.)
 - **What is inside it:** the exact tool call the owner reviewed (tool,
   agentId, canonical args), the SIGNED PURPOSE the window was registered
   under (`connector` + `operation`, plus the gateway's authorization-world

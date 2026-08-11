@@ -23,6 +23,16 @@ export interface LiveKillState {
   killed: boolean;
   /** monotone count of kill engagements; restore never resets it */
   epoch: number;
+  /**
+   * Present when the lookup carried a grant-liveness PROBE (a jti): true
+   * iff the control plane still vouches for that specific grant — it
+   * minted it, remembers it, and its window has NOT been vetoed since.
+   * This is how an owner's veto revokes an already-issued, undispatched
+   * grant: the broker requires `grantLive === true` on both of its live
+   * checks, so a veto observed by the control plane invalidates the grant
+   * before the PUT. Absent when no probe was made (plain kill lookups).
+   */
+  grantLive?: boolean;
 }
 
 export interface Refusal {

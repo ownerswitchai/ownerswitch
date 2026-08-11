@@ -13,7 +13,7 @@ const TICKET: ActionTicket = {
   ruleId: "merge",
   connector: "github",
   operation: "merge_pull_request",
-  canonicalArgs: `{"expectedHeadSha":"${SHA}","owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}`,
+  canonicalArgs: `{"expectedBaseRef":"main","expectedHeadSha":"${SHA}","owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}`,
   resourceId: "github:pr:ownerswitchai/ownerswitch#7",
   policyVersion: "sha256:test",
   killEpoch: 0,
@@ -26,7 +26,7 @@ const TICKET: ActionTicket = {
 function stubClient(merge: GitHubMergeClient["mergePullRequest"]): GitHubMergeClient {
   return {
     mergePullRequest: merge,
-    getPullRequestHead: async () => SHA,
+    getPullRequestHead: async () => ({ headSha: SHA, baseRef: "main" }),
   };
 }
 
@@ -35,11 +35,11 @@ describe("parseMergePrArgs", () => {
     const sha1 = "a".repeat(40);
     const sha256 = "b".repeat(64);
     expect(
-      parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":"${sha1}"}`)
+      parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":"${sha1}","expectedBaseRef":"main"}`)
         .expectedHeadSha,
     ).toBe(sha1);
     expect(
-      parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":"${sha256}"}`)
+      parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":"${sha256}","expectedBaseRef":"main"}`)
         .expectedHeadSha,
     ).toBe(sha256);
   });
@@ -53,7 +53,7 @@ describe("parseMergePrArgs", () => {
   it("refuses an abbreviated or malformed expectedHeadSha — an approval must bind to exactly one head", () => {
     for (const bad of ['"abc123"', `"${"g".repeat(40)}"`, "7", "true"]) {
       expect(() =>
-        parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":${bad}}`),
+        parseMergePrArgs(`{"owner":"o","repo":"r","pullNumber":1,"expectedHeadSha":${bad},"expectedBaseRef":"main"}`),
       ).toThrowError(/expectedHeadSha/);
     }
   });

@@ -3,7 +3,7 @@ import { canonicalJson } from "./merge-grant.js";
 import { parseMergePrArgs } from "./merge-args.js";
 
 const SHA = "a".repeat(40);
-const VALID = { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: SHA };
+const VALID = { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: SHA, expectedBaseRef: "main" };
 
 describe("parseMergePrArgs — the CLOSED canonical merge schema", () => {
   it("parses the exact allowed shape, with and without mergeMethod", () => {
@@ -19,6 +19,16 @@ describe("parseMergePrArgs — the CLOSED canonical merge schema", () => {
       expect(() => parseMergePrArgs(canonicalJson({ ...VALID, ...extra }))).toThrowError(
         /unknown argument/,
       );
+    }
+  });
+
+  it("refuses a missing or malformed expectedBaseRef — the destination pin is mandatory too", () => {
+    const { expectedBaseRef: _base, ...withoutBase } = VALID;
+    expect(() => parseMergePrArgs(canonicalJson(withoutBase))).toThrowError(/expectedBaseRef/);
+    for (const bad of ["", "a".repeat(301), "evil\u0000ref"]) {
+      expect(() =>
+        parseMergePrArgs(canonicalJson({ ...VALID, expectedBaseRef: bad })),
+      ).toThrowError(/expectedBaseRef/);
     }
   });
 

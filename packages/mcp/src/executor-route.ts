@@ -44,14 +44,20 @@ export interface ExecutorWiring {
    */
   requiresGrant?: boolean;
   /**
-   * The review-time head pin for github/merge_pull_request routes: the
-   * PR's CURRENT head sha, read with OwnerSwitch's own credential. The
-   * proxy calls this BEFORE the owner sees the request (before a veto
-   * window opens, before a ticket mints) and writes the result into the
-   * call's canonical arguments as `expectedHeadSha` — server-derived,
-   * never agent-supplied. Absent wiring fails routed merges closed.
+   * The review-time pin for github/merge_pull_request routes: the PR's
+   * CURRENT head sha AND base ref, read with OwnerSwitch's own credential.
+   * The proxy calls this BEFORE the owner sees the request (before a veto
+   * window opens, before a ticket mints) and writes both into the call's
+   * canonical arguments as `expectedHeadSha`/`expectedBaseRef` —
+   * server-derived, never agent-supplied. The base is pinned because
+   * GitHub allows retargeting a PR after approval and the merge API has no
+   * base guard. Absent wiring fails routed merges closed.
    */
-  pinHeadSha?: (args: { owner: string; repo: string; pullNumber: number }) => Promise<string>;
+  pinHeadSha?: (args: {
+    owner: string;
+    repo: string;
+    pullNumber: number;
+  }) => Promise<{ headSha: string; baseRef: string }>;
   /** ticket lifetime in ms; default DEFAULT_TICKET_TTL_MS */
   ticketTtlMs?: number;
   /** injectable for tests */
@@ -110,11 +116,13 @@ export interface NormalizedMergeRequest {
  * set would reject it regardless.
  */
 export function validateMergePrRequestArgs(args: Record<string, unknown>): NormalizedMergeRequest {
-  if ("expectedHeadSha" in args) {
-    throw new Error(
-      "expectedHeadSha is derived by OwnerSwitch at review time and cannot be supplied by " +
-        "the agent — remove it and call again",
-    );
+  for (const pinned of ["expectedHeadSha", "expectedBaseRef"] as const) {
+    if (pinned in args) {
+      throw new Error(
+        `${pinned} is derived by OwnerSwitch at review time and cannot be supplied by ` +
+          `the agent — remove it and call again`,
+      );
+    }
   }
   for (const key of Object.keys(args)) {
     if (!MERGE_PR_ALLOWED_KEYS.has(key)) {

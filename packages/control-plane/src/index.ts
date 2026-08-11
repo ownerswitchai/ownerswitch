@@ -16,6 +16,14 @@ export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.
 export { createControlPlane, DEFAULT_KILL_STATE_FILE } from "./server.js";
 export type { ControlPlane, ControlPlaneOptions } from "./server.js";
 
+export { verifyOwnerAssertion } from "./webauthn.js";
+export type {
+  AssertionVerdict,
+  OwnerPasskey,
+  VerifyAssertionOptions,
+  WebAuthnAssertion,
+} from "./webauthn.js";
+
 export {
   createOwnerSession,
   isLoopbackAddress,

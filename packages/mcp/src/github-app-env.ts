@@ -55,7 +55,15 @@ const TRIPLE = [
 
 const BROKER_VAR = "OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET";
 const ACK_VAR = "OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK";
-const GRANT_KEY_VAR = "OWNERSWITCH_GRANT_KEY";
+/**
+ * The HMAC keys that must NEVER exist in the gateway's environment. The
+ * grant key forges owner approvals outright; the kill-state key is just as
+ * disqualifying by a different route — an agent that reads it can wait for
+ * the real control plane to stop, bind its loopback port, and SIGN fresh
+ * `killed:false` envelopes, defeating the authenticated kill channel. Both
+ * are refused by NAME at startup, before any of them could be read.
+ */
+const FORBIDDEN_KEY_VARS = ["OWNERSWITCH_GRANT_KEY", "OWNERSWITCH_KILL_STATE_KEY"] as const;
 
 export function resolveGitHubConnectorEnv(
   env: Record<string, string | undefined>,
@@ -64,24 +72,27 @@ export function resolveGitHubConnectorEnv(
     const raw = env[name]?.trim();
     return raw === "" ? undefined : raw;
   };
-  // The grant-signing key belongs to the control plane and the merge broker
-  // ONLY — the gateway has no use for it, and in the stdio deployment the
-  // gateway shares a uid with the agent, so a key visible here is a key the
-  // agent can read, and with it MergeGrants can be FORGED: the entire
-  // owner-approval boundary would rest on a secret the adversary holds.
-  // This is not a warning; the isolation claim is enforced at startup. The
-  // usual way to trip it is exporting the key in a shell that then starts
-  // both the control plane and the gateway — scope it to the control-plane
-  // (and broker) process instead, e.g. `OWNERSWITCH_GRANT_KEY=… pnpm
-  // dev:control-plane`.
-  if (clean(GRANT_KEY_VAR) !== undefined) {
-    throw new ConfigError(
-      `${GRANT_KEY_VAR} is set in the gateway's environment. That key signs MergeGrants and ` +
-        `must exist ONLY in the control plane and the merge broker — in the stdio deployment ` +
-        `the gateway shares a uid with the agent, so a key the gateway can read, the agent can ` +
-        `read, and with it owner-approval grants can be forged. Unset it here and provision it ` +
-        `only into the control-plane and broker processes (each isolated from the agent's uid).`,
-    );
+  // The shared HMAC keys belong to the control plane and the merge broker
+  // ONLY — the gateway has no use for either, and in the stdio deployment
+  // the gateway shares a uid with the agent, so a key visible here is a key
+  // the agent can read. With the grant key, MergeGrants can be FORGED
+  // outright; with the kill-state key, an agent can port-squat a stopped
+  // control plane and SIGN fresh `killed:false` envelopes, defeating the
+  // authenticated kill channel. This is not a warning; the isolation claim
+  // is enforced at startup. The usual way to trip it is exporting a key in
+  // a shell that then starts both the control plane and the gateway — read
+  // the keys from their files into the control-plane/broker process
+  // environments only (see MANUAL-VERIFICATION.md).
+  for (const name of FORBIDDEN_KEY_VARS) {
+    if (clean(name) !== undefined) {
+      throw new ConfigError(
+        `${name} is set in the gateway's environment. That key must exist ONLY in the control ` +
+          `plane and the merge broker — in the stdio deployment the gateway shares a uid with ` +
+          `the agent, so a key the gateway can read, the agent can read, and with it the ` +
+          `owner-approval or kill-state boundary can be forged. Unset it here and provision it ` +
+          `only into the control-plane and broker processes (each isolated from the agent's uid).`,
+      );
+    }
   }
   const brokerSocket = clean(BROKER_VAR);
   const values = TRIPLE.map((name) => clean(name));

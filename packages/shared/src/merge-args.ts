@@ -26,6 +26,17 @@ export interface MergePrArgs {
    * nobody reviewed.
    */
   expectedHeadSha: string;
+  /**
+   * The DESTINATION branch the owner's approval was pinned to — mandatory,
+   * derived server-side at review time, same as the head sha. GitHub lets a
+   * PR be retargeted to a different base branch after approval, and the
+   * merge API's `sha` parameter guards only the head — so without this pin
+   * the same approved commits could be merged into a branch the owner never
+   * saw. The executor re-reads the PR's base immediately before dispatch
+   * and refuses on mismatch (the API offers no atomic base guard; the
+   * residual read-to-PUT race is documented in DESIGN.md).
+   */
+  expectedBaseRef: string;
   mergeMethod?: "merge" | "squash" | "rebase";
 }
 
@@ -36,7 +47,11 @@ const MERGE_PR_CANONICAL_KEYS: ReadonlySet<string> = new Set([
   "pullNumber",
   "mergeMethod",
   "expectedHeadSha",
+  "expectedBaseRef",
 ]);
+
+/** Branch names are short; anything past this is not a ref, it's an attack. */
+const MAX_BASE_REF_LENGTH = 300;
 
 /**
  * Parse canonical merge arguments STRICTLY: the closed key set above, the
@@ -58,14 +73,12 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
     if (!MERGE_PR_CANONICAL_KEYS.has(key)) {
       throw new Error(
         `unknown argument "${key}" for merge_pull_request — the argument schema is closed: ` +
-          `owner, repo, pullNumber, mergeMethod, expectedHeadSha`,
+          `owner, repo, pullNumber, mergeMethod, expectedHeadSha, expectedBaseRef`,
       );
     }
   }
-  const { owner, repo, pullNumber, mergeMethod, expectedHeadSha } = parsed as Record<
-    string,
-    unknown
-  >;
+  const { owner, repo, pullNumber, mergeMethod, expectedHeadSha, expectedBaseRef } =
+    parsed as Record<string, unknown>;
   if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
   if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
   if (typeof pullNumber !== "number" || !Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
@@ -92,11 +105,26 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
         "pinned by OwnerSwitch at review time",
     );
   }
+  // MANDATORY, server-derived like the head sha: the merge destination the
+  // owner approved. Non-empty, bounded, no control characters — it is
+  // compared as an exact string against GitHub's reported base ref.
+  if (
+    typeof expectedBaseRef !== "string" ||
+    expectedBaseRef === "" ||
+    expectedBaseRef.length > MAX_BASE_REF_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(expectedBaseRef)
+  ) {
+    throw new Error(
+      "merge_pull_request requires expectedBaseRef: the destination branch pinned by " +
+        "OwnerSwitch at review time (non-empty, printable, bounded)",
+    );
+  }
   return {
     owner,
     repo,
     pullNumber,
     expectedHeadSha,
+    expectedBaseRef,
     ...(mergeMethod !== undefined ? { mergeMethod } : {}),
   };
 }

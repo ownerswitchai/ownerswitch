@@ -26,7 +26,14 @@ export {
   MERGE_PULL_REQUEST,
   parseMergePrArgs,
 } from "./github.js";
-export type { GitHubCredential, GitHubMergeClient, MergePrArgs } from "./github.js";
+export type {
+  GitHubCredential,
+  GitHubMergeClient,
+  MergeAttribution,
+  MergePrArgs,
+  MergeResult,
+  PinnedMergeTarget,
+} from "./github.js";
 
 export { ConnectorCallError } from "./connector-error.js";
 export type { ConnectorOutcome } from "./connector-error.js";

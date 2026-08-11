@@ -94,8 +94,16 @@ export interface MergeBrokerOptions {
   ledger: SecretLedger;
   /** the shared control-plane↔broker key that signs MergeGrants */
   grantKey: string;
-  /** live kill state, fail-closed (liveKillStateFromControlPlane) */
-  fetchLiveKillState: () => Promise<LiveKillState>;
+  /**
+   * Live kill state, fail-closed (signedLiveKillStateFromControlPlane).
+   * For merges the broker passes a grant-liveness PROBE ({jti}) and
+   * requires `grantLive === true` in the answer — the control plane's
+   * signed statement that it minted this grant and its window has not been
+   * vetoed since. A fetcher that ignores the probe (or answers without
+   * grantLive) refuses every merge, by design: an owner's veto must be
+   * able to revoke an issued-but-undispatched grant.
+   */
+  fetchLiveKillState: (probe?: { jti: string }) => Promise<LiveKillState>;
   /**
    * Directory for the DURABLE single-use burn store (burn-store.ts) —
    * broker-owned, mode 0700, outside the agent workspace. Required: a burn
@@ -106,10 +114,16 @@ export interface MergeBrokerOptions {
    * The agent-reachable workspace the burn directory must NOT live under —
    * same rule as the App private key (github-app-key.ts). Passed EXPLICITLY
    * so the boundary is checked against the real workspace, not this
-   * process's cwd. When set, an absolute burnDir inside it is refused at
+   * process's cwd. When set, a burnDir RESOLVING inside it is refused at
    * startup; a retargetable symlink is refused regardless.
    */
   agentWorkspace?: string;
+  /**
+   * TESTS ONLY — forwarded to the burn store so suites can run under
+   * tmpdir(), whose world-writable /tmp ancestor the trusted-ancestry check
+   * rightly refuses. The broker CLI never sets this.
+   */
+  unsafeBurnAncestryForTests?: boolean;
   /**
    * Repositories the broker will act on. undefined = any the installation
    * covers; set it in production so a compromised same-uid requester cannot
@@ -144,7 +158,7 @@ export interface MergeBroker {
 }
 
 type WireResponse =
-  | { ok: true; headSha: string }
+  | { ok: true; headSha: string; baseRef: string }
   | { ok: true; merged: boolean; sha: string; message: string }
   | {
       ok: true;
@@ -211,12 +225,15 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   const burns: JtiBurnStore = createJtiBurnStore(options.burnDir, {
     now,
     ...(options.agentWorkspace !== undefined ? { workspaceDir: options.agentWorkspace } : {}),
+    ...(options.unsafeBurnAncestryForTests === true
+      ? { unsafeAllowUntrustedAncestryForTests: true }
+      : {}),
   });
 
   /** Fail-closed live kill state — an unreadable control plane reads as killed. */
-  async function live(): Promise<LiveKillState> {
+  async function live(probe?: { jti: string }): Promise<LiveKillState> {
     try {
-      return await fetchLiveKillState();
+      return await fetchLiveKillState(probe);
     } catch {
       return { killed: true, epoch: -1 };
     }
@@ -237,8 +254,8 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
     if (state.killed) throw new BrokerRefusal("kill switch engaged (or control plane unreachable) — refused");
     const client = mergeClient();
     try {
-      const headSha = await client.getPullRequestHead(args);
-      return { ok: true, headSha };
+      const target = await client.getPullRequestHead(args);
+      return { ok: true, headSha: target.headSha, baseRef: target.baseRef };
     } catch (err) {
       throw new BrokerRefusal(
         `cannot read the pull request head: ${err instanceof Error ? err.message : "failed"}`,
@@ -289,14 +306,22 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
       assertRepoAllowed(mergeArgs.repo);
 
       // kill recheck BEFORE the mint: killed false AND the live epoch equals
-      // the epoch the owner approved under
-      const before = await live();
+      // the epoch the owner approved under AND the control plane still
+      // VOUCHES for this specific grant (grant-liveness probe) — an owner
+      // veto after issuance revokes the grant right here
+      const before = await live({ jti: grant.jti });
       if (before.killed) {
         throw new BrokerRefusal("kill switch engaged (or control plane unreachable) — refused");
       }
       if (before.epoch !== grant.killEpoch) {
         throw new BrokerRefusal(
           `kill epoch moved since approval (grant ${grant.killEpoch}, live ${before.epoch}) — a kill happened in between`,
+        );
+      }
+      if (before.grantLive !== true) {
+        throw new BrokerRefusal(
+          "the control plane no longer vouches for this grant — vetoed since approval, unknown " +
+            "to it, or it restarted; nothing was dispatched",
         );
       }
 
@@ -315,20 +340,39 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
             "the connection was abandoned before dispatch (client timed out) — not dispatched",
           );
         }
-        const after = await live();
+        const after = await live({ jti: grant.jti });
         if (after.killed || after.epoch !== before.epoch) {
           throw new Error("kill state changed during token minting");
         }
+        if (after.grantLive !== true) {
+          throw new Error(
+            "the control plane no longer vouches for this grant (vetoed during the mint) — refused before dispatch",
+          );
+        }
         if (now() >= grant.expiresAt) {
           throw new Error("the grant expired during token minting — refused before dispatch");
+        }
+        // Re-check the latch SYNCHRONOUSLY, immediately before flipping to
+        // dispatched: the live() read above awaited, and the abandon timer
+        // can fire during exactly that await — a "refused; nothing sent"
+        // would then already be on the wire, so dispatching now would make
+        // it a lie. Between this check and the assignment there is no await,
+        // so the single-threaded timer cannot interleave.
+        if (phase.abandoned) {
+          throw new Error(
+            "the connection was abandoned during the pre-dispatch checks — not dispatched",
+          );
         }
         phase.dispatched = true;
       });
 
       try {
         const result = await client.mergePullRequest(mergeArgs);
+        // "performed" is reserved for a direct confirmation that THIS
+        // dispatch merged; an ambiguity-path success only proved the PR's
+        // merged STATE, and the record must not claim more than that.
         recordOutcome(grant.jti, {
-          state: "performed",
+          state: result.attribution === "merged-state-only" ? "merged-state-observed" : "performed",
           merged: result.merged,
           sha: result.sha,
           message: result.message,
@@ -529,6 +573,7 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
         }
         boundPath = undefined;
       }
+      burns.close();
     },
   };
 }

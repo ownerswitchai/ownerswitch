@@ -1272,7 +1272,13 @@ describe("control-plane HTTP API", () => {
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: "grant-key-cp-and-broker-padded-256bit" });
     const url = await start(cp);
 
-    const mergeArgs = { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40) };
+    const mergeArgs = {
+      owner: "o",
+      repo: "r",
+      pullNumber: 7,
+      expectedHeadSha: "a".repeat(40),
+      expectedBaseRef: "main",
+    };
     const body = JSON.stringify({
       call: { agentId: "mcp-proxy", tool: "github.merge_pr", args: mergeArgs },
       purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" },
@@ -1447,6 +1453,79 @@ describe("control-plane HTTP API", () => {
     const url2 = await start(noKey);
     expect((await fetch(`${url2}/kill-state?nonce=x`)).status).toBe(501);
   });
+
+  it("VETO REVOKES an issued grant: the signed grant-liveness probe flips to false", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+    const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+    const url = await start(cp);
+
+    // an approved merge window whose grant is fetched (the broker's evidence)
+    const window = new VetoWindow(
+      {
+        agentId: "a1",
+        tool: "github.merge_pr",
+        args: {
+          owner: "o",
+          repo: "r",
+          pullNumber: 7,
+          expectedHeadSha: "a".repeat(40),
+          expectedBaseRef: "main",
+        },
+      },
+      0,
+      {
+        now: c.now,
+        purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" },
+      },
+    );
+    window.markDelivered();
+    window.approve("owner-1", 0);
+    cp.vetoWindows.set("v-live", window);
+    const released = (await (await fetch(`${url}/veto/v-live`)).json()) as {
+      grant?: { jti: string };
+    };
+    const jti = released.grant!.jti;
+
+    const probe = async (): Promise<{ jti?: string; grantLive?: boolean; sig: string; killed: boolean; epoch: number; nonce: string; expiresAt: number }> =>
+      (await (await fetch(`${url}/kill-state?nonce=n1&jti=${encodeURIComponent(jti)}`)).json()) as never;
+
+    // before the veto: the plane vouches, and the answer is SIGNED over the probe fields
+    const live = await probe();
+    expect(live.grantLive).toBe(true);
+    expect(live.jti).toBe(jti);
+    const expectedSig = createHmac("sha256", KILL_KEY)
+      .update(
+        canonicalJson({
+          killed: live.killed,
+          epoch: live.epoch,
+          nonce: live.nonce,
+          expiresAt: live.expiresAt,
+          jti: live.jti,
+          grantLive: live.grantLive,
+        }),
+      )
+      .digest("hex");
+    expect(live.sig).toBe(expectedSig);
+
+    // the owner vetoes AFTER issuance — allowed for a purposed window, and
+    // it revokes the outstanding grant
+    const session = createOwnerSession("adam", { now: c.now });
+    const veto = await fetch(`${url}/veto/v-live`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "veto" }),
+    });
+    expect(veto.status).toBe(200);
+    expect((await probe()).grantLive).toBe(false);
+
+    // an unknown jti (or a restarted plane) is never vouched for
+    const unknown = (await (
+      await fetch(`${url}/kill-state?nonce=n2&jti=grant_never_minted`)
+    ).json()) as { grantLive?: boolean };
+    expect(unknown.grantLive).toBe(false);
+  });
 });
 
 describe("MergeGrant issuance on ACTIVE owner approval", () => {
@@ -1472,6 +1551,7 @@ describe("MergeGrant issuance on ACTIVE owner approval", () => {
     repo: "ownerswitch",
     pullNumber: 7,
     expectedHeadSha: "a".repeat(40),
+    expectedBaseRef: "main",
   };
 
   const MERGE_PURPOSE = {

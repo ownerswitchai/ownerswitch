@@ -56,6 +56,7 @@ interface BrokerResponse {
   outcome?: unknown;
   error?: unknown;
   headSha?: unknown;
+  baseRef?: unknown;
   merged?: unknown;
   sha?: unknown;
   message?: unknown;
@@ -207,8 +208,14 @@ export function createBrokerMergeClient(options: BrokerMergeClientOptions): GitH
       } catch (err) {
         throw new Error(err instanceof Error ? err.message : "the merge broker was unreachable");
       }
-      if (res.ok === true && typeof res.headSha === "string" && res.headSha !== "") {
-        return ledger.redact(res.headSha);
+      if (
+        res.ok === true &&
+        typeof res.headSha === "string" &&
+        res.headSha !== "" &&
+        typeof res.baseRef === "string" &&
+        res.baseRef !== ""
+      ) {
+        return { headSha: ledger.redact(res.headSha), baseRef: ledger.redact(res.baseRef) };
       }
       throw new Error(redactedError(res, "the merge broker refused the head-pin read"));
     },

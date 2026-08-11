@@ -200,11 +200,17 @@ NO sha argument; the pin is OwnerSwitch's job:
 1. First call → refused `-32052` (owner-review window open). **Inspect the
    window the owner sees**: its arguments must carry `expectedHeadSha`
    equal to the head SHA you noted — server-derived, agent-untouched.
-2. **Actively approve** the exact window as the owner would — an
-   owner-session-authenticated approval (POST `/veto/<id>` with
-   `{"decision":"approve"}` and the owner bearer token). Confirm that
-   letting it sit WITHOUT approving never merges: a quiet poll stays
-   `pending`, no grant is minted.
+2. **Actively approve** the exact window as the owner would. With a
+   passkey enrolled (production stance): request the ceremony
+   (POST `/veto/<id>/approval-challenge`, owner bearer token) — its
+   response names the exact `canonicalArgs`/`callHash` being approved,
+   including the pinned head AND base — then complete it from the owner
+   app with the passkey (POST `/veto/<id>`
+   `{"decision":"approve","assertion":{…}}`). In a dev run without an
+   enrolled passkey, session-only approve works and SAYS so. Confirm that
+   letting the window sit WITHOUT approving never merges: a quiet poll
+   stays `pending`, no grant is minted — and that with a passkey enrolled,
+   the bearer session ALONE (no assertion) is refused 401.
 3. Call again → the merge runs. Expect a result like
    `{ "resourceId": "github:pr:<you>/ownerswitch-live-test#1",
       "detail": { "merged": true, "sha": "<merge commit>", "message": "…" } }`.
@@ -244,6 +250,16 @@ NO sha argument; the pin is OwnerSwitch's job:
   `409` ("cannot approve while the kill switch is engaged"). Restore, and
   confirm the window must be approved AGAIN (its pre-restore state carried
   no grant): a kill always forces fresh post-restore review.
+- **A veto REVOKES an issued grant.** On a fresh PR: approve, poll once so
+  the grant is fetched, then VETO the same window (allowed after approval
+  for merge windows), then present the held grant bytes at the broker
+  socket by hand → refused ("the control plane no longer vouches for this
+  grant"), zero merges. The owner's "no" wins any time before dispatch.
+- **A retargeted PR does not merge into the new base.** On a fresh PR:
+  approve against base `main`, then change the PR's base branch on
+  github.com, then let the gateway retry → the broker's pre-dispatch base
+  check refuses ("retargeted after approval"), nothing merges. Re-approve
+  against the new destination to proceed (or veto to finish).
 - **Agent-supplied sha refused:** call the tool with an added
   `"expectedHeadSha": "<any 40-hex>"` → refused `-32056` with
   `refusalCode: "invalid-args"`, no veto window opened, GitHub never

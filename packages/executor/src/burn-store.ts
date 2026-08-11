@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  constants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -12,7 +14,9 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+
+const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
 
 /**
  * JtiBurnStore — the broker's DURABLE, ATOMIC single-use ledger.
@@ -28,22 +32,46 @@ import { isAbsolute, join, relative, resolve } from "node:path";
  *    restarted process, sibling broker on a shared directory — sees EEXIST
  *    and refuses. No read-then-write window exists.
  *  - DURABLE = the record is fsynced before the burn is trusted, and the
- *    directory entry is fsynced after it (best-effort on platforms where a
- *    directory fd cannot be fsynced — the file's own fsync is the primary
- *    barrier). A burn a crash could forget is not a burn, so a failure to
- *    persist REFUSES the merge rather than proceeding on memory alone.
+ *    directory ENTRY is fsynced after it through a directory fd PINNED at
+ *    startup. EVERY directory-fsync failure is fatal — a burn a crash
+ *    could forget is not a burn, so a failure to persist REFUSES the
+ *    merge rather than proceeding on memory alone.
+ *  - PATH-STABLE = the directory is opened once and its identity retained:
+ *    the final component must not be a symlink, containment checks run on
+ *    the POST-realpath result (an intermediate symlink cannot smuggle the
+ *    store into the workspace), every ancestor must be trusted (owned by
+ *    root or the broker's uid, not group/world-writable — otherwise a
+ *    writable ancestor could be renamed away and replaced, redirecting
+ *    burns into a fresh namespace), and before every burn the pathname is
+ *    re-resolved and required to still denote the PINNED inode (dev+ino
+ *    equality against the retained fd). Node exposes no openat(), so
+ *    record I/O is by pathname; the trusted-ancestor rule is what removes
+ *    the writer who could exploit the residual check-to-open window, and
+ *    the inode pin detects any swap that happens anyway.
  *
  * The record also carries the dispatch OUTCOME once known ("performed",
- * "not-performed", or a connector classification), so an in-doubt caller —
- * one whose socket died mid-dispatch — can come back and ask what actually
- * happened ({op:"outcome"} on the broker socket) instead of guessing.
+ * "merged-state-observed", "not-performed", or a connector
+ * classification), so an in-doubt caller — one whose socket died
+ * mid-dispatch — can come back and ask what actually happened
+ * ({op:"outcome"} on the broker socket) instead of guessing.
  *
  * Records are pruned only once safely past the grant's own expiry plus a
  * retention slack: until then the jti must stay burned (replay window) and
  * the outcome must stay queryable (in-doubt resolution).
  */
 
-export type BurnState = "dispatching" | "performed" | "connector-error" | "not-performed" | "unreadable";
+export type BurnState =
+  | "dispatching"
+  /** GitHub's direct 200 confirmed THIS dispatch performed the merge */
+  | "performed"
+  /**
+   * an ambiguous dispatch, after which a verification read observed the PR
+   * merged — that proves the PR's STATE, not that this dispatch did it
+   */
+  | "merged-state-observed"
+  | "connector-error"
+  | "not-performed"
+  | "unreadable";
 
 export interface BurnRecord {
   jti: string;
@@ -74,6 +102,8 @@ export interface JtiBurnStore {
   lookup(jti: string): BurnRecord | undefined;
   /** Remove records safely past expiry + retention. Returns count removed. */
   pruneExpired(): number;
+  /** Release the pinned directory fd. The store is unusable afterwards. */
+  close(): void;
 }
 
 export interface BurnStoreOptions {
@@ -82,11 +112,22 @@ export interface BurnStoreOptions {
   retentionMs?: number;
   /**
    * The agent-reachable workspace the store must NOT live under — same rule
-   * as the App private key. When set, an (absolute) burnDir inside it is
-   * refused. A symlinked burnDir is refused regardless: a retargetable
-   * symlink could switch the store's namespace and resurrect spent grants.
+   * as the App private key. When set, a burnDir whose RESOLVED real path is
+   * inside the resolved workspace is refused (checked after realpath, so an
+   * intermediate symlink cannot smuggle it in). A symlinked final component
+   * is refused regardless: a retargetable symlink could switch the store's
+   * namespace and resurrect spent grants.
    */
   workspaceDir?: string;
+  /**
+   * TESTS ONLY. Skips the trusted-ancestor requirement (every ancestor
+   * owned by root or this uid, no group/world write) so suites can run
+   * under tmpdir(), whose /tmp ancestor is world-writable by design.
+   * Production paths (the broker CLI) never set this — an untrusted
+   * ancestor is exactly the writer who can rename the store away and
+   * replay spent grants.
+   */
+  unsafeAllowUntrustedAncestryForTests?: boolean;
 }
 
 /** Records are tiny JSON; anything bigger is corruption, not a record. */
@@ -97,24 +138,12 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
   const retentionMs = opts.retentionMs ?? 6 * 60 * 60_000;
 
   // Path stability BEFORE creating anything: a relative path addresses a
-  // different directory per cwd, and a store inside the agent's workspace is
-  // agent-writable — either lets the adversary delete records and replay
-  // spent grants. Same placement rule as the App private key.
+  // different directory per cwd. Same placement rule as the App private key.
   if (!isAbsolute(rawDir)) {
     throw new Error(
       `burn store directory must be an absolute path, got "${rawDir}" — a relative path ` +
         `silently addresses a different directory per working directory`,
     );
-  }
-  if (opts.workspaceDir !== undefined) {
-    const workspace = resolve(opts.workspaceDir);
-    const rel = relative(workspace, resolve(rawDir));
-    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
-      throw new Error(
-        `burn store directory "${rawDir}" is inside the agent workspace "${workspace}" — the ` +
-          `agent could delete burns and replay spent grants; place it outside the workspace`,
-      );
-    }
   }
   mkdirSync(rawDir, { recursive: true, mode: 0o700 });
   // Refuse a symlinked final component: statSync would follow it, so a
@@ -127,45 +156,80 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
     );
   }
   // Canonicalize and RETAIN the resolved real path; every later operation
-  // uses this, not the caller's string, so an ancestor swapped afterward
-  // cannot redirect reads/writes within a single run.
+  // uses this, not the caller's string.
   const dir = realpathSync(rawDir);
+  // Workspace containment is checked on the POST-realpath result, both
+  // sides resolved — so an INTERMEDIATE symlink cannot smuggle the store
+  // inside the agent workspace while the raw string looks outside it.
+  if (opts.workspaceDir !== undefined) {
+    let workspace: string;
+    try {
+      workspace = realpathSync(resolve(opts.workspaceDir));
+    } catch {
+      workspace = resolve(opts.workspaceDir);
+    }
+    const rel = relative(workspace, dir);
+    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+      throw new Error(
+        `burn store directory "${rawDir}" resolves to "${dir}", inside the agent workspace ` +
+          `"${workspace}" — the agent could delete burns and replay spent grants; place it ` +
+          `outside the workspace`,
+      );
+    }
+  }
+  // Every ANCESTOR must be trusted: owned by root or this uid, and not
+  // group/world-writable. A writable ancestor is a writer who can rename
+  // the store away and substitute a fresh namespace — no later check on
+  // the leaf directory can defend against that.
+  if (opts.unsafeAllowUntrustedAncestryForTests !== true) {
+    assertTrustedAncestry(dir);
+  }
   assertBurnDirHardened(dir);
+  // Pin the directory's IDENTITY: open it once and retain the fd. The fd is
+  // what gets fsynced (so durability commits into the pinned inode), and
+  // before every burn the pathname is re-resolved and required to still
+  // denote this dev+ino — a swapped ancestor redirects the path, the pin
+  // detects it, and the burn refuses instead of landing in a fresh
+  // namespace.
+  const dirFd = openSync(dir, constants.O_RDONLY | O_DIRECTORY);
+  const pinned = fstatSync(dirFd);
+  let closed = false;
+
+  function assertStillPinned(): void {
+    if (closed) throw new Error("burn store is closed");
+    let live;
+    try {
+      live = statSync(dir);
+    } catch (err) {
+      throw new Error(
+        `burn store directory "${dir}" is no longer reachable (${err instanceof Error ? err.message : "stat failed"}) — refusing to burn into an unknown namespace`,
+      );
+    }
+    if (live.ino !== pinned.ino || live.dev !== pinned.dev) {
+      throw new Error(
+        `burn store directory "${dir}" no longer denotes the directory pinned at startup — ` +
+          `an ancestor was renamed or replaced; refusing to burn into a substituted namespace`,
+      );
+    }
+  }
 
   // jti values come from VERIFIED grants (control-plane-authored), but the
   // filename never trusts that: a digest is always path-safe.
   const recordPath = (jti: string): string =>
     join(dir, `${createHash("sha256").update(jti, "utf8").digest("hex")}.json`);
 
-  // errnos that mean "this platform/fd cannot fsync a directory" — tolerated
-  // (the record file's own fsync is the primary barrier). Any OTHER failure
-  // is a real durability failure and must NOT be swallowed.
-  const DIR_FSYNC_UNSUPPORTED = new Set(["EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EBADF", "EPERM"]);
-
   /**
-   * Fsync the directory so the newly-created record's ENTRY is durable — a
-   * file's own fsync does not commit its parent directory entry, so without
-   * this a crash could lose the burn and resurrect the jti. On Linux (the
-   * documented deployment) this succeeds; a genuine failure THROWS (the
-   * caller turns it into a refusal), because a burn that a crash could
-   * forget is not a burn. Only the specific "not supported on this fd type"
-   * errnos are tolerated, for non-Linux dev hosts.
+   * Fsync the PINNED directory fd so the newly-created record's ENTRY is
+   * durable — a file's own fsync does not commit its parent directory
+   * entry, so without this a crash could lose the burn and resurrect the
+   * jti. EVERY failure here throws, on every platform: a burn a crash
+   * could forget is not a burn, and swallowing "unsupported" errnos would
+   * quietly downgrade the boundary exactly where it matters. (The
+   * documented deployment is Linux, where fsync on a directory fd is
+   * supported; a platform that cannot do this cannot host the burn store.)
    */
   function fsyncDir(): void {
-    let fd: number;
-    try {
-      fd = openSync(dir, "r");
-    } catch (err) {
-      if (DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) return;
-      throw err;
-    }
-    try {
-      fsyncSync(fd);
-    } catch (err) {
-      if (!DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
-    } finally {
-      closeSync(fd);
-    }
+    fsyncSync(dirFd);
   }
 
   function writeRecord(path: string, record: BurnRecord, flag: "wx" | "w"): void {
@@ -206,6 +270,9 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
 
   return {
     burn(jti: string, expiresAt: number): "burned" | "already-burned" {
+      // the burn must land in the directory pinned at startup, not wherever
+      // the pathname resolves after an ancestor swap
+      assertStillPinned();
       const path = recordPath(jti);
       try {
         writeRecord(path, { jti, expiresAt, state: "dispatching", burnedAt: now() }, "wx");
@@ -216,7 +283,8 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
         );
       }
       // The record file is fsynced (writeRecord); now commit its directory
-      // ENTRY too, or the burn is not durable. A failure here refuses.
+      // ENTRY too, into the PINNED inode, or the burn is not durable. Any
+      // failure here refuses — no platform exemptions.
       try {
         fsyncDir();
       } catch (err) {
@@ -228,6 +296,7 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
     },
 
     record(jti: string, patch: Partial<BurnRecord> & { state: BurnState }): void {
+      assertStillPinned();
       const path = recordPath(jti);
       const existing = readRecord(path);
       const base: BurnRecord =
@@ -235,6 +304,7 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
           ? existing
           : { jti, expiresAt: 0, state: "dispatching", burnedAt: now() };
       writeRecord(path, { ...base, ...patch }, "w");
+      fsyncDir();
     },
 
     lookup(jti: string): BurnRecord | undefined {
@@ -275,7 +345,48 @@ export function createJtiBurnStore(rawDir: string, opts: BurnStoreOptions = {}):
       }
       return removed;
     },
+
+    close(): void {
+      if (closed) return;
+      closed = true;
+      closeSync(dirFd);
+    },
   };
+}
+
+/**
+ * Every ancestor of the store must be trusted: owned by root or this
+ * process's uid, and writable by NEITHER group NOR other. Any other writer
+ * on the path can rename a component away and substitute its own tree —
+ * after which no check on the leaf directory means anything. Sticky
+ * world-writable directories (/tmp) are refused too: the sticky bit stops
+ * deletion of OTHER users' entries, not the substitution game played one
+ * level down.
+ */
+function assertTrustedAncestry(realDir: string): void {
+  const getuid = process.getuid;
+  const ourUid = getuid === undefined ? 0 : getuid.call(process);
+  let current = realDir;
+  for (;;) {
+    const parent = dirname(current);
+    if (parent === current) break; // reached the filesystem root
+    current = parent;
+    const stat = statSync(current);
+    if (stat.uid !== 0 && stat.uid !== ourUid) {
+      throw new Error(
+        `burn store ancestor "${current}" is owned by uid ${stat.uid} (not root or this ` +
+          `process's uid ${ourUid}) — an untrusted owner of any ancestor can substitute the ` +
+          `whole store; place the store under a root-owned path like /var/lib`,
+      );
+    }
+    if ((stat.mode & 0o022) !== 0) {
+      throw new Error(
+        `burn store ancestor "${current}" is group- or world-writable (mode ` +
+          `${(stat.mode & 0o777).toString(8)}) — any writer on the ancestry can rename the ` +
+          `store away and replay spent grants; place the store under a 0755-or-tighter path`,
+      );
+    }
+  }
 }
 
 /**

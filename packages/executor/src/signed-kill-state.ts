@@ -40,7 +40,7 @@ const KILLED: LiveKillState = { killed: true, epoch: -1 };
 
 export function signedLiveKillStateFromControlPlane(
   options: SignedKillStateOptions,
-): () => Promise<LiveKillState> {
+): (probe?: { jti: string }) => Promise<LiveKillState> {
   const {
     baseUrl,
     killStateKey,
@@ -57,7 +57,7 @@ export function signedLiveKillStateFromControlPlane(
     );
   }
 
-  return async (): Promise<LiveKillState> => {
+  return async (probe?: { jti: string }): Promise<LiveKillState> => {
     const nonce = mintNonce();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -65,6 +65,10 @@ export function signedLiveKillStateFromControlPlane(
     try {
       const url = new URL("/kill-state", baseUrl);
       url.searchParams.set("nonce", nonce);
+      // a grant-liveness probe: the control plane answers (and SIGNS)
+      // whether it still vouches for this specific grant — false once its
+      // window is vetoed, unknown, or the control plane restarted
+      if (probe !== undefined) url.searchParams.set("jti", probe.jti);
       const res = await fetchImpl(url, {
         signal: controller.signal,
         cache: "no-store",
@@ -79,13 +83,26 @@ export function signedLiveKillStateFromControlPlane(
     }
 
     if (typeof body !== "object" || body === null) return KILLED;
-    const { killed, epoch, nonce: echoed, expiresAt, sig } = body as Record<string, unknown>;
+    const {
+      killed,
+      epoch,
+      nonce: echoed,
+      expiresAt,
+      sig,
+      jti: echoedJti,
+      grantLive,
+    } = body as Record<string, unknown>;
 
     // Shape first — a field that is the wrong type can never be trusted.
     if (typeof killed !== "boolean") return KILLED;
     if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return KILLED;
     if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) return KILLED;
     if (typeof echoed !== "string" || typeof sig !== "string" || sig === "") return KILLED;
+    if (probe !== undefined && (echoedJti !== probe.jti || typeof grantLive !== "boolean")) {
+      // the probe's jti must be echoed and answered — a response that
+      // dodges the question does not vouch for the grant
+      return KILLED;
+    }
 
     // The nonce must be OURS, echoed back — this is what makes a replay of a
     // real past response useless.
@@ -96,8 +113,12 @@ export function signedLiveKillStateFromControlPlane(
     // The signature must verify over exactly the signed fields, in the
     // control plane's canonical form. timing-safe, and length-guarded so
     // malformed hex lands here rather than throwing.
+    const signedPayload =
+      probe !== undefined
+        ? { killed, epoch, nonce: echoed, expiresAt, jti: echoedJti, grantLive }
+        : { killed, epoch, nonce: echoed, expiresAt };
     const expected = createHmac("sha256", killStateKey)
-      .update(canonicalJson({ killed, epoch, nonce: echoed, expiresAt }))
+      .update(canonicalJson(signedPayload))
       .digest();
     const provided = Buffer.from(sig, "hex");
     if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
@@ -106,6 +127,7 @@ export function signedLiveKillStateFromControlPlane(
 
     // Verified. A killed answer's epoch is irrelevant (killed refuses before
     // the epoch is compared); a live answer carries the real epoch.
-    return killed ? { killed: true, epoch } : { killed: false, epoch };
+    const base = killed ? { killed: true as const, epoch } : { killed: false as const, epoch };
+    return probe !== undefined ? { ...base, grantLive: grantLive === true } : base;
   };
 }

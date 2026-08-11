@@ -20,6 +20,37 @@ import type { ActionTicket } from "./ticket.js";
 export { GITHUB_CONNECTOR, MERGE_PULL_REQUEST, parseMergePrArgs };
 export type { MergePrArgs };
 
+/**
+ * How a successful merge result is attributed. "this-dispatch" — GitHub's
+ * direct 200 confirmed THIS request performed the merge. "merged-state-only"
+ * — the dispatch was ambiguous and a verification read observed the PR
+ * merged: that proves the PR's STATE, not which request merged it, and
+ * machine-readable consumers (the broker's burn record) must not upgrade it.
+ */
+export type MergeAttribution = "this-dispatch" | "merged-state-only";
+
+export interface MergeResult {
+  merged: boolean;
+  sha: string;
+  message: string;
+  attribution?: MergeAttribution;
+}
+
+/**
+ * The review-time pin: the PR's current head AND its merge destination.
+ * Both are server-derived and both ride into the owner-reviewed canonical
+ * args — the head because the merge API's `sha` guard enforces it
+ * atomically, the base because GitHub lets a PR be RETARGETED to a
+ * different branch after approval and the merge API has no base guard at
+ * all, so OwnerSwitch pins it, shows it, signs it, and re-checks it before
+ * dispatch.
+ */
+export interface PinnedMergeTarget {
+  headSha: string;
+  /** the destination branch name, e.g. "main" */
+  baseRef: string;
+}
+
 /** The calls this connector makes, injectable for tests. */
 export interface GitHubMergeClient {
   /**
@@ -28,17 +59,15 @@ export interface GitHubMergeClient {
    * directly); the broker client REQUIRES it and relays it to the executing
    * broker, which is where authorization is actually verified.
    */
-  mergePullRequest(
-    args: MergePrArgs,
-    grant?: unknown,
-  ): Promise<{ merged: boolean; sha: string; message: string }>;
+  mergePullRequest(args: MergePrArgs, grant?: unknown): Promise<MergeResult>;
   /**
-   * Read-only: the PR's current head sha, for the proxy's review-time pin.
-   * Throws when the PR is already merged or the head is unusable.
+   * Read-only: the PR's current head sha and base ref, for the proxy's
+   * review-time pin. Throws when the PR is already merged or either is
+   * unusable.
    */
   getPullRequestHead(
     args: Pick<MergePrArgs, "owner" | "repo" | "pullNumber">,
-  ): Promise<string>;
+  ): Promise<PinnedMergeTarget>;
 }
 
 /**

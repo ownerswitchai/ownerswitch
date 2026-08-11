@@ -97,9 +97,20 @@ export class VetoWindow {
     this.delivered = true;
   }
 
-  /** One tap from the owner. Valid while the window is open. */
+  /**
+   * One tap from the owner. For a plain window, valid while it is open —
+   * after a release the call may already have forwarded, so a late veto is
+   * an honest error. A PURPOSED window is different: its authority is a
+   * revocable signed grant, and the whole point of grant liveness is that
+   * the owner's "no" invalidates an issued-but-undispatched grant — so a
+   * purposed window accepts a veto at ANY point (even after approval),
+   * and only a repeated veto is refused.
+   */
   veto(by: string): void {
-    if (this.status !== "pending" && this.status !== "extended") {
+    if (this.status === "vetoed") {
+      throw new Error('cannot veto in status "vetoed"');
+    }
+    if (this.purpose === undefined && this.status !== "pending" && this.status !== "extended") {
       throw new Error(`cannot veto in status "${this.status}"`);
     }
     this.status = "vetoed";

@@ -106,4 +106,42 @@ describe("signedLiveKillStateFromControlPlane", () => {
       signedLiveKillStateFromControlPlane({ baseUrl: "http://x", killStateKey: "" }),
     ).toThrowError(/kill-state key/);
   });
+
+  it("carries a SIGNED grant-liveness answer when probed — and fails closed when it is dodged or tampered", async () => {
+    const probing = (grantLive: boolean | undefined, tamper = false): typeof fetch =>
+      (async (input: Parameters<typeof fetch>[0]) => {
+        const url = new URL(String(input));
+        const nonce = url.searchParams.get("nonce") ?? "";
+        const jti = url.searchParams.get("jti");
+        const payload = {
+          killed: false,
+          epoch: 3,
+          nonce,
+          expiresAt: NOW + 5_000,
+          ...(jti !== null && grantLive !== undefined ? { jti, grantLive } : {}),
+        };
+        const sig = createHmac("sha256", KEY).update(canonicalJson(payload)).digest("hex");
+        const body = tamper ? { ...payload, grantLive: true, sig } : { ...payload, sig };
+        return new Response(JSON.stringify(body), { status: 200 });
+      }) as typeof fetch;
+
+    // vouched: grantLive rides back verified
+    expect(await reader(probing(true))({ jti: "jti-1" })).toEqual({
+      killed: false,
+      epoch: 3,
+      grantLive: true,
+    });
+    // revoked (vetoed): grantLive false, verified
+    expect(await reader(probing(false))({ jti: "jti-1" })).toEqual({
+      killed: false,
+      epoch: 3,
+      grantLive: false,
+    });
+    // the probe is DODGED (no jti/grantLive in the answer) → KILLED
+    expect(await reader(probing(undefined))({ jti: "jti-1" })).toEqual({ killed: true, epoch: -1 });
+    // grantLive flipped to true WITHOUT re-signing → signature fails → KILLED
+    expect(await reader(probing(false, true))({ jti: "jti-1" })).toEqual({ killed: true, epoch: -1 });
+    // no probe: the plain envelope still verifies without grant fields
+    expect(await reader(probing(undefined))()).toEqual({ killed: false, epoch: 3 });
+  });
 });

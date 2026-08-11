@@ -76,7 +76,8 @@ const RESOURCE_ID = "github:pr:ownerswitchai/ownerswitch#7";
 /** The head sha OwnerSwitch pins at review time — server-derived, never agent-supplied. */
 const PINNED_SHA = "f".repeat(40);
 /** What actually reaches the backend: the agent's args plus the pin. */
-const PINNED_MERGE_ARGS = { ...MERGE_ARGS, expectedHeadSha: PINNED_SHA };
+const PINNED_BASE = "main";
+const PINNED_MERGE_ARGS = { ...MERGE_ARGS, expectedHeadSha: PINNED_SHA, expectedBaseRef: PINNED_BASE };
 
 /**
  * OwnerSwitch's OWN credential. It is injected through the same config path
@@ -103,7 +104,7 @@ function createFakeGitHub() {
     getPullRequestHead: async (args) => {
       if (pinFailure !== undefined) throw pinFailure;
       headReads.push(args);
-      return headSha;
+      return { headSha, baseRef: PINNED_BASE };
     },
   };
   return {
@@ -692,7 +693,7 @@ describe("review-time head pinning — server-derived, before the owner sees the
       purpose?: Record<string, unknown>;
     };
     const registeredArgs = registered.call?.args ?? registered.args;
-    expect(registeredArgs).toMatchObject({ expectedHeadSha: PINNED_SHA });
+    expect(registeredArgs).toMatchObject({ expectedHeadSha: PINNED_SHA, expectedBaseRef: PINNED_BASE });
     // …and the window carries the canonical PURPOSE the route resolved to,
     // which the control plane will sign into the grant and the broker will
     // enforce — an approval can only be spent as what the window declared
@@ -879,7 +880,12 @@ describe("closed-schema enforcement — approved bytes == executed semantics", (
     const registered = t.controlPlane.registrations[0]?.body as {
       call: { args: Record<string, unknown> };
     };
-    expect(registered.call.args).toEqual({ ...MERGE_ARGS, mergeMethod: "squash", expectedHeadSha: PINNED_SHA });
+    expect(registered.call.args).toEqual({
+      ...MERGE_ARGS,
+      mergeMethod: "squash",
+      expectedHeadSha: PINNED_SHA,
+      expectedBaseRef: PINNED_BASE,
+    });
     await t.close();
   });
 });
@@ -978,7 +984,7 @@ describe("minting", () => {
   });
 
   it("derives the github PR resource id, and a stable args-keyed id for unknown operations", () => {
-    const canonical = `{"expectedHeadSha":"${PINNED_SHA}","owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}`;
+    const canonical = `{"expectedBaseRef":"main","expectedHeadSha":"${PINNED_SHA}","owner":"ownerswitchai","pullNumber":7,"repo":"ownerswitch"}`;
     expect(deriveResourceId(ROUTES["github.merge_pr"], canonical)).toBe(RESOURCE_ID);
     const generic = deriveResourceId({ connector: "stripe", operation: "payout" }, '{"a":1}');
     expect(generic).toMatch(/^stripe:payout:args:[0-9a-f]{16}$/);
@@ -1023,7 +1029,7 @@ describe("minting", () => {
       {
         agentId: "a",
         tool: "github.merge_pr",
-        args: { repo: "r", owner: "o", pullNumber: 1, expectedHeadSha: PINNED_SHA },
+        args: { repo: "r", owner: "o", pullNumber: 1, expectedHeadSha: PINNED_SHA, expectedBaseRef: PINNED_BASE },
       },
       ROUTES["github.merge_pr"],
       VERDICT,
@@ -1033,7 +1039,7 @@ describe("minting", () => {
       {
         agentId: "a",
         tool: "github.merge_pr",
-        args: { expectedHeadSha: PINNED_SHA, pullNumber: 1, owner: "o", repo: "r" },
+        args: { expectedBaseRef: PINNED_BASE, expectedHeadSha: PINNED_SHA, pullNumber: 1, owner: "o", repo: "r" },
       },
       ROUTES["github.merge_pr"],
       VERDICT,

@@ -1,5 +1,5 @@
 import { ConnectorCallError } from "./connector-error.js";
-import type { GitHubMergeClient, MergePrArgs } from "./github.js";
+import type { GitHubMergeClient, MergePrArgs, MergeResult } from "./github.js";
 import type { InstallationTokenSource } from "./github-app-auth.js";
 import {
   assertSafeOwner,
@@ -121,7 +121,12 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
   async function fetchPullRequest(
     prUrl: string,
     token: string,
-  ): Promise<{ merged: boolean; mergeCommitSha: string | undefined; headSha: string | undefined }> {
+  ): Promise<{
+    merged: boolean;
+    mergeCommitSha: string | undefined;
+    headSha: string | undefined;
+    baseRef: string | undefined;
+  }> {
     let res: BoundedResponse;
     try {
       res = await boundedRequest(
@@ -146,16 +151,19 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     } catch {
       throw new Error("the pull request read returned an unreadable body");
     }
-    const { merged, merge_commit_sha, head } = (body ?? {}) as {
+    const { merged, merge_commit_sha, head, base } = (body ?? {}) as {
       merged?: unknown;
       merge_commit_sha?: unknown;
       head?: unknown;
+      base?: unknown;
     };
     const headSha = (head as { sha?: unknown } | null | undefined)?.sha;
+    const baseRef = (base as { ref?: unknown } | null | undefined)?.ref;
     return {
       merged: merged === true,
       mergeCommitSha: typeof merge_commit_sha === "string" ? merge_commit_sha : undefined,
       headSha: typeof headSha === "string" ? headSha : undefined,
+      baseRef: typeof baseRef === "string" ? baseRef : undefined,
     };
   }
 
@@ -169,7 +177,7 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
     prUrl: string,
     token: string,
     cause: string,
-  ): Promise<{ merged: boolean; sha: string; message: string }> {
+  ): Promise<MergeResult> {
     const checkYourself =
       `Check ${args.owner}/${args.repo}#${args.pullNumber} directly before re-approving — ` +
       `a re-approved merge could run the action twice.`;
@@ -192,6 +200,9 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
             `confirms the pull request's MERGED STATE. Note precisely what that proves: the PR ` +
             `is merged; whether THIS dispatch performed the merge cannot be determined.`,
         ),
+        // machine-readable form of the caveat above — consumers must not
+        // record this as "performed by this dispatch"
+        attribution: "merged-state-only" as const,
       };
     }
     throw unknownOutcome(
@@ -279,6 +290,41 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
         );
       }
 
+      // BASE-RETARGET close: GitHub allows a PR's base branch to change
+      // after approval, and the merge API's `sha` parameter guards only the
+      // HEAD — so re-read the PR and require its base to still be the one
+      // the owner's approval pinned. This read-then-PUT is NOT atomic (the
+      // API offers no base guard), so a retarget landing in the window
+      // between this read and the PUT below can still slip through; the
+      // check shrinks that window from "any time since approval" to
+      // milliseconds, and the residual race is documented in DESIGN.md.
+      // A throw is definitively not-performed — nothing has been sent.
+      {
+        let current;
+        try {
+          current = await fetchPullRequest(prUrl, token);
+        } catch (err) {
+          throw notPerformed(
+            `the merge was not dispatched — the pre-dispatch base check could not read the ` +
+              `pull request (${err instanceof Error ? err.message : "read failed"})`,
+          );
+        }
+        if (current.baseRef === undefined) {
+          throw notPerformed(
+            "the merge was not dispatched — GitHub's pull request response carried no usable " +
+              "base ref, so the approved merge destination cannot be verified",
+          );
+        }
+        if (current.baseRef !== args.expectedBaseRef) {
+          throw notPerformed(
+            `the merge was not dispatched — the pull request's base branch is now ` +
+              `"${current.baseRef}", but the owner approved a merge into ` +
+              `"${args.expectedBaseRef}". The PR was retargeted after approval; re-approve ` +
+              `against the new destination.`,
+          );
+        }
+      }
+
       // TOCTOU close: the token mint may have taken seconds. Re-check live
       // kill state across it before anything is sent. A throw here is a
       // definitively-not-performed refusal — nothing has crossed to GitHub.
@@ -348,6 +394,7 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
           // githubErrorMessage: cutting first could leave an unrecognizable
           // fragment of an echoed credential
           message: typeof message === "string" ? ledger.redact(message).slice(0, 300) : "",
+          attribution: "this-dispatch" as const,
         };
       }
       if (DOCUMENTED_REJECTION_STATUSES.has(res.status)) {
@@ -378,7 +425,13 @@ export function createGitHubMergeClient(options: GitHubMergeClientOptions): GitH
       if (pr.headSha === undefined || !/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(pr.headSha)) {
         throw new Error("GitHub's pull request response carried no usable head sha");
       }
-      return ledger.redact(pr.headSha);
+      // the merge DESTINATION is pinned alongside the head: GitHub allows
+      // retargeting a PR's base after approval and the merge API has no
+      // base guard, so the base the owner saw must be recorded here
+      if (pr.baseRef === undefined || pr.baseRef === "") {
+        throw new Error("GitHub's pull request response carried no usable base ref");
+      }
+      return { headSha: ledger.redact(pr.headSha), baseRef: ledger.redact(pr.baseRef) };
     },
   };
 }

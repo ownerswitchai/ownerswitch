@@ -33,7 +33,7 @@ const GRANT_KEY = "grant-key-shared-cp-and-broker-256b";
 const TOKEN = "ghs_installation_token_never_leaves_the_broker";
 const HEAD_SHA = "a".repeat(40);
 const NOW = 1_800_000_000_000;
-const MERGE_ARGS = { owner: "ownerswitchai", repo: "throwaway", pullNumber: 7, expectedHeadSha: HEAD_SHA };
+const MERGE_ARGS = { owner: "ownerswitchai", repo: "throwaway", pullNumber: 7, expectedHeadSha: HEAD_SHA, expectedBaseRef: "main" };
 const CANONICAL_ARGS = canonicalJson(MERGE_ARGS);
 
 let dir: string;
@@ -101,16 +101,17 @@ function fakeGitHub(opts?: { failMerge?: number; hangMergeMs?: number }) {
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
-    // GET pull request (pin or verify)
-    return new Response(JSON.stringify({ merged: false, head: { sha: HEAD_SHA } }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    // GET pull request (pin, pre-dispatch base check, or verify)
+    return new Response(
+      JSON.stringify({ merged: false, head: { sha: HEAD_SHA }, base: { ref: "main" } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
   };
   return { calls, fetchImpl };
 }
 
-const alive = async (): Promise<LiveKillState> => ({ killed: false, epoch: 0 });
+/** Alive AND vouching for whatever grant is probed — the happy fixture. */
+const alive = async (): Promise<LiveKillState> => ({ killed: false, epoch: 0, grantLive: true });
 
 async function startBroker(opts?: {
   fetchLiveKillState?: () => Promise<LiveKillState>;
@@ -131,6 +132,7 @@ async function startBroker(opts?: {
     ledger,
     grantKey: GRANT_KEY,
     burnDir: join(dir, "burns"),
+    unsafeBurnAncestryForTests: true, // tmpdir's /tmp ancestor is world-writable
     fetchLiveKillState: opts?.fetchLiveKillState ?? alive,
     fetchImpl: github.fetchImpl,
     baseUrl: "https://api.github.com",
@@ -359,7 +361,7 @@ describe("createMergeBroker — the executing broker", () => {
     // alive on the first (before-mint) check, killed on the second (during mint)
     const fetchLiveKillState = async (): Promise<LiveKillState> => {
       calls += 1;
-      return calls >= 2 ? { killed: true, epoch: 0 } : { killed: false, epoch: 0 };
+      return calls >= 2 ? { killed: true, epoch: 0 } : { killed: false, epoch: 0, grantLive: true };
     };
     // a token source that takes a beat, so the recheck is meaningful
     const tokens: InstallationTokenSource = {
@@ -371,6 +373,46 @@ describe("createMergeBroker — the executing broker", () => {
     const socketPath = await startBroker({ github, fetchLiveKillState, tokens });
     await expect(client(socketPath).client.mergePullRequest(MERGE_ARGS, grant())).rejects.toThrowError(
       /not dispatched/,
+    );
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
+  it("an owner VETO after issuance REVOKES the grant: grantLive=false refuses, zero PUTs", async () => {
+    const github = fakeGitHub();
+    // the control plane no longer vouches: the window was vetoed after the
+    // grant was fetched (the approve → fetch grant → veto timeline)
+    const socketPath = await startBroker({
+      github,
+      fetchLiveKillState: async () => ({ killed: false, epoch: 0, grantLive: false }),
+    });
+    await expect(client(socketPath).client.mergePullRequest(MERGE_ARGS, grant())).rejects.toThrowError(
+      /no longer vouches/,
+    );
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
+  it("a veto landing DURING the token mint still revokes: second probe false → refused, zero PUTs", async () => {
+    const github = fakeGitHub();
+    let calls = 0;
+    const fetchLiveKillState = async (): Promise<LiveKillState> => {
+      calls += 1;
+      return { killed: false, epoch: 0, grantLive: calls < 2 }; // vouches, then vetoed
+    };
+    const socketPath = await startBroker({ github, fetchLiveKillState });
+    await expect(client(socketPath).client.mergePullRequest(MERGE_ARGS, grant())).rejects.toThrowError(
+      /not dispatched/,
+    );
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
+  it("a kill-state answer WITHOUT grant liveness refuses a merge — dodging the probe is not vouching", async () => {
+    const github = fakeGitHub();
+    const socketPath = await startBroker({
+      github,
+      fetchLiveKillState: async () => ({ killed: false, epoch: 0 }), // no grantLive at all
+    });
+    await expect(client(socketPath).client.mergePullRequest(MERGE_ARGS, grant())).rejects.toThrowError(
+      /no longer vouches/,
     );
     expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
   });
@@ -443,6 +485,27 @@ describe("createMergeBroker — the executing broker", () => {
     expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
   });
 
+  it("LATCH RACE: a timeout firing during the SECOND live read still yields zero PUTs", async () => {
+    // the pre-mint live read is fast; the beforeDispatch live read outlives
+    // the budget, so the timer fires DURING that await. The synchronous
+    // re-check after the await must abort — the "refused" answer already on
+    // the wire would otherwise be a lie.
+    let liveCalls = 0;
+    const fetchLiveKillState = async (): Promise<LiveKillState> => {
+      liveCalls += 1;
+      if (liveCalls >= 2) await new Promise((resolve) => setTimeout(resolve, 700));
+      return { killed: false, epoch: 0, grantLive: true };
+    };
+    const github = fakeGitHub();
+    const socketPath = await startBroker({ github, fetchLiveKillState, requestTimeoutMs: 200 });
+    const res = JSON.parse(
+      await rawExchange(socketPath, `${JSON.stringify({ op: "merge", grant: grant(), args: MERGE_ARGS })}\n`),
+    );
+    expect(res).toMatchObject({ ok: false, kind: "refused" });
+    await new Promise((resolve) => setTimeout(resolve, 900)); // let the live read resolve
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
   it("answers {op:'outcome'} from the burn record — and refuses an unknown jti", async () => {
     const socketPath = await startBroker({});
     const g = grant();
@@ -487,8 +550,8 @@ describe("createMergeBroker — the executing broker", () => {
   it("pin-head is read-only, kill-gated, and needs no grant", async () => {
     const socketPath = await startBroker({});
     const { client: c } = client(socketPath);
-    expect(await c.getPullRequestHead({ owner: "ownerswitchai", repo: "throwaway", pullNumber: 7 })).toBe(
-      HEAD_SHA,
+    expect(await c.getPullRequestHead({ owner: "ownerswitchai", repo: "throwaway", pullNumber: 7 })).toEqual(
+      { headSha: HEAD_SHA, baseRef: "main" },
     );
 
     await broker!.close();
@@ -517,6 +580,7 @@ describe("createMergeBroker — the executing broker", () => {
       ledger: createSecretLedger(),
       grantKey: GRANT_KEY,
       burnDir: join(dir, "burns"),
+      unsafeBurnAncestryForTests: true,
       fetchLiveKillState: alive,
     });
     await expect(broker.listen(join(dir, "b.sock"))).rejects.toThrowError(/world access/);
@@ -553,6 +617,7 @@ describe("createMergeBroker — the executing broker", () => {
         ledger: createSecretLedger(),
         grantKey: "",
         burnDir: join(dir, "burns"),
+        unsafeBurnAncestryForTests: true,
         fetchLiveKillState: alive,
       }),
     ).toThrowError(/grant key/);
@@ -565,6 +630,7 @@ describe("createMergeBroker — the executing broker", () => {
         ledger: createSecretLedger(),
         grantKey: "too-short-key", // < 32 bytes
         burnDir: join(dir, "burns"),
+        unsafeBurnAncestryForTests: true,
         fetchLiveKillState: alive,
       }),
     ).toThrowError(/256 bits|32 bytes/);
@@ -577,6 +643,7 @@ describe("createMergeBroker — the executing broker", () => {
       ledger: createSecretLedger(),
       grantKey: GRANT_KEY,
       burnDir: join(dir, "burns"),
+      unsafeBurnAncestryForTests: true,
       fetchLiveKillState: alive,
     });
     await expect(broker.listen(join(dir, "b.sock"))).rejects.toThrowError(/group-writable/);

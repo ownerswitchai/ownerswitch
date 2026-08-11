@@ -69,6 +69,20 @@ describe("resolveGitHubConnectorEnv", () => {
     ).toThrowError(/numeric installation id/);
   });
 
+  it("REFUSES to start when the kill-state key is in the gateway environment — any mode", () => {
+    // an agent that reads this key can port-squat a stopped control plane
+    // and sign fresh killed:false envelopes — as disqualifying as the grant key
+    for (const env of [
+      { OWNERSWITCH_KILL_STATE_KEY: "cp-and-broker-only" },
+      {
+        OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET: "/run/oswitch/broker.sock",
+        OWNERSWITCH_KILL_STATE_KEY: "cp-and-broker-only",
+      },
+    ]) {
+      expect(() => resolveGitHubConnectorEnv(env)).toThrowError(/OWNERSWITCH_KILL_STATE_KEY/);
+    }
+  });
+
   it("REFUSES to start when the grant-signing key is in the gateway environment — any mode", () => {
     const leak = { OWNERSWITCH_GRANT_KEY: "cp-and-broker-only" };
     // broker mode: the exact deployment whose isolation claim the key breaks

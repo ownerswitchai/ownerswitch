@@ -23,6 +23,7 @@ import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
+import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
 
 /**
  * HTTP layer of the control plane. One process, one KillSwitch, one map of
@@ -141,6 +142,24 @@ export interface ControlPlaneOptions {
    * must fall back to `/status`, which is unauthenticated.
    */
   killStateKey?: string;
+  /**
+   * The owner's enrolled APPROVAL PASSKEY. When set, an active approval of
+   * a grant-eligible (merge) window requires a fresh WebAuthn assertion —
+   * minted challenge, bound to {windowId, callHash}, single-use, UP+UV,
+   * counter-checked (webauthn.ts) — ON TOP of the owner session. An owner
+   * session alone is a reusable bearer token; a stolen one must not mint
+   * merge authority. Enrollment (credential id + SPKI public key + rpId,
+   * optionally the exact origin) happens in the owner app at provisioning
+   * time, the same trust step as the device secret. When ABSENT, approvals
+   * fall back to session-only ONLY in dev mode; a non-dev control plane
+   * with a grant key but no passkey refuses approvals outright.
+   */
+  ownerPasskey?: {
+    credentialId: string;
+    publicKeyPem: string;
+    rpId: string;
+    origin?: string;
+  };
 }
 
 /** Default kill-state location IN DEV MODE, resolved against the working directory. */
@@ -352,7 +371,26 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // outside the agent's reach, authoritative, and it survives whatever the
   // window record survives.
   const grantedWindows = new Set<string>();
+  // Minted grant jtis → their window ids, for the broker's grant-liveness
+  // probe: the broker refuses a merge unless this control plane SIGNS that
+  // it minted the grant and its window is not vetoed. Deliberately
+  // process-local: a restart forgets outstanding grants, which fails
+  // CLOSED — a grant this plane cannot vouch for does not dispatch.
+  const mintedGrants = new Map<string, string>();
   const grantTtlMs = opts.grantTtlMs ?? 2 * 60_000;
+  // Outstanding approval ceremonies, one per window: the server-minted
+  // challenge the owner's passkey must sign, bound to the exact call
+  // (callHash) it would approve. Redeemed ATOMICALLY (deleted before
+  // verification) so each challenge is spent by its first use, valid or
+  // not. Process-local: a restart voids outstanding ceremonies — the owner
+  // requests a fresh one, which only they can complete anyway.
+  const approvalChallenges = new Map<
+    string,
+    { challenge: string; callHash: string; expiresAt: number }
+  >();
+  const APPROVAL_CHALLENGE_TTL_MS = 2 * 60_000;
+  // last accepted signature counter for the enrolled passkey (clone signal)
+  let passkeySignCount = 0;
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
   // this map (a restart) can only make restores harder, never easier — an id
   // that is not in here restores nothing, whatever its body claims.
@@ -429,11 +467,32 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 400, { error: "kill-state requires a nonce (1–128 chars)" });
       return;
     }
+    // Optional grant-liveness probe: the broker asks about a specific jti
+    // and this plane SIGNS whether it still vouches for that grant — it
+    // minted it, remembers it, and its window has not been vetoed. False
+    // for anything unknown (including after a restart): a grant this plane
+    // cannot vouch for must not dispatch. This is what lets an owner's
+    // VETO revoke an already-issued, undispatched grant.
+    const jti = reqUrl.searchParams.get("jti");
+    if (jti !== null && jti.length > 256) {
+      sendJson(res, 400, { error: "kill-state jti probe too long" });
+      return;
+    }
+    let probeFields: { jti: string; grantLive: boolean } | undefined;
+    if (jti !== null && jti !== "") {
+      const windowId = mintedGrants.get(jti);
+      const window = windowId === undefined ? undefined : vetoWindows.get(windowId);
+      probeFields = {
+        jti,
+        grantLive: window !== undefined && window.state !== "vetoed",
+      };
+    }
     const payload = {
       killed: killSwitch.killed,
       epoch: killSwitch.epoch,
       nonce,
       expiresAt: now() + KILL_STATE_TTL_MS,
+      ...(probeFields !== undefined ? probeFields : {}),
     };
     const sig = createHmac("sha256", opts.killStateKey).update(canonicalJson(payload)).digest("hex");
     sendJson(res, 200, { ...payload, sig, ...degradedFields() });
@@ -668,7 +727,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       // meaningful for a grant-eligible window (a github/merge_pull_request
       // call whose args pass the closed schema) — nothing else mints a
       // grant, so approving anything else is a category error, refused.
-      if (grantEligibleArgs(window) === null) {
+      const canonicalArgs = grantEligibleArgs(window);
+      if (canonicalArgs === null) {
         sendJson(res, 400, {
           error:
             "this window is not grant-eligible (only a github/merge_pull_request call with " +
@@ -688,6 +748,63 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         });
         return;
       }
+      // The session identifies the owner but is a REUSABLE bearer token — a
+      // stolen one must not mint merge authority. With a passkey enrolled,
+      // approval additionally requires a fresh WebAuthn assertion over a
+      // single-use challenge bound to THIS window and THIS exact call.
+      if (opts.ownerPasskey !== undefined) {
+        const ceremony = approvalChallenges.get(id);
+        // atomic single-use: the ceremony is SPENT by this redemption
+        // attempt, verified or not — a failed attempt needs a fresh one
+        approvalChallenges.delete(id);
+        if (ceremony === undefined || now() >= ceremony.expiresAt) {
+          sendJson(res, 401, {
+            error:
+              "no live approval ceremony for this window — request POST /veto/:id/approval-challenge " +
+              "and sign it with the enrolled passkey (challenges are single-use and short-lived)",
+          });
+          return;
+        }
+        // the ceremony binds the exact call; if the window's args changed
+        // out from under it (impossible via this API, checked anyway), the
+        // signature must not be transferable to the new bytes
+        if (ceremony.callHash !== sha256Hex(canonicalArgs)) {
+          sendJson(res, 401, { error: "the approval ceremony was minted for different call bytes" });
+          return;
+        }
+        const assertion = assertionFrom(body.assertion);
+        if (assertion === null) {
+          sendJson(res, 400, {
+            error:
+              "approve requires assertion: {credentialId, clientDataJSON, authenticatorData, " +
+              "signature}, each base64url",
+          });
+          return;
+        }
+        const verdict = verifyOwnerAssertion(assertion, {
+          passkey: opts.ownerPasskey,
+          rpId: opts.ownerPasskey.rpId,
+          ...(opts.ownerPasskey.origin !== undefined
+            ? { expectedOrigin: opts.ownerPasskey.origin }
+            : {}),
+          expectedChallenge: ceremony.challenge,
+          lastSignCount: passkeySignCount,
+        });
+        if (!verdict.ok) {
+          sendJson(res, 401, { error: `passkey assertion rejected: ${verdict.reason}` });
+          return;
+        }
+        passkeySignCount = Math.max(passkeySignCount, verdict.signCount);
+      } else if (opts.dev !== true) {
+        // no passkey enrolled and not a dev instance: a bearer session alone
+        // must not mint merge authority — refuse until enrollment
+        sendJson(res, 403, {
+          error:
+            "no owner approval passkey is enrolled — a production control plane refuses " +
+            "session-only merge approval; enroll a passkey (ownerPasskey) or run dev mode",
+        });
+        return;
+      }
       try {
         window.approve(session.ownerId, killSwitch.epoch);
         sendJson(res, 200, { status: "approved" });
@@ -702,6 +819,84 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     } catch (err) {
       sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  /** The wire assertion, or null when the body doesn't carry a usable one. */
+  function assertionFrom(value: unknown): WebAuthnAssertion | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const { credentialId, clientDataJSON, authenticatorData, signature } = value as Record<
+      string,
+      unknown
+    >;
+    if (
+      typeof credentialId !== "string" ||
+      credentialId === "" ||
+      typeof clientDataJSON !== "string" ||
+      clientDataJSON === "" ||
+      clientDataJSON.length > 8 * 1024 ||
+      typeof authenticatorData !== "string" ||
+      authenticatorData === "" ||
+      authenticatorData.length > 8 * 1024 ||
+      typeof signature !== "string" ||
+      signature === "" ||
+      signature.length > 4 * 1024
+    ) {
+      return null;
+    }
+    return { credentialId, clientDataJSON, authenticatorData, signature };
+  }
+
+  /**
+   * Mint the approval CEREMONY for a grant-eligible window: a single-use,
+   * short-lived challenge the owner's passkey must sign, bound server-side
+   * to the window and the exact call bytes it would approve. Owner-session
+   * authenticated — the ceremony is the second factor, not a replacement
+   * for the first.
+   */
+  async function postApprovalChallenge(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+  ): Promise<void> {
+    const session = ownerSessionFrom(req);
+    if (session === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    if (opts.ownerPasskey === undefined) {
+      sendJson(res, 501, { error: "no owner approval passkey is enrolled on this control plane" });
+      return;
+    }
+    const window = vetoWindows.get(id);
+    if (!window) {
+      sendJson(res, 404, { error: `no veto window "${id}"` });
+      return;
+    }
+    const canonicalArgs = grantEligibleArgs(window);
+    if (canonicalArgs === null) {
+      sendJson(res, 400, { error: "approval ceremonies exist only for grant-eligible windows" });
+      return;
+    }
+    if (killSwitch.killed) {
+      sendJson(res, 409, { error: "cannot open an approval ceremony while the kill switch is engaged" });
+      return;
+    }
+    await readRawBody(req); // drain
+    const challenge = randomBytes(32).toString("base64url");
+    approvalChallenges.set(id, {
+      challenge,
+      callHash: sha256Hex(canonicalArgs),
+      expiresAt: now() + APPROVAL_CHALLENGE_TTL_MS,
+    });
+    sendJson(res, 200, {
+      challenge,
+      rpId: opts.ownerPasskey.rpId,
+      credentialId: opts.ownerPasskey.credentialId,
+      // what the ceremony approves, for the owner app's display surface
+      callHash: sha256Hex(canonicalArgs),
+      canonicalArgs,
+      expiresAt: now() + APPROVAL_CHALLENGE_TTL_MS,
+    });
   }
 
   /** The registered call, or null when the body doesn't describe one. */
@@ -899,10 +1094,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     expiresAt: number,
   ): SignedMergeGrant {
     const purpose = window.purpose as VetoPurpose; // grantEligibleArgs guaranteed it
+    const jti = `grant_${windowId}_${randomBytes(8).toString("hex")}`;
+    // remember the mint so the broker's grant-liveness probe can be
+    // answered — and so a veto on this window revokes the grant
+    mintedGrants.set(jti, windowId);
     return signMergeGrant(
       {
         v: 2,
-        jti: `grant_${windowId}_${randomBytes(8).toString("hex")}`,
+        jti,
         agentId: window.call.agentId,
         tool: window.call.tool,
         connector: purpose.connector,
@@ -931,10 +1130,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const reqUrl = new URL(req.url ?? "/", "http://localhost");
     const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
+    const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
+    if (method === "POST" && approvalChallengeMatch) {
+      return postApprovalChallenge(req, res, decodeURIComponent(approvalChallengeMatch[1]));
+    }
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);

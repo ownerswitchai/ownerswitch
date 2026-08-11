@@ -435,18 +435,37 @@ private key** and mints **installation tokens** with it
   or the key**, and instead PERFORMS the merge itself after validating a
   control-plane-signed, single-use grant. It is the theft target now, and
   it is small, credential-only, and auditable in one sitting.
-- **A merge needs the owner's ACTIVE approval, not their silence.** The
-  party that registers an owner-review window is the gateway, which shares
-  the agent's uid and whose device secret the agent can therefore forge —
-  so a window's mere existence proves nothing, and silence-approval would
-  let an agent's own registration release itself into a merge. The control
-  plane mints a merge grant ONLY when the owner actively approves the exact
-  pinned call through an owner SESSION (`POST /veto/:id decision=approve`) —
-  a token on the owner's device the agent cannot reach. Silence leaves a
-  merge pending forever; only a real "yes" moves it, and the grant binds
-  the kill epoch at approval so a window opened during a kill cannot outlive
-  it. This is the difference between the CP verifying an owner assertion and
-  the CP signing whatever the gateway claims.
+- **A merge needs the owner's ACTIVE approval, not their silence — and the
+  approval is a passkey ceremony, not a bearer token.** The party that
+  registers an owner-review window is the gateway, which shares the agent's
+  uid and whose device secret the agent can therefore forge — so a window's
+  mere existence proves nothing, and silence-approval would let an agent's
+  own registration release itself into a merge. The control plane mints a
+  merge grant ONLY on the owner's active approval, and with a passkey
+  enrolled that approval requires a fresh WebAuthn assertion: a single-use
+  challenge bound to {windowId, callHash}, signed by the authenticator with
+  UP+UV, counter-checked, atomically redeemed. An owner SESSION (a reusable
+  bearer token) only OPENS the ceremony — a stolen session cannot complete
+  it, because completing it takes the hardware in the owner's hand passing
+  its screen lock. Session-only approval exists only in dev mode; a
+  production control plane without an enrolled passkey refuses approvals.
+  Silence leaves a merge pending forever; the grant binds the kill epoch at
+  approval so a window opened during a kill cannot outlive it.
+- **The owner's veto revokes an issued, undispatched grant.** The control
+  plane tracks every minted jti; a purposed window accepts a veto even
+  after approval; and the broker's signed kill-state probe answers
+  `grantLive` per jti — false once vetoed, unknown, or after a control
+  plane restart. The broker requires `grantLive === true` before the token
+  mint AND immediately before the PUT, so the approve → fetch grant → veto
+  timeline ends in a refusal, not a merge. Grant issuance is therefore not
+  terminal: the "no" wins any time before dispatch.
+- **The merge destination is pinned, not just the head.** GitHub allows
+  retargeting a PR's base branch after approval and its merge API guards
+  only the head sha — so OwnerSwitch pins `expectedBaseRef` server-side at
+  review time, shows it to the owner, signs it into the grant, and
+  re-checks the PR's live base immediately before dispatch, refusing on
+  mismatch. The residual read-to-PUT race (the API has no atomic base
+  guard) is documented in DESIGN.md rather than papered over.
 - **The merge is authorized by evidence the gateway cannot forge.** That
   **MergeGrant** (`packages/shared/src/merge-grant.ts`) is minted by the
   CONTROL PLANE at the owner's active approval, signed with a key
@@ -514,8 +533,19 @@ private key** and mints **installation tokens** with it
   gateway/agent AND from the broker uid that owns the App PEM), is read
   from a file into the process environment rather than passed on any
   command line (argv is world-readable via `/proc`), and the gateway
-  REFUSES to start if it ever finds `OWNERSWITCH_GRANT_KEY` in its own
-  environment.
+  REFUSES to start if it finds EITHER `OWNERSWITCH_GRANT_KEY` or
+  `OWNERSWITCH_KILL_STATE_KEY` in its own environment — the second because
+  an agent holding the kill-state key could port-squat a stopped control
+  plane and SIGN fresh `killed:false` envelopes, defeating the
+  authenticated kill channel from the inside.
+- **The burn store's namespace is pinned, not assumed.** Containment is
+  checked on the post-realpath result (an intermediate symlink cannot
+  smuggle it into the agent workspace), every ancestor must be trusted
+  (owned by root or the broker, no group/world write) so no other writer
+  can rename the store away, the directory's inode is pinned at startup
+  and re-verified before every burn, the pinned fd is what gets fsynced,
+  and EVERY directory-fsync failure refuses the burn — no platform
+  exemptions.
 - **The blast radius is configured, not coded.** An installation token
   is scoped at mint to ONE repository and
   `{ contents: write, pull_requests: read }`, and dies within an hour —

@@ -243,9 +243,9 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           "on this gateway (see packages/executor/DESIGN.md §6)",
       );
     }
-    let headSha: string;
+    let target: { headSha: string; baseRef: string };
     try {
-      headSha = await executor.pinHeadSha(base);
+      target = await executor.pinHeadSha(base);
     } catch (err) {
       throw routedCallRefused(
         call.tool,
@@ -255,12 +255,18 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       );
     }
     // Build the pinned call from the NORMALIZED base (owner, repo,
-    // pullNumber, mergeMethod) plus the server-derived sha — NEVER by
-    // spreading the raw request args. This is what keeps approved-bytes ==
-    // executed-semantics: an unknown field the agent slipped in was already
-    // rejected by validateMergePrRequestArgs, and it cannot reach the
-    // canonical action here because we do not copy it.
-    return { ...call, args: { ...base, expectedHeadSha: headSha } };
+    // pullNumber, mergeMethod) plus the server-derived head sha AND base
+    // ref — NEVER by spreading the raw request args. This is what keeps
+    // approved-bytes == executed-semantics: an unknown field the agent
+    // slipped in was already rejected by validateMergePrRequestArgs, and it
+    // cannot reach the canonical action here because we do not copy it. The
+    // base ref is pinned for the same reason as the head: GitHub allows
+    // retargeting a PR after approval, so the destination the owner sees is
+    // the destination that gets signed and re-checked at dispatch.
+    return {
+      ...call,
+      args: { ...base, expectedHeadSha: target.headSha, expectedBaseRef: target.baseRef },
+    };
   }
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
