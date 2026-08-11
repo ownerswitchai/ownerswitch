@@ -39,29 +39,72 @@ The point of doing this properly in a test run is that the run rehearses
 the deployment rule: the key belongs to a uid the gateway and agent do
 NOT share, and the broker performs the merge — it never hands out a token.
 
-**Run only INSTALLED, root-owned artifacts — never a user checkout.** The
-broker and the control plane hold the HMAC keys and the App PEM, so the
-CODE they execute must be immutable to the agent: a same-uid agent that can
-edit files in your working copy could rewrite `dev-control-plane.ts` (or
-the broker entrypoint) and wait for a restart, and the isolated process
-would then run attacker-controlled code holding both keys. Build once and
-install the built `dist/` to a root-owned tree the service uids can execute
-but not write:
+**The trust boundary starts BEFORE the build, not at the final `chown`.**
+The broker and control plane hold the HMAC keys and the App PEM, so every
+authority they rely on — the CODE they execute, the keys, the App PEM — must
+never pass through the agent/gateway uid's environment (its shell, its home,
+its writable checkout). That uid is the very thing this design defends
+against: anything it can read or write, it can copy or poison. A later
+`chown root`/`chmod go-w` does **not** retract what the same uid could have
+already exfiltrated or tampered with. Concretely, these are NOT safe:
+
+- building in the agent-writable checkout (a poisoned dependency or a
+  rewritten entrypoint is baked into the artifact before it is installed);
+- `cp -R .` from that checkout (it can carry a symlink, or a link into a
+  shared/agent-controlled pnpm store, into the "immutable" tree);
+- the App PEM landing in `~/Downloads`, or HMAC keys generated in the
+  gateway user's shell (both are readable by the hostile uid at that moment,
+  even if moved root-owned a second later);
+- a service environment that carries `NODE_OPTIONS`/`NODE_PATH` (a preload
+  vector runs attacker code in-process *before* the launcher does anything).
+
+**Build hermetically, install atomically, from a trusted context only.**
+Produce the artifact as root or in CI, from a PINNED, verified commit (a
+signed tag or a known-good SHA), in a clean checkout the agent never
+touched; package it self-contained with **no external symlinks and no
+shared-store reference**; install it to a versioned, root-owned path and
+flip a `current` symlink so each release is immutable and the running tree
+is never half-written:
 
 ```sh
-pnpm -r build
-sudo mkdir -p /opt/ownerswitch
-sudo cp -R . /opt/ownerswitch/src            # or install just the built dist/ trees
-sudo chown -R root:root /opt/ownerswitch     # root-owned: no service uid can modify the code
-sudo chmod -R go-w /opt/ownerswitch
+# --- in the TRUSTED build context (root/CI, pinned commit, clean checkout) ---
+git checkout <verified-tag-or-sha>
+pnpm install --frozen-lockfile && pnpm -r build
+# self-contained artifact — resolves bare workspace deps to bundled dist,
+# NOT to a shared store the agent can influence (never `cp -R .`):
+pnpm --filter @ownerswitchai/mcp deploy --prod /tmp/osw-stage/mcp
+pnpm --filter @ownerswitchai/executor deploy --prod /tmp/osw-stage/executor
+tar -C /tmp/osw-stage -czf /tmp/ownerswitch-<ver>.tgz .   # or an OCI image
+
+# --- on the target host, as root (the staged tarball is the ONLY input) ---
+sudo install -d -o root -g root -m 0755 /opt/ownerswitch/releases/<ver>
+sudo tar --no-same-owner -xzf /tmp/ownerswitch-<ver>.tgz -C /opt/ownerswitch/releases/<ver>
+sudo chown -R root:root /opt/ownerswitch/releases/<ver>   # immutable to every service uid
+sudo chmod -R go-w      /opt/ownerswitch/releases/<ver>
+sudo ln -sfn /opt/ownerswitch/releases/<ver> /opt/ownerswitch/current  # atomic release swap
 ```
 
-Launch every service from `/opt/ownerswitch` (absolute paths), under
-systemd units whose `ExecStart` names an absolute, root-owned binary —
-never `pnpm ... dev:control-plane` from your home directory. The commands
-below use `/opt/ownerswitch` to make the point; a production deployment
-uses packaged artifacts and `systemd` service files with `User=`,
-`SupplementaryGroups=`, `LoadCredential=` and `ReadOnlyPaths=/opt/ownerswitch`.
+Then **smoke-test the INSTALLED tree as the real service uids** before it
+carries any secret — prove `node .../current/.../dist/*.js` resolves and
+reaches its config check (not a module-resolution error) under the very uid
+that will run it:
+
+```sh
+sudo -u oswitch-cp     /usr/bin/node /opt/ownerswitch/current/packages/mcp/dist/control-plane.js || true
+sudo -u oswitch-broker /usr/bin/node /opt/ownerswitch/current/packages/executor/dist/merge-broker-cli.js || true
+#   each must print a CONFIG error ("… is required"), NOT ERR_MODULE_NOT_FOUND
+```
+
+Launch every service from `/opt/ownerswitch/current` (absolute paths),
+under systemd units whose `ExecStart` names an absolute, root-owned binary —
+never `pnpm ... dev:control-plane` from a home directory. Give each unit a
+**clean environment**: `User=`, `SupplementaryGroups=`, `LoadCredential=`,
+`ReadOnlyPaths=/opt/ownerswitch`, and crucially clear the preload vectors
+(`Environment=` with `NODE_OPTIONS`/`NODE_PATH` unset, or
+`UnsetEnvironment=NODE_OPTIONS NODE_PATH`). The launchers now **refuse to
+start** if either is present — a tripwire so a misconfigured unit fails
+loudly instead of silently running injected code with the keys in-process.
+The `/opt/ownerswitch/current` commands below stand in for that unit.
 
 Create **three** distinct uids and two groups. The broker owns the App PEM
 and the burn store; the control plane runs as a SEPARATE uid (it must not
@@ -77,11 +120,25 @@ sudo usermod -aG oswitch oswitch-broker                          # broker in it 
 sudo groupadd oswitch-secrets                                    # holds the shared HMAC keys
 sudo usermod -aG oswitch-secrets oswitch-broker
 sudo usermod -aG oswitch-secrets oswitch-cp                      # NOT the gateway/agent user
+```
 
+Group membership does NOT apply to sessions or processes that already
+exist. The gateway user was just added to `oswitch` (the socket group), so
+its current shell — and any gateway already running in it — still lacks the
+membership and will get `EACCES` connecting to the broker socket. Start a
+**fresh login**, or run the gateway under `newgrp oswitch` / `sg oswitch -c
+'…'`, so its egid list actually includes `oswitch` before it connects.
+(systemd units get this right automatically via `SupplementaryGroups=`.)
+
+```sh
 sudo mkdir -p /etc/ownerswitch
-sudo mv ~/Downloads/<app-name>.*.private-key.pem /etc/ownerswitch/github-app.pem
-sudo chown oswitch-broker /etc/ownerswitch/github-app.pem        # broker only — CP cannot read it
-sudo chmod 600 /etc/ownerswitch/github-app.pem
+# Deliver the App PEM through an admin channel the agent uid cannot read —
+# e.g. `scp` straight to root, or a secrets manager — placed directly at its
+# broker-owned path. If it EVER touched a shared home (a browser download to
+# ~/Downloads on the agent's machine), treat it as EXPOSED: rotate it (GitHub
+# App → Generate a new private key, delete the old) before going live.
+sudo install -o oswitch-broker -g oswitch-broker -m 600 /path/from/admin-channel/github-app.pem \
+  /etc/ownerswitch/github-app.pem                                # broker only — CP cannot read it
 # setgid (02750) socket dir so the socket inode inherits the oswitch group:
 sudo install -d -o oswitch-broker -g oswitch -m 02750 /run/ownerswitch
 OSWITCH_GID=$(getent group oswitch | cut -d: -f3)
@@ -91,14 +148,16 @@ sudo install -d -o oswitch-broker -g oswitch-broker -m 0700 /var/lib/ownerswitch
 
 Two shared **HMAC keys**, each ≥256 bits — the `grant` key authorizes
 merges, the `kill-state` key authenticates the broker's live kill check.
-Both belong to the broker AND the control plane and to NOTHING else. Write
-them to root-owned, `oswitch-secrets`-readable files (mode 0640) — never to
-a shell the gateway shares, and never onto any command line:
+Both belong to the broker AND the control plane and to NOTHING else.
+Generate them in a **root/service context** with an **absolute**
+`/usr/bin/openssl` (never the gateway user's shell, where a shadowed
+`openssl` earlier in `$PATH` could emit an attacker-known "random" key),
+writing straight to root-owned, `oswitch-secrets`-readable files (mode
+0640), never onto any command line:
 
 ```sh
-umask 077
-openssl rand -hex 32 | sudo tee /etc/ownerswitch/grant.key      >/dev/null
-openssl rand -hex 32 | sudo tee /etc/ownerswitch/kill-state.key  >/dev/null
+sudo sh -c 'umask 077; /usr/bin/openssl rand -hex 32 > /etc/ownerswitch/grant.key'
+sudo sh -c 'umask 077; /usr/bin/openssl rand -hex 32 > /etc/ownerswitch/kill-state.key'
 sudo chgrp oswitch-secrets /etc/ownerswitch/grant.key /etc/ownerswitch/kill-state.key
 sudo chmod 0640           /etc/ownerswitch/grant.key /etc/ownerswitch/kill-state.key
 ```
@@ -128,7 +187,7 @@ sudo -u oswitch-broker sg oswitch -c '
   OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test
   OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:4600
   set +a
-  exec /usr/bin/node /opt/ownerswitch/src/packages/executor/dist/merge-broker-cli.js'
+  exec /usr/bin/node /opt/ownerswitch/current/packages/executor/dist/merge-broker-cli.js'
 ```
 
 (The control-plane URL is `:4600` — the port the control plane listens on
@@ -224,7 +283,7 @@ sudo -u oswitch-cp sg oswitch-secrets -c '
   OWNERSWITCH_OWNER_PASSKEY_RP_ID=owner.example
   OWNERSWITCH_OWNER_PASSKEY_ORIGIN=https://owner.example
   set +a
-  exec /usr/bin/node /opt/ownerswitch/src/packages/mcp/dist/control-plane.js'
+  exec /usr/bin/node /opt/ownerswitch/current/packages/mcp/dist/control-plane.js'
 ```
 
 The owner authenticates to this control plane with the SAME passkey: the

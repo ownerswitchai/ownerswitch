@@ -11,9 +11,10 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
  * but we treat WRITE and PATH exactly as strictly as the App private key:
  * an absolute path whose real ancestry is trusted, opened O_NOFOLLOW so the
  * leaf is never a symlink, a regular file, size-capped, owned by root or
- * this process, and NOT writable by group or other. Then it must parse as an
- * EC P-256 (prime256v1) SPKI key — the only curve the assertion verifier
- * accepts.
+ * this process, and NOT writable by group or other. Then it must be EXACTLY
+ * one SPKI `PUBLIC KEY` block on the P-256 (prime256v1) curve — a private
+ * PEM is refused (see parseSpkiP256PublicKey), because this world-readable
+ * file must never carry signing authority.
  *
  * The ancestry walk runs on the POST-realpath parent (matching the burn
  * store): an intermediate symlink cannot present a trusted-looking lexical
@@ -117,25 +118,70 @@ export function loadOwnerPasskeyPublicKey(
     closeSync(fd);
   }
 
-  let key: KeyObject;
-  try {
-    key = createPublicKey(pem);
-  } catch {
+  return parseSpkiP256PublicKey(pem, realPath);
+}
+
+/**
+ * Parse STRICTLY as a P-256 SPKI *public* key and return a CANONICAL
+ * re-export — never the caller's bytes.
+ *
+ * The critical hole this closes: `createPublicKey(pem)` will happily DERIVE a
+ * public key from a PKCS#8 or SEC1 *private* PEM (verified: both parse, curve
+ * prime256v1, and the private PEM even verifies its own assertions). Since
+ * this file is treated as public and provisioned 0644 — READABLE by the
+ * agent's uid — accepting a private key would hand the agent full assertion
+ * authority (it could sign login, approval, AND restore assertions itself).
+ * So we refuse anything that is not EXACTLY one SPKI `PUBLIC KEY` block:
+ *  - any `PRIVATE KEY` armor is rejected outright (the reproduced attack);
+ *  - exactly one PEM block, no second block, no leading/trailing content;
+ *  - the body is parsed as DER with an explicit {type:"spki"}, so a private
+ *    DER smuggled under a public header fails the ASN.1 shape too;
+ *  - the returned `pem` is re-exported canonical SPKI, so downstream never
+ *    sees attacker-influenced bytes.
+ */
+export function parseSpkiP256PublicKey(pem: string, path: string): { pem: string; key: KeyObject } {
+  if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(pem)) {
     throw new Error(
-      `owner passkey public key "${realPath}" does not parse as a public key — expected an SPKI PEM ` +
-        `(the enrolled authenticator's P-256 public key)`,
+      `owner passkey public key "${path}" is a PRIVATE key — provide ONLY the SPKI public key. A ` +
+        `private key here (the file is world-readable config) would let the agent sign assertions itself`,
     );
   }
+  if ((pem.match(/-----BEGIN /g) ?? []).length !== 1) {
+    throw new Error(
+      `owner passkey public key "${path}" must be exactly one PEM block — multiple blocks or trailing ` +
+        `content are refused`,
+    );
+  }
+  const match = /^-----BEGIN PUBLIC KEY-----\r?\n([A-Za-z0-9+/=\s]+?)-----END PUBLIC KEY-----\s*$/.exec(
+    pem.trim(),
+  );
+  if (match === null) {
+    throw new Error(
+      `owner passkey public key "${path}" is not a single SPKI "PUBLIC KEY" PEM block (the enrolled ` +
+        `authenticator's P-256 public key, \`openssl pkey -pubout\` form)`,
+    );
+  }
+  let key: KeyObject;
+  try {
+    const der = Buffer.from(match[1].replace(/\s+/g, ""), "base64");
+    // Explicit SPKI DER parse — NOT createPublicKey(pem), which would derive
+    // a public key from a private PEM. A private DER fails the SPKI shape.
+    key = createPublicKey({ key: der, format: "der", type: "spki" });
+  } catch {
+    throw new Error(`owner passkey public key "${path}" does not parse as an SPKI public key`);
+  }
   if (key.asymmetricKeyType !== "ec") {
-    throw new Error(`owner passkey public key "${realPath}" is not an EC key — WebAuthn ES256 needs P-256`);
+    throw new Error(`owner passkey public key "${path}" is not an EC key — WebAuthn ES256 needs P-256`);
   }
   const curve = (key.asymmetricKeyDetails as { namedCurve?: string } | undefined)?.namedCurve;
   if (curve !== "prime256v1") {
     throw new Error(
-      `owner passkey public key "${realPath}" is EC curve "${curve ?? "unknown"}", not prime256v1 (P-256)`,
+      `owner passkey public key "${path}" is EC curve "${curve ?? "unknown"}", not prime256v1 (P-256)`,
     );
   }
-  return { pem, key };
+  // Return CANONICAL SPKI, re-exported from the parsed key — downstream binds
+  // to bytes this loader produced, not the on-disk input.
+  return { pem: key.export({ type: "spki", format: "pem" }).toString(), key };
 }
 
 /**

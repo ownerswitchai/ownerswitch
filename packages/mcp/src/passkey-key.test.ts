@@ -15,14 +15,8 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  * design.
  */
 
-function p256Spki(): string {
-  return generateKeyPairSync("ec", { namedCurve: "prime256v1" }).publicKey.export({
-    type: "spki",
-    format: "pem",
-  }) as string;
-}
-
-const SPKI = p256Spki();
+const P256 = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const SPKI = P256.publicKey.export({ type: "spki", format: "pem" }) as string;
 
 let dir: string;
 beforeEach(() => {
@@ -100,8 +94,35 @@ describe("loadOwnerPasskeyPublicKey", () => {
   it("refuses garbage that does not parse as a public key", () => {
     const path = writeKey("bad.pem", "-----BEGIN PUBLIC KEY-----\nnope\n-----END PUBLIC KEY-----\n");
     expect(() => loadOwnerPasskeyPublicKey(path, skipAncestry)).toThrowError(
-      /does not parse as a public key/,
+      /does not parse as an SPKI public key/,
     );
+  });
+
+  // R10-1: createPublicKey() will DERIVE a public key from a PRIVATE PEM, so a
+  // private key provisioned as the world-readable "public" file would hand the
+  // agent full assertion authority. Both P-256 private armors must be refused.
+  it("REFUSES a PKCS#8 P-256 private key masquerading as the public key file", () => {
+    const pkcs8 = P256.privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    const path = writeKey("priv-pkcs8.pem", pkcs8);
+    expect(() => loadOwnerPasskeyPublicKey(path, skipAncestry)).toThrowError(/is a PRIVATE key/);
+  });
+
+  it("REFUSES a SEC1 EC private key masquerading as the public key file", () => {
+    const sec1 = P256.privateKey.export({ type: "sec1", format: "pem" }) as string;
+    const path = writeKey("priv-sec1.pem", sec1);
+    expect(() => loadOwnerPasskeyPublicKey(path, skipAncestry)).toThrowError(/is a PRIVATE key/);
+  });
+
+  it("REFUSES two concatenated PEM blocks (trailing content is not ignored)", () => {
+    const path = writeKey("double.pem", `${SPKI}\n${SPKI}\n`);
+    expect(() => loadOwnerPasskeyPublicKey(path, skipAncestry)).toThrowError(/exactly one PEM block/);
+  });
+
+  it("returns CANONICAL re-exported SPKI, byte-identical to the key's own export", () => {
+    const path = writeKey("passkey.pem", `   \n${SPKI}\n   \n`); // padded/whitespaced input
+    const loaded = loadOwnerPasskeyPublicKey(path, skipAncestry);
+    const canonical = P256.publicKey.export({ type: "spki", format: "pem" }).toString();
+    expect(loaded.pem).toBe(canonical); // NOT the padded on-disk bytes
   });
 
   it("refuses a non-EC key — WebAuthn ES256 requires P-256", () => {

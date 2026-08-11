@@ -33,7 +33,30 @@ function required(name: string): string {
   return value;
 }
 
+/**
+ * Refuse to start if a Node PRELOAD vector is present in the environment.
+ * `NODE_OPTIONS=--import=…`/`--require=…` and `NODE_PATH` run attacker code
+ * BEFORE this script — and this process holds the grant key, the kill-state
+ * key, and mints owner authority. This is a tripwire: the preload has already
+ * run by the time we look, so the real defense is a clean service environment
+ * (the MANUAL's systemd unit clears it). But a misconfigured unit then fails
+ * LOUDLY here instead of silently serving with injected code in-process.
+ */
+function assertCleanRuntimeEnv(): void {
+  for (const name of ["NODE_OPTIONS", "NODE_PATH"]) {
+    const value = process.env[name]?.trim();
+    if (value !== undefined && value !== "") {
+      throw new Error(
+        `${name} is set — refusing to start. This control plane holds the grant and kill-state keys ` +
+          `and must run in a clean environment; ${name} can preload code before it. Clear it in the ` +
+          `service definition (systemd: Environment=/unset it), then restart.`,
+      );
+    }
+  }
+}
+
 function main(): void {
+  assertCleanRuntimeEnv();
   const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
   const host = process.env.OWNERSWITCH_CONTROL_PLANE_HOST ?? "127.0.0.1";
   const deviceSecret = required("OWNERSWITCH_DEVICE_SECRET");

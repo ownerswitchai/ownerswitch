@@ -50,8 +50,31 @@ function required(env: Record<string, string | undefined>, name: string): string
   return value;
 }
 
+/**
+ * Refuse to start if a Node PRELOAD vector is present. `NODE_OPTIONS`
+ * (`--import`/`--require`) and `NODE_PATH` run code BEFORE this script — and
+ * this broker alone reads the GitHub App private key and holds the grant and
+ * kill-state keys. A tripwire only (the preload has already run when we look),
+ * so the real defense is a clean service environment; but a misconfigured
+ * unit then fails LOUDLY here rather than serving with injected in-process
+ * code that could exfiltrate the App key.
+ */
+function assertCleanRuntimeEnv(env: Record<string, string | undefined>): void {
+  for (const name of ["NODE_OPTIONS", "NODE_PATH"]) {
+    const value = env[name]?.trim();
+    if (value !== undefined && value !== "") {
+      throw new Error(
+        `${name} is set — refusing to start. This broker holds the App private key and the grant/` +
+          `kill-state keys and must run in a clean environment; ${name} can preload code before it. ` +
+          `Clear it in the service definition (systemd: Environment=/unset it), then restart.`,
+      );
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const env = process.env;
+  assertCleanRuntimeEnv(env);
   const appId = required(env, "OWNERSWITCH_GITHUB_APP_ID");
   const installationId = required(env, "OWNERSWITCH_GITHUB_APP_INSTALLATION_ID");
   const keyFile = required(env, "OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE");
