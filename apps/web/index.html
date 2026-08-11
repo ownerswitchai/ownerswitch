@@ -13,6 +13,7 @@
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   }
   *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
   body{background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
   .wrap{max-width:640px;margin:0 auto;padding:0 20px}
 
@@ -57,6 +58,35 @@
   footer a{color:var(--ink-dim);text-decoration:underline}
   footer a:hover{color:var(--red)}
 
+  /* cta + waitlist */
+  .cta-row{text-align:center;margin:24px 0 0}
+  .btn{display:inline-block;font-family:var(--mono);font-size:13px;letter-spacing:.06em;
+       background:var(--ink);color:#fff;text-decoration:none;padding:13px 22px;border-radius:10px;
+       border:none;cursor:pointer;transition:transform .08s ease, background .15s ease}
+  .btn:hover{background:#000;transform:translateY(-1px)}
+  .btn.red{background:var(--red)} .btn.red:hover{background:var(--red-deep)}
+
+  .sec-head{text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.22em;
+            color:var(--ink-dim);text-transform:uppercase;margin:34px 0 2px}
+
+  .price{display:grid;gap:12px;padding:12px 0 6px}
+  .plan{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+  .plan.free{border-color:var(--green);box-shadow:0 0 0 1px var(--green) inset}
+  .plan .row{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .plan h3{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--ink)}
+  .plan .tag{font-family:var(--mono);font-size:12px;color:var(--green);white-space:nowrap}
+  .plan .tag.dim{color:var(--ink-dim)}
+  .plan p{font-size:13.5px;line-height:1.5;color:var(--ink-dim);margin-top:8px}
+
+  .waitlist{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+            padding:26px 20px;text-align:center;margin:24px 0 6px}
+  .waitlist h2{font-size:21px;letter-spacing:-.02em}
+  .waitlist p{color:var(--ink-dim);font-size:14px;margin:6px 0 16px}
+  .wform{display:flex;gap:8px;max-width:420px;margin:0 auto;flex-wrap:wrap;justify-content:center}
+  .wform input{flex:1;min-width:200px;font-family:var(--sans);font-size:15px;padding:12px 14px;
+               border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink)}
+  .wform input:focus{outline:2px solid var(--ink);outline-offset:-1px}
+
   /* blackout */
   #blackout{position:fixed;inset:0;background:#000;z-index:50;display:none;
             align-items:center;justify-content:center;text-align:left}
@@ -87,7 +117,7 @@
         </svg>
         <span>wnerswitch</span>
       </a>
-      <span class="nav-tag">v0 · demo</span>
+      <span class="nav-tag">private beta</span>
     </nav>
 
     <header>
@@ -95,13 +125,13 @@
       <h1>The kill switch your agents can't argue past — on every call it sees.</h1>
       <p class="sub">Your agents deploy, move money, touch production. Every call that routes through OwnerSwitch is checked against live policy and kill state, fail-closed, held by the real owner.</p>
       <p class="tagline">One press to stop. Two GOs to start.</p>
-      <p class="threat-link">We wrote down what this can't stop — <a href="https://github.com/ownerswitchai/ownerswitch/blob/main/packages/mcp/THREAT-MODEL.md" target="_blank" rel="noopener">read the threat model on GitHub</a>.</p>
-      <p class="threat-link">Kill signal to the gateway's next policy check, measured locally: ~1 millisecond — <a href="https://github.com/ownerswitchai/ownerswitch/blob/main/examples/kill-latency-benchmark.ts" target="_blank" rel="noopener">see the benchmark</a>.</p>
+      <p class="threat-link">Kill signal to the gateway's next policy check: <strong>~1&nbsp;ms</strong>, measured locally. Fail-closed by default.</p>
+      <div class="cta-row"><a class="btn red" href="#waitlist">Join the private beta &rarr;</a></div>
     </header>
 
     <div class="switch-zone">
       <button class="estop" id="estop" aria-label="Press the kill switch — demo">
-        <svg viewBox="0 0 100 100" width="96" height="96">
+        <svg viewBox="0 0 100 100" width="150" height="150">
           <circle cx="50" cy="55" r="38" fill="#8F0F0F"/>
           <circle cx="50" cy="48" r="34" fill="#E02323"/>
           <ellipse cx="41" cy="37" rx="13" ry="8" fill="#fff" opacity="0.25"/>
@@ -116,9 +146,34 @@
       <div class="tier"><b>VETO</b><p><strong>Risky moves wait for you.</strong> Medium-risk actions hold for a few minutes. One tap on your phone stops them. Silence lets them through.</p></div>
       <div class="tier"><b>APPROVE</b><p><strong>Critical ops never run alone.</strong> Money, deletion, production keys — default deny until your passkey says yes. No passkey, no action.</p></div>
     </div>
+
+    <div class="sec-head">Pricing</div>
+    <div class="price">
+      <div class="plan free">
+        <div class="row"><h3>THE STOP</h3><span class="tag">Free forever</span></div>
+        <p>The red button, the tripwires, fail-closed kill on every routed call. The safety layer is free — for everyone, always. No card, no seat limit.</p>
+      </div>
+      <div class="plan">
+        <div class="row"><h3>TEAM</h3><span class="tag dim">Early access</span></div>
+        <p>Owner approvals, veto windows, passkey-gated actions, and a shared audit trail across your agents and teammates. Priced per owner when we open it up.</p>
+      </div>
+      <div class="plan">
+        <div class="row"><h3>ENTERPRISE</h3><span class="tag dim">Talk to us</span></div>
+        <p>SSO, on-prem control plane, custom policy, incident support, and hardware kill switches on the desk. Built with design partners.</p>
+      </div>
+    </div>
+
+    <div class="waitlist" id="waitlist">
+      <h2>Get the STOP first.</h2>
+      <p>The private beta opens in waves. Leave your email — we'll send an invite.</p>
+      <form class="wform" action="https://formspree.io/f/moeadpok" method="POST">
+        <input type="email" name="email" placeholder="you@company.com" required aria-label="Email address">
+        <button class="btn red" type="submit">Request an invite</button>
+      </form>
+    </div>
   </div>
 
-  <footer><em>ownerswitch.ai</em> — built in public. <a href="https://github.com/ownerswitchai/ownerswitch" target="_blank" rel="noopener">Code on GitHub</a>.</footer>
+  <footer><em>ownerswitch.ai</em> — one press to stop. Two GOs to start.</footer>
   <div class="hazard"></div>
 
   <div id="blackout" role="dialog" aria-live="polite">
