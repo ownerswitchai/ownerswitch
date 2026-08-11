@@ -3,6 +3,7 @@ import { createButtonDaemon, type KillConfirmation } from "./daemon.js";
 import {
   createHttpSource,
   createKeyboardSource,
+  createSerialSource,
   DEFAULT_HTTP_PORT,
   type PressSource,
 } from "./input.js";
@@ -13,9 +14,11 @@ const USAGE = `Usage: ownerswitch-button --url <control-plane> --device-id <id> 
 Options:
   --url <url>        control plane base URL, e.g. http://localhost:4000
   --device-id <id>   this button's provisioned device id (no "." allowed)
-  --source <kind>    "keyboard" (default) or "http"
+  --source <kind>    "keyboard" (default), "http", or "serial"
   --key <key>        keyboard source: "space" (default), "enter", or one character
   --port <port>      http source: POST /press port (default ${DEFAULT_HTTP_PORT})
+  --device <path>    serial source: the button's serial device, e.g. /dev/ttyACM0
+  --trigger <line>   serial source: the line that means "pressed" (default "KILL")
   --help             show this help
 
 The device secret (signs every kill request) comes from OWNERSWITCH_DEVICE_SECRET
@@ -95,6 +98,8 @@ export async function main(
         source: { type: "string", default: "keyboard" },
         key: { type: "string", default: "space" },
         port: { type: "string" },
+        device: { type: "string" },
+        trigger: { type: "string" },
         help: { type: "boolean", default: false },
       },
     }));
@@ -117,18 +122,24 @@ export async function main(
         "kill request and is never accepted as a CLI flag.",
     );
   const sourceKind = values.source;
-  if (sourceKind !== "keyboard" && sourceKind !== "http") {
-    fail(`--source must be "keyboard" or "http", got "${sourceKind}"`);
+  if (sourceKind !== "keyboard" && sourceKind !== "http" && sourceKind !== "serial") {
+    fail(`--source must be "keyboard", "http", or "serial", got "${sourceKind}"`);
   }
   const port = values.port === undefined ? DEFAULT_HTTP_PORT : Number(values.port);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     fail(`--port must be an integer between 0 and 65535, got "${values.port}"`);
   }
 
-  const source: PressSource =
-    sourceKind === "keyboard"
-      ? createKeyboardSource({ key: values.key })
-      : createHttpSource({ port });
+  let source: PressSource;
+  if (sourceKind === "keyboard") {
+    source = createKeyboardSource({ key: values.key });
+  } else if (sourceKind === "http") {
+    source = createHttpSource({ port });
+  } else {
+    const device =
+      values.device ?? fail("--device is required for --source serial (e.g. /dev/ttyACM0)");
+    source = createSerialSource({ device, trigger: values.trigger });
+  }
 
   // The kill acknowledgement is in hand; re-read /status for the audit detail.
   const printConfirmation = async (confirmation: KillConfirmation): Promise<void> => {
