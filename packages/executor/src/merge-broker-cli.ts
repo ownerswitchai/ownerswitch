@@ -1,0 +1,141 @@
+#!/usr/bin/env node
+/**
+ * ownerswitch-merge-broker — the standalone EXECUTING credential broker
+ * (merge-broker.ts). Run it under its OWN uid, one the agent and gateway do
+ * not share; it alone reads the GitHub App private key, alone holds the
+ * control-plane grant key, and NEVER returns a token — it validates a signed
+ * grant and performs the merge itself.
+ *
+ * Environment (all secrets via env or file, never argv — CONTRIBUTING.md):
+ *   OWNERSWITCH_GITHUB_APP_ID                the App id (iss claim)
+ *   OWNERSWITCH_GITHUB_APP_INSTALLATION_ID   numeric installation id
+ *   OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE  absolute path, broker-owned,
+ *                                            0600, outside the agent workspace
+ *   OWNERSWITCH_AGENT_WORKSPACE              the agent's workspace, passed
+ *                                            EXPLICITLY so the key placement
+ *                                            check runs against the real
+ *                                            workspace, not this process's cwd
+ *   OWNERSWITCH_GRANT_KEY                    HMAC key shared ONLY with the
+ *                                            control plane; verifies grants
+ *   OWNERSWITCH_KILL_STATE_KEY               HMAC key shared ONLY with the
+ *                                            control plane; AUTHENTICATES the
+ *                                            live kill-state channel so an
+ *                                            impostor that binds the port
+ *                                            cannot answer "not killed"
+ *   OWNERSWITCH_BROKER_SOCKET                socket path; parent dir must be
+ *                                            broker-owned, setgid 02750, with
+ *                                            the gateway's user in its group
+ *   OWNERSWITCH_BROKER_BURN_DIR              directory for the DURABLE
+ *                                            single-use burn store —
+ *                                            broker-owned, mode 0700, outside
+ *                                            the agent workspace; burns must
+ *                                            survive a broker restart
+ *   OWNERSWITCH_BROKER_SOCKET_GID            optional: the gid the socket must
+ *                                            end up owned by; refuses to serve
+ *                                            on a mismatch
+ *   OWNERSWITCH_CONTROL_PLANE_URL            kill state — checked live before
+ *                                            every pin and every merge
+ *   OWNERSWITCH_BROKER_ALLOWED_REPOS         optional comma-separated repos
+ *   OWNERSWITCH_TIMEOUT_MS                   optional control-plane timeout
+ */
+import { createInstallationTokenSource } from "./github-app-auth.js";
+import { loadGitHubAppPrivateKey } from "./github-app-key.js";
+import { createMergeBroker } from "./merge-broker.js";
+import { createSecretLedger } from "./secret-ledger.js";
+import { signedLiveKillStateFromControlPlane } from "./signed-kill-state.js";
+
+function required(env: Record<string, string | undefined>, name: string): string {
+  const value = env[name]?.trim();
+  if (value === undefined || value === "") throw new Error(`${name} is required`);
+  return value;
+}
+
+/**
+ * Refuse to start if a Node PRELOAD vector is present. `NODE_OPTIONS`
+ * (`--import`/`--require`) and `NODE_PATH` run code BEFORE this script — and
+ * this broker alone reads the GitHub App private key and holds the grant and
+ * kill-state keys. A tripwire only (the preload has already run when we look),
+ * so the real defense is a clean service environment; but a misconfigured
+ * unit then fails LOUDLY here rather than serving with injected in-process
+ * code that could exfiltrate the App key.
+ */
+function assertCleanRuntimeEnv(env: Record<string, string | undefined>): void {
+  for (const name of ["NODE_OPTIONS", "NODE_PATH"]) {
+    const value = env[name]?.trim();
+    if (value !== undefined && value !== "") {
+      throw new Error(
+        `${name} is set — refusing to start. This broker holds the App private key and the grant/` +
+          `kill-state keys and must run in a clean environment; ${name} can preload code before it. ` +
+          `Clear it in the service definition (systemd: Environment=/unset it), then restart.`,
+      );
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const env = process.env;
+  assertCleanRuntimeEnv(env);
+  const appId = required(env, "OWNERSWITCH_GITHUB_APP_ID");
+  const installationId = required(env, "OWNERSWITCH_GITHUB_APP_INSTALLATION_ID");
+  const keyFile = required(env, "OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE");
+  const agentWorkspace = required(env, "OWNERSWITCH_AGENT_WORKSPACE");
+  const grantKey = required(env, "OWNERSWITCH_GRANT_KEY");
+  const killStateKey = required(env, "OWNERSWITCH_KILL_STATE_KEY");
+  const socketPath = required(env, "OWNERSWITCH_BROKER_SOCKET");
+  const burnDir = required(env, "OWNERSWITCH_BROKER_BURN_DIR");
+  const controlPlaneUrl = required(env, "OWNERSWITCH_CONTROL_PLANE_URL");
+  const allowedRaw = env.OWNERSWITCH_BROKER_ALLOWED_REPOS?.trim();
+  const allowedRepos =
+    allowedRaw === undefined || allowedRaw === ""
+      ? undefined
+      : allowedRaw.split(",").map((r) => r.trim()).filter((r) => r !== "");
+  const socketGidRaw = env.OWNERSWITCH_BROKER_SOCKET_GID?.trim();
+  const socketGid = socketGidRaw !== undefined && socketGidRaw !== "" ? Number(socketGidRaw) : undefined;
+  const timeoutMs = env.OWNERSWITCH_TIMEOUT_MS !== undefined ? Number(env.OWNERSWITCH_TIMEOUT_MS) : 1500;
+
+  const ledger = createSecretLedger();
+  const key = loadGitHubAppPrivateKey(keyFile, { workspaceDir: agentWorkspace });
+  ledger.add(key.pem);
+  ledger.add(grantKey);
+  ledger.add(killStateKey);
+
+  const broker = createMergeBroker({
+    tokens: createInstallationTokenSource({
+      app: { appId, installationId, privateKey: key.key },
+      ledger,
+    }),
+    ledger,
+    grantKey,
+    burnDir,
+    agentWorkspace,
+    // AUTHENTICATED kill-state: the broker verifies a signed, nonce-bound
+    // envelope, so a process impersonating a stopped control plane on the
+    // loopback port cannot answer "not killed".
+    fetchLiveKillState: signedLiveKillStateFromControlPlane({
+      baseUrl: controlPlaneUrl,
+      killStateKey,
+      timeoutMs,
+    }),
+    ...(allowedRepos !== undefined ? { allowedRepos } : {}),
+    ...(socketGid !== undefined ? { socketGid } : {}),
+    log: (line) => console.error(line),
+  });
+
+  await broker.listen(socketPath);
+  console.error(
+    `[merge-broker] EXECUTING broker — App ${appId}, installation ${installationId}; ` +
+      `never returns a token or the key; grants verified against the shared control-plane key; ` +
+      `kill state: ${controlPlaneUrl} (checked before every pin and every merge, fail closed)`,
+  );
+
+  const shutdown = (): void => {
+    void broker.close().finally(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((err: unknown) => {
+  console.error(`[merge-broker] failed to start: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});

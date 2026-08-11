@@ -38,6 +38,13 @@ export interface RefusalData {
   vetoStatus?: string;
   /** the executor's refusal code, e.g. "epoch-mismatch" (TicketRefused only) */
   refusalCode?: string;
+  /**
+   * ExecutionFailed only: whether the connector could establish that the
+   * action definitively did not happen ("not-performed" — e.g. GitHub
+   * received and refused the request) or genuinely cannot know ("unknown" —
+   * the request died on the wire and verification could not settle it).
+   */
+  connectorOutcome?: "not-performed" | "unknown";
 }
 
 /**
@@ -190,6 +197,26 @@ export function ticketRefused(
 }
 
 /**
+ * A routed call refused BEFORE any owner review opened or any ticket
+ * minted — invalid arguments for the route, or a review-time prerequisite
+ * (like pinning the pull request head) that could not be met. Unlike
+ * ticketRefused there is no approval to void: nothing was spent, nothing
+ * ran, and the agent may retry once the named cause is fixed.
+ */
+export function routedCallRefused(
+  tool: string,
+  refusalCode: string,
+  reason: string,
+): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.TicketRefused,
+    `OwnerSwitch refused "${tool}": ${reason}. The action did NOT run and no owner review ` +
+      `was opened; nothing was spent. Fix the named cause before calling again.`,
+    { decision: "refused", tool, reason, refusalCode },
+  );
+}
+
+/**
  * A veto window released, but a kill happened after the window was opened —
  * the control plane reports the release "spent" (its server-side record
  * binds every window to the kill epoch at registration). Approvals do not
@@ -216,22 +243,40 @@ export function vetoReleaseSpent(tool: string, vetoWindowId: string): OwnerSwitc
 }
 
 /**
- * The connector call failed AFTER the single-use ticket was consumed. Unlike
- * every refusal above, this is the one genuinely ambiguous outcome: the
- * nonce burns before the call (at-most-once, DESIGN.md §3), so the action
- * may or may not have completed on the backend — dispatched work cannot be
- * recalled, and undispatched work leaves no trace to distinguish itself by.
- * Deliberately explicit about that — the one wrong takeaway would be "retry
- * until it works".
+ * The connector call failed AFTER the single-use ticket was consumed. The
+ * nonce burns before the call (at-most-once, DESIGN.md §3), so the ticket is
+ * spent either way — but the connector can often still say WHICH way the
+ * world went, and the agent must be told the strongest truth available:
+ *
+ *  - "not-performed": the backend received the request and refused it (or
+ *    it was never dispatched at all) — the action definitively did not run.
+ *    A retry is safe from double-execution, though it starts a fresh owner
+ *    decision and will likely refuse again for the same reason.
+ *  - "unknown": the request died on the wire and post-dispatch verification
+ *    could not settle it — the action MAY OR MAY NOT have completed. The
+ *    one wrong takeaway would be "retry until it works".
+ *
+ * Connectors signal the distinction with ConnectorCallError
+ * (packages/executor/src/connector-error.ts); anything else stays "unknown"
+ * — ambiguity is the fail-safe reading, never the optimistic one.
  */
-export function executionFailed(tool: string, detail: string): OwnerSwitchRefusal {
+export function executionFailed(
+  tool: string,
+  detail: string,
+  connectorOutcome: "not-performed" | "unknown" = "unknown",
+): OwnerSwitchRefusal {
+  const consequence =
+    connectorOutcome === "not-performed"
+      ? `The single-use ticket was consumed and the action did NOT run — the backend refused ` +
+        `it before performing anything. Retrying starts a fresh owner decision and will ` +
+        `likely fail the same way until the cause is fixed; tell the user why it failed.`
+      : `The single-use ticket was consumed, and the action MAY OR MAY NOT have completed — ` +
+        `check the resource directly before doing anything else. Retrying starts a fresh ` +
+        `owner decision and could run the action twice; tell the user.`;
   return new OwnerSwitchRefusal(
     OwnerSwitchErrorCode.ExecutionFailed,
-    `OwnerSwitch accepted "${tool}" but the backend call failed: ${detail}. The single-use ` +
-      `ticket was consumed, and the action MAY OR MAY NOT have completed — check the ` +
-      `resource directly before doing anything else. Retrying starts a fresh owner ` +
-      `decision and could run the action twice; tell the user.`,
-    { decision: "failed", tool, reason: detail },
+    `OwnerSwitch accepted "${tool}" but the backend call failed: ${detail}. ${consequence}`,
+    { decision: "failed", tool, reason: detail, connectorOutcome },
   );
 }
 

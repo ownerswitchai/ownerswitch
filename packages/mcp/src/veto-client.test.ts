@@ -24,6 +24,20 @@ describe("createVetoClient", () => {
     ).resolves.toEqual({ id: "veto_ab12" });
   });
 
+  it("register sends the declared purpose in the body — and omits the key entirely without one", async () => {
+    const bodies: unknown[] = [];
+    const capturing: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ id: "veto_ab12", status: "pending" }), { status: 201 });
+    };
+    const call = { agentId: "a1", tool: "merge_pull_request" };
+    const purpose = { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" };
+    await client(capturing).register(call, purpose);
+    await client(capturing).register({ agentId: "a1", tool: "write_file" });
+    expect(bodies[0]).toEqual({ call, purpose });
+    expect(bodies[1]).toEqual({ call: { agentId: "a1", tool: "write_file" } });
+  });
+
   it("register maps a 401 to a device-credentials message (quickstart's likely mistake)", async () => {
     const err = await client(jsonResponse({ error: "unauthorized" }, 401))
       .register({ agentId: "a1", tool: "write_file" })
@@ -46,17 +60,32 @@ describe("createVetoClient", () => {
   });
 
   it("status returns the window state, 'missing' on 404, and rejects garbage", async () => {
-    await expect(client(jsonResponse({ status: "vetoed" })).status("veto_1")).resolves.toBe("vetoed");
-    await expect(client(jsonResponse({ error: "gone" }, 404)).status("veto_1")).resolves.toBe(
-      "missing",
-    );
+    await expect(client(jsonResponse({ status: "vetoed" })).status("veto_1")).resolves.toEqual({
+      status: "vetoed",
+    });
+    await expect(client(jsonResponse({ error: "gone" }, 404)).status("veto_1")).resolves.toEqual({
+      status: "missing",
+    });
     await expect(client(jsonResponse({ status: "sideways" })).status("veto_1")).rejects.toThrowError(
       VetoClientError,
     );
   });
 
   it("status passes 'spent' through — a release from a dead kill epoch must reach the proxy", async () => {
-    await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toBe("spent");
+    await expect(client(jsonResponse({ status: "spent" })).status("veto_1")).resolves.toEqual({
+      status: "spent",
+    });
+  });
+
+  it("status surfaces the control plane's grant on a released window, verbatim", async () => {
+    const grant = { v: 1, jti: "g1", sig: "abc" };
+    await expect(
+      client(jsonResponse({ status: "released", grant })).status("veto_1"),
+    ).resolves.toEqual({ status: "released", grant });
+    // no grant field when the control plane doesn't mint one
+    await expect(client(jsonResponse({ status: "released" })).status("veto_1")).resolves.toEqual({
+      status: "released",
+    });
   });
 
   it("status() requests /veto/:id with caching defeated — a cached 'released' is as dangerous as a cached killed:false", async () => {

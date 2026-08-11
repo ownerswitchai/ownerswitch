@@ -22,11 +22,32 @@ const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
 const deviceSecret = process.env.OWNERSWITCH_DEVICE_SECRET ?? "dev-device-secret";
 const killStateFile =
   process.env.OWNERSWITCH_KILL_STATE_FILE ?? resolve(process.cwd(), DEFAULT_KILL_STATE_FILE);
+// The grant key the executing merge broker verifies MergeGrants with — set it
+// (matching the broker's OWNERSWITCH_GRANT_KEY) to exercise the broker path;
+// unset, the control plane mints no grants and the broker deployment cannot run.
+const grantKey = process.env.OWNERSWITCH_GRANT_KEY;
+// The kill-state key that authenticates the broker's live kill-state channel
+// (matching the broker's OWNERSWITCH_KILL_STATE_KEY). Unset, /kill-state is
+// 501 and the broker cannot use its authenticated channel.
+const killStateKey = process.env.OWNERSWITCH_KILL_STATE_KEY;
+// DEV ONLY: with a grant key but no enrolled passkey, this instance would
+// approve merges on a reusable owner session. That weaker boundary is fine
+// for the quickstart but must be acknowledged explicitly — see
+// packages/mcp/src/control-plane.ts for the PRODUCTION launcher that
+// enrolls a passkey and runs dev:false.
+const acceptSessionOnly = process.env.OWNERSWITCH_ACCEPT_SESSION_ONLY_APPROVAL_RISK === "1";
 
 // dev: true — this is the quickstart instance; the kill-state path safety
 // checks that production enforces (absolute path, protected directory) are
 // deliberately off here, and createControlPlane says so loudly at boot.
-const controlPlane = createControlPlane({ deviceSecret, killStateFile, dev: true });
+const controlPlane = createControlPlane({
+  deviceSecret,
+  killStateFile,
+  dev: true,
+  ...(grantKey !== undefined && grantKey !== "" ? { grantKey } : {}),
+  ...(killStateKey !== undefined && killStateKey !== "" ? { killStateKey } : {}),
+  ...(acceptSessionOnly ? { acceptSessionOnlyApprovalRisk: true } : {}),
+});
 const owner = createOwnerSession("owner-dev");
 
 createServer(controlPlane.handler).listen(port, "127.0.0.1", () => {

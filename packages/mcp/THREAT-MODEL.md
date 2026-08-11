@@ -409,6 +409,226 @@ The control plane is deliberately one small, framework-free process — a
 surface auditable in one sitting. That concentration is the design: one
 place to defend, and the place most worth defending.
 
+## 5. What changes now that a real downstream credential exists
+
+"There is little to steal" (§4) was written for the proxy-only
+deployment, and it stops being true the moment the executor's GitHub
+connector is configured: the deployment now contains a **GitHub App
+private key** and mints **installation tokens** with it
+(`packages/executor/DESIGN.md` §6). This section is what that changes.
+
+- **Neither the key nor a token lives in the gateway — because of the
+  uid problem, and because a token is raw authority.** File modes (0600,
+  ownership) defend against other USERS; they defend nothing against a
+  process under the SAME uid, and in the stdio deployment the MCP client
+  spawns the gateway, so gateway and agent share a uid. A key the gateway
+  could read, the agent could read. An earlier design moved the key into
+  a separate-uid broker that VENDED tokens — but a `contents: write`
+  installation token authenticates git-over-HTTPS, so anything that
+  reached the broker socket held raw push authority, and within one uid
+  nothing distinguishes the gateway from the agent: a same-uid agent could
+  take the vended token and push directly, bypassing owner review, the
+  ticket, the head pin and policy. The separate uid protected the KEY; it
+  did not preserve the AUTHORIZATION BOUNDARY. The shipped shape is
+  therefore the **executing merge broker** (`ownerswitch-merge-broker`):
+  a separate-uid process that alone reads the PEM, **never returns a token
+  or the key**, and instead PERFORMS the merge itself after validating a
+  control-plane-signed, single-use grant. It is the theft target now, and
+  it is small, credential-only, and auditable in one sitting.
+- **A merge needs the owner's ACTIVE approval, not their silence — and the
+  approval is a passkey ceremony, not a bearer token.** The party that
+  registers an owner-review window is the gateway, which shares the agent's
+  uid and whose device secret the agent can therefore forge — so a window's
+  mere existence proves nothing, and silence-approval would let an agent's
+  own registration release itself into a merge. The control plane mints a
+  merge grant ONLY on the owner's active approval, and with a passkey
+  enrolled that approval requires a fresh WebAuthn assertion: a single-use
+  challenge bound to {windowId, callHash}, signed by the authenticator with
+  UP+UV, counter-checked, atomically redeemed. An owner SESSION (a reusable
+  bearer token) only OPENS the ceremony — a stolen session cannot complete
+  it, because completing it takes the hardware in the owner's hand passing
+  its screen lock. Session-only approval exists only in dev mode; a
+  production control plane without an enrolled passkey refuses approvals.
+  Silence leaves a merge pending forever; the grant binds the kill epoch at
+  approval so a window opened during a kill cannot outlive it.
+- **The owner's veto revokes an issued, undispatched grant — atomically,
+  not as a snapshot.** The control plane tracks every minted jti; a
+  purposed window accepts a veto even after approval; the broker's
+  read-only signed probe answers `grantLive` per jti before the token mint;
+  and the FINAL pre-PUT check is an ATOMIC COMMIT — the broker sends an
+  HMAC-signed commit request (only it holds the key, so an agent cannot
+  pre-commit) and the control plane transitions the grant
+  live→committed-for-dispatch only if a veto has not already won. Both the
+  commit and the veto handlers are synchronous, so the race has exactly one
+  winner: if commit wins, the later veto is reported 409 "in flight"; if
+  veto wins, the commit returns `committed:false` and no PUT is sent. This
+  closes the window a signed-then-stale `grantLive:true` snapshot left open.
+- **Single request per broker connection.** The broker latches the
+  connection the instant it reads a full request line, before any await, so
+  a second chunk arriving mid-merge (or oversized trailing data) can never
+  re-parse the line and launch a duplicate coroutine that double-burns and
+  false-refuses while the original dispatches.
+- **The passkey approval binds the DISPLAYED transaction, in the current
+  kill epoch.** The approval ceremony stores the kill epoch it was minted
+  in and is cleared on any kill, so a challenge created before a kill can
+  never be redeemed after a restore. The ceremony returns a typed,
+  per-field `RenderableApprovalV1` — never raw canonical JSON — with every
+  string field (owner, repo, base ref, head) proven safe to display: NFC
+  form, and rejected by Unicode PROPERTY (`Cc`/`Cf`/`Zl`/`Zp`/`Bidi_Control`/
+  `Default_Ignorable_Code_Point`) rather than an enumerated range, so
+  U+061C, U+00AD, U+180E, U+FFF9–FFFB and astral default-ignorables are all
+  refused. The render's hash is bound to the challenge. In production the
+  owner obtains the session that opens the ceremony by a passkey login
+  (`POST /session/challenge` → `POST /session`), so a fresh process needs no
+  seeded credential. WebAuthn assertion verification requires an exact
+  https origin, rejects cross-origin (embedded) ceremonies, and rejects an
+  unexpected `topOrigin`. So "the owner tapped yes" means the owner saw an
+  unspoofable transaction, at the real origin, in the world the approval
+  belongs to.
+- **The merge destination is pinned, not just the head.** GitHub allows
+  retargeting a PR's base branch after approval and its merge API guards
+  only the head sha — so OwnerSwitch pins `expectedBaseRef` server-side at
+  review time, shows it to the owner, signs it into the grant, and
+  re-checks the PR's live base immediately before dispatch, refusing on
+  mismatch. The residual read-to-PUT race (the API has no atomic base
+  guard) is documented in DESIGN.md rather than papered over.
+- **The merge is authorized by evidence the gateway cannot forge.** That
+  **MergeGrant** (`packages/shared/src/merge-grant.ts`) is minted by the
+  CONTROL PLANE at the owner's active approval, signed with a key
+  (`OWNERSWITCH_GRANT_KEY`) shared ONLY with the broker — never in the
+  gateway/agent environment, and that is ENFORCED, not assumed: the
+  gateway refuses to start if the variable is present in its environment,
+  and the control plane requires the same uid/host isolation from the
+  agent as the broker (whoever reads the key mints approvals). The grant
+  carries the exact owner-reviewed call (including the pinned
+  `expectedHeadSha`), its SIGNED PURPOSE (connector + operation — the
+  broker refuses any purpose but `github`/`merge_pull_request`, so an
+  approval registered for another tool can never be spent as a merge, and
+  the control plane mints only for that purpose in the first place), the
+  authorization-world hash, a single-use id, the approval's kill epoch,
+  and a short expiry anchored to the RELEASE moment — a release that sits
+  unread past the grant window is `spent`, never a later fresh
+  capability. The broker verifies all of it independently and merges only
+  the signed args. Single-use burns twice, both out of the agent's reach
+  and neither in volatile memory alone: the control plane issues each
+  window's grant once, and the broker burns the jti in a durable, atomic
+  on-disk store that survives restarts and arbitrates between broker
+  processes — a burn it cannot persist is a refusal.
+- **What a same-uid agent that finds the socket can obtain NOW, stated
+  plainly.** A read-only head sha (`pin-head` — public-ish, low value),
+  and a merge ONLY if it also presents a currently-valid, unburned,
+  owner-approved grant it cannot mint (the signing key is not in its
+  reach — and which is now minted only when the OWNER actively approves,
+  never on silence). It can never obtain a token or the key. Neither
+  filesystem permissions nor SO_PEERCRED would help — they cannot tell
+  gateway from agent within one uid — which is why the executing design
+  removes the thing worth stealing rather than trying to identify the
+  caller. The residual: a same-uid agent racing the gateway for a
+  freshly-issued grant could present it first, but that grant exists only
+  because the owner actively approved THAT exact call, and the double
+  single-use burn caps it at the one merge the owner approved, with the
+  args the owner approved. The
+  **same-process mode** (key in the gateway, merges direct, no grant)
+  still exists behind an explicit
+  `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` acknowledgment — it
+  refuses to start without it and warns loudly with it, because in stdio
+  deployments it means the agent can read the key.
+- **The socket's GID is verified, not assumed.** A unix socket inherits
+  the broker process's effective gid, not the directory's group, so a
+  documented "0750 dir + 0660 socket" can silently deny the intended
+  gateway user or admit a wider one. The broker checks the socket's actual
+  gid after bind and refuses to serve on a mismatch with
+  `OWNERSWITCH_BROKER_SOCKET_GID`; the deployment makes them agree with a
+  setgid (02750) socket directory and/or by running the broker with that
+  gid. The socket directory must also be neither world- nor group-writable
+  (a group member that can write it could unlink the socket and bind its
+  own), which the broker enforces.
+- **The kill-state channel is authenticated, so fail-closed means closed
+  against an impostor.** The broker's live kill check does not trust the
+  unauthenticated loopback `/status`: it calls `GET /kill-state?nonce=…`
+  and requires an HMAC-signed, nonce-bound envelope (shared
+  `OWNERSWITCH_KILL_STATE_KEY`). If the isolated control plane stops, a
+  hostile local process can bind the unprivileged port and answer
+  "not killed" — but it cannot sign, and a replayed real answer carries a
+  stale nonce, so the broker reads KILLED. Without this, "unreachable ⇒
+  fail closed" is defeated by an impostor that makes the plane look
+  reachable while lying.
+- **The grant and kill-state keys are isolated three ways, and enforced.**
+  Each is ≥256 bits (short keys refused at startup), lives only in the
+  broker and a control plane running under its OWN uid (distinct from the
+  gateway/agent AND from the broker uid that owns the App PEM), is read
+  from a file into the process environment rather than passed on any
+  command line (argv is world-readable via `/proc`), and the gateway
+  REFUSES to start if it finds EITHER `OWNERSWITCH_GRANT_KEY` or
+  `OWNERSWITCH_KILL_STATE_KEY` in its own environment — the second because
+  an agent holding the kill-state key could port-squat a stopped control
+  plane and SIGN fresh `killed:false` envelopes, defeating the
+  authenticated kill channel from the inside.
+- **The burn store's namespace is pinned, not assumed.** Containment is
+  checked on the post-realpath result (an intermediate symlink cannot
+  smuggle it into the agent workspace), every ancestor must be trusted
+  (owned by root or the broker, no group/world write) so no other writer
+  can rename the store away, the directory's inode is pinned at startup
+  and re-verified before every burn, the pinned fd is what gets fsynced,
+  and EVERY directory-fsync failure refuses the burn — no platform
+  exemptions.
+- **The blast radius is configured, not coded.** An installation token
+  is scoped at mint to ONE repository and
+  `{ contents: write, pull_requests: read }`, and dies within an hour —
+  and the mint VERIFIES GitHub's repositories echo, refusing tokens
+  that come back broader (enterprise-owned installations cannot be
+  repository-downscoped and are therefore unsupported, enforced by
+  behavior). The key itself is bounded by the App's installation list
+  and permissions. Deployment requirements, restated as requirements:
+  install the App on exactly the repositories the executor may merge
+  in, grant it Contents read/write + Pull requests read-only and
+  nothing else, and never install it org-wide out of convenience —
+  every extra repository in the installation list is a wider key.
+- **The key's placement is the same class of requirement as the
+  kill-state file.** Absolute path, outside the AGENT'S workspace
+  (passed to the loader explicitly — never inferred from the loading
+  process's cwd), owned by the broker's user, mode 0600. The loader
+  enforces what a process can check (symlink refusal, mode, ownership,
+  size, "not under the given workspace") and refuses to start
+  otherwise; whether the agent has some OTHER route to that path is a
+  property of the deployment, and no Node-level check can prove a
+  negative about host access.
+- **Approvals bind to exactly one head.** Every routed merge carries a
+  mandatory `expectedHeadSha`, derived BY OWNERSWITCH from GitHub at
+  review time — the agent cannot supply it, the owner sees it in the
+  veto window, the ticket canonicalizes it, and the merge sends it as
+  the API's head-match guard. Commits pushed after the owner's review
+  draw HTTP 409 (or a fresh review), never a merge under the old
+  approval.
+- **Credentials appear on the wire to exactly one host, from exactly one
+  process.** Installation tokens exist only inside the broker and ride in
+  an `Authorization` header to `api.github.com` and nowhere else — never
+  across the broker socket, never in the gateway. No code path logs them,
+  thrown errors are assembled from status codes and a redacted, bounded
+  `message` field, transport failures collapse to fixed sentences (a token
+  FRAGMENT cannot be exact-match redacted, so the channel is removed), and
+  everything crosses a second SecretLedger redaction before an error can
+  reach the agent. The residual leak surface is a compromised broker
+  process itself — which is §4's scenario, now with something
+  real to exfiltrate.
+- **Kill does not revoke a minted installation token.** Same boundary
+  as ever: KILL stops new executions (the executor's live re-checks) AND
+  new merges at the broker (it checks live kill state before every merge,
+  requires the grant's kill epoch to match, and re-checks ACROSS the
+  token mint to catch a kill that lands during it). But a token exists
+  only inside the broker and never crosses the socket, so the only way a
+  token outlives a kill is a broker compromise — and a compromised broker
+  is §4's scenario regardless. GitHub exposes
+  `DELETE /installation/token`; wiring token revocation into the kill
+  path is future hardening, not shipped. Until then the honest bound on
+  a stolen token is one hour and one repository.
+- **The agent-side containments carry unchanged weight.** The upstream
+  child's environment is built explicitly with every credential
+  stripped by name and value, a credential in `upstream.args` is a
+  startup refusal, and `OWNERSWITCH_GITHUB_TOKEN` — the PAT seam the
+  App model replaces — is no longer accepted as a credential at all; if
+  set, it only arms scrubbing and the env-strip.
+
 ---
 
 **Rule of thumb.** Treat the gateway as where decisions are made and

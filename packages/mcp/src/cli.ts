@@ -8,16 +8,24 @@
  */
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { resolve } from "node:path";
 import {
+  createBrokerMergeClient,
+  createGitHubMergeClient,
+  createInstallationTokenSource,
+  createSecretLedger,
   Executor,
   GitHubMergePrExecutor,
   liveKillStateFromControlPlane,
+  loadGitHubAppPrivateKey,
   type ActionTicket,
+  type GitHubMergeClient,
 } from "@ownerswitchai/executor";
 import { createControlPlaneClient } from "@ownerswitchai/gateway";
 import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
+import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy } from "./proxy.js";
 import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
@@ -82,25 +90,105 @@ async function runGateway(argv: string[]): Promise<void> {
   // control-plane client the decision path uses. One Executor instance for
   // the gateway's lifetime — its nonce store is what makes tickets
   // single-use WITHIN THIS PROCESS (see DESIGN.md §5 for the deployment
-  // constraint). The GitHub backend has no HTTP client yet (deliberately
-  // stubbed): a routed call that clears every check still fails at the
-  // backend with a clear "not implemented" until the live client lands.
-  // OWNERSWITCH_GITHUB_TOKEN is the credential seam the live client will
-  // authenticate with; wiring it today only arms the backend's scrubbing of
-  // its own secret — it never widens what the agent can see.
+  // constraint).
+  //
+  // The GitHub connector's credential (DESIGN.md §6), two mutually
+  // exclusive modes resolved by resolveGitHubConnectorEnv:
+  //
+  //  - BROKER (recommended): OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET names
+  //    the UNIX socket of ownerswitch-merge-broker running under its OWN
+  //    uid. The gateway holds NO GitHub credential and NO grant key; it
+  //    relays a control-plane-signed grant to the broker, which VALIDATES it
+  //    and performs the merge itself, returning only the outcome — never a
+  //    token. In the stdio deployment the client spawns this gateway, so
+  //    gateway and agent share a uid; only the executing broker keeps the
+  //    authorization boundary an agent cannot cross. requiresGrant is set,
+  //    so routed merges must clear an owner-gated lane.
+  //
+  //  - SAME-PROCESS (degraded, explicit opt-in via
+  //    OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1): the
+  //    OWNERSWITCH_GITHUB_APP_* triple loads the key into THIS process and
+  //    merges directly (no grant). The key placement check runs against the
+  //    UPSTREAM AGENT'S workspace (config.upstream.cwd — when unset, the
+  //    child inherits this process's cwd, so that is the workspace), and the
+  //    startup line says the isolation this mode does NOT have.
+  //
+  // With neither configured the gateway still runs; routed merges refuse
+  // cleanly as not-configured — at the review-time pin, before any owner
+  // window opens or ticket burns.
+  //
+  // OWNERSWITCH_GITHUB_TOKEN is NOT an accepted credential — a PAT is a
+  // standing, broadly-scoped secret, exactly what DESIGN.md §5 rules out.
+  // If it is set anyway, it still arms the backend's scrubbing and the
+  // upstream env-strip below, so a stray token can never widen what the
+  // agent sees.
   const routes = config.executorRoutes;
   const githubToken = process.env.OWNERSWITCH_GITHUB_TOKEN;
+  const connectorEnv = resolveGitHubConnectorEnv(process.env);
+  const ledger = createSecretLedger();
+  let githubClient: GitHubMergeClient | undefined;
+  let githubAppKeyPem: string | undefined;
+  let requiresGrant = false;
+  let connectorState = "github connector: not configured (routed merges will refuse)";
+  if (connectorEnv?.mode === "broker") {
+    githubClient = createBrokerMergeClient({ socketPath: connectorEnv.socketPath, ledger });
+    requiresGrant = true;
+    connectorState = `github connector: live via EXECUTING merge broker at ${connectorEnv.socketPath} (key + merge authority isolated in the broker's uid; owner-gated grants required)`;
+  } else if (connectorEnv?.mode === "same-process") {
+    const agentWorkspace = resolve(config.upstream.cwd ?? process.cwd());
+    let key;
+    try {
+      key = loadGitHubAppPrivateKey(connectorEnv.privateKeyFile, { workspaceDir: agentWorkspace });
+    } catch (err) {
+      throw new ConfigError(err instanceof Error ? err.message : String(err));
+    }
+    githubAppKeyPem = key.pem;
+    ledger.add(key.pem);
+    githubClient = createGitHubMergeClient({
+      tokens: createInstallationTokenSource({
+        app: {
+          appId: connectorEnv.appId,
+          installationId: connectorEnv.installationId,
+          privateKey: key.key,
+        },
+        ledger,
+      }),
+      ledger,
+    });
+    connectorState = `github connector: live (App ${connectorEnv.appId}) — DEGRADED same-process key: readable by this uid, which the agent shares in stdio deployments`;
+    console.error(
+      "[ownerswitch-mcp] WARNING: same-process GitHub App key (explicitly acknowledged). " +
+        "Any process under this uid — in stdio deployments, the agent — can read the key " +
+        "file, and the gateway performs merges directly with no owner-gated grant. The " +
+        "executing merge broker (ownerswitch-merge-broker) is the deployment that actually " +
+        "isolates the credential and the merge authority. See packages/mcp/THREAT-MODEL.md §5.",
+    );
+  }
   const executor =
     routes !== undefined && Object.keys(routes).length > 0
       ? (() => {
+          const client = githubClient;
           const backend = new GitHubMergePrExecutor(
-            undefined,
+            client,
             githubToken !== undefined && githubToken !== "" ? { token: githubToken } : undefined,
+            (text) => ledger.redact(text),
           );
           const runner = new Executor(backend, {
             fetchLiveKillState: liveKillStateFromControlPlane(controlPlane),
           });
-          return { routes, run: (ticket: ActionTicket) => runner.run(ticket) };
+          return {
+            routes,
+            requiresGrant,
+            run: (ticket: ActionTicket, grant?: unknown) => runner.run(ticket, { grant }),
+            // review-time head pin: server-derived, before the owner sees
+            // the request; absent client = routed merges fail closed at pin
+            ...(client !== undefined
+              ? {
+                  pinHeadSha: (args: { owner: string; repo: string; pullNumber: number }) =>
+                    client.getPullRequestHead(args),
+                }
+              : {}),
+          };
         })()
       : undefined;
 
@@ -135,9 +223,13 @@ async function runGateway(argv: string[]): Promise<void> {
   // both the environment filter (by value AND by known alias name) and the
   // args check below (by value — a credential in argv is a hard refusal,
   // not a filter, since argv is visible to any process that can read it).
+  // The GitHub App PRIVATE KEY rides along: installation tokens minted from
+  // it exist only after startup and can't be inherited, but the key itself
+  // pasted into an env var or an argument absolutely can be.
   const gatewaySecretValues = [
     config.device.secret,
     githubToken,
+    githubAppKeyPem,
     process.env.OWNERSWITCH_CANARY_KEY,
     process.env.OWNERSWITCH_DEVICE_SECRET,
   ];
@@ -176,7 +268,7 @@ async function runGateway(argv: string[]): Promise<void> {
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
       `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}; ` +
-      `executor routes: ${executor !== undefined ? Object.keys(executor.routes).join(", ") : "none (all yes-decisions forward upstream)"}`,
+      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}`,
   );
 }
 

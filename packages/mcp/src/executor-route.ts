@@ -29,13 +29,124 @@ export interface ExecutorWiring {
    * forward(); everything else keeps forwarding exactly as today.
    */
   routes: Record<string, ExecutorRouteConfig>;
-  /** run an already-minted ticket — an Executor instance's run() */
-  run: (ticket: ActionTicket) => Promise<ExecutionOutcome>;
+  /**
+   * Run an already-minted ticket — an Executor instance's run(). `grant` is
+   * the control-plane-signed MergeGrant from a released veto window, relayed
+   * to an executing broker; undefined for the in-process/same-process
+   * backends (and for the allow lane, which is refused when requiresGrant).
+   */
+  run: (ticket: ActionTicket, grant?: unknown) => Promise<ExecutionOutcome>;
+  /**
+   * True for the executing-broker deployment: a routed action MUST carry an
+   * owner-approval grant, so the proxy refuses a routed execution with no
+   * grant (the allow lane, or any path that did not go through a released
+   * veto window). The in-process/same-process wirings leave this false.
+   */
+  requiresGrant?: boolean;
+  /**
+   * The review-time pin for github/merge_pull_request routes: the PR's
+   * CURRENT head sha AND base ref, read with OwnerSwitch's own credential.
+   * The proxy calls this BEFORE the owner sees the request (before a veto
+   * window opens, before a ticket mints) and writes both into the call's
+   * canonical arguments as `expectedHeadSha`/`expectedBaseRef` —
+   * server-derived, never agent-supplied. The base is pinned because
+   * GitHub allows retargeting a PR after approval and the merge API has no
+   * base guard. Absent wiring fails routed merges closed.
+   */
+  pinHeadSha?: (args: {
+    owner: string;
+    repo: string;
+    pullNumber: number;
+  }) => Promise<{ headSha: string; baseRef: string }>;
   /** ticket lifetime in ms; default DEFAULT_TICKET_TTL_MS */
   ticketTtlMs?: number;
   /** injectable for tests */
   now?: () => number;
   mintNonce?: () => string;
+}
+
+/**
+ * The agent-facing input schema for a routed merge tool, advertised by the
+ * proxy in tools/list IN PLACE OF whatever the upstream declares under the
+ * same name. Deliberately closed (`additionalProperties: false`) and
+ * deliberately WITHOUT `expectedHeadSha`: the head sha is pinned by
+ * OwnerSwitch at review time, and an agent-supplied value — stale or
+ * false — is refused at call time (validateMergePrRequestArgs), not merely
+ * undeclared.
+ */
+export const MERGE_PR_AGENT_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    owner: { type: "string", description: "repository owner (user or organization)" },
+    repo: { type: "string", description: "repository name" },
+    pullNumber: { type: "integer", minimum: 1, description: "pull request number" },
+    mergeMethod: { type: "string", enum: ["merge", "squash", "rebase"] },
+  },
+  required: ["owner", "repo", "pullNumber"],
+  additionalProperties: false,
+} as const;
+
+/** The exact, closed key set an agent may send for a routed merge. */
+const MERGE_PR_ALLOWED_KEYS = new Set(["owner", "repo", "pullNumber", "mergeMethod"]);
+const MERGE_METHODS = new Set(["merge", "squash", "rebase"]);
+
+/** The normalized agent-supplied merge request, before OwnerSwitch pins the head. */
+export interface NormalizedMergeRequest {
+  owner: string;
+  repo: string;
+  pullNumber: number;
+  mergeMethod?: "merge" | "squash" | "rebase";
+}
+
+/**
+ * Validates AND NORMALIZES the agent's arguments for a routed merge — the
+ * shape before OwnerSwitch pins the head. It ENFORCES the closed schema
+ * rather than merely advertising it: the exact key set {owner, repo,
+ * pullNumber, mergeMethod}, mergeMethod against the allowed set, and no
+ * others. This matters because the caller builds the canonical action — the
+ * owner-reviewed, hashed, signed bytes — from THIS normalized object, never
+ * from the raw input. A raw MCP client that slips in an unknown field (a
+ * `dryRun: true`, say) would otherwise ride into the owner-reviewed bytes
+ * while execution silently ignored it, breaking approved-bytes ==
+ * executed-semantics. Here an unknown field is a hard refusal, before any
+ * head read, veto window, or ticket.
+ *
+ * `expectedHeadSha` is refused with a specific message (it is a common,
+ * well-meaning mistake) — but it is also just an unknown key, so the closed
+ * set would reject it regardless.
+ */
+export function validateMergePrRequestArgs(args: Record<string, unknown>): NormalizedMergeRequest {
+  for (const pinned of ["expectedHeadSha", "expectedBaseRef"] as const) {
+    if (pinned in args) {
+      throw new Error(
+        `${pinned} is derived by OwnerSwitch at review time and cannot be supplied by ` +
+          `the agent — remove it and call again`,
+      );
+    }
+  }
+  for (const key of Object.keys(args)) {
+    if (!MERGE_PR_ALLOWED_KEYS.has(key)) {
+      throw new Error(
+        `unknown argument "${key}" for merge_pull_request — allowed: owner, repo, pullNumber, mergeMethod`,
+      );
+    }
+  }
+  const { owner, repo, pullNumber, mergeMethod } = args;
+  if (typeof owner !== "string" || owner === "") throw new Error("merge_pull_request requires owner");
+  if (typeof repo !== "string" || repo === "") throw new Error("merge_pull_request requires repo");
+  if (typeof pullNumber !== "number" || !Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+    throw new Error("merge_pull_request requires a safe positive integer pullNumber");
+  }
+  if (mergeMethod !== undefined && (typeof mergeMethod !== "string" || !MERGE_METHODS.has(mergeMethod))) {
+    throw new Error('mergeMethod must be one of "merge", "squash", "rebase"');
+  }
+  // rebuild explicitly — the returned object contains ONLY normalized fields
+  return {
+    owner,
+    repo,
+    pullNumber,
+    ...(mergeMethod !== undefined ? { mergeMethod: mergeMethod as "merge" | "squash" | "rebase" } : {}),
+  };
 }
 
 /**

@@ -3,9 +3,11 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
-  "bin": { "ownerswitch-honeytoken": "dist/cli.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ownerswitch-honeytoken": "dist/cli.js"
+  },
   "dependencies": {
     "@ownerswitchai/control-plane": "workspace:*"
   },
@@ -13,5 +15,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
+  },
+  "exports": {
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   }
 }

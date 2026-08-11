@@ -312,6 +312,48 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 `OWNERSWITCH_UPSTREAM_ARGS` (JSON array), `OWNERSWITCH_POLICY` (JSON),
 `OWNERSWITCH_AGENT_ID`, `OWNERSWITCH_TIMEOUT_MS`, `OWNERSWITCH_EXECUTOR_ROUTES` (JSON).
 
+The GitHub connector's credential is environment-only (never the config
+file, never argv), a GitHub App — not a personal access token — minting
+hour-long installation tokens scoped per merge to one repository. Two
+mutually exclusive modes (`packages/executor/DESIGN.md` §6 for the model
+and provisioning):
+
+- **`OWNERSWITCH_GITHUB_TOKEN_BROKER_SOCKET`** (recommended): the UNIX
+  socket of `ownerswitch-merge-broker`, a separate process under its own
+  uid that alone holds the App private key and **never returns a token** —
+  it validates a control-plane-signed, single-use grant and PERFORMS the
+  merge itself, returning only the outcome. The gateway holds neither the
+  key nor a token. This is the only shape that keeps the authorization
+  boundary an agent cannot cross, since in stdio deployments the gateway
+  shares a uid with the agent (a vended `contents: write` token would be
+  raw push authority). Requires an owner-gated lane (see below).
+- **`OWNERSWITCH_GITHUB_APP_ID` + `OWNERSWITCH_GITHUB_APP_INSTALLATION_ID`
+  + `OWNERSWITCH_GITHUB_APP_PRIVATE_KEY_FILE`** (degraded): loads the key
+  into the gateway process and merges directly. Refused at startup unless
+  `OWNERSWITCH_GITHUB_APP_ACCEPT_SAME_UID_KEY_RISK=1` explicitly accepts
+  that a same-uid agent can read it; starts with a loud warning. A
+  partial triple refuses naming what's missing.
+
+Neither configured runs the gateway with routed merges refusing cleanly
+as not-configured — at the review-time pin, before any owner window
+opens. Routed merges always carry a **mandatory, server-derived
+`expectedHeadSha`**: OwnerSwitch pins the PR's head at review time, the
+owner approves exactly that head, and an agent-supplied sha is refused
+(`-32056`, `refusalCode: "invalid-args"`). In broker mode a routed merge
+also requires an **owner-gated lane** — an `allow`-lane routed merge is
+refused (`-32056`, `refusalCode: "owner-grant-required"`), because the
+merge is authorized by a control-plane grant minted only on the owner's
+**active approval** of that exact pinned call (an owner-session
+`decision=approve`), never on a silent timeout — the gateway that
+registers a window shares the agent's uid, so the agent could open its own
+window, and only a real owner "yes" the agent cannot forge may release a
+merge. The control plane and broker share an `OWNERSWITCH_GRANT_KEY` (and a
+separate `OWNERSWITCH_KILL_STATE_KEY` that authenticates the broker's kill
+check) the gateway never sees — enforced at startup: a gateway that finds
+`OWNERSWITCH_GRANT_KEY` in its environment refuses to run, because in stdio
+deployments anything the gateway can read, the agent can read, and with
+that key grants could be forged.
+
 ## What the agent sees (error codes)
 
 | code | meaning | retry? |
@@ -323,7 +365,7 @@ No file? The same config can come from env vars: `OWNERSWITCH_CONTROL_PLANE_URL`
 | `-32054` `Lockdown` | kill switch engaged, or control plane unreachable | once restored |
 | `-32055` `HoneytokenTripped` | a decoy credential surfaced in the call — the kill is already firing | no |
 | `-32056` `TicketRefused` | an executor-routed action was approved, but refused at execution time: expired, replayed, a kill happened since the approval, or its veto release predates a kill (release "spent") — it did NOT run. The precise guarantee: a ticket is refused if the final pre-dispatch live-state check observes a kill or an epoch change; a kill landing after that check may race with dispatch, and once dispatched it cannot be recalled | a retry starts a fresh owner decision |
-| `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed — the action MAY OR MAY NOT have completed | check the resource first; a retry could duplicate the action |
+| `-32057` `ExecutionFailed` | the executor's backend call failed after the single-use ticket was consumed. The error's `data.connectorOutcome` says which kind: `"not-performed"` (the backend received and refused the request — the action definitively did NOT run) or `"unknown"` (it died on the wire and a post-dispatch verification read could not settle it — the action MAY OR MAY NOT have completed) | `not-performed`: a retry is safe but will likely refuse again until the cause is fixed. `unknown`: check the resource first; a retry could duplicate the action |
 
 Each error's `data` carries the machine-readable detail:
 `{ decision, tool, reason, ruleId, vetoWindowId?, vetoStatus?, refusalCode? }`.

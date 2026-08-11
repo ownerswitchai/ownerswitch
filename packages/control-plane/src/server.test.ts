@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
 import {
@@ -50,7 +51,15 @@ const ephemeral = (opts: Omit<ControlPlaneOptions, "killStateFile" | "dev"> = {}
   const original = console.error;
   console.error = () => {};
   try {
-    return createControlPlane({ ...opts, dev: true, killStateFile: null });
+    // dev instances here approve session-only by design; acknowledge it so
+    // the startup guard (which the WebAuthn suite exercises) stays out of
+    // the way of the non-passkey tests
+    return createControlPlane({
+      acceptSessionOnlyApprovalRisk: true,
+      ...opts,
+      dev: true,
+      killStateFile: null,
+    });
   } finally {
     console.error = original;
   }
@@ -1266,6 +1275,81 @@ describe("control-plane HTTP API", () => {
     expect(window?.vetoedBy).toBe("adam");
   });
 
+  it("POST /veto records the declared PURPOSE and signs it into the grant on active approval", async () => {
+    const c = clock(100_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: "grant-key-cp-and-broker-padded-256bit" });
+    const url = await start(cp);
+
+    const mergeArgs = {
+      owner: "o",
+      repo: "r",
+      pullNumber: 7,
+      expectedHeadSha: "a".repeat(40),
+      expectedBaseRef: "main",
+    };
+    const body = JSON.stringify({
+      call: { agentId: "mcp-proxy", tool: "github.merge_pr", args: mergeArgs },
+      purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" },
+    });
+    const res = await fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+    expect(res.status).toBe(201);
+    const { id } = (await res.json()) as { id: string };
+    expect(cp.vetoWindows.get(id)?.purpose).toEqual({
+      connector: "github",
+      operation: "merge_pull_request",
+      policyVersion: "sha256:pv",
+    });
+
+    // the owner actively approves (owner session) — the only path to a grant
+    const session = createOwnerSession("adam", { now: c.now });
+    await fetch(`${url}/veto/${id}`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    const released = (await (await fetch(`${url}/veto/${id}`)).json()) as {
+      status: string;
+      grant?: { connector: string; operation: string; policyVersion: string };
+    };
+    expect(released.status).toBe("released");
+    expect(released.grant).toMatchObject({
+      connector: "github",
+      operation: "merge_pull_request",
+      policyVersion: "sha256:pv",
+    });
+  });
+
+  it("POST /veto refuses a malformed purpose, and a merge purpose whose args fail the closed schema", async () => {
+    const c = clock(100_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const send = async (payload: unknown): Promise<Response> => {
+      const body = JSON.stringify(payload);
+      return fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+    };
+    const call = { agentId: "a", tool: "t", args: { owner: "o", repo: "r", pullNumber: 7 } };
+
+    // closed purpose schema: unknown field, missing/empty operation
+    for (const purpose of [
+      { connector: "github", operation: "merge_pull_request", extra: 1 },
+      { connector: "github" },
+      { connector: "github", operation: "" },
+    ]) {
+      const res = await send({ call, purpose });
+      expect(res.status).toBe(400);
+    }
+    // a merge-purpose window whose args are NOT exactly one merge
+    // (expectedHeadSha missing) must never be put in front of the owner
+    const res = await send({
+      call, // no expectedHeadSha in args
+      purpose: { connector: "github", operation: "merge_pull_request" },
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toMatch(/closed merge schema/);
+    expect(cp.vetoWindows.size).toBe(0);
+  });
+
   it("POST /veto without a valid signature -> 401, even from loopback, nothing registered", async () => {
     const c = clock(100_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
@@ -1342,5 +1426,460 @@ describe("control-plane HTTP API", () => {
 
     // the server is still alive and well
     expect((await fetch(`${url}/status`)).status).toBe(200);
+  });
+
+  it("GET /kill-state returns a nonce-bound signed envelope (and 501 without a key)", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const withKey = ephemeral({ now: c.now, killStateKey: KILL_KEY });
+    const url = await start(withKey);
+
+    const nonce = "nonce-abc123";
+    const body = (await (await fetch(`${url}/kill-state?nonce=${nonce}`)).json()) as {
+      killed: boolean;
+      epoch: number;
+      nonce: string;
+      expiresAt: number;
+      sig: string;
+    };
+    expect(body.killed).toBe(false);
+    expect(body.nonce).toBe(nonce);
+    expect(body.expiresAt).toBe(c.now() + 5_000);
+    // the signature verifies over exactly {killed, epoch, nonce, expiresAt}
+    const expected = createHmac("sha256", KILL_KEY)
+      .update(
+        canonicalJson({ killed: body.killed, epoch: body.epoch, nonce, expiresAt: body.expiresAt }),
+      )
+      .digest("hex");
+    expect(body.sig).toBe(expected);
+    // no nonce → 400
+    expect((await fetch(`${url}/kill-state`)).status).toBe(400);
+
+    server?.close();
+    // without a kill-state key configured → 501
+    const noKey = ephemeral({ now: c.now });
+    const url2 = await start(noKey);
+    expect((await fetch(`${url2}/kill-state?nonce=x`)).status).toBe(501);
+  });
+
+  it("VETO REVOKES an issued grant: the signed grant-liveness probe flips to false", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+    const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+    const url = await start(cp);
+
+    // an approved merge window whose grant is fetched (the broker's evidence)
+    const window = new VetoWindow(
+      {
+        agentId: "a1",
+        tool: "github.merge_pr",
+        args: {
+          owner: "o",
+          repo: "r",
+          pullNumber: 7,
+          expectedHeadSha: "a".repeat(40),
+          expectedBaseRef: "main",
+        },
+      },
+      0,
+      {
+        now: c.now,
+        purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" },
+      },
+    );
+    window.markDelivered();
+    window.approve("owner-1", 0);
+    cp.vetoWindows.set("v-live", window);
+    const released = (await (await fetch(`${url}/veto/v-live`)).json()) as {
+      grant?: { jti: string };
+    };
+    const jti = released.grant!.jti;
+
+    const probe = async (): Promise<{ jti?: string; grantLive?: boolean; sig: string; killed: boolean; epoch: number; nonce: string; expiresAt: number }> =>
+      (await (await fetch(`${url}/kill-state?nonce=n1&jti=${encodeURIComponent(jti)}`)).json()) as never;
+
+    // before the veto: the plane vouches, and the answer is SIGNED over the probe fields
+    const live = await probe();
+    expect(live.grantLive).toBe(true);
+    expect(live.jti).toBe(jti);
+    const expectedSig = createHmac("sha256", KILL_KEY)
+      .update(
+        canonicalJson({
+          killed: live.killed,
+          epoch: live.epoch,
+          nonce: live.nonce,
+          expiresAt: live.expiresAt,
+          jti: live.jti,
+          grantLive: live.grantLive,
+        }),
+      )
+      .digest("hex");
+    expect(live.sig).toBe(expectedSig);
+
+    // the owner vetoes AFTER issuance — allowed for a purposed window, and
+    // it revokes the outstanding grant
+    const session = createOwnerSession("adam", { now: c.now });
+    const veto = await fetch(`${url}/veto/v-live`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "veto" }),
+    });
+    expect(veto.status).toBe(200);
+    expect((await probe()).grantLive).toBe(false);
+
+    // an unknown jti (or a restarted plane) is never vouched for
+    const unknown = (await (
+      await fetch(`${url}/kill-state?nonce=n2&jti=grant_never_minted`)
+    ).json()) as { grantLive?: boolean };
+    expect(unknown.grantLive).toBe(false);
+  });
+
+  it("ATOMIC COMMIT: a committed grant blocks a later veto (in-flight), and a vetoed grant blocks commit", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+
+    // helper: build a signed broker commit request for a jti
+    const commit = async (base: string, jti: string, nonce: string) => {
+      const ts = c.now();
+      const sig = createHmac("sha256", KILL_KEY)
+        .update(canonicalJson({ jti, nonce, ts }))
+        .digest("hex");
+      return (await (
+        await fetch(`${base}/kill-state/commit`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jti, nonce, ts, sig }),
+        })
+      ).json()) as { committed?: boolean };
+    };
+
+    const makeGrant = async (base: string, cp: ControlPlane, id: string): Promise<string> => {
+      const window = new VetoWindow(
+        {
+          agentId: "a1",
+          tool: "github.merge_pr",
+          args: { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40), expectedBaseRef: "main" },
+        },
+        0,
+        { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+      );
+      window.markDelivered();
+      window.approve("owner-1", 0);
+      cp.vetoWindows.set(id, window);
+      const released = (await (await fetch(`${base}/veto/${id}`)).json()) as { grant?: { jti: string } };
+      return released.grant!.jti;
+    };
+
+    // Case A: COMMIT wins → a later veto is 409 in-flight
+    {
+      const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+      const url = await start(cp);
+      const jti = await makeGrant(url, cp, "v-a");
+      expect((await commit(url, jti, "cn1")).committed).toBe(true);
+      const session = createOwnerSession("adam", { now: c.now });
+      const late = await fetch(`${url}/veto/v-a`, {
+        method: "POST",
+        headers: bearer(session.token),
+        body: JSON.stringify({ decision: "veto" }),
+      });
+      expect(late.status).toBe(409);
+      expect(((await late.json()) as { error: string }).error).toMatch(/in flight/);
+      server?.close();
+    }
+
+    // Case B: VETO wins → the commit that follows returns committed:false
+    {
+      const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+      const url = await start(cp);
+      const jti = await makeGrant(url, cp, "v-b");
+      const session = createOwnerSession("adam", { now: c.now });
+      const veto = await fetch(`${url}/veto/v-b`, {
+        method: "POST",
+        headers: bearer(session.token),
+        body: JSON.stringify({ decision: "veto" }),
+      });
+      expect(veto.status).toBe(200);
+      expect((await commit(url, jti, "cn2")).committed).toBe(false);
+    }
+  });
+
+  it("the commit endpoint refuses an UNSIGNED (agent-forged) request — only the broker may commit", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+    const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      {
+        agentId: "a1",
+        tool: "github.merge_pr",
+        args: { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40), expectedBaseRef: "main" },
+      },
+      0,
+      { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+    );
+    window.markDelivered();
+    window.approve("owner-1", 0);
+    cp.vetoWindows.set("v-1", window);
+    const jti = ((await (await fetch(`${url}/veto/v-1`)).json()) as { grant: { jti: string } }).grant.jti;
+
+    // no valid signature → 401, and the grant stays vetoable
+    const forged = await fetch(`${url}/kill-state/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jti, nonce: "x", ts: c.now(), sig: "00" }),
+    });
+    expect(forged.status).toBe(401);
+    const session = createOwnerSession("adam", { now: c.now });
+    const veto = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "veto" }),
+    });
+    expect(veto.status).toBe(200); // still vetoable — the forged commit did nothing
+  });
+});
+
+describe("MergeGrant issuance on ACTIVE owner approval", () => {
+  let server: Server | undefined;
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  const GRANT_KEY = "grant-key-cp-and-broker-padded-256bit";
+  const MERGE_ARGS = {
+    owner: "ownerswitchai",
+    repo: "ownerswitch",
+    pullNumber: 7,
+    expectedHeadSha: "a".repeat(40),
+    expectedBaseRef: "main",
+  };
+
+  const MERGE_PURPOSE = {
+    connector: "github",
+    operation: "merge_pull_request",
+    policyVersion: "sha256:authzworld",
+  };
+
+  /** A grant-eligible window, delivered but NOT yet approved. */
+  const mergeWindow = (
+    c: ReturnType<typeof clock>,
+    purpose: { connector: string; operation: string; policyVersion: string } | null = MERGE_PURPOSE,
+    args: Record<string, unknown> = MERGE_ARGS,
+  ) => {
+    const window = new VetoWindow({ agentId: "agent-1", tool: "github.merge_pr", args }, 0, {
+      now: c.now,
+      windowMs: 4 * 60_000,
+      ...(purpose !== null ? { purpose } : {}),
+    });
+    window.markDelivered();
+    return window;
+  };
+
+  /** A window the owner has ACTIVELY approved at the current clock/epoch. */
+  const approvedWindow = (c: ReturnType<typeof clock>, epoch = 0) => {
+    const window = mergeWindow(c);
+    window.approve("owner-1", epoch);
+    return window;
+  };
+
+  it("mints a single-use signed grant over the APPROVED call — silence alone mints nothing", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    // delivered + past deadline (would 'release' on the veto lane) but NOT
+    // approved: a merge must NOT mint on silence
+    cp.vetoWindows.set("v-silent", mergeWindow(c));
+    c.advance(4 * 60_000);
+    const silent = (await (await fetch(`${url}/veto/v-silent`)).json()) as {
+      status: string;
+      grant?: unknown;
+    };
+    expect(silent.status).toBe("pending");
+    expect(silent.grant).toBeUndefined();
+
+    // now an actively approved window mints the grant
+    cp.vetoWindows.set("v-ok", approvedWindow(c));
+    const body = (await (await fetch(`${url}/veto/v-ok`)).json()) as {
+      status: string;
+      grant?: { killEpoch: number };
+    };
+    expect(body.status).toBe("released");
+    const verified = verifyMergeGrant(body.grant, GRANT_KEY, { now: c.now });
+    expect(verified.ok).toBe(true);
+    if (verified.ok) {
+      expect(verified.grant.tool).toBe("github.merge_pr");
+      expect(verified.grant.canonicalArgs).toBe(canonicalJson(MERGE_ARGS));
+      expect(verified.grant.killEpoch).toBe(0);
+      expect(verified.grant.connector).toBe("github");
+      expect(verified.grant.operation).toBe("merge_pull_request");
+      expect(verified.grant.policyVersion).toBe("sha256:authzworld");
+    }
+    expect(verifyMergeGrant(body.grant, "wrong-key", { now: c.now }).ok).toBe(false);
+  });
+
+  it("anchors the grant's expiry to the APPROVAL moment, not the read that fetched it", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    const approvedAt = c.now();
+    cp.vetoWindows.set("v-1", approvedWindow(c));
+    // first read 90s AFTER approval — no fresh 2 minutes
+    c.advance(90_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as {
+      status: string;
+      grant?: { expiresAt: number };
+    };
+    expect(body.status).toBe("released");
+    expect(body.grant?.expiresAt).toBe(approvedAt + 2 * 60_000);
+  });
+
+  it("an approval that sat unread past the grant window is SPENT — never a late fresh capability", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", approvedWindow(c));
+    c.advance(3 * 60_000); // grants live 2 min from approval; one minute late
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body.status).toBe("spent");
+    expect(body.grant).toBeUndefined();
+  });
+
+  it("issues the grant AT MOST ONCE — a second read is 'spent', no second grant", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", approvedWindow(c));
+
+    const first = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(first.status).toBe("released");
+    expect(first.grant).toBeDefined();
+    const second = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(second.status).toBe("spent");
+    expect(second.grant).toBeUndefined();
+  });
+
+  it("a kill AFTER approval spends the grant (epoch moved) and mints nothing", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", approvedWindow(c, 0)); // approved at epoch 0
+
+    const killBody = JSON.stringify({ source: "button" });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now()), body: killBody });
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body.status).toBe("spent");
+    expect(body.grant).toBeUndefined();
+  });
+
+  it("POST /veto/:id decision=approve is owner-authenticated, and refused while killed", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", mergeWindow(c));
+
+    // no owner session → 401, nothing approved
+    const bare = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(bare.status).toBe(401);
+    expect(cp.vetoWindows.get("v-1")?.approvedBy).toBeNull();
+
+    // engage the kill, then an owner approval must be REFUSED (409) — no
+    // approval may be minted while killed
+    const killBody = JSON.stringify({ source: "button" });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now()), body: killBody });
+    const session = createOwnerSession("adam", { now: c.now });
+    const whileKilled = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(whileKilled.status).toBe(409);
+    expect(cp.vetoWindows.get("v-1")?.approvedBy).toBeNull();
+  });
+
+  it("POST /veto/:id decision=approve refuses a non-grant-eligible window (400)", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-plain", mergeWindow(c, null)); // no purpose
+    const session = createOwnerSession("adam", { now: c.now });
+    const res = await fetch(`${url}/veto/v-plain`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("the full loop: approve over HTTP, then the next read mints the grant", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", mergeWindow(c));
+
+    // before approval, a read is 'pending'
+    expect(((await (await fetch(`${url}/veto/v-1`)).json()) as { status: string }).status).toBe(
+      "pending",
+    );
+    const session = createOwnerSession("adam", { now: c.now });
+    const approve = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approve.status).toBe(200);
+    expect(await approve.json()).toEqual({ status: "approved" });
+
+    const released = (await (await fetch(`${url}/veto/v-1`)).json()) as {
+      status: string;
+      grant?: unknown;
+    };
+    expect(released.status).toBe("released");
+    expect(released.grant).toBeDefined();
+  });
+
+  it("mints NO grant for a merge-purpose window whose args fail the closed schema", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now, grantKey: GRANT_KEY });
+    const url = await start(cp);
+    const window = mergeWindow(c, MERGE_PURPOSE, { ...MERGE_ARGS, dryRun: true });
+    // even if somehow approved, args that fail the closed schema are not
+    // grant-eligible, so no grant is ever minted
+    window.approve("owner-1", 0);
+    cp.vetoWindows.set("v-bad", window);
+
+    const body = (await (await fetch(`${url}/veto/v-bad`)).json()) as { status: string; grant?: unknown };
+    expect(body.grant).toBeUndefined();
+  });
+
+  it("no grant key configured → a merge window is never grant-eligible", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now }); // no grantKey
+    const url = await start(cp);
+    cp.vetoWindows.set("v-1", approvedWindow(c));
+    c.advance(4 * 60_000);
+
+    const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
+    expect(body.grant).toBeUndefined();
   });
 });
