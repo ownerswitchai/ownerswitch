@@ -1,8 +1,9 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
+  buildRenderableApproval,
   canonicalJson,
   GITHUB_CONNECTOR,
   MERGE_PULL_REQUEST,
@@ -158,8 +159,23 @@ export interface ControlPlaneOptions {
     credentialId: string;
     publicKeyPem: string;
     rpId: string;
-    origin?: string;
+    /**
+     * The exact origin the owner app runs at (e.g. https://owner.example) —
+     * REQUIRED, and https:// outside dev. WebAuthn's phishing resistance is
+     * the origin binding, so it is not optional; the control plane refuses
+     * to start with an enrolled passkey and no (or a non-https) origin.
+     */
+    origin: string;
   };
+  /**
+   * Explicit acknowledgment that this DEV control plane mints merge grants
+   * on a SESSION-ONLY approval (a reusable bearer token), with no passkey.
+   * Required to start a dev control plane that has a grant key but no
+   * `ownerPasskey` — otherwise it refuses, so a session-only approval
+   * boundary is never reached by accident. Ignored in production (where a
+   * passkey is mandatory) and irrelevant without a grant key.
+   */
+  acceptSessionOnlyApprovalRisk?: boolean;
 }
 
 /** Default kill-state location IN DEV MODE, resolved against the working directory. */
@@ -358,6 +374,38 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         "and must carry at least 256 bits of secret; generate one with `openssl rand -hex 32`",
     );
   }
+  // An enrolled approval passkey needs an exact origin — https:// outside
+  // dev — because WebAuthn's phishing resistance IS the origin binding.
+  if (opts.ownerPasskey !== undefined) {
+    const origin = opts.ownerPasskey.origin;
+    if (typeof origin !== "string" || origin === "") {
+      throw new Error(
+        "ownerPasskey.origin is required — WebAuthn assertion verification must bind the exact " +
+          "origin the owner app runs at (e.g. https://owner.example)",
+      );
+    }
+    if (opts.dev !== true && !origin.startsWith("https://")) {
+      throw new Error(
+        `ownerPasskey.origin must be https:// in production, got "${origin}" — an http origin ` +
+          "defeats the phishing-resistance the passkey provides",
+      );
+    }
+  }
+  // A control plane that mints merge grants but has no passkey approves on a
+  // reusable bearer session — the weaker boundary. In production that path
+  // is simply refused (the approve handler returns 403). In DEV it stays
+  // available for the quickstart, but only behind an explicit written
+  // acknowledgment, so it is never reached by accident.
+  const grantsWithoutPasskey =
+    opts.grantKey !== undefined && opts.grantKey !== "" && opts.ownerPasskey === undefined;
+  if (grantsWithoutPasskey && opts.dev === true && opts.acceptSessionOnlyApprovalRisk !== true) {
+    throw new Error(
+      "this control plane has a grant key but no enrolled ownerPasskey, so it would approve " +
+        "merges on a reusable owner SESSION alone. In dev that requires " +
+        "acceptSessionOnlyApprovalRisk: true (env OWNERSWITCH_ACCEPT_SESSION_ONLY_APPROVAL_RISK=1); " +
+        "in production, enroll a passkey instead.",
+    );
+  }
   const killSwitch = new KillSwitch(
     now,
     killStateFile === undefined ? {} : { store: new KillStateFileStore(killStateFile) },
@@ -377,7 +425,19 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // process-local: a restart forgets outstanding grants, which fails
   // CLOSED — a grant this plane cannot vouch for does not dispatch.
   const mintedGrants = new Map<string, string>();
+  // Reverse of mintedGrants for the veto path: a window id → its grant jti,
+  // so a veto can tell whether the grant is already committed for dispatch.
+  const windowToGrant = new Map<string, string>();
+  // Grants the broker has ATOMICALLY committed for dispatch. Once a jti is
+  // here, a merge is in flight and a later veto is too late; before it is
+  // here, a veto still revokes. The commit handler and the veto handler are
+  // the only writers, both synchronous, so they cannot interleave — the
+  // race has exactly one winner.
+  const committedGrants = new Set<string>();
   const grantTtlMs = opts.grantTtlMs ?? 2 * 60_000;
+  // How long a broker's signed commit request may be in flight before the
+  // control plane rejects it as stale (replay bound).
+  const COMMIT_REQUEST_SKEW_MS = 30_000;
   // Outstanding approval ceremonies, one per window: the server-minted
   // challenge the owner's passkey must sign, bound to the exact call
   // (callHash) it would approve. Redeemed ATOMICALLY (deleted before
@@ -386,7 +446,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // requests a fresh one, which only they can complete anyway.
   const approvalChallenges = new Map<
     string,
-    { challenge: string; callHash: string; expiresAt: number }
+    { challenge: string; callHash: string; renderHash: string; killEpoch: number; expiresAt: number }
   >();
   const APPROVAL_CHALLENGE_TTL_MS = 2 * 60_000;
   // last accepted signature counter for the enrolled passkey (clone signal)
@@ -498,6 +558,93 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 200, { ...payload, sig, ...degradedFields() });
   }
 
+  /**
+   * The ATOMIC commit-for-dispatch. The broker calls this as its FINAL
+   * check before the merge PUT, and the answer is authoritative rather than
+   * a snapshot: this control plane transitions the grant
+   * live→committed-for-dispatch here, and a concurrent veto competes for
+   * the same jti. Because both this handler and the veto handler are
+   * synchronous (no await between reading the state and writing it), the
+   * race has exactly one winner — if commit runs first the veto that
+   * follows is "in flight" (409), if veto runs first this returns
+   * committed:false and the broker sends nothing.
+   *
+   * The REQUEST is HMAC-signed with the shared kill-state key so ONLY the
+   * broker can commit — otherwise a same-uid agent could pre-commit a grant
+   * to lock it in ahead of the owner's veto. The response is signed and
+   * nonce-bound exactly like the read probe.
+   */
+  async function postGrantCommit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (opts.killStateKey === undefined || opts.killStateKey === "") {
+      sendJson(res, 501, { error: "signed kill-state channel is not configured" });
+      return;
+    }
+    const parsed = parseJsonBody(await readRawBody(req));
+    const jti = parsed.jti;
+    const nonce = parsed.nonce;
+    const ts = parsed.ts;
+    const reqSig = parsed.sig;
+    if (
+      typeof jti !== "string" ||
+      jti === "" ||
+      jti.length > 256 ||
+      typeof nonce !== "string" ||
+      nonce === "" ||
+      nonce.length > 128 ||
+      typeof ts !== "number" ||
+      !Number.isFinite(ts) ||
+      typeof reqSig !== "string" ||
+      reqSig === ""
+    ) {
+      sendJson(res, 400, { error: "commit requires {jti, nonce, ts, sig}" });
+      return;
+    }
+    // authenticate the REQUEST: only the broker holds the key
+    const expectedReqSig = createHmac("sha256", opts.killStateKey)
+      .update(canonicalJson({ jti, nonce, ts }))
+      .digest();
+    const providedReqSig = Buffer.from(reqSig, "hex");
+    if (
+      providedReqSig.length !== expectedReqSig.length ||
+      !timingSafeEqual(providedReqSig, expectedReqSig)
+    ) {
+      sendUnauthorized(res);
+      return;
+    }
+    if (Math.abs(now() - ts) > COMMIT_REQUEST_SKEW_MS) {
+      sendJson(res, 401, { error: "commit request timestamp is stale" });
+      return;
+    }
+
+    // THE ATOMIC TRANSITION — no await from here to the state write.
+    const windowId = mintedGrants.get(jti);
+    const window = windowId === undefined ? undefined : vetoWindows.get(windowId);
+    let committed: boolean;
+    if (
+      window === undefined ||
+      window.state === "vetoed" ||
+      killSwitch.killed ||
+      window.approvalEpoch !== killSwitch.epoch
+    ) {
+      // a veto/kill/epoch-move won, or the grant is unknown — do NOT commit
+      committed = false;
+    } else {
+      committedGrants.add(jti); // idempotent: a retried commit stays committed
+      committed = true;
+    }
+
+    const payload = {
+      killed: killSwitch.killed,
+      epoch: killSwitch.epoch,
+      nonce,
+      expiresAt: now() + KILL_STATE_TTL_MS,
+      jti,
+      committed,
+    };
+    const sig = createHmac("sha256", opts.killStateKey).update(canonicalJson(payload)).digest("hex");
+    sendJson(res, 200, { ...payload, sig });
+  }
+
   function getStatus(res: ServerResponse): void {
     if (!killSwitch.killed) {
       sendJson(res, 200, { killed: false, epoch: killSwitch.epoch, ...degradedFields() });
@@ -535,6 +682,10 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const source = authenticated ? claimed : "api";
     const reason = typeof body.reason === "string" ? body.reason : undefined;
     killSwitch.engage(source, reason, { unauthenticated: !authenticated });
+    // A kill voids every outstanding approval ceremony: a challenge minted
+    // before the kill must never be redeemable after a restore (its epoch
+    // no longer matches, but clearing is the belt to that suspenders).
+    approvalChallenges.clear();
     // The kill is in force in memory no matter what; the response only claims
     // durability when the persist actually succeeded.
     sendJson(res, 200, { killed: true, ...degradedFields() });
@@ -765,6 +916,19 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
           });
           return;
         }
+        // EPOCH binding: a ceremony minted in one kill epoch must not
+        // authorize a merge in another. A challenge created before a kill
+        // could otherwise survive a restore (within its TTL) and, redeemed
+        // after, bind window.approve() to the post-restore epoch — laundering
+        // a pre-kill "yes" into a post-kill world. (Kills also clear the map;
+        // this is the belt to that suspenders, and covers the epoch moving
+        // without a kill-in-force at redemption time.)
+        if (ceremony.killEpoch !== killSwitch.epoch) {
+          sendJson(res, 401, {
+            error: "the approval ceremony was minted in a different kill epoch — request a fresh one",
+          });
+          return;
+        }
         // the ceremony binds the exact call; if the window's args changed
         // out from under it (impossible via this API, checked anyway), the
         // signature must not be transferable to the new bytes
@@ -784,9 +948,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         const verdict = verifyOwnerAssertion(assertion, {
           passkey: opts.ownerPasskey,
           rpId: opts.ownerPasskey.rpId,
-          ...(opts.ownerPasskey.origin !== undefined
-            ? { expectedOrigin: opts.ownerPasskey.origin }
-            : {}),
+          expectedOrigin: opts.ownerPasskey.origin,
           expectedChallenge: ceremony.challenge,
           lastSignCount: passkeySignCount,
         });
@@ -811,6 +973,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
       }
+      return;
+    }
+    // Too late to veto once the grant is COMMITTED for dispatch: the merge
+    // is in flight and cannot be recalled. Reported honestly rather than
+    // accepting a veto that does nothing. This branch and the commit handler
+    // are synchronous, so exactly one of them wins the race.
+    const grantJti = windowToGrant.get(id);
+    if (grantJti !== undefined && committedGrants.has(grantJti)) {
+      sendJson(res, 409, {
+        error: "the approved merge is already committed for dispatch (in flight) — too late to veto",
+      });
       return;
     }
     try {
@@ -882,19 +1055,43 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return;
     }
     await readRawBody(req); // drain
+    // RE-CHECK kill AFTER the await: a kill can land while the body drains,
+    // and a challenge minted into a killed world must not exist.
+    if (killSwitch.killed) {
+      sendJson(res, 409, { error: "cannot open an approval ceremony while the kill switch is engaged" });
+      return;
+    }
+    // The TYPED, per-field renderable the owner app displays — never raw
+    // canonical JSON — with every string field proven safe to display. Its
+    // hash is bound into the ceremony, so the passkey signs a challenge tied
+    // to exactly the transaction the owner saw.
+    let renderable;
+    try {
+      renderable = buildRenderableApproval(parseMergePrArgs(canonicalArgs));
+    } catch (err) {
+      sendJson(res, 400, {
+        error: `cannot render this call for owner approval: ${err instanceof Error ? err.message : "unsafe"}`,
+      });
+      return;
+    }
+    const renderHash = sha256Hex(canonicalJson(renderable));
     const challenge = randomBytes(32).toString("base64url");
     approvalChallenges.set(id, {
       challenge,
       callHash: sha256Hex(canonicalArgs),
+      renderHash,
+      killEpoch: killSwitch.epoch,
       expiresAt: now() + APPROVAL_CHALLENGE_TTL_MS,
     });
     sendJson(res, 200, {
       challenge,
       rpId: opts.ownerPasskey.rpId,
       credentialId: opts.ownerPasskey.credentialId,
-      // what the ceremony approves, for the owner app's display surface
+      // what the ceremony approves — a typed, sanitized, per-field render for
+      // the owner app, plus the hashes the challenge is bound to
+      renderable,
+      renderHash,
       callHash: sha256Hex(canonicalArgs),
-      canonicalArgs,
       expiresAt: now() + APPROVAL_CHALLENGE_TTL_MS,
     });
   }
@@ -1095,9 +1292,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   ): SignedMergeGrant {
     const purpose = window.purpose as VetoPurpose; // grantEligibleArgs guaranteed it
     const jti = `grant_${windowId}_${randomBytes(8).toString("hex")}`;
-    // remember the mint so the broker's grant-liveness probe can be
-    // answered — and so a veto on this window revokes the grant
+    // remember the mint (both directions) so the broker's grant-liveness
+    // probe and atomic commit can be answered — and so a veto on this
+    // window can find and revoke the grant
     mintedGrants.set(jti, windowId);
+    windowToGrant.set(windowId, jti);
     return signMergeGrant(
       {
         v: 2,
@@ -1135,6 +1334,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
+    if (method === "POST" && path === "/kill-state/commit") return postGrantCommit(req, res);
     if (method === "POST" && approvalChallengeMatch) {
       return postApprovalChallenge(req, res, decodeURIComponent(approvalChallengeMatch[1]));
     }

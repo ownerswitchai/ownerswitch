@@ -39,6 +39,30 @@ The point of doing this properly in a test run is that the run rehearses
 the deployment rule: the key belongs to a uid the gateway and agent do
 NOT share, and the broker performs the merge — it never hands out a token.
 
+**Run only INSTALLED, root-owned artifacts — never a user checkout.** The
+broker and the control plane hold the HMAC keys and the App PEM, so the
+CODE they execute must be immutable to the agent: a same-uid agent that can
+edit files in your working copy could rewrite `dev-control-plane.ts` (or
+the broker entrypoint) and wait for a restart, and the isolated process
+would then run attacker-controlled code holding both keys. Build once and
+install the built `dist/` to a root-owned tree the service uids can execute
+but not write:
+
+```sh
+pnpm -r build
+sudo mkdir -p /opt/ownerswitch
+sudo cp -R . /opt/ownerswitch/src            # or install just the built dist/ trees
+sudo chown -R root:root /opt/ownerswitch     # root-owned: no service uid can modify the code
+sudo chmod -R go-w /opt/ownerswitch
+```
+
+Launch every service from `/opt/ownerswitch` (absolute paths), under
+systemd units whose `ExecStart` names an absolute, root-owned binary —
+never `pnpm ... dev:control-plane` from your home directory. The commands
+below use `/opt/ownerswitch` to make the point; a production deployment
+uses packaged artifacts and `systemd` service files with `User=`,
+`SupplementaryGroups=`, `LoadCredential=` and `ReadOnlyPaths=/opt/ownerswitch`.
+
 Create **three** distinct uids and two groups. The broker owns the App PEM
 and the burn store; the control plane runs as a SEPARATE uid (it must not
 be able to read the App PEM); the gateway is your own user. A secrets
@@ -99,10 +123,13 @@ sudo -u oswitch-broker sg oswitch -c '
   OWNERSWITCH_BROKER_SOCKET_GID='"$OSWITCH_GID"'
   OWNERSWITCH_BROKER_BURN_DIR=/var/lib/ownerswitch/burns
   OWNERSWITCH_BROKER_ALLOWED_REPOS=ownerswitch-live-test
-  OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:8787
+  OWNERSWITCH_CONTROL_PLANE_URL=http://127.0.0.1:4600
   set +a
   exec ownerswitch-merge-broker'
 ```
+
+(The control-plane URL is `:4600` — the port the control plane listens on
+below. Keep the two in lock-step.)
 
 (In production this is a systemd unit with `User=oswitch-broker`,
 `SupplementaryGroups=oswitch`, and `LoadCredential=`/`EnvironmentFile=` for
@@ -143,24 +170,40 @@ OwnerSwitch pins it server-side.
 
 ## 4. Run the control plane and the gateway
 
-Start the dev control plane as its OWN uid (`oswitch-cp`), reading BOTH
-shared keys from their files into its environment — never argv. It uses
-the grant key to sign approvals and the kill-state key to sign the
-broker's kill-state channel:
+Start the PRODUCTION control plane as its OWN uid (`oswitch-cp`), from the
+installed artifact, reading its secrets from files into its environment —
+never argv. This is `control-plane` (dev:false), NOT `dev:control-plane`:
+it enforces the hardened kill-state path, the ≥256-bit key floors, the
+https-origin requirement, and — because a passkey is enrolled — it requires
+a fresh WebAuthn assertion for every merge approval (a reusable owner
+session alone is refused). Enroll the owner's approval passkey in the owner
+app first; that yields a credential id, an SPKI public-key PEM, an rpId and
+the app's exact https origin, provided here as configuration:
 
 ```sh
 sudo -u oswitch-cp sg oswitch-secrets -c '
   set -a
+  OWNERSWITCH_CONTROL_PLANE_PORT=4600
+  OWNERSWITCH_DEVICE_SECRET="$(cat /etc/ownerswitch/device.secret)"
+  OWNERSWITCH_KILL_STATE_FILE=/var/lib/ownerswitch/kill-state.json
   OWNERSWITCH_GRANT_KEY="$(cat /etc/ownerswitch/grant.key)"
   OWNERSWITCH_KILL_STATE_KEY="$(cat /etc/ownerswitch/kill-state.key)"
+  OWNERSWITCH_OWNER_PASSKEY_CREDENTIAL_ID="$(cat /etc/ownerswitch/passkey.credential-id)"
+  OWNERSWITCH_OWNER_PASSKEY_PUBLIC_KEY_FILE=/etc/ownerswitch/passkey.pub.pem
+  OWNERSWITCH_OWNER_PASSKEY_RP_ID=owner.example
+  OWNERSWITCH_OWNER_PASSKEY_ORIGIN=https://owner.example
   set +a
-  exec pnpm --filter @ownerswitchai/mcp dev:control-plane'
+  exec node /opt/ownerswitch/src/packages/mcp/dist/control-plane.js'
 ```
 
 The control plane runs where the agent's uid cannot read its environment,
-so the keys it holds are out of the agent's reach — the same isolation the
-broker gets, and the reason it is a distinct uid from both the gateway and
-(so it cannot read the App PEM) the broker.
+from code the agent cannot rewrite, so the keys it holds are out of the
+agent's reach — the same isolation the broker gets, and the reason it is a
+distinct uid from both the gateway and (so it cannot read the App PEM) the
+broker. (The 5-minute QUICKSTART uses `dev:control-plane`, which approves
+on a reusable session and must set
+`OWNERSWITCH_ACCEPT_SESSION_ONLY_APPROVAL_RISK=1` to start with a grant key
+but no passkey — that path is for the quickstart only, never a live merge.)
 
 Then launch the gateway with a config whose policy puts `github.merge_pr`
 in an **owner-gated lane** and whose `executorRoutes` maps it to

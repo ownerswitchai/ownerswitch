@@ -107,6 +107,48 @@ describe("signedLiveKillStateFromControlPlane", () => {
     ).toThrowError(/kill-state key/);
   });
 
+  it("the COMMIT posts a signed request and verifies the signed answer", async () => {
+    let seen: { method?: string; body?: unknown } = {};
+    const committingCp = (committed: boolean, tamper = false): typeof fetch =>
+      (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        seen = { method: init?.method, body: JSON.parse(String(init?.body)) };
+        const reqBody = seen.body as { jti: string; nonce: string; ts: number; sig: string };
+        // the control plane authenticates the REQUEST signature
+        const expectedReqSig = createHmac("sha256", KEY)
+          .update(canonicalJson({ jti: reqBody.jti, nonce: reqBody.nonce, ts: reqBody.ts }))
+          .digest("hex");
+        expect(reqBody.sig).toBe(expectedReqSig);
+        const payload = {
+          killed: false,
+          epoch: 0,
+          nonce: reqBody.nonce,
+          expiresAt: NOW + 5_000,
+          jti: reqBody.jti,
+          committed,
+        };
+        const sig = createHmac("sha256", tamper ? "wrong" : KEY)
+          .update(canonicalJson(payload))
+          .digest("hex");
+        return new Response(JSON.stringify({ ...payload, sig }), { status: 200 });
+      }) as typeof fetch;
+
+    // committed:true rides back verified
+    const ok = await reader(committingCp(true))({ jti: "jti-1", commit: true });
+    expect(seen.method).toBe("POST");
+    expect(ok).toEqual({ killed: false, epoch: 0, committed: true });
+    // committed:false (veto won the race) rides back verified
+    expect(await reader(committingCp(false))({ jti: "jti-1", commit: true })).toEqual({
+      killed: false,
+      epoch: 0,
+      committed: false,
+    });
+    // a tampered commit answer → KILLED (no committed=true slips through)
+    expect(await reader(committingCp(true, true))({ jti: "jti-1", commit: true })).toEqual({
+      killed: true,
+      epoch: -1,
+    });
+  });
+
   it("carries a SIGNED grant-liveness answer when probed — and fails closed when it is dodged or tampered", async () => {
     const probing = (grantLive: boolean | undefined, tamper = false): typeof fetch =>
       (async (input: Parameters<typeof fetch>[0]) => {

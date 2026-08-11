@@ -54,6 +54,33 @@ const MERGE_PR_CANONICAL_KEYS: ReadonlySet<string> = new Set([
 const MAX_BASE_REF_LENGTH = 300;
 
 /**
+ * Rejects strings that would be UNSAFE TO DISPLAY to the owner: a signed
+ * approval is worthless if the bytes the owner saw are not the bytes that
+ * execute, and Unicode gives many ways to make "main" render as something
+ * else. We refuse (not sanitize — sanitizing invites its own confusion):
+ *  - C0/C1 control characters and DEL;
+ *  - bidirectional formatting controls (LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI,
+ *    LRM/RLM/ALM) — the classic "reorder the visible identifier" attack;
+ *  - line/paragraph separators (U+2028/U+2029);
+ *  - the zero-width joiners/non-joiner and BOM;
+ *  - anything not in Unicode NFC form, so one code-point sequence has one
+ *    representation both when hashed and when rendered.
+ * Git itself permits many of these in ref names, so the pin cannot lean on
+ * git's rules; OwnerSwitch's display contract is stricter than git on
+ * purpose.
+ */
+const UNSAFE_DISPLAY_CHARS =
+  // eslint-disable-next-line no-control-regex -- refusing control chars is the point
+  /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u2028\u2029\ufeff]/u;
+
+export function isSafeToDisplay(value: string): boolean {
+  if (UNSAFE_DISPLAY_CHARS.test(value)) return false;
+  // NFC idempotence: the value must already be in normalized form, so the
+  // hash the owner's device signs over covers exactly the glyphs shown.
+  return value.normalize("NFC") === value;
+}
+
+/**
  * Parse canonical merge arguments STRICTLY: the closed key set above, the
  * allowed merge methods, a full-length head sha. An unknown key is a hard
  * error, never ignored — arguments that carry a field execution would not
@@ -106,17 +133,20 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
     );
   }
   // MANDATORY, server-derived like the head sha: the merge destination the
-  // owner approved. Non-empty, bounded, no control characters — it is
-  // compared as an exact string against GitHub's reported base ref.
+  // owner approved. Non-empty, bounded, and SAFE TO DISPLAY — the owner sees
+  // and approves this branch name, so a bidi override or a non-NFC form that
+  // renders as a different branch is refused, not just C0 controls. Compared
+  // as an exact string against GitHub's reported base ref.
   if (
     typeof expectedBaseRef !== "string" ||
     expectedBaseRef === "" ||
     expectedBaseRef.length > MAX_BASE_REF_LENGTH ||
-    /[\u0000-\u001f\u007f]/.test(expectedBaseRef)
+    !isSafeToDisplay(expectedBaseRef)
   ) {
     throw new Error(
       "merge_pull_request requires expectedBaseRef: the destination branch pinned by " +
-        "OwnerSwitch at review time (non-empty, printable, bounded)",
+        "OwnerSwitch at review time (non-empty, bounded, and free of control/bidi/format " +
+        "characters that could spoof the displayed branch)",
     );
   }
   return {
@@ -126,5 +156,54 @@ export function parseMergePrArgs(canonicalArgs: string): MergePrArgs {
     expectedHeadSha,
     expectedBaseRef,
     ...(mergeMethod !== undefined ? { mergeMethod } : {}),
+  };
+}
+
+/**
+ * RenderableApprovalV1 — the TYPED, per-field structure the owner's app
+ * displays and approves. The owner does not read raw canonical JSON: they
+ * read named fields, each already proven safe to display, and their passkey
+ * signs a challenge bound to the HASH of this exact structure. That closes
+ * the gap the reviewer named: WebAuthn proves user verification over the
+ * challenge, but only binding the challenge to a hashed, sanitized,
+ * per-field rendering proves the owner saw the transaction that will run.
+ */
+export interface RenderableApprovalV1 {
+  v: 1;
+  action: "github.merge_pull_request";
+  owner: string;
+  repo: string;
+  pullNumber: number;
+  expectedHeadSha: string;
+  expectedBaseRef: string;
+  mergeMethod: "merge" | "squash" | "rebase" | "default";
+}
+
+/**
+ * Build the renderable from parsed merge args, re-validating EVERY string
+ * field as safe to display (owner/repo/base/head). Throws if any field is
+ * unsafe — the owner must never be shown, or asked to approve, a spoofable
+ * identifier.
+ */
+export function buildRenderableApproval(args: MergePrArgs): RenderableApprovalV1 {
+  for (const [field, value] of [
+    ["owner", args.owner],
+    ["repo", args.repo],
+    ["expectedBaseRef", args.expectedBaseRef],
+    ["expectedHeadSha", args.expectedHeadSha],
+  ] as const) {
+    if (!isSafeToDisplay(value)) {
+      throw new Error(`merge_pull_request ${field} is not safe to display`);
+    }
+  }
+  return {
+    v: 1,
+    action: "github.merge_pull_request",
+    owner: args.owner,
+    repo: args.repo,
+    pullNumber: args.pullNumber,
+    expectedHeadSha: args.expectedHeadSha,
+    expectedBaseRef: args.expectedBaseRef,
+    mergeMethod: args.mergeMethod ?? "default",
   };
 }

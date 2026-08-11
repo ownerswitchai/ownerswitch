@@ -51,7 +51,15 @@ const ephemeral = (opts: Omit<ControlPlaneOptions, "killStateFile" | "dev"> = {}
   const original = console.error;
   console.error = () => {};
   try {
-    return createControlPlane({ ...opts, dev: true, killStateFile: null });
+    // dev instances here approve session-only by design; acknowledge it so
+    // the startup guard (which the WebAuthn suite exercises) stays out of
+    // the way of the non-passkey tests
+    return createControlPlane({
+      acceptSessionOnlyApprovalRisk: true,
+      ...opts,
+      dev: true,
+      killStateFile: null,
+    });
   } finally {
     console.error = original;
   }
@@ -1525,6 +1533,112 @@ describe("control-plane HTTP API", () => {
       await fetch(`${url}/kill-state?nonce=n2&jti=grant_never_minted`)
     ).json()) as { grantLive?: boolean };
     expect(unknown.grantLive).toBe(false);
+  });
+
+  it("ATOMIC COMMIT: a committed grant blocks a later veto (in-flight), and a vetoed grant blocks commit", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+
+    // helper: build a signed broker commit request for a jti
+    const commit = async (base: string, jti: string, nonce: string) => {
+      const ts = c.now();
+      const sig = createHmac("sha256", KILL_KEY)
+        .update(canonicalJson({ jti, nonce, ts }))
+        .digest("hex");
+      return (await (
+        await fetch(`${base}/kill-state/commit`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jti, nonce, ts, sig }),
+        })
+      ).json()) as { committed?: boolean };
+    };
+
+    const makeGrant = async (base: string, cp: ControlPlane, id: string): Promise<string> => {
+      const window = new VetoWindow(
+        {
+          agentId: "a1",
+          tool: "github.merge_pr",
+          args: { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40), expectedBaseRef: "main" },
+        },
+        0,
+        { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+      );
+      window.markDelivered();
+      window.approve("owner-1", 0);
+      cp.vetoWindows.set(id, window);
+      const released = (await (await fetch(`${base}/veto/${id}`)).json()) as { grant?: { jti: string } };
+      return released.grant!.jti;
+    };
+
+    // Case A: COMMIT wins → a later veto is 409 in-flight
+    {
+      const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+      const url = await start(cp);
+      const jti = await makeGrant(url, cp, "v-a");
+      expect((await commit(url, jti, "cn1")).committed).toBe(true);
+      const session = createOwnerSession("adam", { now: c.now });
+      const late = await fetch(`${url}/veto/v-a`, {
+        method: "POST",
+        headers: bearer(session.token),
+        body: JSON.stringify({ decision: "veto" }),
+      });
+      expect(late.status).toBe(409);
+      expect(((await late.json()) as { error: string }).error).toMatch(/in flight/);
+      server?.close();
+    }
+
+    // Case B: VETO wins → the commit that follows returns committed:false
+    {
+      const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+      const url = await start(cp);
+      const jti = await makeGrant(url, cp, "v-b");
+      const session = createOwnerSession("adam", { now: c.now });
+      const veto = await fetch(`${url}/veto/v-b`, {
+        method: "POST",
+        headers: bearer(session.token),
+        body: JSON.stringify({ decision: "veto" }),
+      });
+      expect(veto.status).toBe(200);
+      expect((await commit(url, jti, "cn2")).committed).toBe(false);
+    }
+  });
+
+  it("the commit endpoint refuses an UNSIGNED (agent-forged) request — only the broker may commit", async () => {
+    const c = clock(100_000);
+    const KILL_KEY = "kill-state-key-cp-and-broker-256bit";
+    const GRANT_KEY2 = "grant-key-cp-and-broker-padded-256bit";
+    const cp = ephemeral({ now: c.now, killStateKey: KILL_KEY, grantKey: GRANT_KEY2 });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      {
+        agentId: "a1",
+        tool: "github.merge_pr",
+        args: { owner: "o", repo: "r", pullNumber: 7, expectedHeadSha: "a".repeat(40), expectedBaseRef: "main" },
+      },
+      0,
+      { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+    );
+    window.markDelivered();
+    window.approve("owner-1", 0);
+    cp.vetoWindows.set("v-1", window);
+    const jti = ((await (await fetch(`${url}/veto/v-1`)).json()) as { grant: { jti: string } }).grant.jti;
+
+    // no valid signature → 401, and the grant stays vetoable
+    const forged = await fetch(`${url}/kill-state/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jti, nonce: "x", ts: c.now(), sig: "00" }),
+    });
+    expect(forged.status).toBe(401);
+    const session = createOwnerSession("adam", { now: c.now });
+    const veto = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "veto" }),
+    });
+    expect(veto.status).toBe(200); // still vetoable — the forged commit did nothing
   });
 });
 

@@ -20,6 +20,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "dev:control-plane": "tsx src/dev-control-plane.ts"
+    "dev:control-plane": "tsx src/dev-control-plane.ts",
+    "control-plane": "tsx src/control-plane.ts"
   }
 }

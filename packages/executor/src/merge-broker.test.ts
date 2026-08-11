@@ -111,7 +111,7 @@ function fakeGitHub(opts?: { failMerge?: number; hangMergeMs?: number }) {
 }
 
 /** Alive AND vouching for whatever grant is probed — the happy fixture. */
-const alive = async (): Promise<LiveKillState> => ({ killed: false, epoch: 0, grantLive: true });
+const alive = async (): Promise<LiveKillState> => ({ killed: false, epoch: 0, grantLive: true, committed: true });
 
 async function startBroker(opts?: {
   fetchLiveKillState?: () => Promise<LiveKillState>;
@@ -169,6 +169,58 @@ function rawExchange(socketPath: string, line: string): Promise<string> {
 }
 
 describe("createMergeBroker — the executing broker", () => {
+  it("ONE REQUEST PER CONNECTION: a second chunk mid-merge cannot spawn a duplicate — exactly one PUT", async () => {
+    // the token mint is slow, so the first merge is still awaiting when a
+    // second (identical) line arrives on the same socket. The pre-latch bug
+    // would re-parse the first line and launch a duplicate that burns the
+    // jti again and answers "refused" while the original still PUTs. The
+    // latch drops the second chunk: one response, exactly one PUT.
+    const github = fakeGitHub();
+    const tokens: InstallationTokenSource = {
+      tokenFor: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return TOKEN;
+      },
+    };
+    const socketPath = await startBroker({ github, tokens });
+    const g = grant();
+    const line = `${JSON.stringify({ op: "merge", grant: g, args: MERGE_ARGS })}\n`;
+    const response = await new Promise<string>((resolve, reject) => {
+      const socket = connect(socketPath);
+      let buffer = "";
+      socket.on("connect", () => {
+        socket.write(line);
+        // second identical line arrives WHILE the first is minting
+        setTimeout(() => socket.write(line), 80);
+      });
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        if (buffer.includes("\n")) {
+          socket.destroy();
+          resolve(buffer);
+        }
+      });
+      socket.on("error", reject);
+    });
+    expect(JSON.parse(response)).toMatchObject({ ok: true, merged: true });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(github.calls.filter((call) => call.method === "PUT")).toHaveLength(1);
+  });
+
+  it("oversized data (valid line + huge trailing) is refused with ZERO PUTs — never a double dispatch", async () => {
+    const github = fakeGitHub();
+    const socketPath = await startBroker({ github });
+    const g = grant();
+    // a valid line immediately followed by a huge blob: the size bound trips
+    // first and refuses the whole connection. The property that matters is
+    // that a refusal implies nothing was dispatched.
+    const payload = `${JSON.stringify({ op: "merge", grant: g, args: MERGE_ARGS })}\n${"x".repeat(20 * 1024)}`;
+    const response = await rawExchange(socketPath, payload);
+    expect(JSON.parse(response)).toMatchObject({ ok: false, kind: "refused" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(github.calls.some((call) => call.method === "PUT")).toBe(false);
+  });
+
   it("PERFORMS the merge with a valid grant and returns only the outcome — never a token", async () => {
     const github = fakeGitHub();
     const socketPath = await startBroker({ github });
@@ -396,7 +448,9 @@ describe("createMergeBroker — the executing broker", () => {
     let calls = 0;
     const fetchLiveKillState = async (): Promise<LiveKillState> => {
       calls += 1;
-      return { killed: false, epoch: 0, grantLive: calls < 2 }; // vouches, then vetoed
+      return calls < 2
+        ? { killed: false, epoch: 0, grantLive: true }
+        : { killed: false, epoch: 0, committed: false }; // vouches, then veto wins the commit
     };
     const socketPath = await startBroker({ github, fetchLiveKillState });
     await expect(client(socketPath).client.mergePullRequest(MERGE_ARGS, grant())).rejects.toThrowError(
@@ -494,7 +548,9 @@ describe("createMergeBroker — the executing broker", () => {
     const fetchLiveKillState = async (): Promise<LiveKillState> => {
       liveCalls += 1;
       if (liveCalls >= 2) await new Promise((resolve) => setTimeout(resolve, 700));
-      return { killed: false, epoch: 0, grantLive: true };
+      return liveCalls >= 2
+        ? { killed: false, epoch: 0, committed: true }
+        : { killed: false, epoch: 0, grantLive: true };
     };
     const github = fakeGitHub();
     const socketPath = await startBroker({ github, fetchLiveKillState, requestTimeoutMs: 200 });

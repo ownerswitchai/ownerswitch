@@ -96,14 +96,15 @@ export interface MergeBrokerOptions {
   grantKey: string;
   /**
    * Live kill state, fail-closed (signedLiveKillStateFromControlPlane).
-   * For merges the broker passes a grant-liveness PROBE ({jti}) and
-   * requires `grantLive === true` in the answer — the control plane's
-   * signed statement that it minted this grant and its window has not been
-   * vetoed since. A fetcher that ignores the probe (or answers without
-   * grantLive) refuses every merge, by design: an owner's veto must be
-   * able to revoke an issued-but-undispatched grant.
+   * For merges the broker uses two signed checks: a read-only grant-liveness
+   * PROBE ({jti}) before the token mint (fail fast on an already-vetoed
+   * grant), and an ATOMIC COMMIT ({jti, commit:true}) as the FINAL step
+   * before the PUT. The commit is not a snapshot: the control plane
+   * transitions the grant live→committed only if a veto/kill has not won the
+   * race, and answers `committed`. A fetcher that ignores the probe/commit
+   * refuses every merge, by design.
    */
-  fetchLiveKillState: (probe?: { jti: string }) => Promise<LiveKillState>;
+  fetchLiveKillState: (probe?: { jti: string; commit?: boolean }) => Promise<LiveKillState>;
   /**
    * Directory for the DURABLE single-use burn store (burn-store.ts) —
    * broker-owned, mode 0700, outside the agent workspace. Required: a burn
@@ -231,7 +232,7 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   });
 
   /** Fail-closed live kill state — an unreadable control plane reads as killed. */
-  async function live(probe?: { jti: string }): Promise<LiveKillState> {
+  async function live(probe?: { jti: string; commit?: boolean }): Promise<LiveKillState> {
     try {
       return await fetchLiveKillState(probe);
     } catch {
@@ -340,17 +341,25 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
             "the connection was abandoned before dispatch (client timed out) — not dispatched",
           );
         }
-        const after = await live({ jti: grant.jti });
+        // The FINAL check is an ATOMIC COMMIT, not a snapshot: the control
+        // plane transitions this grant live→committed-for-dispatch and
+        // answers `committed`, losing the race to any veto that arrives
+        // first. If it commits, a later veto is reported "in flight"; if a
+        // veto already landed, committed is false and nothing is sent. This
+        // is what closes the "signed live:true, then veto 200, then PUT"
+        // window that a read-only probe left open.
+        const after = await live({ jti: grant.jti, commit: true });
         if (after.killed || after.epoch !== before.epoch) {
           throw new Error("kill state changed during token minting");
         }
-        if (after.grantLive !== true) {
-          throw new Error(
-            "the control plane no longer vouches for this grant (vetoed during the mint) — refused before dispatch",
-          );
-        }
         if (now() >= grant.expiresAt) {
           throw new Error("the grant expired during token minting — refused before dispatch");
+        }
+        if (after.committed !== true) {
+          throw new Error(
+            "the control plane did not commit this grant for dispatch (vetoed, killed, or " +
+              "unknown at commit time) — refused before dispatch",
+          );
         }
         // Re-check the latch SYNCHRONOUSLY, immediately before flipping to
         // dispatched: the live() read above awaited, and the abandon timer
@@ -437,6 +446,16 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
   function handleConnection(socket: Socket): void {
     let buffer = "";
     let done = false;
+    // ONE request per connection, latched SYNCHRONOUSLY the instant the
+    // first full line is seen — before any await. Without this, a second
+    // `data` chunk arriving while the first merge coroutine is still
+    // awaiting (liveness, token mint) would re-find the same newline,
+    // re-parse the same line, and launch a DUPLICATE coroutine; the
+    // duplicate would see the already-burned jti and answer "refused" while
+    // the original could still PUT — a false refusal alongside a real
+    // merge. The latch closes that: once a request is launched every
+    // further byte on the connection is ignored.
+    let started = false;
     const phase: RequestPhase = { dispatched: false, abandoned: false };
     // Phase-aware: before dispatch a timeout refuses (nothing was sent) AND
     // latches `abandoned` so the merge() coroutine aborts at its
@@ -484,7 +503,10 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
       clearTimeout(timer);
     });
     socket.on("data", (chunk) => {
-      if (done) return;
+      // once a request is launched (or the connection is finished), every
+      // further byte on this connection is ignored — a connection carries
+      // exactly one request
+      if (done || started) return;
       buffer += chunk.toString("utf8");
       if (buffer.length > MAX_REQUEST_BYTES) {
         finish({ ok: false, kind: "refused", error: "request too large" });
@@ -493,6 +515,9 @@ export function createMergeBroker(options: MergeBrokerOptions): MergeBroker {
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
       const line = buffer.slice(0, newline);
+      // LATCH before the first await — nothing after this (a later chunk,
+      // trailing bytes) can spawn a second request on this connection
+      started = true;
       void (async () => {
         try {
           const parsed: unknown = JSON.parse(line);

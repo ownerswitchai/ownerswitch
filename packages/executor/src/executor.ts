@@ -27,12 +27,20 @@ export interface LiveKillState {
    * Present when the lookup carried a grant-liveness PROBE (a jti): true
    * iff the control plane still vouches for that specific grant — it
    * minted it, remembers it, and its window has NOT been vetoed since.
-   * This is how an owner's veto revokes an already-issued, undispatched
-   * grant: the broker requires `grantLive === true` on both of its live
-   * checks, so a veto observed by the control plane invalidates the grant
-   * before the PUT. Absent when no probe was made (plain kill lookups).
+   * The broker's read-only pre-mint check requires this. Absent when no
+   * probe was made (plain kill lookups).
    */
   grantLive?: boolean;
+  /**
+   * Present on a COMMIT probe: the control plane ATOMICALLY transitioned
+   * this grant live→committed-for-dispatch (true), or refused because a
+   * veto/kill won the race first (false). This is the broker's FINAL
+   * pre-PUT check — not a snapshot. Once committed, a later veto is
+   * reported "in flight"; if the veto landed first, commit is false and no
+   * PUT is sent. The transition is single-threaded on the control plane,
+   * so it and a concurrent veto cannot interleave.
+   */
+  committed?: boolean;
 }
 
 export interface Refusal {

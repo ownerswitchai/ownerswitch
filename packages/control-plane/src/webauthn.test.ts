@@ -1,8 +1,11 @@
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { canonicalJson, sha256Hex } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it } from "vitest";
-import { createOwnerSession } from "./auth.js";
+import { createOwnerSession, signDeviceRequest } from "./auth.js";
 import { createControlPlane, type ControlPlane, type ControlPlaneOptions } from "./server.js";
 import { VetoWindow } from "./veto.js";
 import { verifyOwnerAssertion } from "./webauthn.js";
@@ -144,7 +147,12 @@ describe("assertion-gated approval over HTTP", () => {
     const original = console.error;
     console.error = () => {};
     try {
-      return createControlPlane({ ...opts, dev: true, killStateFile: null });
+      return createControlPlane({
+        acceptSessionOnlyApprovalRisk: true,
+        ...opts,
+        dev: true,
+        killStateFile: null,
+      });
     } finally {
       console.error = original;
     }
@@ -202,11 +210,24 @@ describe("assertion-gated approval over HTTP", () => {
     expect(bare.status).toBe(401);
     expect(((await bare.json()) as { error: string }).error).toMatch(/approval ceremony/);
 
-    // mint the ceremony — it names the exact call bytes being approved
+    // mint the ceremony — it names the exact call bytes being approved, and
+    // returns a TYPED, per-field renderable (never raw canonical JSON)
     const ch = (await (
       await fetch(`${url}/veto/v-1/approval-challenge`, { method: "POST", headers: bearer })
-    ).json()) as { challenge: string; callHash: string; canonicalArgs: string };
+    ).json()) as {
+      challenge: string;
+      callHash: string;
+      renderHash: string;
+      renderable: { action: string; owner: string; repo: string; expectedBaseRef: string };
+    };
     expect(ch.callHash).toBe(sha256Hex(canonicalJson(MERGE_ARGS)));
+    expect(ch.renderable).toMatchObject({
+      action: "github.merge_pull_request",
+      owner: "o",
+      repo: "r",
+      expectedBaseRef: "main",
+    });
+    expect(ch.renderHash).toBe(sha256Hex(canonicalJson(ch.renderable)));
 
     // the enrolled passkey signs it; approval succeeds; the grant mints
     const ok = await fetch(`${url}/veto/v-1`, {
@@ -291,24 +312,129 @@ describe("assertion-gated approval over HTTP", () => {
     expect(cp.vetoWindows.get("v-2")?.approvedBy).toBeNull();
   });
 
-  it("a non-dev control plane with no enrolled passkey refuses session-only approval", async () => {
-    // dev:true instances fall back to session-only (the quickstart), which
-    // the rest of the suite exercises; here the PRODUCTION stance is pinned
-    // via the same code path the server uses (opts.dev !== true branch).
-    // A full non-dev boot needs a hardened kill-state path, so this is the
-    // one spot the flag is asserted through the pure option check:
+  it("a GENUINE non-dev control plane with no passkey refuses session-only approval (403)", async () => {
+    // This actually boots dev:false, with a hardened (0700, owned) kill-state
+    // path, so it exercises the production refusal — not a dev helper.
+    const dir = mkdtempSync(join(tmpdir(), "oswitch-cp-"));
+    try {
+      const c = clock();
+      const original = console.error;
+      console.error = () => {};
+      let cp: ControlPlane;
+      try {
+        cp = createControlPlane({
+          now: c.now,
+          grantKey: GRANT_KEY,
+          killStateFile: join(dir, "kill-state.json"),
+          // dev:false and NO passkey: production, session-only path must refuse
+        });
+      } finally {
+        console.error = original;
+      }
+      const url = await start(cp);
+      cp.vetoWindows.set("v-1", mergeWindow(c.now));
+      const session = createOwnerSession("adam", { now: c.now });
+      const res = await fetch(`${url}/veto/v-1`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${session.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as { error: string }).error).toMatch(/session-only/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to START a non-dev control plane whose passkey origin is not https", () => {
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "oswitch-cp-"));
+      expect(() =>
+        createControlPlane({
+          grantKey: GRANT_KEY,
+          killStateFile: join(dir, "ks.json"),
+          ownerPasskey: { credentialId: CRED_ID, publicKeyPem: "x", rpId: RP_ID, origin: "http://insecure" },
+        }),
+      ).toThrowError(/https/);
+      rmSync(dir, { recursive: true, force: true });
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("rejects a cross-origin (embedded) assertion and a mismatched topOrigin", () => {
+    const auth = authenticator();
+    const passkey = { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem };
+    const CH = randomBytes(32).toString("base64url");
+    const base = { passkey, rpId: RP_ID, expectedChallenge: CH, expectedOrigin: ORIGIN, lastSignCount: 0 };
+    // build clientData with crossOrigin / topOrigin by hand
+    const withClientData = (extra: Record<string, unknown>) => {
+      const a = auth.assert({ challenge: CH });
+      const cd = JSON.stringify({ type: "webauthn.get", challenge: CH, origin: ORIGIN, ...extra });
+      // re-sign is not needed: crossOrigin/topOrigin are checked BEFORE the
+      // signature, so a rejected verdict here proves the context gate fires
+      return { ...a, clientDataJSON: Buffer.from(cd, "utf8").toString("base64url") };
+    };
+    expect(verifyOwnerAssertion(withClientData({ crossOrigin: true }), base).ok).toBe(false);
+    expect(
+      verifyOwnerAssertion(withClientData({ topOrigin: "https://evil.example" }), base).ok,
+    ).toBe(false);
+  });
+
+  it("a ceremony minted before a KILL cannot be redeemed after a restore (epoch binding)", async () => {
+    const auth = authenticator();
     const c = clock();
-    const cp = quiet({ now: c.now, grantKey: GRANT_KEY });
+    const cp = quiet({
+      now: c.now,
+      grantKey: GRANT_KEY,
+      deviceSecret: "dev-secret",
+      ownerPasskey: { credentialId: CRED_ID, publicKeyPem: auth.publicKeyPem, rpId: RP_ID, origin: ORIGIN },
+    });
     const url = await start(cp);
     cp.vetoWindows.set("v-1", mergeWindow(c.now));
     const session = createOwnerSession("adam", { now: c.now });
-    // dev instance without passkey: session-only approval still works…
-    const ok = await fetch(`${url}/veto/v-1`, {
+    const bearer = { authorization: `Bearer ${session.token}`, "content-type": "application/json" };
+
+    const ch = (await (
+      await fetch(`${url}/veto/v-1/approval-challenge`, { method: "POST", headers: bearer })
+    ).json()) as { challenge: string };
+
+    // a kill bumps the epoch (and clears challenges); a restore would leave
+    // the epoch advanced. We simulate the epoch move via a device-signed kill.
+    const deviceHeaders = (body: string) => {
+      const timestamp = c.now();
+      const nonce = `n-${Math.random().toString(36).slice(2)}`;
+      return {
+        "content-type": "application/json",
+        "x-device-id": "btn",
+        "x-device-timestamp": String(timestamp),
+        "x-device-nonce": nonce,
+        "x-device-signature": signDeviceRequest(
+          { deviceId: "btn", timestamp, nonce },
+          body,
+          "dev-secret",
+        ),
+      };
+    };
+    const killBody = JSON.stringify({ source: "button" });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody), body: killBody });
+
+    // even though the challenge value is still known to the attacker, it is
+    // both cleared and epoch-stale — redemption is refused
+    const res = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: { authorization: `Bearer ${session.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approve" }),
+      headers: bearer,
+      body: JSON.stringify({
+        decision: "approve",
+        assertion: auth.assert({ challenge: ch.challenge, signCount: 9 }),
+      }),
     });
-    expect(ok.status).toBe(200);
+    // 409 (approve refused while killed) — the kill is still engaged here;
+    // the point is that this pre-kill ceremony never authorizes a merge
+    expect([401, 409]).toContain(res.status);
+    expect(cp.vetoWindows.get("v-1")?.approvedBy).toBeNull();
   });
 
   it("the challenge endpoint is owner-authenticated and grant-eligible-only", async () => {

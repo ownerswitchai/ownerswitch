@@ -52,8 +52,13 @@ export interface VerifyAssertionOptions {
   rpId: string;
   /** the exact base64url challenge this ceremony was minted for */
   expectedChallenge: string;
-  /** when set, clientData.origin must equal it exactly */
-  expectedOrigin?: string;
+  /**
+   * The exact origin the owner app runs at, e.g. https://owner.example.
+   * REQUIRED: WebAuthn's anti-phishing guarantee is the origin binding, so a
+   * verifier that skips it accepts an assertion produced against any site.
+   * The caller (server.ts) demands this in any grant-enabled configuration.
+   */
+  expectedOrigin: string;
   /** the last accepted signature counter; 0 = none recorded yet */
   lastSignCount: number;
 }
@@ -77,7 +82,13 @@ export function verifyOwnerAssertion(
   // 2. clientDataJSON: the right ceremony, over OUR challenge, from the
   //    expected origin
   let clientDataRaw: Buffer;
-  let clientData: { type?: unknown; challenge?: unknown; origin?: unknown };
+  let clientData: {
+    type?: unknown;
+    challenge?: unknown;
+    origin?: unknown;
+    crossOrigin?: unknown;
+    topOrigin?: unknown;
+  };
   try {
     clientDataRaw = Buffer.from(assertion.clientDataJSON, "base64url");
     clientData = JSON.parse(clientDataRaw.toString("utf8")) as typeof clientData;
@@ -93,8 +104,23 @@ export function verifyOwnerAssertion(
   ) {
     return { ok: false, reason: "assertion challenge does not match this ceremony" };
   }
-  if (opts.expectedOrigin !== undefined && clientData.origin !== opts.expectedOrigin) {
+  // ORIGIN is mandatory and exact — the anti-phishing binding.
+  if (opts.expectedOrigin === "") {
+    return { ok: false, reason: "no expected origin configured — refusing to skip origin binding" };
+  }
+  if (clientData.origin !== opts.expectedOrigin) {
     return { ok: false, reason: "assertion origin does not match the enrolled origin" };
+  }
+  // IFRAME context (WebAuthn L3 §5.8.1 / §13.4.9): a ceremony produced in a
+  // cross-origin embedding is not the top-level owner app. Reject a truthy
+  // crossOrigin, and any topOrigin that is not the enrolled origin. (Absent
+  // fields mean a top-level ceremony from an authenticator that predates the
+  // field — allowed; present-and-wrong is refused.)
+  if (clientData.crossOrigin === true) {
+    return { ok: false, reason: "assertion was produced in a cross-origin (embedded) context" };
+  }
+  if (clientData.topOrigin !== undefined && clientData.topOrigin !== opts.expectedOrigin) {
+    return { ok: false, reason: "assertion topOrigin does not match the enrolled origin" };
   }
 
   // 3. authenticatorData: rpIdHash, UP+UV flags, signature counter

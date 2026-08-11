@@ -451,14 +451,35 @@ private key** and mints **installation tokens** with it
   production control plane without an enrolled passkey refuses approvals.
   Silence leaves a merge pending forever; the grant binds the kill epoch at
   approval so a window opened during a kill cannot outlive it.
-- **The owner's veto revokes an issued, undispatched grant.** The control
-  plane tracks every minted jti; a purposed window accepts a veto even
-  after approval; and the broker's signed kill-state probe answers
-  `grantLive` per jti — false once vetoed, unknown, or after a control
-  plane restart. The broker requires `grantLive === true` before the token
-  mint AND immediately before the PUT, so the approve → fetch grant → veto
-  timeline ends in a refusal, not a merge. Grant issuance is therefore not
-  terminal: the "no" wins any time before dispatch.
+- **The owner's veto revokes an issued, undispatched grant — atomically,
+  not as a snapshot.** The control plane tracks every minted jti; a
+  purposed window accepts a veto even after approval; the broker's
+  read-only signed probe answers `grantLive` per jti before the token mint;
+  and the FINAL pre-PUT check is an ATOMIC COMMIT — the broker sends an
+  HMAC-signed commit request (only it holds the key, so an agent cannot
+  pre-commit) and the control plane transitions the grant
+  live→committed-for-dispatch only if a veto has not already won. Both the
+  commit and the veto handlers are synchronous, so the race has exactly one
+  winner: if commit wins, the later veto is reported 409 "in flight"; if
+  veto wins, the commit returns `committed:false` and no PUT is sent. This
+  closes the window a signed-then-stale `grantLive:true` snapshot left open.
+- **Single request per broker connection.** The broker latches the
+  connection the instant it reads a full request line, before any await, so
+  a second chunk arriving mid-merge (or oversized trailing data) can never
+  re-parse the line and launch a duplicate coroutine that double-burns and
+  false-refuses while the original dispatches.
+- **The passkey approval binds the DISPLAYED transaction, in the current
+  kill epoch.** The approval ceremony stores the kill epoch it was minted
+  in and is cleared on any kill, so a challenge created before a kill can
+  never be redeemed after a restore. The ceremony returns a typed,
+  per-field `RenderableApprovalV1` — never raw canonical JSON — with every
+  string field (owner, repo, base ref, head) proven safe to display (NFC
+  form; no bidi, format, or control characters), and binds that render's
+  hash to the challenge. WebAuthn assertion verification requires an exact
+  https origin, rejects cross-origin (embedded) ceremonies, and rejects an
+  unexpected `topOrigin`. So "the owner tapped yes" means the owner saw an
+  unspoofable transaction, at the real origin, in the world the approval
+  belongs to.
 - **The merge destination is pinned, not just the head.** GitHub allows
   retargeting a PR's base branch after approval and its merge API guards
   only the head sha — so OwnerSwitch pins `expectedBaseRef` server-side at

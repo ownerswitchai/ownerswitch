@@ -40,7 +40,7 @@ const KILLED: LiveKillState = { killed: true, epoch: -1 };
 
 export function signedLiveKillStateFromControlPlane(
   options: SignedKillStateOptions,
-): (probe?: { jti: string }) => Promise<LiveKillState> {
+): (probe?: { jti: string; commit?: boolean }) => Promise<LiveKillState> {
   const {
     baseUrl,
     killStateKey,
@@ -57,23 +57,45 @@ export function signedLiveKillStateFromControlPlane(
     );
   }
 
-  return async (probe?: { jti: string }): Promise<LiveKillState> => {
+  const hmac = (payload: unknown): Buffer =>
+    createHmac("sha256", killStateKey).update(canonicalJson(payload)).digest();
+
+  return async (probe?: { jti: string; commit?: boolean }): Promise<LiveKillState> => {
     const nonce = mintNonce();
+    const isCommit = probe?.commit === true;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let body: unknown;
     try {
-      const url = new URL("/kill-state", baseUrl);
-      url.searchParams.set("nonce", nonce);
-      // a grant-liveness probe: the control plane answers (and SIGNS)
-      // whether it still vouches for this specific grant — false once its
-      // window is vetoed, unknown, or the control plane restarted
-      if (probe !== undefined) url.searchParams.set("jti", probe.jti);
-      const res = await fetchImpl(url, {
-        signal: controller.signal,
-        cache: "no-store",
-        headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
-      });
+      let res: Response;
+      if (isCommit) {
+        // The ATOMIC commit-for-dispatch: a state-changing request the
+        // control plane performs only for the broker, so it is HMAC-signed
+        // with the shared key (an agent cannot forge it to pre-commit a
+        // grant ahead of the owner's veto). ts bounds replay; the response
+        // nonce bounds the answer.
+        const ts = now();
+        const request = { jti: probe!.jti, nonce, ts };
+        res = await fetchImpl(new URL("/kill-state/commit", baseUrl), {
+          method: "POST",
+          signal: controller.signal,
+          cache: "no-store",
+          headers: { "content-type": "application/json", "cache-control": "no-store, no-cache" },
+          body: JSON.stringify({ ...request, sig: hmac(request).toString("hex") }),
+        });
+      } else {
+        const url = new URL("/kill-state", baseUrl);
+        url.searchParams.set("nonce", nonce);
+        // a read-only grant-liveness probe: the control plane answers (and
+        // SIGNS) whether it still vouches for this specific grant — false
+        // once its window is vetoed, unknown, or the control plane restarted
+        if (probe !== undefined) url.searchParams.set("jti", probe.jti);
+        res = await fetchImpl(url, {
+          signal: controller.signal,
+          cache: "no-store",
+          headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
+        });
+      }
       if (!res.ok) return KILLED;
       body = await res.json();
     } catch {
@@ -91,6 +113,7 @@ export function signedLiveKillStateFromControlPlane(
       sig,
       jti: echoedJti,
       grantLive,
+      committed,
     } = body as Record<string, unknown>;
 
     // Shape first — a field that is the wrong type can never be trusted.
@@ -98,9 +121,11 @@ export function signedLiveKillStateFromControlPlane(
     if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return KILLED;
     if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) return KILLED;
     if (typeof echoed !== "string" || typeof sig !== "string" || sig === "") return KILLED;
-    if (probe !== undefined && (echoedJti !== probe.jti || typeof grantLive !== "boolean")) {
-      // the probe's jti must be echoed and answered — a response that
-      // dodges the question does not vouch for the grant
+    if (probe !== undefined && echoedJti !== probe.jti) return KILLED;
+    if (isCommit) {
+      if (typeof committed !== "boolean") return KILLED;
+    } else if (probe !== undefined && typeof grantLive !== "boolean") {
+      // a read probe that dodges the question does not vouch for the grant
       return KILLED;
     }
 
@@ -113,13 +138,12 @@ export function signedLiveKillStateFromControlPlane(
     // The signature must verify over exactly the signed fields, in the
     // control plane's canonical form. timing-safe, and length-guarded so
     // malformed hex lands here rather than throwing.
-    const signedPayload =
-      probe !== undefined
+    const signedPayload = isCommit
+      ? { killed, epoch, nonce: echoed, expiresAt, jti: echoedJti, committed }
+      : probe !== undefined
         ? { killed, epoch, nonce: echoed, expiresAt, jti: echoedJti, grantLive }
         : { killed, epoch, nonce: echoed, expiresAt };
-    const expected = createHmac("sha256", killStateKey)
-      .update(canonicalJson(signedPayload))
-      .digest();
+    const expected = hmac(signedPayload);
     const provided = Buffer.from(sig, "hex");
     if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
       return KILLED;
@@ -128,6 +152,7 @@ export function signedLiveKillStateFromControlPlane(
     // Verified. A killed answer's epoch is irrelevant (killed refuses before
     // the epoch is compared); a live answer carries the real epoch.
     const base = killed ? { killed: true as const, epoch } : { killed: false as const, epoch };
+    if (isCommit) return { ...base, committed: committed === true };
     return probe !== undefined ? { ...base, grantLive: grantLive === true } : base;
   };
 }
