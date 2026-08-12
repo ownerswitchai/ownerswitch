@@ -70,17 +70,20 @@ self.addEventListener("notificationclick", (event) => {
     (async () => {
       const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const client of all) {
-        if ("focus" in client) {
+        if ("focus" in client && "navigate" in client) {
           // NAVIGATE BEFORE FOCUS: focusing first would run the existing
           // page's pending two-rAF ack for whatever window it was already
           // showing, before this notification's target navigation lands. The
           // route change bumps the render generation and abandons that ack.
-          if ("navigate" in client) {
-            try {
-              await client.navigate(target);
-            } catch (e) {
-              /* navigation may be disallowed cross-origin; focus still helps */
-            }
+          //
+          // And if the navigation FAILS, we must NOT focus this client on its
+          // stale view: that surfaces some other window's review (whose ack may
+          // still be pending) as if it were the one the owner tapped. Fall
+          // through to openWindow(target) instead, which lands on the right one.
+          try {
+            await client.navigate(target);
+          } catch (e) {
+            break; // navigation refused — do not focus a stale surface
           }
           await client.focus();
           return;

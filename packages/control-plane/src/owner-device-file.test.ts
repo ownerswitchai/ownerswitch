@@ -50,6 +50,31 @@ describe("enrolledOwnerDeviceFromSpki — strict public-key parsing", () => {
     expect(() => enrolledOwnerDeviceFromSpki("d", spkiDer.toString("base64"))).not.toThrow();
   });
 
+  it("REJECTS two base64 encodings concatenated as TEXT — the decoder drops the tail, but the file still carries the private key", () => {
+    const kp = p256();
+    const spkiDer = kp.publicKey.export({ format: "der", type: "spki" }) as Buffer;
+    const pkcs8Der = kp.privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
+
+    // base64(SPKI) || base64(PKCS8): NOT base64(SPKI||PKCS8). Node's base64
+    // decoder stops after the canonical SPKI padding and silently ignores the
+    // rest, so the DECODED bytes are a clean SPKI (the DER check passes) — but
+    // the raw file text still holds the full private key in base64. Only a
+    // canonical-encoding round-trip catches it.
+    const bodyConcat = spkiDer.toString("base64") + pkcs8Der.toString("base64");
+    expect(() => enrolledOwnerDeviceFromSpki("d", bodyConcat)).toThrow(/canonical base64/);
+
+    // and the same smuggle inside a single PUBLIC KEY PEM body
+    const pem = `-----BEGIN PUBLIC KEY-----\n${bodyConcat}\n-----END PUBLIC KEY-----\n`;
+    expect(() => enrolledOwnerDeviceFromSpki("d", pem)).toThrow(/canonical base64/);
+
+    // base64url smuggle on the raw path is refused too
+    const urlConcat = spkiDer.toString("base64url") + pkcs8Der.toString("base64url");
+    expect(() => enrolledOwnerDeviceFromSpki("d", urlConcat)).toThrow(/canonical base64|trailing bytes/);
+
+    // a clean base64url SPKI (the browser export form) still passes
+    expect(() => enrolledOwnerDeviceFromSpki("d", spkiDer.toString("base64url"))).not.toThrow();
+  });
+
   it("rejects a non-P-256 key and multiple PEM blocks", () => {
     const ed = generateKeyPairSync("ed25519");
     expect(() => enrolledOwnerDeviceFromSpki("d", ed.publicKey.export({ format: "pem", type: "spki" }).toString())).toThrow(

@@ -63,6 +63,16 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
         "private key here would put signing authority in public-key configuration",
     );
   }
+  // The base64 body we will decode, whitespace-stripped, plus whether it is a
+  // PEM block (standard base64, padded) or a raw browser export (base64url, no
+  // padding — exportPublicKeySpki emits base64url). We keep the exact body text
+  // so a NON-CANONICAL encoding can be caught: Node's base64 decoder silently
+  // DROPS text after the canonical padding, so `base64(SPKI) || base64(PKCS8)`
+  // (two encodings concatenated as text — distinct from `base64(SPKI||PKCS8)`,
+  // which the DER length check already rejects) would decode to a clean SPKI
+  // while the 0644 registry text still carries the whole private key in base64.
+  // The exact-DER check below cannot see that; a canonical round-trip can.
+  let bodyText: string;
   let der: Buffer;
   if (trimmed.includes("BEGIN")) {
     if ((trimmed.match(/-----BEGIN /g) ?? []).length !== 1) {
@@ -72,9 +82,15 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
     if (match === null) {
       throw new Error(`owner device "${deviceId}" key is not a single SPKI "PUBLIC KEY" PEM block`);
     }
-    der = Buffer.from(match[1].replace(/\s+/g, ""), "base64");
+    bodyText = match[1].replace(/\s+/g, "");
+    der = Buffer.from(bodyText, "base64");
   } else {
-    der = Buffer.from(trimmed, "base64");
+    bodyText = trimmed.replace(/\s+/g, "");
+    // a raw body may be standard base64 or base64url — decode in the alphabet
+    // it actually uses (Node's "base64" mode is lenient about -/_ , which would
+    // let a base64url input mis-decode); the round-trip below is the real gate.
+    const isUrl = /[-_]/.test(bodyText);
+    der = Buffer.from(bodyText, isUrl ? "base64url" : "base64");
   }
   let key: KeyObject;
   try {
@@ -101,6 +117,19 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
     throw new Error(
       `owner device "${deviceId}" key has trailing bytes after the SPKI public key — ` +
         "refusing (a private key or padding may be smuggled after the public half)",
+    );
+  }
+  // CANONICAL-ENCODING check: the body text must be EXACTLY the base64/base64url
+  // of the canonical SPKI — nothing after it. `canonicalDer.equals(der)` only
+  // sees the DECODED bytes, and the decoder drops post-padding text, so a
+  // second base64 blob (`base64(SPKI) || base64(PKCS8)`) passes the DER check
+  // while smuggling the private key in the file. A canonical encoding is clean
+  // and complete, so the concatenation — strictly longer — can equal neither
+  // form and is refused here.
+  if (bodyText !== canonicalDer.toString("base64") && bodyText !== canonicalDer.toString("base64url")) {
+    throw new Error(
+      `owner device "${deviceId}" key is not canonical base64 — trailing or non-standard ` +
+        "characters after the SPKI public key (a second key may be smuggled in the encoding)",
     );
   }
   // bind bytes this parser produced, not the input

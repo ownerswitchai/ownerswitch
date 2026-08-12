@@ -178,3 +178,19 @@ export async function sendVeto(windowId) {
   const body = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, vetoed: res.ok && body.status === "vetoed", body };
 }
+
+/**
+ * What a veto RESPONSE may do to the (shared) veto button, guarded by the
+ * render generation the click was armed under. Pure and generation-checked so
+ * a stale response for window A cannot paint the button after the view moved to
+ * B: a click on A arms `armedGen`; navigating to B bumps the app's render
+ * generation; A's late response then sees `armedGen !== currentGen` and returns
+ * "superseded" — the caller touches nothing. Only an explicitly confirmed veto
+ * (`result.vetoed === true`) yields "stopped"; everything else is "retry".
+ * Exported for the deployed app AND its regression test (app.js is a classic
+ * script and cannot be imported, so the decision lives here where it can be).
+ */
+export function vetoResultAction(armedGen, currentGen, result) {
+  if (armedGen !== currentGen) return "superseded";
+  return result && result.vetoed === true ? "stopped" : "retry";
+}

@@ -186,9 +186,16 @@
       btn.disabled = true;
       rt.sendVeto(windowId)
         .then(function (result) {
-          // STOPPED only when the server explicitly confirms the window is
-          // vetoed — a 4xx/5xx is NOT success and stays retryable.
-          if (result.vetoed) {
+          // The response for window A must not paint the SHARED button after
+          // the view moved to B: the click handler was replaced, but this
+          // in-flight promise still closes over the old button. The generation-
+          // guarded decision (tested in owner-runtime) reports "superseded" so
+          // a stale STOPPED can never tell the owner B is stopped when only A
+          // was; "stopped" only on an explicitly confirmed veto (a 4xx/5xx is
+          // NOT success and stays retryable).
+          var action = rt.vetoResultAction(gen, renderGen, result);
+          if (action === "superseded") return;
+          if (action === "stopped") {
             btn.textContent = "STOPPED";
           } else {
             btn.textContent = "VETO — retry";
@@ -196,6 +203,7 @@
           }
         })
         .catch(function () {
+          if (gen !== renderGen) return; // superseded — do not touch B's button
           btn.textContent = "VETO — retry";
           btn.disabled = false; // network failure stays retryable (idempotent server-side)
         });
