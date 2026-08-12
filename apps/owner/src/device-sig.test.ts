@@ -132,6 +132,32 @@ describe("deviceSigPreimage", () => {
     expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?a b" })).toThrow(/ASCII/);
     expect(() => deviceSigPreimage({ ...base, pathAndQuery: "veto/w1" })).toThrow(/origin-form/);
   });
+
+  it("refuses strings the WHATWG URL serializer would rewrite (signed bytes must be wire bytes)", () => {
+    // the serializer re-encodes these before they ever reach the wire, so a
+    // signature over the raw form binds bytes that are never transmitted
+    for (const raw of [
+      '/x"y?q=1', // "  -> %22
+      "/x<y", //      <  -> %3C
+      "/x>y", //      >  -> %3E
+      "/x`y", //      `  -> %60
+      "/x{y}", //     { } -> %7B %7D in a path
+      "/x\\y", //     \  -> / (path separator rewrite)
+      "/x?q=<z>", //  < > -> %3C %3E in a query too
+      '/x?q="z"', //  "  -> %22 in a query too
+      "//evil", //    protocol-relative: serializes to "/" on another host
+    ]) {
+      expect(() => deviceSigPreimage({ ...base, pathAndQuery: raw }), raw).toThrow(
+        /serialized request-target|request target/,
+      );
+    }
+    // ...and accepts exactly what the serializer transmits verbatim: these are
+    // the wire bytes, position-dependently. ^ survives in path AND query; { }
+    // survive in a query (only the path re-encodes them).
+    for (const wire of ["/x^y", "/x?q=^v", "/x?q={z}", "/x%7By%7D", "/x?q=%3Cz%3E"]) {
+      expect(() => deviceSigPreimage({ ...base, pathAndQuery: wire }), wire).not.toThrow();
+    }
+  });
 });
 
 describe("enrollPopTranscript", () => {
