@@ -1,7 +1,9 @@
+import { createPublicKey } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   generateLicenseKeys,
   mintLicense,
+  OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
   RESTORE_GRACE_MS,
   verifyLicense,
   type LicensePayload,
@@ -82,6 +84,18 @@ describe("license mint + verify", () => {
     const unbound = mintLicense(payload(), keys.privateKeyPem);
     expect(verifyLicense(unbound, keys.publicKeyPem, 2_000, "dep-alpha").ok).toBe(true);
     expect(verifyLicense(unbound, keys.publicKeyPem, 2_000).ok).toBe(true);
+  });
+
+  it("the pinned vendor key is a real Ed25519 key, and self-minted tokens die against it", () => {
+    expect(createPublicKey(OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM).asymmetricKeyType).toBe(
+      "ed25519",
+    );
+    // protected by default: a token signed with ANY other key — including a
+    // fresh keygen on the deployment's own host — does not verify
+    const selfMinted = mintLicense(payload(), keys.privateKeyPem);
+    const verdict = verifyLicense(selfMinted, OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM, 2_000);
+    expect(verdict).toMatchObject({ ok: false });
+    if (!verdict.ok) expect(verdict.reason).toMatch(/signature/);
   });
 
   it("mint refuses malformed payloads outright", () => {

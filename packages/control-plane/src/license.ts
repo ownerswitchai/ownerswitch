@@ -35,6 +35,22 @@ import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify, 
 
 export const LICENSE_PREFIX = "osl1";
 
+/**
+ * The OFFICIAL OwnerSwitch vendor license-verifying key, pinned. This is the
+ * PUBLIC half — committing it is the point: every production launcher arms
+ * the 2GO gate against it by default, so a fresh production deployment is
+ * born protected (unlicensed restores answer 402) with zero configuration.
+ * The signing half exists only offline with the vendor. Rotation is a code
+ * change (replace this constant), which is exactly the auditability a
+ * pinned trust root should have; self-hosted forks may override it via
+ * OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE — the FSL license terms, not this
+ * constant, are what bind a fork.
+ */
+export const OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAqwfjngoxSBib0t+TnWLgXDU4hKuiYKRpynv0jVYvenw=
+-----END PUBLIC KEY-----
+`;
+
 /** How long past expiry a restore still works. A floor, not a knob. */
 export const RESTORE_GRACE_MS = 72 * 3_600_000;
 

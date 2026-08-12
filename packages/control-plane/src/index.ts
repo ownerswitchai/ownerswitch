@@ -19,6 +19,7 @@ export {
   generateLicenseKeys,
   LICENSE_PREFIX,
   mintLicense,
+  OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
   RESTORE_GRACE_MS,
   verifyLicense,
 } from "./license.js";

@@ -1,7 +1,10 @@
 import { createPublicKey } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { createControlPlane } from "@ownerswitchai/control-plane";
+import {
+  createControlPlane,
+  OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
+} from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
 
 /**
@@ -28,12 +31,16 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *   OWNERSWITCH_OWNER_PASSKEY_RP_ID          relying-party id (e.g. owner.example)
  *   OWNERSWITCH_OWNER_PASSKEY_ORIGIN         exact https:// origin of the owner app
  *
- * Optional — 2GO licensing (the paid gate; every stop path is free forever,
- * see control-plane/src/license.ts):
- *   OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE      vendor Ed25519 SPKI PEM; presence
- *                                            arms the gate (402 on unlicensed
- *                                            restore-ceremony starts)
+ * 2GO licensing — ALWAYS ARMED in production (control-plane/src/license.ts;
+ * every stop path is free forever). The gate verifies against the pinned
+ * official vendor key by default, so an unlicensed production plane is born
+ * protected: POST /restore/ceremony answers 402 until OWNERSWITCH_LICENSE is
+ * provisioned. Dev/quickstart (dev-control-plane.ts) stays ungated.
  *   OWNERSWITCH_LICENSE                      this deployment's osl1 token
+ *   OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE      optional override of the pinned
+ *                                            vendor key (self-hosted forks)
+ *   OWNERSWITCH_DEPLOYMENT_ID                required by deployment-bound
+ *                                            licenses (theft containment)
  */
 
 function required(name: string): string {
@@ -86,31 +93,33 @@ function main(): void {
   // readFileSync of an attacker-writable path.
   const publicKeyPem = loadOwnerPasskeyPublicKey(publicKeyFile).pem;
 
-  // 2GO licensing arms only when the verifying key is provisioned. The key
-  // must parse as an Ed25519 public key HERE, at boot — a corrupt file must
-  // fail the start, not silently turn every future restore into a 402. It
-  // gates the paid direction only; a bad license never touches a stop path.
+  // 2GO licensing is ALWAYS ARMED in production: the pinned official vendor
+  // key by default, or an explicit override for self-hosted forks. An
+  // override must parse as an Ed25519 public key HERE, at boot — a corrupt
+  // file must fail the start, not silently turn every future restore into a
+  // 402. The gate covers the paid direction only; no license state ever
+  // touches a stop path.
   const licenseKeyFile = process.env.OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE?.trim();
-  let licensing: { vendorPublicKeyPem: string; token?: string } | undefined;
+  let vendorPublicKeyPem = OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM;
   if (licenseKeyFile !== undefined && licenseKeyFile !== "") {
-    const vendorPublicKeyPem = readFileSync(licenseKeyFile, "utf8");
+    vendorPublicKeyPem = readFileSync(licenseKeyFile, "utf8");
     if (createPublicKey(vendorPublicKeyPem).asymmetricKeyType !== "ed25519") {
       throw new Error(
         `OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE (${licenseKeyFile}) is not an Ed25519 public key — ` +
           "provision the vendor's license-verifying.pub.pem",
       );
     }
-    const token = process.env.OWNERSWITCH_LICENSE?.trim();
-    // deployment-bound licenses need this to match what the vendor minted;
-    // the honeytoken registry already treats it as the deployment's
-    // immutable name, so licensing reuses it rather than inventing another
-    const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID?.trim();
-    licensing = {
-      vendorPublicKeyPem,
-      ...(token !== undefined && token !== "" ? { token } : {}),
-      ...(deploymentId !== undefined && deploymentId !== "" ? { deploymentId } : {}),
-    };
   }
+  const token = process.env.OWNERSWITCH_LICENSE?.trim();
+  // deployment-bound licenses need this to match what the vendor minted;
+  // the honeytoken registry already treats it as the deployment's
+  // immutable name, so licensing reuses it rather than inventing another
+  const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID?.trim();
+  const licensing = {
+    vendorPublicKeyPem,
+    ...(token !== undefined && token !== "" ? { token } : {}),
+    ...(deploymentId !== undefined && deploymentId !== "" ? { deploymentId } : {}),
+  };
 
   // dev:false — createControlPlane enforces the production kill-state path
   // guard, the >=256-bit key floors, and the https-origin requirement, and
@@ -123,7 +132,7 @@ function main(): void {
     grantKey,
     killStateKey,
     ownerPasskey: { credentialId, publicKeyPem, rpId, origin },
-    ...(licensing !== undefined ? { licensing } : {}),
+    licensing,
   });
 
   createServer(controlPlane.handler).listen(port, host, () => {

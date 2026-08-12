@@ -19,12 +19,19 @@ Stops are cheap and attributable; starts are expensive and ceremonial.
 One press to stop is free, forever, for everyone — no stop path consults a
 license, by construction (the only enforcement point in the codebase is
 the restore-ceremony start, which answers **402** unlicensed). Two GOs to
-start is the product: a TEAM/ENTERPRISE deployment provisions
+start is the product, and **production is protected by default**: the
+production launcher (`packages/mcp/src/control-plane.ts`) arms the gate
+against the pinned official vendor key
+(`OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM`) with zero configuration —
+a fresh production plane stops perfectly and answers 402 on restore until
+its token arrives. A TEAM/ENTERPRISE deployment provisions just
 
 ```
-OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE=/etc/ownerswitch/license-verifying.pub.pem
 OWNERSWITCH_LICENSE=osl1.<payload>.<signature>
 ```
+
+(`OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE` overrides the pinned key for
+self-hosted forks; dev/quickstart instances stay ungated.)
 
 Tokens are Ed25519-signed, verified offline — no phone-home, no
 telemetry, air-gap friendly. An expired license keeps restoring for a
