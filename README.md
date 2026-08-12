@@ -63,7 +63,7 @@ packages/shared       — policy model types
 packages/gateway      — the decision engine (start here)
 packages/mcp          — MCP gateway: OwnerSwitch in front of any MCP server
 packages/sdk          — agent-side client (stub)
-packages/button       — physical kill button daemon (V0: keyboard-mode USB buttons)
+packages/button       — physical kill button daemon (keyboard, HTTP, or serial e-stop)
 packages/honeytoken   — decoy credentials that trip an automatic kill on touch
 packages/control-plane— policies, kill state, audit (stub)
 ```

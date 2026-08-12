@@ -1,16 +1,19 @@
+import { createReadStream } from "node:fs";
 import { createServer, type Server } from "node:http";
 
 /**
  * Press sources — where physical presses come from.
  *
- * Two V0 sources behind one interface:
+ * Three V0 sources behind one interface:
  *  - "keyboard": stdin in raw mode. Any USB kill button that enumerates as a
  *    keyboard (most cheap ones do) works with zero drivers.
  *  - "http": a tiny loopback POST /press endpoint, for testing the daemon
  *    without hardware.
+ *  - "serial": a line-based USB serial device — an e-stop wired to a
+ *    microcontroller that prints a trigger line ("KILL") on press.
  *
  * The daemon only ever sees `OnPress` — a registration function — so tests
- * and future sources (GPIO, BLE) plug in without touching the daemon.
+ * and new sources (GPIO, BLE) plug in without touching the daemon.
  */
 
 /** A single press listener. */
@@ -173,6 +176,170 @@ export function createHttpSource(opts: HttpSourceOptions = {}): HttpPressSource 
       server = null;
       boundPort = null;
       await new Promise<void>((resolve) => srv.close(() => resolve()));
+    },
+  };
+}
+
+/**
+ * What the serial source needs from an opened device — a seam for tests.
+ * `fs.ReadStream` satisfies it; so does a fake EventEmitter.
+ */
+export interface SerialPortStream {
+  on(event: "data", handler: (chunk: Buffer | string) => void): unknown;
+  once(event: "close", handler: () => void): unknown;
+  once(event: "error", handler: (err: Error) => void): unknown;
+  /** Release the device (closes the underlying descriptor). */
+  destroy(): void;
+}
+
+/** Cancels a pending reconnect. */
+type CancelReconnect = () => void;
+
+export interface SerialSourceOptions {
+  /** Device path, e.g. /dev/ttyACM0 (Linux) or /dev/cu.usbmodem1101 (macOS). */
+  device: string;
+  /**
+   * The line that counts as a press, matched after trimming. Default "KILL" —
+   * what the reference Pico e-stop firmware prints on the press edge. "READY"
+   * and every other line are ignored.
+   */
+  trigger?: string;
+  /**
+   * Opens the device. Default: `fs.createReadStream`. The Pico's USB CDC data
+   * channel is a character device you read like a file — USB CDC ignores baud,
+   * so the firmware's lines arrive without termios. A seam for tests.
+   */
+  open?: (device: string) => SerialPortStream;
+  /**
+   * Re-open this many ms after the device errors or closes — a flaky USB cable
+   * or a physical reconnect. Default 2000; 0 disables reconnect (open once,
+   * then give up).
+   */
+  reconnectMs?: number;
+  /** Schedules a reconnect and returns its canceller. Seam for tests; default setTimeout, unref'd. */
+  schedule?: (fn: () => void, ms: number) => CancelReconnect;
+  /**
+   * Reports a device error / disconnect. Default: warn to stderr. A lost device
+   * is reported, NOT treated as a press: a silent unplug must not forge a kill,
+   * and a flaky cable must not kill on every hiccup. The firmware's own
+   * fail-safe still prints a real "KILL" line while it has power.
+   */
+  onError?: (err: Error) => void;
+}
+
+/** The reference firmware prints this on the e-stop's press edge. */
+export const DEFAULT_SERIAL_TRIGGER = "KILL";
+
+/**
+ * Cap the unterminated-line buffer so a wedged device can't grow it without
+ * bound. Counted in UTF-16 code units after decoding, not incoming bytes —
+ * memory stays bounded either way (within a small constant factor).
+ */
+const SERIAL_BUFFER_CAP = 4096;
+
+function defaultSerialOpen(device: string): SerialPortStream {
+  return createReadStream(device);
+}
+
+function defaultSerialSchedule(fn: () => void, ms: number): CancelReconnect {
+  const timer = setTimeout(fn, ms);
+  // A reconnect timer must not, by itself, keep the process alive.
+  (timer as { unref?: () => void }).unref?.();
+  return () => clearTimeout(timer);
+}
+
+/**
+ * A press source backed by a line-based USB serial device: the button is an
+ * e-stop wired to a microcontroller that prints `trigger` (default "KILL") over
+ * USB when pressed. Lines are buffered across chunks, so a trigger split across
+ * two reads still counts as exactly one press. Survives a flaky cable by
+ * re-opening the device (see `reconnectMs`).
+ */
+export function createSerialSource(opts: SerialSourceOptions): PressSource {
+  const { device } = opts;
+  // Trim to match the per-line trim below; refuse a trigger that could never
+  // match (multiline) or would match a BLANK line (empty) — an empty trigger
+  // would turn every keepalive newline into a press.
+  const trigger = (opts.trigger ?? DEFAULT_SERIAL_TRIGGER).trim();
+  if (trigger === "" || /[\r\n]/.test(trigger)) {
+    throw new Error("serial trigger must be a non-empty single line");
+  }
+  const reconnectMs = opts.reconnectMs ?? 2_000;
+  const openDevice = opts.open ?? defaultSerialOpen;
+  const schedule = opts.schedule ?? defaultSerialSchedule;
+  const onError =
+    opts.onError ??
+    ((err: Error) => console.error(`ownerswitch-button: serial ${device}: ${err.message}`));
+  const listeners = listenerSet();
+
+  let stream: SerialPortStream | null = null;
+  let cancelReconnect: CancelReconnect | null = null;
+  let running = false;
+  let buffer = "";
+
+  const feed = (chunk: Buffer | string): void => {
+    buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let nl: number;
+    while ((nl = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line === trigger) listeners.emit();
+    }
+    // A device that never sends a newline must not grow the buffer forever.
+    if (buffer.length > SERIAL_BUFFER_CAP) buffer = buffer.slice(-SERIAL_BUFFER_CAP);
+  };
+
+  const scheduleReconnect = (): void => {
+    if (!running || reconnectMs <= 0) return;
+    cancelReconnect?.();
+    cancelReconnect = schedule(() => {
+      cancelReconnect = null;
+      connect();
+    }, reconnectMs);
+  };
+
+  function connect(): void {
+    if (!running) return;
+    let opened: SerialPortStream;
+    try {
+      opened = openDevice(device);
+    } catch (err) {
+      onError(err instanceof Error ? err : new Error(String(err)));
+      scheduleReconnect();
+      return;
+    }
+    stream = opened;
+    buffer = "";
+    // Ignore late data from a stream we've since replaced or stopped.
+    opened.on("data", (chunk) => {
+      if (stream === opened) feed(chunk);
+    });
+    const gone = (err?: Error): void => {
+      if (stream !== opened) return;
+      stream = null;
+      if (err !== undefined) onError(err);
+      scheduleReconnect();
+    };
+    opened.once("error", (err) => gone(err));
+    opened.once("close", () => gone());
+  }
+
+  return {
+    onPress: (listener) => listeners.add(listener),
+    describe: () => `serial — ${device} (trigger "${trigger}")`,
+    async start() {
+      if (running) return;
+      running = true;
+      connect();
+    },
+    async stop() {
+      running = false;
+      cancelReconnect?.();
+      cancelReconnect = null;
+      const open = stream;
+      stream = null;
+      buffer = "";
+      open?.destroy();
     },
   };
 }

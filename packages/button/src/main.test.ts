@@ -54,6 +54,46 @@ describe("main() — --secret refusal", () => {
   });
 });
 
+describe("main() — serial source", () => {
+  it("refuses --source serial without --device (after the secret resolves)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`__exit_${code}__`);
+    }) as never);
+    try {
+      await expect(
+        main(["--url", "http://cp", "--device-id", "d1", "--source", "serial"], {
+          OWNERSWITCH_DEVICE_SECRET: "s3cr3t",
+        }),
+      ).rejects.toThrow("__exit_1__");
+      const msg = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(msg).toMatch(/--device is required/);
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('rejects an unknown --source with the three valid kinds named', async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`__exit_${code}__`);
+    }) as never);
+    try {
+      await expect(
+        main(["--url", "http://cp", "--device-id", "d1", "--source", "gpio"], {
+          OWNERSWITCH_DEVICE_SECRET: "s3cr3t",
+        }),
+      ).rejects.toThrow("__exit_1__");
+      const msg = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(msg).toMatch(/"keyboard", "http", or "serial"/);
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+  });
+});
+
 describe("fetchAuditStatus", () => {
   it("returns the parsed status on a normal response", async () => {
     const fetchImpl = (async () =>
