@@ -2203,6 +2203,111 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     expect(((await terminal.json()) as { error: string }).error).toMatch(/vetoed/);
   });
 
+  it("the detail summary NAMES the concrete merge (repo#pr into base @ head), not just the operation", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      {
+        agentId: "agent-1",
+        tool: "github.merge_pr",
+        args: {
+          owner: "ownerswitchai",
+          repo: "ownerswitch",
+          pullNumber: 43,
+          expectedHeadSha: "a".repeat(40),
+          expectedBaseRef: "main",
+          mergeMethod: "squash",
+        },
+      },
+      cp.killSwitch.epoch,
+      { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    // decision-complete: WHICH pr, into WHICH branch, at WHICH head — not "github/merge_pull_request"
+    expect(detail.summary).toBe("Merge ownerswitchai/ownerswitch#43 into main — squash, head aaaaaaaaaaaa");
+    expect(typeof detail.deliveryId).toBe("string");
+
+    // and it is ackable end-to-end
+    const res = await ackWindow(url, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+  });
+
+  it("a plain tool's summary is its exact canonical args; a short, clean call is ackable", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "stripe.payout", args: { amount: 5000, to: "acct_x" } },
+      cp.killSwitch.epoch,
+      { now: c.now },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.summary).toBe('{"amount":5000,"to":"acct_x"}');
+    const res = await ackWindow(url, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+  });
+
+  it("a window whose summary cannot be rendered decision-completely is NON-ACKABLE and fails closed to held", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    // an oversized argument: the full display-safe args exceed the V1 summary
+    // limit, so we refuse to truncate — no delivery is minted
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "bash", args: { script: "x".repeat(300) } },
+      cp.killSwitch.epoch,
+      { now: c.now, windowMs: 60_000 },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.deliveryId).toBeNull(); // non-ackable: no delivery to echo
+    // and any attempt to ack (with a fabricated echo) is refused
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({ deliveryId: "del_forged", revision: 1, renderContentHash: "x" });
+    const forged = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(forged.status).toBe(409);
+    expect(window.isDelivered).toBe(false);
+
+    // never delivered → silence extends then holds (fail closed), never releases
+    c.advance(60_001);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000 + 1);
+    expect(window.tick()).toBe("held");
+  });
+
+  it("a bidi/control character in an agent-supplied envelope field makes the window non-ackable (V1 conformance)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    // a right-to-left override in the RAW tool field (the envelope carries
+    // agentId/tool verbatim, not JSON-escaped): FORBIDDEN → non-conformant
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "git‮hsab", args: {} },
+      cp.killSwitch.epoch,
+      { now: c.now },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.deliveryId).toBeNull();
+    // display still shows who (stripped) and states approval is required
+    expect(detail.agentId).toBe("agent-1");
+    expect(detail.tool).toBe("githsab"); // the override stripped for display only
+    expect(detail.summary).toMatch(/full owner approval/);
+  });
+
   it("device-signed POST /veto/:id relays a channel stop with honest attribution, idempotently", async () => {
     const c = clock(1_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });

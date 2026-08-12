@@ -63,6 +63,15 @@ export {
   parseMergePrArgs,
 } from "./merge-args.js";
 export type { MergePrArgs, RenderableApprovalV1 } from "./merge-args.js";
+export {
+  assertRenderableAlert,
+  canonicalRenderableAlert,
+  codePointLength,
+  RENDERABLE_ALERT_FORBIDDEN,
+  RENDERABLE_ALERT_V1_LIMITS,
+  validateRenderableAlert,
+} from "./renderable-alert.js";
+export type { AlertField, AlertViolation, RenderableAlertV1 } from "./renderable-alert.js";
 export type {
   GrantVerifyResult,
   MergeGrant,

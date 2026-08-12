@@ -1,15 +1,21 @@
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   buildRenderableApproval,
   canonicalJson,
+  canonicalRenderableAlert,
+  codePointLength,
   GITHUB_CONNECTOR,
   MERGE_PULL_REQUEST,
   parseMergePrArgs,
+  RENDERABLE_ALERT_FORBIDDEN,
+  RENDERABLE_ALERT_V1_LIMITS,
   sha256Hex,
   signMergeGrant,
+  validateRenderableAlert,
+  type RenderableAlertV1,
   type SignedMergeGrant,
   type ToolCall,
 } from "@ownerswitchai/shared";
@@ -548,11 +554,19 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
   // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
   // consumed by the ack. Keyed by deliveryId; each binds the exact window,
-  // revision, and rendered-content hash the device saw, so an ack can only
-  // confirm the CURRENT showing of THIS window, once (apps/owner DESIGN.md §3).
+  // revision, rendered-content hash, and the hash of the exact call bytes
+  // (callHash) the device saw, so an ack can only confirm the CURRENT showing
+  // of THIS window and THIS call, once (apps/owner DESIGN.md §3).
   const ownerDeliveries = new Map<
     string,
-    { windowId: string; revision: number; renderHash: string; expiresAt: number; consumed: boolean }
+    {
+      windowId: string;
+      revision: number;
+      renderHash: string;
+      callHash: string;
+      expiresAt: number;
+      consumed: boolean;
+    }
   >();
   // Window ids whose single-use MergeGrant has already been minted. A window
   // authorizes exactly ONE merge: the first releasing read mints the grant
@@ -1489,32 +1503,105 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * clock, and the device is told to re-ack against the new deadline.
    */
   /**
-   * The renderable the owner app displays and the ack echoes — a bounded,
-   * display-safe RenderableAlertV1. The hash is canonical over exactly these
-   * fields, so an ack proving "I rendered this hash at revision N" is proof of
-   * the concrete, current showing, not a blank one (apps/owner DESIGN.md §3).
+   * A DECISION-COMPLETE summary that names the concrete operation, or null if
+   * this window cannot be rendered decision-completely. "github/merge_pull_request"
+   * is not a decision — the owner must see WHICH pr into WHICH branch at WHICH
+   * head. So:
+   *  - the one grant-eligible purpose (github.merge_pull_request) renders a full
+   *    sentence from its parsed, display-safe args;
+   *  - a purpose we have no decision-complete renderer for returns null;
+   *  - a plain forwarded tool renders the exact canonical call bytes — but we
+   *    NEVER truncate a decisive summary or strip characters out of it: if the
+   *    full, display-safe args do not fit the V1 limit, or carry any FORBIDDEN
+   *    character, the summary is null.
+   * A null summary makes the window NON-ACKABLE (below): no delivery is minted,
+   * so silence can never release it — it walks to held (full approval). This is
+   * the fail-closed stance the ack path depends on (apps/owner DESIGN.md §3).
    */
-  function renderableFor(windowId: string, window: VetoWindow, status: VetoWireStatus) {
-    const boundedSafe = (text: string): string =>
-      // strip control chars and cap — the app renders via textContent, but the
-      // canonical hash must be over a stable, sane string
-      [...text].filter((ch) => ch >= " " && ch !== "").join("").slice(0, 200);
+  function decisionCompleteSummary(window: VetoWindow): string | null {
     const purpose = window.purpose;
-    const summary =
-      purpose !== undefined ? `${purpose.connector}/${purpose.operation}` : window.call.tool;
-    return {
+    if (purpose !== undefined) {
+      if (purpose.connector !== GITHUB_CONNECTOR || purpose.operation !== MERGE_PULL_REQUEST) {
+        return null; // no decision-complete renderer for this purpose → hold
+      }
+      const canonicalArgs = grantEligibleArgs(window);
+      if (canonicalArgs === null) return null;
+      let approval;
+      try {
+        approval = buildRenderableApproval(parseMergePrArgs(canonicalArgs));
+      } catch {
+        return null;
+      }
+      const method = approval.mergeMethod === "default" ? "merge" : approval.mergeMethod;
+      // owner/repo/base/head are proven ASCII-display-safe by parseMergePrArgs.
+      return (
+        `Merge ${approval.owner}/${approval.repo}#${approval.pullNumber} ` +
+        `into ${approval.expectedBaseRef} — ${method}, head ${approval.expectedHeadSha.slice(0, 12)}`
+      );
+    }
+    // Plain forwarded tool: the exact canonical call bytes, verbatim. The tool
+    // name is already its own envelope field, so the summary is the arguments.
+    const canonicalArgs = canonicalJson(window.call.args ?? {});
+    const summary = canonicalArgs === "{}" ? "(no arguments)" : canonicalArgs;
+    if (RENDERABLE_ALERT_FORBIDDEN.test(summary)) return null; // never strip-and-hide
+    if (codePointLength(summary) > RENDERABLE_ALERT_V1_LIMITS.summary) return null; // never truncate
+    return summary;
+  }
+
+  /**
+   * The ACKABLE content — the strict RenderableAlertV1 whose hash the delivery
+   * binds and the ack echoes. Returns null when the window cannot be rendered
+   * decision-completely (a null summary) OR when the agent-supplied agentId /
+   * tool themselves fail V1 conformance (oversized or FORBIDDEN). A null here
+   * is the whole fail-closed guarantee: no delivery, so no release on silence.
+   */
+  function ackableContent(window: VetoWindow): RenderableAlertV1 | null {
+    const summary = decisionCompleteSummary(window);
+    if (summary === null) return null;
+    const alert = {
       v: 1 as const,
-      windowId,
-      agentId: boundedSafe(window.call.agentId),
-      tool: boundedSafe(window.call.tool),
-      summary: boundedSafe(summary),
-      status,
-      revision: window.revision,
-      deadline: window.deadlineAt,
+      agentId: window.call.agentId,
+      tool: window.call.tool,
+      summary,
+    };
+    return validateRenderableAlert(alert) === null ? alert : null;
+  }
+
+  /**
+   * The fields the app DISPLAYS. On the ack path these are exactly the ackable
+   * envelope (so the hash the client can recompute matches). Off it (a terminal
+   * window, or one we cannot render decision-completely) there is no ack and no
+   * hash, so a lossy, stripped, bounded render is acceptable here — the owner
+   * still sees who/what, and the summary states that full approval is required.
+   */
+  function displayEnvelope(
+    window: VetoWindow,
+    ackable: RenderableAlertV1 | null,
+  ): { agentId: string; tool: string; summary: string } {
+    if (ackable !== null) {
+      return { agentId: ackable.agentId, tool: ackable.tool, summary: ackable.summary };
+    }
+    const strip = (text: string, cap: number): string =>
+      [...String(text)].filter((ch) => !RENDERABLE_ALERT_FORBIDDEN.test(ch)).slice(0, cap).join("");
+    return {
+      agentId: strip(window.call.agentId, RENDERABLE_ALERT_V1_LIMITS.agentId),
+      tool: strip(window.call.tool, RENDERABLE_ALERT_V1_LIMITS.tool),
+      summary: "This action needs full owner approval — open OwnerSwitch to review.",
     };
   }
 
-  const renderHashOf = (renderable: unknown): string => sha256Hex(canonicalJson(renderable));
+  /**
+   * renderContentHash — base64url(sha256(canonical RenderableAlertV1)), over
+   * EXACTLY {v, agentId, tool, summary} and nothing else, so the owner app can
+   * recompute it from the very fields it rendered. Not sha256Hex over an ad-hoc
+   * object: status/revision/deadline are carried and CAS-checked separately, and
+   * must not ride the content hash (the client cannot reproduce them).
+   */
+  const renderContentHashOf = (alert: RenderableAlertV1): string =>
+    createHash("sha256").update(canonicalRenderableAlert(alert), "utf8").digest("base64url");
+
+  /** The hash of the exact canonical call bytes the delivery is bound to. */
+  const callHashOf = (window: VetoWindow): string => sha256Hex(canonicalJson(window.call.args ?? {}));
 
   /**
    * GET /veto/:id/detail — owner-device-signed. Returns the RenderableAlertV1
@@ -1539,23 +1626,40 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return;
     }
     const status = window.tick();
-    const renderable = renderableFor(id, window, status);
-    if (status !== "pending" && status !== "extended") {
-      // nothing to ack — render the terminal state, mint no delivery
-      sendJson(res, 200, { ...renderable, deliveryId: null });
+    // Ackable content only for a still-open window; a terminal window has
+    // nothing to confirm. A live window we cannot render decision-completely
+    // yields null too — it mints no delivery and, never delivered, fails
+    // closed to held rather than releasing on silence.
+    const ackable =
+      status === "pending" || status === "extended" ? ackableContent(window) : null;
+    const disp = displayEnvelope(window, ackable);
+    const base = {
+      v: 1 as const,
+      windowId: id,
+      agentId: disp.agentId,
+      tool: disp.tool,
+      summary: disp.summary,
+      status,
+      revision: window.revision,
+      deadline: window.deadlineAt,
+    };
+    if (ackable === null) {
+      // terminal, or non-ackable (held-bound) — render state, mint no delivery
+      sendJson(res, 200, { ...base, deliveryId: null });
       return;
     }
-    const renderHash = renderHashOf(renderable);
+    const renderHash = renderContentHashOf(ackable);
     const deliveryId = `del_${randomBytes(12).toString("hex")}`;
     ownerDeliveries.set(deliveryId, {
       windowId: id,
       revision: window.revision,
       renderHash,
+      callHash: callHashOf(window),
       expiresAt: now() + DELIVERY_TTL_MS,
       consumed: false,
     });
     sendJson(res, 200, {
-      ...renderable,
+      ...base,
       deliveryId,
       renderContentHash: renderHash,
       deliveryExpiresAt: now() + DELIVERY_TTL_MS,
@@ -1619,10 +1723,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return reject("stale delivery — the window advanced since it was rendered; re-fetch the detail");
     }
     // the render hash must match the delivery AND the window's current
-    // renderable (recomputed now), so the ack proves the concrete current view
-    const currentHash = renderHashOf(renderableFor(id, window, status));
+    // renderable (recomputed now), so the ack proves the concrete current view.
+    // A window that stopped being ackable (e.g. its args no longer render
+    // decision-completely) has no current hash and cannot be confirmed.
+    const currentAckable = ackableContent(window);
+    if (currentAckable === null) {
+      return reject("this window is no longer ackable — it requires full owner approval");
+    }
+    const currentHash = renderContentHashOf(currentAckable);
     if (delivery.renderHash !== currentHash || echoedHash !== currentHash) {
       return reject("render hash mismatch — the detail does not match the current window");
+    }
+    // the exact call bytes the delivery was bound to must still be the window's
+    // call bytes — a delivery cannot confirm a call other than the one rendered
+    if (delivery.callHash !== callHashOf(window)) {
+      return reject("call mismatch — the detail was minted for different call bytes");
     }
     if (now() > window.deadlineAt - MIN_VETO_RESPONSE_MS) {
       return reject(
