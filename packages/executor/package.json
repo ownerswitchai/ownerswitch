@@ -1,6 +1,7 @@
 {
   "name": "@ownerswitchai/executor",
   "version": "0.0.1",
+  "license": "FSL-1.1-ALv2",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",

@@ -1,5 +1,25 @@
 # Contributing
 
+## License and sign-off (DCO)
+
+This project is licensed under the [Functional Source License,
+FSL-1.1-ALv2](LICENSE.md). By contributing you agree that your
+contributions are licensed under the same terms, and that the project
+maintainer may relicense the project (including your contributions) —
+for example to a more permissive license, consistent with the FSL's
+built-in conversion to Apache-2.0.
+
+Every commit must be signed off under the
+[Developer Certificate of Origin](https://developercertificate.org/):
+
+```bash
+git commit -s
+```
+
+The `-s` flag adds a `Signed-off-by:` line certifying you have the right
+to submit the work under the project license. PRs with unsigned commits
+won't be merged.
+
 ## Security conventions
 
 This repo has learned the rules below the hard way — each one closes a class
