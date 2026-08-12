@@ -53,10 +53,23 @@
   }
 
   // LIVE MODE.
+  // A render generation: every route change / navigation / hide / blur that
+  // could make the current review invalid bumps it. A pending ack (and the
+  // veto handler) captures the generation it was armed under and refuses to
+  // act once it is superseded — so a two-rAF ack armed for window A can never
+  // fire after the view moved to B, and a stale click can't stop the wrong one.
+  var renderGen = 0;
+  function invalidateRender() {
+    renderGen++;
+  }
   window.addEventListener("hashchange", function () {
+    invalidateRender(); // any hash change abandons the previous review
     syncTabs();
     routeAlert();
   });
+  document.addEventListener("visibilitychange", invalidateRender);
+  window.addEventListener("pagehide", invalidateRender);
+  window.addEventListener("blur", invalidateRender);
   syncTabs();
 
   var runtime = null;
@@ -103,6 +116,14 @@
   // guarded, top-level, visible, focused, unchanged — echo the delivery ack.
   function routeAlert() {
     var h = currentHash();
+    // Any route entry supersedes the previous review's pending ack/veto and
+    // disables the stale control immediately, BEFORE the new detail loads.
+    var gen = ++renderGen;
+    var btn = document.querySelector("#alert .veto-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.onclick = null;
+    }
     if (h.tab !== "alert" || !h.arg) return;
     var windowId = h.arg;
     if (!isTopLevel()) return; // never render/ack a framed review surface
@@ -110,21 +131,23 @@
     loadRuntime().then(function (rt) {
       rt.fetchDetail(windowId)
         .then(function (detail) {
+          if (gen !== renderGen) return; // superseded while loading
           // render as TEXT (agent-supplied strings are never markup)
           setText("kv-agent", detail.agentId);
           setText("kv-tool", detail.tool);
           setText("kv-action", detail.summary || detail.tool);
           setText("kv-window", windowId);
-          wireVeto(rt, windowId);
+          wireVeto(rt, windowId, gen);
 
           if ((detail.status === "pending" || detail.status === "extended") && detail.deliveryId) {
-            // The guard is re-checked inside signedFetch, AFTER the key is
-            // retrieved and immediately before signing: if the surface stopped
-            // being a valid top-level, visible, focused view of THIS window,
-            // no signature is produced.
+            // The guard is re-checked inside signedFetch AFTER the key is
+            // retrieved and again immediately before the fetch: if the surface
+            // stopped being a valid top-level, visible, focused, CURRENT-
+            // generation view of THIS window, no signature is sent.
             var stillValid = function () {
               var cur = currentHash();
               return (
+                gen === renderGen &&
                 isTopLevel() &&
                 document.visibilityState === "visible" &&
                 document.hasFocus() &&
@@ -146,17 +169,20 @@
           }
         })
         .catch(function () {
-          setText("kv-action", "This review could not be loaded — reopen from the notification.");
+          if (gen === renderGen) setText("kv-action", "This review could not be loaded — reopen from the notification.");
         });
     });
   }
 
-  function wireVeto(rt, windowId) {
+  function wireVeto(rt, windowId, gen) {
     var btn = document.querySelector("#alert .veto-btn");
     if (!btn) return;
     btn.disabled = false;
     btn.removeAttribute("aria-disabled");
-    btn.addEventListener("click", function () {
+    // ASSIGN (not addEventListener): one active handler, so a click after the
+    // view moved to another window cannot fire a stale window's veto.
+    btn.onclick = function () {
+      if (gen !== renderGen) return; // stale view — ignore
       btn.disabled = true;
       rt.sendVeto(windowId)
         .then(function (result) {
@@ -173,7 +199,7 @@
           btn.textContent = "VETO — retry";
           btn.disabled = false; // network failure stays retryable (idempotent server-side)
         });
-    });
+    };
   }
 
   routeAlert();

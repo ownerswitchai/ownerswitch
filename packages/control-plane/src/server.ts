@@ -1407,8 +1407,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     id: string,
     raw: string,
   ): Promise<void> {
-    const deviceId = validDeviceIdFrom(req, raw);
-    if (deviceId === null) {
+    // Two device credentials may STOP here, both deny-only: the fleet device
+    // HMAC (the escalation ladder's relayed channel stops) and the OWNER APP's
+    // asymmetric device signature (its one-tap veto — the same non-extractable
+    // key that acks delivery). Either is enough to veto; NEITHER can approve
+    // (that stays the owner session + passkey). The owner-app key gets the
+    // stronger label, but the verb is identical: stop.
+    const fleetId = validDeviceIdFrom(req, raw);
+    const ownerDeviceId = fleetId === null ? validOwnerDeviceIdFrom(req, raw) : null;
+    if (fleetId === null && ownerDeviceId === null) {
       sendUnauthorized(res);
       return;
     }
@@ -1424,7 +1431,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       });
       return;
     }
-    let attribution = `device:${deviceId}`;
+    let attribution = fleetId !== null ? `device:${fleetId}` : `owner-device:${ownerDeviceId}`;
     if (body.attribution !== undefined) {
       if (
         typeof body.attribution !== "string" ||

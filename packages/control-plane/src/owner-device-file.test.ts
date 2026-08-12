@@ -33,6 +33,23 @@ describe("enrolledOwnerDeviceFromSpki — strict public-key parsing", () => {
     expect(() => enrolledOwnerDeviceFromSpki("d", pkcs8Pem(kp))).toThrow(/PRIVATE key/i);
   });
 
+  it("REJECTS trailing bytes after the SPKI — a private key or padding cannot hide behind the public half", () => {
+    const kp = p256();
+    const spkiDer = kp.publicKey.export({ format: "der", type: "spki" }) as Buffer;
+    const pkcs8Der = kp.privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
+
+    // canonical SPKI || matching PKCS#8 private key, base64'd as one DER input
+    const smuggled = Buffer.concat([spkiDer, pkcs8Der]).toString("base64");
+    expect(() => enrolledOwnerDeviceFromSpki("d", smuggled)).toThrow(/trailing bytes/);
+
+    // even a single appended 0x00 is refused
+    const padded = Buffer.concat([spkiDer, Buffer.from([0x00])]).toString("base64");
+    expect(() => enrolledOwnerDeviceFromSpki("d", padded)).toThrow(/trailing bytes/);
+
+    // the clean SPKI still passes
+    expect(() => enrolledOwnerDeviceFromSpki("d", spkiDer.toString("base64"))).not.toThrow();
+  });
+
   it("rejects a non-P-256 key and multiple PEM blocks", () => {
     const ed = generateKeyPairSync("ed25519");
     expect(() => enrolledOwnerDeviceFromSpki("d", ed.publicKey.export({ format: "pem", type: "spki" }).toString())).toThrow(

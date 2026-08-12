@@ -89,9 +89,14 @@ async function signedFetch(baseUrl, path, method, body, guard) {
     timestamp: Date.now(),
     nonce: nonce(),
   });
+  // Re-check AFTER the async WebCrypto sign and IMMEDIATELY before the fetch:
+  // hide/blur/navigation during signing must not still send the ack. The
+  // signature is single-use (server nonce), so an unsent one is simply wasted.
+  if (guard && !guard()) throw new Error("aborted: review surface no longer valid after signing");
   return fetch(baseUrl + path, {
     method,
     cache: "no-store",
+    redirect: "error", // a redirected control-plane response is never trusted
     headers: { "content-type": "application/json", "cache-control": "no-store", ...headers },
     ...(method === "POST" ? { body: body ?? "" } : {}),
   });

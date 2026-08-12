@@ -2231,6 +2231,34 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     expect(window.vetoedBy).toBe("channel:sms-reply"); // first attribution stands
   });
 
+  it("the owner app's ECDSA device signature vetoes on POST /veto/:id (deny-only, E2E)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // the same owner-device key that acks delivery signs the one-tap veto
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", "/veto/v-1", "", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "vetoed" });
+    expect(window.vetoedBy).toBe("owner-device:owner-app");
+
+    // but that same credential can NEVER approve
+    const approveBody = JSON.stringify({ decision: "approve" });
+    openWindow(cp, c, "v-appr");
+    const approve = await fetch(`${url}/veto/v-appr`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", "/veto/v-appr", approveBody, c.now()),
+      body: approveBody,
+    });
+    expect(approve.status).toBe(403);
+    expect(((await approve.json()) as { error: string }).error).toMatch(/one verb/);
+  });
+
   it("without an attribution a device stop is recorded against the signing device", async () => {
     const c = clock(1_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });

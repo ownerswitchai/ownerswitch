@@ -90,8 +90,21 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
   if (curve !== "prime256v1") {
     throw new Error(`owner device "${deviceId}" key must be on prime256v1 (P-256), got ${curve ?? "unknown"}`);
   }
-  // canonical re-export: bind bytes this parser produced, not the input
-  return { deviceId, publicKey: createPublicKey(key.export({ type: "spki", format: "pem" })) };
+  // FULL-CONSUMPTION check: Node's DER decoder parses the leading SPKI and
+  // ignores trailing bytes, so `canonical-SPKI-DER || PKCS8-private-DER` (even
+  // base64'd into one PUBLIC KEY block) would parse as a public key while a
+  // 0644 file smuggles the private half for the agent to read. Re-export the
+  // canonical SPKI DER and require it to equal the input byte-for-byte — any
+  // appended bytes (a private key, a 0x00, anything) fail here.
+  const canonicalDer = key.export({ type: "spki", format: "der" });
+  if (!canonicalDer.equals(der)) {
+    throw new Error(
+      `owner device "${deviceId}" key has trailing bytes after the SPKI public key — ` +
+        "refusing (a private key or padding may be smuggled after the public half)",
+    );
+  }
+  // bind bytes this parser produced, not the input
+  return { deviceId, publicKey: createPublicKey({ key: canonicalDer, format: "der", type: "spki" }) };
 }
 
 /**
