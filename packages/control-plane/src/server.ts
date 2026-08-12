@@ -79,7 +79,20 @@ import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
  *                     /kill there is no loopback fallback: a gateway that
  *                     cannot register must fail its call closed, not get an
  *                     open door here.
- *  - POST /veto/:id — owner session required; the session names the vetoer.
+ *  - POST /veto/:id — owner session (the session names the vetoer, and only
+ *                     a session may approve) OR device signature (deny-only:
+ *                     the escalation ladder's relayed channel stops and the
+ *                     owner app's one-tap veto; idempotent on re-veto).
+ *  - POST /veto/:id/seen — device signature required, no other variant; the
+ *                     enrolled device's delivery ack — the production caller
+ *                     of markDelivered(). Refused inside the 60 s response
+ *                     floor before the deadline (MIN_VETO_RESPONSE_MS).
+ *  - GET  /veto/pending — device signature required; the open-window listing
+ *                     the escalation ladder polls, with deadlines and
+ *                     delivered bits.
+ *  - GET  /veto/:id — open read is status-only; a device-signed read adds
+ *                     `deadline` and `delivered` so escalation paces itself
+ *                     off the window's own clock.
  *  - GET  /status   — open; the gateway polls it. Body carries `killed` and
  *                     the kill `epoch` (a monotone count of every kill this
  *                     deployment has ever had) — the deliberate, documented
@@ -275,6 +288,15 @@ export interface ControlPlane {
  * map without bound, which is why it sits far above any legitimate count.
  */
 export const MAX_CEREMONY_RECORDS = 256;
+
+/**
+ * The minimum time the owner must have between an accepted delivery ack and
+ * the deadline it would let silence spend (apps/owner/DESIGN.md §3): an ack
+ * that lands closer than this is refused, so the window extends or holds on
+ * its own clock instead of releasing an action the owner had no real chance
+ * to veto. A floor, not a knob to zero out.
+ */
+export const MIN_VETO_RESPONSE_MS = 60_000;
 
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
@@ -498,10 +520,22 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   function hasValidDeviceSignature(req: IncomingMessage, rawBody: string): boolean {
-    if (opts.deviceSecret === undefined) return false;
+    return validDeviceIdFrom(req, rawBody) !== null;
+  }
+
+  /**
+   * The deviceId behind a VALID device signature, or null. The escalation
+   * surface needs the identity, not just the boolean: a delivery ack is
+   * recorded against the device that made it, and a relayed channel veto is
+   * attributed to the relaying credential.
+   */
+  function validDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
+    if (opts.deviceSecret === undefined) return null;
     const credential = deviceCredentialFrom(req);
-    if (credential === null) return false;
-    return verifyDeviceSignature(credential, rawBody, opts.deviceSecret, { now, seenNonces });
+    if (credential === null) return null;
+    return verifyDeviceSignature(credential, rawBody, opts.deviceSecret, { now, seenNonces })
+      ? credential.deviceId
+      : null;
   }
 
   // Degraded durability is worth a field only when true: the in-memory state
@@ -1037,24 +1071,27 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   async function postVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
-    // Both a veto (stop) and an approval (the merge lane's active "yes") name
-    // an owner, so both stay authenticated by an owner SESSION — a token on
-    // the owner's device, NOT the gateway's device secret. That is exactly
-    // why an approval is a boundary a same-uid agent cannot cross: it can
-    // forge a registration (device secret), but not the owner's session.
-    // The session, not the body, says who acted; the body carries only the
-    // decision.
+    // An APPROVAL names an owner, so it stays authenticated by an owner
+    // SESSION — a token on the owner's device, NOT the gateway's device
+    // secret. That is exactly why an approval is a boundary a same-uid agent
+    // cannot cross: it can forge a registration (device secret), but not the
+    // owner's session. A VETO additionally accepts a device signature — the
+    // escalation ladder relays SMS replies and DTMF keypresses under its
+    // device credential (escalation DESIGN.md §3), and the owner app's
+    // one-tap stop rides its enrolled-device key. Stops are cheap and
+    // attributable; the device path carries no other verb (deny-only, the
+    // same doctrine as the kill surface).
+    const raw = await readRawBody(req);
     const session = ownerSessionFrom(req);
     if (session === null) {
-      sendUnauthorized(res);
-      return;
+      return postDeviceVeto(req, res, id, raw);
     }
     const window = vetoWindows.get(id);
     if (!window) {
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    const body = parseJsonBody(await readRawBody(req));
+    const body = parseJsonBody(raw);
     const decision = body.decision ?? "veto";
     if (decision !== "veto" && decision !== "approve") {
       sendJson(res, 400, { error: 'decision must be "veto" or "approve"' });
@@ -1179,6 +1216,164 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     } catch (err) {
       sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  /**
+   * The device-signed veto relay — the deny-only half of POST /veto/:id.
+   * Carries exactly one verb: stop. `decision: "approve"` under a device
+   * signature is refused loudly — a device credential must never mint the
+   * merge lane's authorizing event, however the request is shaped.
+   *
+   * Attribution is honest about its weakness: a relayed channel stop names
+   * the channel ("channel:sms-reply", "channel:voice-dtmf"), never a person
+   * — a forged SMS after a SIM swap stopped something, and the audit trail
+   * should say a phone did it, not the owner. Without an attribution the
+   * stop is recorded against the signing device id.
+   *
+   * IDEMPOTENT: re-vetoing a vetoed window succeeds as a no-op, so the
+   * owner app's service worker and the ladder can blind-retry a send they
+   * cannot prove arrived.
+   */
+  async function postDeviceVeto(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+    raw: string,
+  ): Promise<void> {
+    const deviceId = validDeviceIdFrom(req, raw);
+    if (deviceId === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const window = vetoWindows.get(id);
+    if (!window) {
+      sendJson(res, 404, { error: `no veto window "${id}"` });
+      return;
+    }
+    const body = parseJsonBody(raw);
+    if (body.decision !== undefined && body.decision !== "veto") {
+      sendJson(res, 403, {
+        error: "a device credential carries exactly one verb here: veto — approval requires the owner's session and passkey",
+      });
+      return;
+    }
+    let attribution = `device:${deviceId}`;
+    if (body.attribution !== undefined) {
+      if (
+        typeof body.attribution !== "string" ||
+        !/^channel:[a-z0-9][a-z0-9-]{0,62}$/.test(body.attribution)
+      ) {
+        sendJson(res, 400, {
+          error: 'attribution must be "channel:<kind>" (lowercase alphanumeric/hyphen), e.g. "channel:sms-reply"',
+        });
+        return;
+      }
+      attribution = body.attribution;
+    }
+    if (window.state === "vetoed") {
+      sendJson(res, 200, { status: "vetoed" });
+      return;
+    }
+    // Too late once the grant is committed for dispatch — same honest 409 as
+    // the session path; the two handlers stay synchronous so the race with
+    // the commit handler has exactly one winner.
+    const grantJti = windowToGrant.get(id);
+    if (grantJti !== undefined && committedGrants.has(grantJti)) {
+      sendJson(res, 409, {
+        error: "the approved merge is already committed for dispatch (in flight) — too late to veto",
+      });
+      return;
+    }
+    try {
+      window.veto(attribution);
+      sendJson(res, 200, { status: window.state });
+    } catch (err) {
+      sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * POST /veto/:id/seen — the production caller of markDelivered(), and the
+   * ONLY caller (escalation DESIGN.md §3): the enrolled device reports the
+   * alert was rendered in front of a human. Strictly device-signed — no
+   * session variant, no open variant — because this is the PERMISSIVE bit of
+   * the veto lane: it is what lets silence release a held call, so it must
+   * ride the one path the telephony provider never touches. Nothing a
+   * carrier, a webhook, or an owner session asserts may flip it.
+   *
+   * A last-second ack must never convert straight into a release the owner
+   * had no time to answer: inside the response floor (60 s before the
+   * deadline) the ack is refused, the window extends or holds on its own
+   * clock, and the device is told to re-ack against the new deadline.
+   */
+  async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const raw = await readRawBody(req);
+    const deviceId = validDeviceIdFrom(req, raw);
+    if (deviceId === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const window = vetoWindows.get(id);
+    if (!window) {
+      sendJson(res, 404, { error: `no veto window "${id}"` });
+      return;
+    }
+    // idempotent: a delivered window stays delivered; re-acks succeed
+    if (window.isDelivered) {
+      sendJson(res, 200, { status: window.tick(), delivered: true, deadline: window.deadlineAt });
+      return;
+    }
+    const status = window.tick();
+    if (status !== "pending" && status !== "extended") {
+      sendJson(res, 409, { error: `cannot ack in status "${status}"` });
+      return;
+    }
+    if (now() > window.deadlineAt - MIN_VETO_RESPONSE_MS) {
+      sendJson(res, 409, {
+        error:
+          "ack arrived inside the minimum veto-response floor (60 s before the deadline) — not counted; " +
+          "the window will extend or hold, re-ack against the new deadline",
+      });
+      return;
+    }
+    window.markDelivered(deviceId);
+    sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt });
+  }
+
+  /**
+   * GET /veto/pending — the listing the escalation ladder polls to discover
+   * work. Device-signed: window contents describe held agent actions, so the
+   * listing is authenticated like registration is. Serves only windows still
+   * open (pending/extended, after a tick), each with the deadline and
+   * delivered bit the ladder paces itself off.
+   */
+  async function getVetoPending(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const raw = await readRawBody(req);
+    if (validDeviceIdFrom(req, raw) === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const windows: Array<{
+      id: string;
+      status: VetoWireStatus;
+      agentId: string;
+      tool: string;
+      deadline: number;
+      delivered: boolean;
+    }> = [];
+    for (const [windowId, window] of vetoWindows) {
+      const status = window.tick();
+      if (status !== "pending" && status !== "extended") continue;
+      windows.push({
+        id: windowId,
+        status,
+        agentId: window.call.agentId,
+        tool: window.call.tool,
+        deadline: window.deadlineAt,
+        delivered: window.isDelivered,
+      });
+    }
+    sendJson(res, 200, { windows });
   }
 
   /** The wire assertion, or null when the body doesn't carry a usable one. */
@@ -1467,12 +1662,20 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 201, { id, status: window.state });
   }
 
-  function getVeto(res: ServerResponse, id: string): void {
+  async function getVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const window = vetoWindows.get(id);
     if (!window) {
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
+    // The open read stays status-only — anyone holding an id learns how the
+    // question ended, nothing about its clock. An enrolled device (the
+    // ladder, the owner app) additionally gets the deadline and the
+    // delivered bit, so escalation paces itself off the window's own clock
+    // instead of guessing (escalation DESIGN.md §3).
+    const deviceRead = validDeviceIdFrom(req, await readRawBody(req)) !== null;
+    const pacing = () =>
+      deviceRead ? { deadline: window.deadlineAt, delivered: window.isDelivered } : {};
     let status: VetoWireStatus = window.tick();
     // A release authorizes exactly one run IN THE EPOCH IT WAS GRANTED. If a
     // kill happened after the window was registered — even one since
@@ -1503,7 +1706,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       if (window.approvedBy === null) {
         // registered and shown to the owner, but not yet actively approved —
         // keep the gateway waiting; a merge never proceeds on silence
-        sendJson(res, 200, { status: "pending" });
+        sendJson(res, 200, { status: "pending", ...pacing() });
         return;
       }
       // Actively approved. Mint at most once, bound to the epoch in force AT
@@ -1534,7 +1737,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
     // Not grant-eligible: the plain veto lane, unchanged — silence-release is
     // fine and mints no signed authority (no grant is ever minted here).
-    sendJson(res, 200, { status });
+    sendJson(res, 200, { status, ...pacing() });
   }
 
   /**
@@ -1613,6 +1816,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const reqUrl = new URL(req.url ?? "/", "http://localhost");
     const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
+    const vetoSeenMatch = /^\/veto\/([^/]+)\/seen$/.exec(path);
     const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
     const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
@@ -1636,10 +1840,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     if (method === "POST" && path === "/restore") return postRestore(req, res);
     if (method === "POST" && path === "/veto") return postRegisterVeto(req, res);
+    // literal routes outrun the :id capture — "pending" is a listing, not a window id
+    if (method === "GET" && path === "/veto/pending") return getVetoPending(req, res);
+    if (method === "POST" && vetoSeenMatch) {
+      return postVetoSeen(req, res, decodeURIComponent(vetoSeenMatch[1]));
+    }
     if (vetoMatch) {
       const id = decodeURIComponent(vetoMatch[1]);
       if (method === "POST") return postVeto(req, res, id);
-      if (method === "GET") return getVeto(res, id);
+      if (method === "GET") return getVeto(req, res, id);
     }
     sendJson(res, 404, { error: "not found" });
   }

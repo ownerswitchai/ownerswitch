@@ -13,7 +13,7 @@ export type { VetoStatus, VetoOptions, VetoPurpose, VetoWireStatus } from "./vet
 export { RestoreCeremony } from "./twogo.js";
 export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.js";
 
-export { createControlPlane, DEFAULT_KILL_STATE_FILE } from "./server.js";
+export { createControlPlane, DEFAULT_KILL_STATE_FILE, MIN_VETO_RESPONSE_MS } from "./server.js";
 export type { ControlPlane, ControlPlaneOptions } from "./server.js";
 
 export { verifyOwnerAssertion } from "./webauthn.js";
