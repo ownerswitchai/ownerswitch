@@ -1,3 +1,5 @@
+import { createPublicKey } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createControlPlane } from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
@@ -25,6 +27,13 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *   OWNERSWITCH_OWNER_PASSKEY_PUBLIC_KEY_FILE  path to the SPKI PEM public key
  *   OWNERSWITCH_OWNER_PASSKEY_RP_ID          relying-party id (e.g. owner.example)
  *   OWNERSWITCH_OWNER_PASSKEY_ORIGIN         exact https:// origin of the owner app
+ *
+ * Optional — 2GO licensing (the paid gate; every stop path is free forever,
+ * see control-plane/src/license.ts):
+ *   OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE      vendor Ed25519 SPKI PEM; presence
+ *                                            arms the gate (402 on unlicensed
+ *                                            restore-ceremony starts)
+ *   OWNERSWITCH_LICENSE                      this deployment's osl1 token
  */
 
 function required(name: string): string {
@@ -77,6 +86,24 @@ function main(): void {
   // readFileSync of an attacker-writable path.
   const publicKeyPem = loadOwnerPasskeyPublicKey(publicKeyFile).pem;
 
+  // 2GO licensing arms only when the verifying key is provisioned. The key
+  // must parse as an Ed25519 public key HERE, at boot — a corrupt file must
+  // fail the start, not silently turn every future restore into a 402. It
+  // gates the paid direction only; a bad license never touches a stop path.
+  const licenseKeyFile = process.env.OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE?.trim();
+  let licensing: { vendorPublicKeyPem: string; token?: string } | undefined;
+  if (licenseKeyFile !== undefined && licenseKeyFile !== "") {
+    const vendorPublicKeyPem = readFileSync(licenseKeyFile, "utf8");
+    if (createPublicKey(vendorPublicKeyPem).asymmetricKeyType !== "ed25519") {
+      throw new Error(
+        `OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE (${licenseKeyFile}) is not an Ed25519 public key — ` +
+          "provision the vendor's license-verifying.pub.pem",
+      );
+    }
+    const token = process.env.OWNERSWITCH_LICENSE?.trim();
+    licensing = { vendorPublicKeyPem, ...(token !== undefined && token !== "" ? { token } : {}) };
+  }
+
   // dev:false — createControlPlane enforces the production kill-state path
   // guard, the >=256-bit key floors, and the https-origin requirement, and
   // (with a passkey enrolled) the approve handler requires a fresh WebAuthn
@@ -88,6 +115,7 @@ function main(): void {
     grantKey,
     killStateKey,
     ownerPasskey: { credentialId, publicKeyPem, rpId, origin },
+    ...(licensing !== undefined ? { licensing } : {}),
   });
 
   createServer(controlPlane.handler).listen(port, host, () => {

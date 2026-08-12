@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
+import { generateLicenseKeys, mintLicense } from "./license.js";
 import {
   createControlPlane,
   MAX_CEREMONY_RECORDS,
@@ -2143,5 +2144,146 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       deadline: window.deadlineAt,
       delivered: false,
     });
+  });
+});
+
+describe("2GO licensing — the ONE paid gate; every stop path stays free", () => {
+  let server: Server | undefined;
+
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+
+  const keys = generateLicenseKeys();
+  const YEAR = 365 * 86_400_000;
+  const license = (expiresAt: number, issuedAt = 0) =>
+    mintLicense(
+      { v: 1, jti: "lic_test", plan: "team", licensee: "Test Co", issuedAt, expiresAt },
+      keys.privateKeyPem,
+    );
+
+  const startCeremony = async (url: string, c: { now: () => number }) => {
+    const session = createOwnerSession("adam", { now: c.now });
+    return fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+  };
+
+  it("a valid license mints ceremonies; expiry falls into the 72 h grace, then 402", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({
+      now: c.now,
+      licensing: { vendorPublicKeyPem: keys.publicKeyPem, token: license(YEAR) },
+    });
+    const url = await start(cp);
+    await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+
+    expect((await startCeremony(url, c)).status).toBe(201);
+
+    // license expires; the ceremony above ages out; grace holds the door open
+    c.advance(YEAR + 3_600_000); // 1 h past expiry — inside grace
+    const inGrace = await startCeremony(url, c);
+    expect(inGrace.status).toBe(201);
+
+    c.advance(72 * 3_600_000); // now past expiry + 72 h
+    const dead = await startCeremony(url, c);
+    expect(dead.status).toBe(402);
+    const body = (await dead.json()) as { error: string };
+    expect(body.error).toMatch(/license/);
+    expect(body.error).toMatch(/free forever/);
+  });
+
+  it("an UNLICENSED plane refuses new ceremonies with 402 — and every stop path still works", async () => {
+    const c = clock(1_000);
+    const original = console.error;
+    console.error = () => {}; // boot warning is loud by design; silence for the test
+    let cp: ControlPlane;
+    try {
+      cp = ephemeral({
+        now: c.now,
+        deviceSecret: DEVICE_SECRET,
+        licensing: { vendorPublicKeyPem: keys.publicKeyPem }, // no token
+      });
+    } finally {
+      console.error = original;
+    }
+    const url = await start(cp);
+
+    // stopping is free: the kill engages without any license
+    const kill = await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+    expect(kill.status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the veto lane is free: register (device-signed), ack seen, veto
+    const window = new VetoWindow({ agentId: "a", tool: "bash" }, cp.killSwitch.epoch, { now: c.now });
+    cp.vetoWindows.set("v-free", window);
+    const seen = await fetch(`${url}/veto/v-free/seen`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(200);
+    const veto = await fetch(`${url}/veto/v-free`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(veto.status).toBe(200);
+    expect(window.state).toBe("vetoed");
+
+    // status stays open and honest
+    expect((await (await fetch(`${url}/status`)).json() as { killed: boolean }).killed).toBe(true);
+
+    // only the paid act — minting a NEW 2GO ceremony — answers 402
+    const refused = await startCeremony(url, c);
+    expect(refused.status).toBe(402);
+
+    // and without the licensing option at all (dev/quickstart), 2GO is ungated
+    const free = ephemeral({ now: c.now });
+    const freeUrl = await start(free);
+    await fetch(`${freeUrl}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+    expect((await startCeremony(freeUrl, c)).status).toBe(201);
+  });
+
+  it("an owner already HOLDING a ceremony keeps it through a license lapse (idempotent return outruns the gate)", async () => {
+    const c = clock(1_000);
+    const cpLive = ephemeral({
+      now: c.now,
+      licensing: { vendorPublicKeyPem: keys.publicKeyPem, token: license(2_000) },
+    });
+    const url = await start(cpLive);
+    await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+
+    const session = createOwnerSession("adam", { now: c.now });
+    const mint = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(mint.status).toBe(201); // license valid at t=1s (expires t=2s, grace 72h — still ok)
+    const { id } = (await mint.json()) as { id: string };
+
+    // same owner asks again — idempotent return, no fresh license judgment
+    const again = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { id: string }).id).toBe(id);
   });
 });

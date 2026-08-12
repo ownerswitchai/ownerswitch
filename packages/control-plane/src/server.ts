@@ -23,6 +23,7 @@ import {
 } from "./auth.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
+import { verifyLicense } from "./license.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
 import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
@@ -198,6 +199,24 @@ export interface ControlPlaneOptions {
    * passkey is mandatory) and irrelevant without a grant key.
    */
   acceptSessionOnlyApprovalRisk?: boolean;
+  /**
+   * Commercial licensing for 2GO — the ONE license-aware point in the whole
+   * system, and it gates exactly one thing: STARTING a restore ceremony
+   * (POST /restore/ceremony → 402 without a valid license). The doctrine
+   * lives in license.ts and is worth restating at the option: no deny-path
+   * — kill, veto, ack, status, the escalation ladder — ever consults this;
+   * stopping is free forever. Expired licenses keep restoring for the 72 h
+   * anti-ransom grace, and an unlicensed plane still STOPS perfectly — it
+   * just cannot be turned back on through 2GO until licensed. When this
+   * option is absent (the default, and every dev/quickstart instance),
+   * ceremonies are ungated — the private-beta behavior.
+   */
+  licensing?: {
+    /** the vendor's Ed25519 SPKI PEM that license tokens verify against */
+    vendorPublicKeyPem: string;
+    /** the deployment's OWNERSWITCH_LICENSE token; absent = unlicensed */
+    token?: string;
+  };
 }
 
 /** Default kill-state location IN DEV MODE, resolved against the working directory. */
@@ -436,6 +455,28 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         "acceptSessionOnlyApprovalRisk: true (env OWNERSWITCH_ACCEPT_SESSION_ONLY_APPROVAL_RISK=1); " +
         "in production, enroll a passkey instead.",
     );
+  }
+  // Licensing never stops a boot and never touches a stop path — but a
+  // plane whose restores WILL be refused should say so at startup, not
+  // during the incident. (license.ts holds the doctrine.)
+  if (opts.licensing !== undefined) {
+    const verdict = verifyLicense(opts.licensing.token ?? "", opts.licensing.vendorPublicKeyPem, now());
+    if (!verdict.ok) {
+      console.error(
+        `[ownerswitch] UNLICENSED for 2GO restore: ${verdict.reason} — the kill switch, vetoes and ` +
+          "all stop paths run free and unaffected; POST /restore/ceremony will answer 402 until licensed.",
+      );
+    } else if (verdict.state === "grace") {
+      console.error(
+        `[ownerswitch] license for "${verdict.license.licensee}" is EXPIRED and inside the 72 h ` +
+          "restore grace — renew now; restores stop working when the grace ends.",
+      );
+    } else if (verdict.license.expiresAt - now() < 14 * 86_400_000) {
+      console.error(
+        `[ownerswitch] license for "${verdict.license.licensee}" expires ` +
+          `${new Date(verdict.license.expiresAt).toISOString()} — renew soon.`,
+      );
+    }
   }
   const killSwitch = new KillSwitch(
     now,
@@ -837,6 +878,32 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
           expiresAt: record.ceremony.expiresAt,
         });
         return;
+      }
+    }
+    // THE ONE LICENSE GATE in the system (license.ts doctrine): minting a
+    // NEW 2GO ceremony is the paid act. It sits after the idempotent
+    // return — a ceremony the owner already holds is never yanked away by
+    // a mid-flight lapse — and nothing on any stop path ever reaches this
+    // check. 402, the HTTP status that says exactly what this is.
+    if (opts.licensing !== undefined) {
+      const verdict = verifyLicense(
+        opts.licensing.token ?? "",
+        opts.licensing.vendorPublicKeyPem,
+        now(),
+      );
+      if (!verdict.ok) {
+        sendJson(res, 402, {
+          error:
+            `2GO restore requires an active OwnerSwitch license: ${verdict.reason}. ` +
+            "Stopping, vetoes, acks and the audit trail are free forever and unaffected.",
+        });
+        return;
+      }
+      if (verdict.state === "grace") {
+        console.error(
+          `[ownerswitch] restore ceremony started on the 72 h grace of an EXPIRED license ` +
+            `("${verdict.license.licensee}") — renew now.`,
+        );
       }
     }
     // Secondary backstop only — with the purge and the one-per-owner rule
