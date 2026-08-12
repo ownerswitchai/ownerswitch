@@ -50,12 +50,15 @@ function assertCanonicalPathAndQuery(pathAndQuery: string): void {
   }
   // WHATWG fixpoint: printable-ASCII is necessary but not sufficient — the URL
   // serializer every fetch runs re-encodes some code points position-dependently
-  // (`"` `<` `>` `` ` `` always; `{` `}` in the path; `\` becomes `/`), so a
-  // string it would rewrite signs bytes the wire never carries. Parse against a
-  // fixed dummy origin and require the serialized form to reproduce the input
-  // byte-for-byte. This is the exact per-position truth: `^` or `{` in a query
-  // survive serialization verbatim, so they verify; the same `{` in a path does
-  // not, so it is refused. Also collapses protocol-relative "//host" smuggling.
+  // (`"` `<` `>` `` ` `` always; `{` `}` and `\` in a path), so a string it
+  // would rewrite signs bytes the wire never carries. Parse against a fixed
+  // dummy origin and require the serialized form to reproduce the input
+  // byte-for-byte. Deliberately no hand-maintained punctuation list: the
+  // percent-encode sets are versioned spec surface (the path set gained `^`
+  // between Node 22 and 24), so THE RUNNING SERIALIZER decides — whatever it
+  // would rewrite is refused, whatever it transmits verbatim verifies, and
+  // both directions stay byte-exact on every engine. Also collapses
+  // protocol-relative "//host" smuggling.
   let parsed: URL;
   try {
     parsed = new URL(pathAndQuery, "http://canonical.invalid");

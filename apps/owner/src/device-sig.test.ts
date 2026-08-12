@@ -135,7 +135,8 @@ describe("deviceSigPreimage", () => {
 
   it("refuses strings the WHATWG URL serializer would rewrite (signed bytes must be wire bytes)", () => {
     // the serializer re-encodes these before they ever reach the wire, so a
-    // signature over the raw form binds bytes that are never transmitted
+    // signature over the raw form binds bytes that are never transmitted.
+    // These vectors are stable across the spec's history:
     for (const raw of [
       '/x"y?q=1', // "  -> %22
       "/x<y", //      <  -> %3C
@@ -151,11 +152,31 @@ describe("deviceSigPreimage", () => {
         /serialized request-target|request target/,
       );
     }
-    // ...and accepts exactly what the serializer transmits verbatim: these are
-    // the wire bytes, position-dependently. ^ survives in path AND query; { }
-    // survive in a query (only the path re-encodes them).
-    for (const wire of ["/x^y", "/x?q=^v", "/x?q={z}", "/x%7By%7D", "/x?q=%3Cz%3E"]) {
+    // ...and accepts exactly what the serializer transmits verbatim. Canonical
+    // percent-encoded spellings are wire bytes on every engine, and the query
+    // percent-encode set has never contained ^ or { }:
+    for (const wire of ["/x%5Ey", "/x?q=^v", "/x?q={z}", "/x%7By%7D", "/x?q=%3Cz%3E"]) {
       expect(() => deviceSigPreimage({ ...base, pathAndQuery: wire }), wire).not.toThrow();
+    }
+  });
+
+  it("^ in a PATH follows the running serializer — the fixpoint decides, not a punctuation list", () => {
+    // The WHATWG path percent-encode set gained U+005E (^): engines tracking
+    // the current spec (Node 24+) rewrite "/x^y" to "/x%5Ey", while older
+    // engines (Node 20/22) transmit it verbatim. The validator's contract is
+    // "signed bytes are THIS runtime's wire bytes", so the expectation is
+    // derived from the active serializer rather than pinned — either way the
+    // validator fails closed on anything the wire would not carry as-is.
+    // https://url.spec.whatwg.org/#path-percent-encode-set
+    const url = new URL("/x^y", "http://canonical.invalid");
+    const isFixpoint = url.pathname + url.search === "/x^y";
+    if (isFixpoint) {
+      expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x^y" })).not.toThrow();
+    } else {
+      expect(url.pathname).toBe("/x%5Ey");
+      expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x^y" })).toThrow(
+        /serialized request-target/,
+      );
     }
   });
 });
