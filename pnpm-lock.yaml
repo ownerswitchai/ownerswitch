@@ -37,6 +37,9 @@ importers:
 
   packages/escalation:
     dependencies:
+      '@ownerswitchai/control-plane':
+        specifier: workspace:*
+        version: link:../control-plane
       '@ownerswitchai/shared':
         specifier: workspace:*
         version: link:../shared

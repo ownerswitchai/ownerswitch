@@ -6,6 +6,9 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "ownerswitch-license": "./dist/license-cli.js"
+  },
   "dependencies": {
     "@ownerswitchai/shared": "workspace:*"
   },

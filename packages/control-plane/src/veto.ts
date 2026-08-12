@@ -56,6 +56,8 @@ export interface VetoOptions {
 export class VetoWindow {
   private status: VetoStatus = "pending";
   private delivered = false;
+  private deliveredByDevice: string | null = null;
+  private deliveredAtMs: number | null = null;
   private deadline: number;
   private releasedAtMs: number | null = null;
   private approvedByOwner: string | null = null;
@@ -93,8 +95,15 @@ export class VetoWindow {
    * after a SIM swap it's proof the attacker's handset got the bytes,
    * not that the owner did. See packages/escalation/DESIGN.md §3.
    */
-  markDelivered(): void {
-    this.delivered = true;
+  markDelivered(deviceId?: string): void {
+    // First ack wins the attribution: a "released on silence" must be
+    // explainable from one recorded (device, time) pair, not the last of
+    // many retries.
+    if (!this.delivered) {
+      this.delivered = true;
+      this.deliveredByDevice = deviceId ?? null;
+      this.deliveredAtMs = this.now();
+    }
   }
 
   /**
@@ -161,6 +170,26 @@ export class VetoWindow {
 
   get state(): VetoStatus {
     return this.status;
+  }
+
+  /** When silence next decides this window (ms). Moves once, on extension. */
+  get deadlineAt(): number {
+    return this.deadline;
+  }
+
+  /** Has an enrolled device confirmed the alert was rendered? */
+  get isDelivered(): boolean {
+    return this.delivered;
+  }
+
+  /** The enrolled device whose ack flipped delivered, or null. */
+  get deliveredBy(): string | null {
+    return this.deliveredByDevice;
+  }
+
+  /** When the ack landed (ms), or null. */
+  get deliveredAt(): number | null {
+    return this.deliveredAtMs;
   }
 
   /** When silence became approval (the deadline), or null while unreleased. */

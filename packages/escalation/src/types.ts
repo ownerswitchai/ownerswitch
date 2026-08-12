@@ -120,6 +120,13 @@ export interface ChannelAttempt {
 export interface ProviderCallback {
   rawBody: string;
   headers: Record<string, string>;
+  /**
+   * The exact public URL the provider was told to call (scheme, host, path,
+   * query) — providers that sign callbacks (Twilio) sign over it, so the
+   * webhook edge must pass the URL it advertised, not the one the local
+   * socket saw behind a proxy.
+   */
+  url?: string;
 }
 
 /** What comes back from a channel, after verification. */

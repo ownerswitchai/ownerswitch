@@ -205,6 +205,17 @@ export interface SerialSourceOptions {
    */
   trigger?: string;
   /**
+   * The line that reports a hardware self-check failure — the dual-channel
+   * firmware's NC/NO cross-check disagreeing (issue #40). Default "FAULT".
+   * A fault is NEVER a press: it flows to `onFault` only, so a wiring
+   * defect is reported to the owner instead of forging (or masking) a
+   * kill. The firmware re-asserts it while the condition persists; the
+   * reporter dedupes episodes.
+   */
+  faultLine?: string;
+  /** Called once per received fault line (see `faultLine`). */
+  onFault?: () => void;
+  /**
    * Opens the device. Default: `fs.createReadStream`. The Pico's USB CDC data
    * channel is a character device you read like a file — USB CDC ignores baud,
    * so the firmware's lines arrive without termios. A seam for tests.
@@ -229,6 +240,9 @@ export interface SerialSourceOptions {
 
 /** The reference firmware prints this on the e-stop's press edge. */
 export const DEFAULT_SERIAL_TRIGGER = "KILL";
+
+/** The dual-channel firmware prints this while its NC/NO cross-check disagrees. */
+export const DEFAULT_SERIAL_FAULT_LINE = "FAULT";
 
 /**
  * Cap the unterminated-line buffer so a wedged device can't grow it without
@@ -264,6 +278,15 @@ export function createSerialSource(opts: SerialSourceOptions): PressSource {
   if (trigger === "" || /[\r\n]/.test(trigger)) {
     throw new Error("serial trigger must be a non-empty single line");
   }
+  const faultLine = (opts.faultLine ?? DEFAULT_SERIAL_FAULT_LINE).trim();
+  if (faultLine === "" || /[\r\n]/.test(faultLine)) {
+    throw new Error("serial fault line must be a non-empty single line");
+  }
+  // one line, one meaning: a config where a press and a fault are the same
+  // bytes would let a wiring defect read as a kill (or vice versa)
+  if (faultLine === trigger) {
+    throw new Error(`serial fault line and trigger must differ (both "${trigger}")`);
+  }
   const reconnectMs = opts.reconnectMs ?? 2_000;
   const openDevice = opts.open ?? defaultSerialOpen;
   const schedule = opts.schedule ?? defaultSerialSchedule;
@@ -284,6 +307,7 @@ export function createSerialSource(opts: SerialSourceOptions): PressSource {
       const line = buffer.slice(0, nl).trim();
       buffer = buffer.slice(nl + 1);
       if (line === trigger) listeners.emit();
+      else if (line === faultLine) opts.onFault?.();
     }
     // A device that never sends a newline must not grow the buffer forever.
     if (buffer.length > SERIAL_BUFFER_CAP) buffer = buffer.slice(-SERIAL_BUFFER_CAP);

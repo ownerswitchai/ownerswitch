@@ -1,0 +1,399 @@
+import { randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname } from "node:path";
+import { signDeviceRequest, verifyDeviceSignature } from "@ownerswitchai/control-plane";
+import { createTwilioSmsChannel, createTwilioVoiceChannel, TWILIO_PATHS } from "./channels/twilio.js";
+import { createWebPushChannel, type PushSubscriptionJson } from "./channels/webpush.js";
+import { LadderEngine } from "./ladder.js";
+import type { EscalationEnvConfig } from "./config.js";
+import type { Channel, ChannelEvent, ChannelKind, LadderAction } from "./types.js";
+
+/**
+ * The escalation service — the ladder's edge, and its own always-on
+ * process (DESIGN.md §1): it holds the provider credentials and the
+ * webhook surface, and talks to the control plane only through the same
+ * device-signed HTTP every other component uses. The control plane stays
+ * the one small framework-free process; nothing in here runs inside it.
+ *
+ * The engine decides, this file performs. Everything imported from
+ * ladder.ts is pure; this file owns the clocks, the sockets, the state
+ * file, and the honest logging. Its ENTIRE write surface toward the veto
+ * state machine is the device-signed veto relay — the deny direction. It
+ * cannot ack (`/veto/:id/seen` is the owner app's, on the app's own
+ * credential), cannot approve, cannot extend.
+ */
+
+interface PendingWindow {
+  id: string;
+  status: "pending" | "extended";
+  agentId: string;
+  tool: string;
+  deadline: number;
+  delivered: boolean;
+}
+
+export interface EscalationServiceOptions {
+  config: EscalationEnvConfig;
+  /** injectable for tests; replaces the channels built from config */
+  channels?: Partial<Record<ChannelKind, Channel>>;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+  /** honest, terse logging; default console.error. Never carries secrets. */
+  log?: (line: string) => void;
+}
+
+export interface EscalationService {
+  /** one poll + engine tick + action execution; the run loop calls this */
+  tickOnce(): Promise<void>;
+  /** plug into http.createServer — the webhook + enrollment surface */
+  webhookHandler: (req: IncomingMessage, res: ServerResponse) => void;
+  /** the currently enrolled push subscription, if any (tests, doctor) */
+  subscription(): PushSubscriptionJson | null;
+}
+
+const MAX_WEBHOOK_BODY_BYTES = 64 * 1024;
+
+export function createEscalationService(opts: EscalationServiceOptions): EscalationService {
+  const cfg = opts.config;
+  const now = opts.now ?? Date.now;
+  const doFetch = opts.fetchImpl ?? fetch;
+  const log = opts.log ?? ((line: string) => console.error(`[ownerswitch-escalation] ${line}`));
+
+  /* ---------------- push subscription store (0600, atomic) ------------- */
+
+  let storedSubscription: PushSubscriptionJson | null = loadSubscription();
+
+  function loadSubscription(): PushSubscriptionJson | null {
+    if (cfg.stateFile === undefined) return null;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(cfg.stateFile, "utf8"));
+      const sub = (parsed as { subscription?: unknown }).subscription;
+      return isSubscription(sub) ? sub : null;
+    } catch {
+      return null; // absent or unreadable: no subscription until re-enrolled
+    }
+  }
+
+  function persistSubscription(sub: PushSubscriptionJson): void {
+    if (cfg.stateFile === undefined) return;
+    // atomic replace, private from birth: the subscription is a send
+    // capability, and a half-written store must not exist even briefly
+    mkdirSync(dirname(cfg.stateFile), { recursive: true, mode: 0o700 });
+    const tmp = `${cfg.stateFile}.${randomBytes(6).toString("hex")}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ subscription: sub }, null, 2), { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, cfg.stateFile);
+  }
+
+  function isSubscription(value: unknown): value is PushSubscriptionJson {
+    if (typeof value !== "object" || value === null) return false;
+    const { endpoint, keys } = value as Record<string, unknown>;
+    if (typeof endpoint !== "string" || !endpoint.startsWith("https://")) return false;
+    if (typeof keys !== "object" || keys === null) return false;
+    const { p256dh, auth } = keys as Record<string, unknown>;
+    return typeof p256dh === "string" && p256dh !== "" && typeof auth === "string" && auth !== "";
+  }
+
+  /* ---------------- channels ------------------------------------------ */
+
+  const channels = new Map<ChannelKind, Channel>();
+  if (cfg.vapid !== undefined) {
+    channels.set(
+      "push",
+      createWebPushChannel({
+        vapidPublicKey: cfg.vapid.publicKey,
+        vapidPrivateKey: cfg.vapid.privateKey,
+        subject: cfg.vapid.subject,
+        getSubscription: () => storedSubscription,
+        fetch: doFetch,
+        now,
+      }),
+    );
+  }
+  if (cfg.twilio !== undefined) {
+    const twilioCfg = {
+      ...cfg.twilio,
+      webhookBaseUrl: cfg.webhookBaseUrl as string,
+      fetch: doFetch,
+      now,
+    };
+    channels.set("sms", createTwilioSmsChannel(twilioCfg));
+    channels.set("voice", createTwilioVoiceChannel(twilioCfg));
+  }
+  for (const [kind, channel] of Object.entries(opts.channels ?? {})) {
+    if (channel !== undefined) channels.set(kind as ChannelKind, channel);
+  }
+
+  const engine = new LadderEngine({
+    rungs: cfg.rungs.filter((r) => channels.has(r.channel)),
+    limits: cfg.limits,
+  });
+
+  /* ---------------- device-signed control-plane client ----------------- */
+
+  async function deviceRequest(path: string, method: "GET" | "POST", body = ""): Promise<Response> {
+    const timestamp = now();
+    const nonce = randomBytes(12).toString("hex");
+    return doFetch(new URL(path, cfg.controlPlaneUrl), {
+      method,
+      cache: "no-store",
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store, no-cache",
+        "x-device-id": cfg.device.id,
+        "x-device-timestamp": String(timestamp),
+        "x-device-nonce": nonce,
+        "x-device-signature": signDeviceRequest(
+          { deviceId: cfg.device.id, timestamp, nonce },
+          body,
+          cfg.device.secret,
+        ),
+      },
+      ...(method === "POST" ? { body } : {}),
+    });
+  }
+
+  async function listPending(): Promise<PendingWindow[] | null> {
+    try {
+      const res = await deviceRequest("/veto/pending", "GET");
+      if (!res.ok) {
+        log(`control plane refused /veto/pending: HTTP ${res.status}`);
+        return null;
+      }
+      const parsed = (await res.json()) as { windows?: unknown };
+      return Array.isArray(parsed.windows) ? (parsed.windows as PendingWindow[]) : [];
+    } catch {
+      // unreachable control plane: DELIVERY stalls, which degrades toward
+      // held — the fail-closed direction. Nothing to do but say so.
+      log("control plane unreachable — ladder paused this tick");
+      return null;
+    }
+  }
+
+  async function relayVeto(windowId: string, attribution: string): Promise<void> {
+    const body = JSON.stringify({ decision: "veto", attribution });
+    try {
+      const res = await deviceRequest(`/veto/${encodeURIComponent(windowId)}`, "POST", body);
+      if (!res.ok && res.status !== 409) {
+        log(`veto relay for ${windowId} refused: HTTP ${res.status}`);
+        return;
+      }
+      log(`relayed stop for ${windowId} (${attribution})`);
+    } catch {
+      log(`veto relay for ${windowId} failed — will retry while the window stays open`);
+      pendingRelays.push({ windowId, attribution });
+    }
+  }
+
+  /* ---------------- reconcile + tick ----------------------------------- */
+
+  /** window ids the engine currently knows, to detect closures */
+  const tracked = new Set<string>();
+  /** relays that failed transport; retried each tick (idempotent server-side) */
+  let pendingRelays: Array<{ windowId: string; attribution: string }> = [];
+
+  async function tickOnce(): Promise<void> {
+    const listing = await listPending();
+    if (listing !== null) {
+      const openIds = new Set(listing.map((w) => w.id));
+      for (const id of tracked) {
+        if (!openIds.has(id)) {
+          engine.windowClosed(id);
+          tracked.delete(id);
+        }
+      }
+      for (const w of listing) {
+        if (!tracked.has(w.id)) {
+          engine.windowOpened(w.id, `"${w.tool}"`, w.deadline);
+          tracked.add(w.id);
+        }
+        engine.windowDeadline(w.id, w.deadline);
+        if (w.delivered) engine.windowDelivered(w.id);
+      }
+    }
+
+    const retries = pendingRelays.filter((r) => tracked.has(r.windowId));
+    pendingRelays = [];
+    for (const retry of retries) await relayVeto(retry.windowId, retry.attribution);
+
+    for (const action of engine.tick(now())) await perform(action);
+  }
+
+  async function perform(action: LadderAction): Promise<void> {
+    if (action.type === "send") {
+      const channel = channels.get(action.channel);
+      if (channel === undefined) return; // rungs are filtered to built channels
+      try {
+        const attempt = await channel.send(action.alert);
+        log(
+          `sent ${action.channel} alert covering ${attempt.windowIds.length} window(s)` +
+            (attempt.providerRef !== undefined ? ` ref=${attempt.providerRef}` : ""),
+        );
+      } catch (err) {
+        // one rung failing must not stop the ladder — the next rung is the
+        // retry story, and total failure degrades to held (fail closed)
+        log(`${action.channel} send failed: ${err instanceof Error ? err.message : "error"}`);
+      }
+      return;
+    }
+    if (action.type === "relay-veto") {
+      for (const windowId of action.windowIds) await relayVeto(windowId, action.attribution);
+      return;
+    }
+    log(`stand-down (${action.reason}) for ${action.windowIds.length} window(s)`);
+  }
+
+  /* ---------------- webhook + enrollment surface ------------------------ */
+
+  function webhookHandler(req: IncomingMessage, res: ServerResponse): void {
+    void routeWebhook(req, res).catch(() => {
+      if (!res.writableEnded) send(res, 500, "text/plain", "error");
+    });
+  }
+
+  async function routeWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const method = req.method ?? "GET";
+    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    const rawBody = await readBody(req);
+    if (rawBody === null) {
+      send(res, 413, "text/plain", "body too large");
+      return;
+    }
+
+    if (method === "GET" && path === "/healthz") {
+      send(res, 200, "application/json", JSON.stringify({ ok: true, active: engine.active }));
+      return;
+    }
+
+    // enrollment: the owner app registers its push subscription, signed with
+    // the OWNER APP's own secret — NOT the fleet device secret this service
+    // holds. Enrollment picks who receives every future alert, so gating it
+    // on the fleet secret would let any fleet-secret holder redirect the
+    // owner's push channel to their own endpoint. Absent an owner-app secret,
+    // enrollment is simply unavailable (501).
+    if (method === "POST" && path === "/push/subscription") {
+      if (cfg.ownerAppSecret === undefined) {
+        send(
+          res,
+          501,
+          "application/json",
+          JSON.stringify({
+            error:
+              "push enrollment is not available: no owner-app credential is configured " +
+              "(OWNERSWITCH_OWNER_APP_SECRET)",
+          }),
+        );
+        return;
+      }
+      if (!validSignature(req, rawBody, cfg.ownerAppSecret)) {
+        send(res, 401, "application/json", JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      let sub: unknown;
+      try {
+        sub = (JSON.parse(rawBody) as Record<string, unknown>).subscription;
+      } catch {
+        send(res, 400, "application/json", JSON.stringify({ error: "malformed JSON" }));
+        return;
+      }
+      if (!isSubscription(sub)) {
+        send(res, 400, "application/json", JSON.stringify({ error: "subscription must be {endpoint: https-url, keys: {p256dh, auth}}" }));
+        return;
+      }
+      storedSubscription = sub;
+      persistSubscription(sub);
+      log("push subscription enrolled");
+      send(res, 200, "application/json", JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // Twilio callbacks: verification lives INSIDE the channel that owns the
+    // provider relationship; this edge only reconstructs the advertised URL
+    const twilioPaths = Object.values(TWILIO_PATHS) as string[];
+    if (method === "POST" && twilioPaths.includes(path)) {
+      const events = collectTwilioEvents(path, rawBody, req);
+      for (const event of events) engine.channelEvent(event);
+      if (events.length > 0) {
+        // a stop should not wait for the next poll tick — relay immediately
+        for (const action of engine.tick(now())) await perform(action);
+      }
+      respondTwiml(res, path, events);
+      return;
+    }
+
+    send(res, 404, "text/plain", "not found");
+  }
+
+  function collectTwilioEvents(path: string, rawBody: string, req: IncomingMessage): ChannelEvent[] {
+    if (cfg.webhookBaseUrl === undefined) return [];
+    const callback = {
+      rawBody,
+      headers: Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? (v[0] ?? "") : (v ?? "")]),
+      ),
+      url: `${cfg.webhookBaseUrl}${path}`,
+    };
+    const events: ChannelEvent[] = [];
+    for (const kind of ["sms", "voice"] as const) {
+      const channel = channels.get(kind);
+      if (channel !== undefined) events.push(...channel.handleCallback(callback));
+    }
+    return events;
+  }
+
+  function respondTwiml(res: ServerResponse, path: string, events: ChannelEvent[]): void {
+    const stopped = events.some((e) => e.type === "veto");
+    if (path === TWILIO_PATHS.voiceKey) {
+      const say = stopped
+        ? "Stopped. Nothing will run. Goodbye."
+        : "Nothing stopped. Goodbye.";
+      send(
+        res,
+        200,
+        "text/xml",
+        `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${say}</Say></Response>`,
+      );
+      return;
+    }
+    // inbound SMS / status callbacks want an empty TwiML ack
+    send(res, 200, "text/xml", `<?xml version="1.0" encoding="UTF-8"?><Response/>`);
+  }
+
+  function validSignature(req: IncomingMessage, rawBody: string, secret: string): boolean {
+    const header = (name: string) => {
+      const value = req.headers[name];
+      return Array.isArray(value) ? value[0] : value;
+    };
+    const deviceId = header("x-device-id");
+    const timestamp = header("x-device-timestamp");
+    const nonce = header("x-device-nonce");
+    const signature = header("x-device-signature");
+    if (!deviceId || !timestamp || !nonce || !signature) return false;
+    return verifyDeviceSignature(
+      { deviceId, timestamp: Number(timestamp), nonce, signature },
+      rawBody,
+      secret,
+      { now, seenNonces },
+    );
+  }
+  const seenNonces = new Map<string, number>();
+
+  async function readBody(req: IncomingMessage): Promise<string | null> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > MAX_WEBHOOK_BODY_BYTES) return null;
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  function send(res: ServerResponse, status: number, type: string, body: string): void {
+    res.writeHead(status, { "content-type": type, "cache-control": "no-store, max-age=0" });
+    res.end(body);
+  }
+
+  return { tickOnce, webhookHandler, subscription: () => storedSubscription };
+}

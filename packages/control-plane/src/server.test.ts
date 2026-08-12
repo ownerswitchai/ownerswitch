@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
+import { generateLicenseKeys, mintLicense } from "./license.js";
 import {
   createControlPlane,
   MAX_CEREMONY_RECORDS,
@@ -20,6 +21,7 @@ const clock = (start = 0) => {
 };
 
 const DEVICE_SECRET = "button-secret";
+const OWNER_APP_SECRET = "owner-app-secret";
 
 /** Headers for a device-signed request over `body`, signed "now". */
 const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
@@ -31,6 +33,23 @@ const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random(
     { deviceId: "btn-1", timestamp: at, nonce },
     body,
     DEVICE_SECRET,
+  ),
+});
+
+/** Headers signed with the OWNER APP's own secret — the delivery-ack credential. */
+const ownerAppHeaders = (
+  body: string,
+  at: number,
+  nonce = `oa-${at}-${Math.random().toString(36).slice(2)}`,
+) => ({
+  "content-type": "application/json",
+  "x-device-id": "owner-app",
+  "x-device-timestamp": String(at),
+  "x-device-nonce": nonce,
+  "x-device-signature": signDeviceRequest(
+    { deviceId: "owner-app", timestamp: at, nonce },
+    body,
+    OWNER_APP_SECRET,
   ),
 });
 
@@ -1881,5 +1900,449 @@ describe("MergeGrant issuance on ACTIVE owner approval", () => {
 
     const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
     expect(body.grant).toBeUndefined();
+  });
+});
+
+describe("the escalation surface — seen acks, device veto relay, pending listing", () => {
+  let server: Server | undefined;
+
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+
+  const openWindow = (cp: ControlPlane, c: { now: () => number }, id = "v-1", windowMs = 4 * 60_000) => {
+    const window = new VetoWindow({ agentId: "agent-1", tool: "bash" }, cp.killSwitch.epoch, {
+      now: c.now,
+      windowMs,
+    });
+    cp.vetoWindows.set(id, window);
+    return window;
+  };
+
+  it("POST /veto/:id/seen (owner-app-signed) flips delivered, records the device, and silence then releases", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      status: "pending",
+      delivered: true,
+      deadline: 1_000 + 4 * 60_000,
+    });
+    expect(window.isDelivered).toBe(true);
+    expect(window.deliveredBy).toBe("owner-app");
+    expect(window.deliveredAt).toBe(c.now());
+
+    c.advance(4 * 60_000);
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "released" });
+  });
+
+  it("the FLEET device secret cannot flip the permissive bit — only the owner-app secret", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // a valid FLEET-signed request (the gateway's / a same-uid agent's
+    // credential) is rejected: it may stop, never confirm-delivered
+    const viaFleet = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(viaFleet.status).toBe(401);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("with no owner-app secret enrolled, /veto/:id/seen is 501 and delivery stays unwired (fail closed)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET }); // no ownerAppSecret
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(501);
+    expect(((await res.json()) as { error: string }).error).toMatch(/not wired/);
+    expect(window.isDelivered).toBe(false);
+
+    // and the window then walks to held, never released, on silence
+    c.advance(4 * 60_000);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000);
+    expect(window.tick()).toBe("held");
+  });
+
+  it("POST /veto/:id/seen without a valid signature -> 401; no session variant exists", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const bare = await fetch(`${url}/veto/v-1/seen`, { method: "POST", body: "" });
+    expect(bare.status).toBe(401);
+
+    // an owner SESSION must not flip the permissive bit — the ack is
+    // enrolled-device evidence, not a session assertion
+    const session = createOwnerSession("adam", { now: c.now });
+    const viaSession = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: "",
+    });
+    expect(viaSession.status).toBe(401);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("an ack inside the 60 s response floor is refused and the window extends, never releases", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    c.advance(4 * 60_000 - 30_000); // 30 s before the deadline — inside the floor
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/response floor/);
+    expect(window.isDelivered).toBe(false);
+
+    c.advance(30_000); // deadline passes undelivered -> extended, not released
+    expect(window.tick()).toBe("extended");
+
+    // against the NEW deadline there is time again; the re-ack counts
+    const again = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(again.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+  });
+
+  it("re-acking a delivered window is an idempotent success; a terminal window refuses", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+    window.markDelivered("owner-app");
+
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(true);
+
+    // a delivered window stays ack-able even after it turns terminal — the
+    // bit cannot un-flip, so the retry stays a no-op success
+    window.veto("adam");
+    const deliveredTerminal = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(deliveredTerminal.status).toBe(200);
+
+    // but a FIRST ack on a terminal window refuses: there is nothing left
+    // for the permissive bit to permit
+    openWindow(cp, c, "v-2").veto("adam");
+    const terminal = await fetch(`${url}/veto/v-2/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(terminal.status).toBe(409);
+    expect(((await terminal.json()) as { error: string }).error).toMatch(/vetoed/);
+  });
+
+  it("device-signed POST /veto/:id relays a channel stop with honest attribution, idempotently", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const body = JSON.stringify({ decision: "veto", attribution: "channel:sms-reply" });
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "vetoed" });
+    expect(window.vetoedBy).toBe("channel:sms-reply");
+
+    // blind retry (the relay could not prove the first arrived) -> no-op success
+    const retryBody = JSON.stringify({ attribution: "channel:sms-reply" });
+    const retry = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: deviceHeaders(retryBody, c.now()),
+      body: retryBody,
+    });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ status: "vetoed" });
+    expect(window.vetoedBy).toBe("channel:sms-reply"); // first attribution stands
+  });
+
+  it("without an attribution a device stop is recorded against the signing device", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    expect(window.vetoedBy).toBe("device:btn-1");
+  });
+
+  it("a device credential can never approve, and a malformed attribution is refused", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const approve = JSON.stringify({ decision: "approve" });
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: deviceHeaders(approve, c.now()),
+      body: approve,
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toMatch(/one verb/);
+    expect(window.state).toBe("pending");
+    expect(window.approvedBy).toBeNull();
+
+    const forged = JSON.stringify({ attribution: "owner:adam" }); // not a channel:* label
+    const bad = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: deviceHeaders(forged, c.now()),
+      body: forged,
+    });
+    expect(bad.status).toBe(400);
+    expect(window.state).toBe("pending");
+  });
+
+  it("GET /veto/pending is device-signed and lists only open windows, with pacing fields", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    const open = openWindow(cp, c, "v-open");
+    openWindow(cp, c, "v-vetoed").veto("adam");
+    const delivered = openWindow(cp, c, "v-delivered");
+    delivered.markDelivered("app-1");
+
+    expect((await fetch(`${url}/veto/pending`)).status).toBe(401);
+
+    const res = await fetch(`${url}/veto/pending`, { headers: deviceHeaders("", c.now()) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { windows: Array<Record<string, unknown>> };
+    expect(body.windows).toHaveLength(2);
+    expect(body.windows).toContainEqual({
+      id: "v-open",
+      status: "pending",
+      agentId: "agent-1",
+      tool: "bash",
+      deadline: open.deadlineAt,
+      delivered: false,
+    });
+    expect(body.windows).toContainEqual({
+      id: "v-delivered",
+      status: "pending",
+      agentId: "agent-1",
+      tool: "bash",
+      deadline: delivered.deadlineAt,
+      delivered: true,
+    });
+  });
+
+  it("GET /veto/:id stays status-only for the open read; a device-signed read adds the pacing fields", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const open = (await (await fetch(`${url}/veto/v-1`)).json()) as Record<string, unknown>;
+    expect(open).toEqual({ status: "pending" }); // no clock leak to id holders
+
+    const signed = await fetch(`${url}/veto/v-1`, { headers: deviceHeaders("", c.now()) });
+    expect(await signed.json()).toEqual({
+      status: "pending",
+      deadline: window.deadlineAt,
+      delivered: false,
+    });
+  });
+});
+
+describe("2GO licensing — the ONE paid gate; every stop path stays free", () => {
+  let server: Server | undefined;
+
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+
+  const keys = generateLicenseKeys();
+  const YEAR = 365 * 86_400_000;
+  const license = (expiresAt: number, issuedAt = 0) =>
+    mintLicense(
+      { v: 1, jti: "lic_test", plan: "team", licensee: "Test Co", issuedAt, expiresAt },
+      keys.privateKeyPem,
+    );
+
+  const startCeremony = async (url: string, c: { now: () => number }) => {
+    const session = createOwnerSession("adam", { now: c.now });
+    return fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+  };
+
+  it("a valid license mints ceremonies; expiry falls into the 72 h grace, then 402", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({
+      now: c.now,
+      licensing: { vendorPublicKeyPem: keys.publicKeyPem, token: license(YEAR) },
+    });
+    const url = await start(cp);
+    await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+
+    expect((await startCeremony(url, c)).status).toBe(201);
+
+    // license expires; the ceremony above ages out; grace holds the door open
+    c.advance(YEAR + 3_600_000); // 1 h past expiry — inside grace
+    const inGrace = await startCeremony(url, c);
+    expect(inGrace.status).toBe(201);
+
+    c.advance(72 * 3_600_000); // now past expiry + 72 h
+    const dead = await startCeremony(url, c);
+    expect(dead.status).toBe(402);
+    const body = (await dead.json()) as { error: string };
+    expect(body.error).toMatch(/license/);
+    expect(body.error).toMatch(/free forever/);
+  });
+
+  it("an UNLICENSED plane refuses new ceremonies with 402 — and every stop path still works", async () => {
+    const c = clock(1_000);
+    const original = console.error;
+    console.error = () => {}; // boot warning is loud by design; silence for the test
+    let cp: ControlPlane;
+    try {
+      cp = ephemeral({
+        now: c.now,
+        deviceSecret: DEVICE_SECRET,
+        ownerAppSecret: OWNER_APP_SECRET,
+        licensing: { vendorPublicKeyPem: keys.publicKeyPem }, // no token
+      });
+    } finally {
+      console.error = original;
+    }
+    const url = await start(cp);
+
+    // stopping is free: the kill engages without any license
+    const kill = await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+    expect(kill.status).toBe(200);
+    expect(cp.killSwitch.killed).toBe(true);
+
+    // the deny direction is free: the delivery ack (owner-app-signed) and the
+    // device veto relay both work with no license
+    const window = new VetoWindow({ agentId: "a", tool: "bash" }, cp.killSwitch.epoch, { now: c.now });
+    cp.vetoWindows.set("v-free", window);
+    const seen = await fetch(`${url}/veto/v-free/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(200);
+    const veto = await fetch(`${url}/veto/v-free`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(veto.status).toBe(200);
+    expect(window.state).toBe("vetoed");
+
+    // status stays open and honest
+    expect((await (await fetch(`${url}/status`)).json() as { killed: boolean }).killed).toBe(true);
+
+    // only the paid act — minting a NEW 2GO ceremony — answers 402
+    const refused = await startCeremony(url, c);
+    expect(refused.status).toBe(402);
+
+    // and without the licensing option at all (dev/quickstart), 2GO is ungated
+    const free = ephemeral({ now: c.now });
+    const freeUrl = await start(free);
+    await fetch(`${freeUrl}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+    expect((await startCeremony(freeUrl, c)).status).toBe(201);
+  });
+
+  it("an owner already HOLDING a ceremony keeps it through a license lapse (idempotent return outruns the gate)", async () => {
+    const c = clock(1_000);
+    const cpLive = ephemeral({
+      now: c.now,
+      licensing: { vendorPublicKeyPem: keys.publicKeyPem, token: license(2_000) },
+    });
+    const url = await start(cpLive);
+    await fetch(`${url}/kill`, { method: "POST", body: JSON.stringify({ source: "api" }) });
+
+    const session = createOwnerSession("adam", { now: c.now });
+    const mint = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(mint.status).toBe(201); // license valid at t=1s (expires t=2s, grace 72h — still ok)
+    const { id } = (await mint.json()) as { id: string };
+
+    // same owner asks again — idempotent return, no fresh license judgment
+    const again = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({}),
+    });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { id: string }).id).toBe(id);
   });
 });

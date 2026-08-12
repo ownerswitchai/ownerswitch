@@ -6,11 +6,15 @@
 export { createButtonDaemon } from "./daemon.js";
 export type { ButtonDaemon, ButtonDaemonOptions, KillConfirmation } from "./daemon.js";
 
+export { createFaultReporter } from "./alert.js";
+export type { FaultReporter, FaultReporterOptions } from "./alert.js";
+
 export {
   createHttpSource,
   createKeyboardSource,
   createSerialSource,
   DEFAULT_HTTP_PORT,
+  DEFAULT_SERIAL_FAULT_LINE,
   DEFAULT_SERIAL_TRIGGER,
 } from "./input.js";
 export type {

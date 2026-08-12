@@ -13,7 +13,17 @@ export type { VetoStatus, VetoOptions, VetoPurpose, VetoWireStatus } from "./vet
 export { RestoreCeremony } from "./twogo.js";
 export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.js";
 
-export { createControlPlane, DEFAULT_KILL_STATE_FILE } from "./server.js";
+export { createControlPlane, DEFAULT_KILL_STATE_FILE, MIN_VETO_RESPONSE_MS } from "./server.js";
+
+export {
+  generateLicenseKeys,
+  LICENSE_PREFIX,
+  mintLicense,
+  OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
+  RESTORE_GRACE_MS,
+  verifyLicense,
+} from "./license.js";
+export type { LicensePayload, LicensePlan, LicenseVerdict } from "./license.js";
 export type { ControlPlane, ControlPlaneOptions } from "./server.js";
 
 export { verifyOwnerAssertion } from "./webauthn.js";

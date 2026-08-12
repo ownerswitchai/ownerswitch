@@ -13,8 +13,12 @@ This is the hardware side of `packages/button`'s `serial` press source
 
 - **Raspberry Pi Pico** (RP2040 — the plain Pico is fine; no Wi-Fi needed).
 - An **emergency-stop button** with a **normally-closed (NC)** contact
-  (e.g. the common 22 mm mushroom "STOP" switch).
-- Two jumper wires and a USB cable that carries **data** (not charge-only).
+  (e.g. the common 22 mm mushroom "STOP" switch). For the optional
+  dual-channel self-check (next section), pick one that also carries a
+  **normally-open (NO)** contact block — most do, or take one as an add-on
+  block.
+- Two jumper wires (four for dual-channel) and a USB cable that carries
+  **data** (not charge-only).
 
 ## Wiring — use the NC contact (fail-safe)
 
@@ -37,8 +41,49 @@ The firmware enables GP15's **internal pull-up**, so:
 | Cable cut / unplugged | line floats up | **HIGH** | `KILL` (fail-safe) |
 
 Using the **NC** contact is what makes it fail-safe: a cut wire or a yanked
-button reads the same as a press. (A normally-open contact would fail *silent*
-— don't use it.)
+button reads the same as a press. (A normally-open contact **alone** would
+fail *silent* — never use NO as the kill channel. As a *second, cross-checked*
+channel it earns its keep; next section.)
+
+## Optional: dual-channel monitoring (NC + NO cross-check)
+
+Single-channel is fail-safe in the press direction, but a contact or wiring
+fault is indistinguishable from a press and is not independently detectable
+([#40](https://github.com/ownerswitchai/ownerswitch/issues/40), from external
+security-engineering review). If your e-stop has an NO contact too, wire it
+as a second channel and let the firmware cross-check the pair:
+
+```
+   e-stop NC contact          e-stop NO contact         DUAL jumper
+  GP15 ──────── GND          GP16 ──────── GND        GP17 ──── GND
+  (pin 20)     (pin 18)      (pin 21)     (pin 23)    (pin 22)  (pin 23)
+```
+
+All three GPIOs use internal pull-ups. The **DUAL jumper (GP17 → GND)** arms
+the cross-check and is read **once at boot** — the same doctrine as the
+maintenance jumper: a physical act the host cannot fake, and a missing or
+broken jumper fails to single-channel, the direction that can never invent a
+false fault.
+
+| State | NC → GP15 | NO → GP16 | Result |
+| --- | --- | --- | --- |
+| At rest | closed → **LOW** | open → **HIGH** | quiet (channels opposite = healthy) |
+| Pressed | open → **HIGH** | closed → **LOW** | `KILL` (channels opposite = healthy) |
+| Wire break (either/both) | **HIGH** | **HIGH** | `KILL` from NC as before, **plus `FAULT`** |
+| Welded / shorted contact | **LOW** | **LOW** | **`FAULT`** — the button may not carry the next press |
+
+The cross-check judges the two **debounced** levels and only declares a fault
+after they agree for **500 ms** — longer than the button's break-before-make
+transition (NC opens before NO closes), so a normal press never reads as a
+transient fault. `FAULT` re-asserts every 5 s while the condition persists;
+the daemon collapses that into one owner alert per episode (a device-signed
+`POST /alert` — flagged and audited, kill state untouched).
+
+**What the cross-check is NOT:** a kill trigger, or a kill suppressor. `KILL`
+is raised by the NC rule exactly as in single-channel mode — the NO channel
+adds detection only. Both-wires-cut still kills (NC HIGH), and now also says
+the hardware needs service; a welded contact — previously a *silent* loss of
+the button — becomes a loud one.
 
 ## Two modes — the host is inside the threat model
 
@@ -108,10 +153,14 @@ first; only one program can hold the port.)
 
 ## What the firmware emits
 
-- `READY` once at power-up.
+- `READY` once at power-up (`READY-DUAL` when the DUAL jumper armed the
+  cross-check).
 - `KILL` on every LOW→HIGH edge (press, or a broken/cut line), debounced ~30 ms.
 - `KILL` again on boot if it comes up already HIGH (booted into the pressed or
   wire-broken state), and re-asserted every second while HIGH.
+- `FAULT` (dual-channel only) once the NC/NO cross-check has disagreed for
+  500 ms, re-asserted every 5 s while it persists. A fault is **never** a
+  press: the daemon routes it to `POST /alert`, not `POST /kill`.
 
 Emission is **non-blocking by construction**: writes carry a zero timeout and
 run through a small outbox, so a slow, stalled, or absent reader can never
@@ -136,3 +185,12 @@ firmware's own fail-safe still prints a real `KILL` while it has power.
   USB. Anyone with **physical** access can fit the maintenance jumper —
   physical access has always been outside this boundary (they could as easily
   unplug the button, which at least fails safe).
+- Threat-model notes for dual-channel: the cross-check detects *accidental*
+  faults (a chafed wire, a welded contact) and makes a previously silent
+  button loss loud. It does **not** defend against a physical attacker, who
+  could wire both channels to read healthy forever — physical access stays
+  outside the boundary, exactly as above. The FAULT path is deny-nothing by
+  construction: it cannot kill (no forged stop from a wiring defect) and it
+  cannot un-kill or delay a kill (the NC rule runs first and independently).
+  Its failure mode is the old status quo — a fault nobody hears about — plus
+  the daemon's loud logging when the control plane is unreachable.

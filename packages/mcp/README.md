@@ -383,11 +383,19 @@ the *same* call track the *same* window instead of spamming the owner:
 - window **held** (owner unreachable at deadline) → escalates to approval (`-32051`), fail closed
 - control plane lost the window (restart) → a fresh window is registered
 
-V0 honesty: release-on-silence requires delivery confirmation (the owner app's
-push pipeline), which isn't wired yet — so an untouched window walks
-pending → extended → held and ends as an approval. Silence only approves when
-the system *knows* the owner saw the notification. The veto tap works today,
-as the quickstart shows.
+Honesty, updated: release-on-silence requires delivery confirmation, and the
+control plane now has the production path for it — the enrolled owner app's
+`POST /veto/:id/seen`, signed with the owner app's OWN secret
+(`OWNERSWITCH_OWNER_APP_SECRET`, distinct from the fleet device secret so no
+fleet component or same-uid agent can forge the "I saw it"; refused inside the
+60 s response floor before the deadline), with `GET /veto/pending` and a
+device-signed veto relay for the escalation ladder (`packages/escalation`)
+that pushes, texts and calls until the owner is reached. Without an owner-app
+secret enrolled, `/veto/:id/seen` is 501 and windows walk to held → approval,
+fail closed. A deployment WITHOUT the owner app or the
+escalation service still walks pending → extended → held and ends as an
+approval: silence only approves when the system *knows* the owner saw the
+notification. The veto tap works today, as the quickstart shows.
 
 ## Design notes
 

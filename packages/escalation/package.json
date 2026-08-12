@@ -6,7 +6,11 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "ownerswitch-escalation": "./dist/cli.js"
+  },
   "dependencies": {
+    "@ownerswitchai/control-plane": "workspace:*",
     "@ownerswitchai/shared": "workspace:*"
   },
   "scripts": {

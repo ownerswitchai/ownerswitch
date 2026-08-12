@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { createFaultReporter } from "./alert.js";
 import { createButtonDaemon, type KillConfirmation } from "./daemon.js";
 import {
   createHttpSource,
@@ -138,7 +139,15 @@ export async function main(
   } else {
     const device =
       values.device ?? fail("--device is required for --source serial (e.g. /dev/ttyACM0)");
-    source = createSerialSource({ device, trigger: values.trigger });
+    // Dual-channel firmware (hardware/pico, issue #40) prints FAULT while
+    // its NC/NO cross-check disagrees; report each episode to the owner via
+    // POST /alert. A fault is never a press — and never suppresses one.
+    const faultReporter = createFaultReporter({ controlPlaneUrl: url, deviceId, secret });
+    source = createSerialSource({
+      device,
+      trigger: values.trigger,
+      onFault: () => faultReporter.faultSignal(),
+    });
   }
 
   // The kill acknowledgement is in hand; re-read /status for the audit detail.

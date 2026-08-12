@@ -1,5 +1,10 @@
+import { createPublicKey } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { createControlPlane } from "@ownerswitchai/control-plane";
+import {
+  createControlPlane,
+  OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
+} from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
 
 /**
@@ -25,6 +30,17 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *   OWNERSWITCH_OWNER_PASSKEY_PUBLIC_KEY_FILE  path to the SPKI PEM public key
  *   OWNERSWITCH_OWNER_PASSKEY_RP_ID          relying-party id (e.g. owner.example)
  *   OWNERSWITCH_OWNER_PASSKEY_ORIGIN         exact https:// origin of the owner app
+ *
+ * 2GO licensing — ALWAYS ARMED in production (control-plane/src/license.ts;
+ * every stop path is free forever). The gate verifies against the pinned
+ * official vendor key by default, so an unlicensed production plane is born
+ * protected: POST /restore/ceremony answers 402 until OWNERSWITCH_LICENSE is
+ * provisioned. Dev/quickstart (dev-control-plane.ts) stays ungated.
+ *   OWNERSWITCH_LICENSE                      this deployment's osl1 token
+ *   OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE      optional override of the pinned
+ *                                            vendor key (self-hosted forks)
+ *   OWNERSWITCH_DEPLOYMENT_ID                required by deployment-bound
+ *                                            licenses (theft containment)
  */
 
 function required(name: string): string {
@@ -60,6 +76,20 @@ function main(): void {
   const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
   const host = process.env.OWNERSWITCH_CONTROL_PLANE_HOST ?? "127.0.0.1";
   const deviceSecret = required("OWNERSWITCH_DEVICE_SECRET");
+  // The owner app's OWN secret — distinct from the fleet device secret, and
+  // the only credential that may flip the release-permitting delivered bit
+  // (POST /veto/:id/seen). Optional: absent, delivery confirmation is 501 and
+  // windows walk to passkey approval (fail closed). It must NOT equal the
+  // fleet secret — that would re-merge the two credential classes the split
+  // exists to keep apart.
+  const ownerAppSecret = process.env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
+  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === deviceSecret) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner-app " +
+        "delivery-ack credential is deliberately separate from the fleet device secret; reusing the " +
+        "fleet secret lets any fleet component (or a same-uid agent) forge the owner's 'I saw it'",
+    );
+  }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -77,17 +107,47 @@ function main(): void {
   // readFileSync of an attacker-writable path.
   const publicKeyPem = loadOwnerPasskeyPublicKey(publicKeyFile).pem;
 
+  // 2GO licensing is ALWAYS ARMED in production: the pinned official vendor
+  // key by default, or an explicit override for self-hosted forks. An
+  // override must parse as an Ed25519 public key HERE, at boot — a corrupt
+  // file must fail the start, not silently turn every future restore into a
+  // 402. The gate covers the paid direction only; no license state ever
+  // touches a stop path.
+  const licenseKeyFile = process.env.OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE?.trim();
+  let vendorPublicKeyPem = OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM;
+  if (licenseKeyFile !== undefined && licenseKeyFile !== "") {
+    vendorPublicKeyPem = readFileSync(licenseKeyFile, "utf8");
+    if (createPublicKey(vendorPublicKeyPem).asymmetricKeyType !== "ed25519") {
+      throw new Error(
+        `OWNERSWITCH_LICENSE_PUBLIC_KEY_FILE (${licenseKeyFile}) is not an Ed25519 public key — ` +
+          "provision the vendor's license-verifying.pub.pem",
+      );
+    }
+  }
+  const token = process.env.OWNERSWITCH_LICENSE?.trim();
+  // deployment-bound licenses need this to match what the vendor minted;
+  // the honeytoken registry already treats it as the deployment's
+  // immutable name, so licensing reuses it rather than inventing another
+  const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID?.trim();
+  const licensing = {
+    vendorPublicKeyPem,
+    ...(token !== undefined && token !== "" ? { token } : {}),
+    ...(deploymentId !== undefined && deploymentId !== "" ? { deploymentId } : {}),
+  };
+
   // dev:false — createControlPlane enforces the production kill-state path
   // guard, the >=256-bit key floors, and the https-origin requirement, and
   // (with a passkey enrolled) the approve handler requires a fresh WebAuthn
   // assertion. A misconfiguration refuses to start with a named reason.
   const controlPlane = createControlPlane({
     deviceSecret,
+    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
     killStateFile,
     dev: false,
     grantKey,
     killStateKey,
     ownerPasskey: { credentialId, publicKeyPem, rpId, origin },
+    licensing,
   });
 
   createServer(controlPlane.handler).listen(port, host, () => {
