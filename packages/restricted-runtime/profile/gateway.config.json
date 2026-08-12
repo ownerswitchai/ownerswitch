@@ -1,0 +1,20 @@
+{
+  "controlPlaneUrl": "http://127.0.0.1:4600",
+  "device": { "id": "restricted-runtime-gateway", "secret": "dev-device-secret" },
+  "upstream": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/ownerswitch-demo"]
+  },
+  "policy": {
+    "rules": [
+      { "id": "reads", "tool": "read_*", "decision": "allow", "description": "reading is safe" },
+      { "id": "lists", "tool": "list_*", "decision": "allow", "description": "listing is safe" },
+      { "id": "dirtree", "tool": "directory_tree", "decision": "allow", "description": "listing is safe" },
+      { "id": "allowed-dirs", "tool": "list_allowed_directories", "decision": "allow", "description": "listing is safe" },
+      { "id": "writes", "tool": "write_file", "decision": "deny", "description": "policy blocks writes through the gateway (this is the denied action the reproduction exercises)" },
+      { "id": "edits", "tool": "edit_file", "decision": "deny", "description": "policy blocks edits through the gateway" },
+      { "id": "moves", "tool": "move_file", "decision": "deny", "description": "renames never run" }
+    ],
+    "defaultDecision": "approve"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "deny": [
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Bash",
+      "BashOutput",
+      "KillShell",
+      "KillBash",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Task"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  }
+}

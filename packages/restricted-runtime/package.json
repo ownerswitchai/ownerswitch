@@ -1,0 +1,23 @@
+{
+  "name": "@ownerswitchai/restricted-runtime",
+  "version": "0.0.1",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "ownerswitch-restricted": "src/launch.ts"
+  },
+  "scripts": {
+    "start": "tsx src/launch.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ownerswitchai/mcp": "workspace:*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.7.10"
+  }
+}
