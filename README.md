@@ -80,4 +80,7 @@ pnpm test
 
 Pre-launch, building in public — [@ownerswitchai](https://x.com/ownerswitchai) · [ownerswitch.ai](https://ownerswitch.ai)
 
-License: TBD before the repo goes public (Apache-2.0 vs FSL — open question).
+License: [FSL-1.1-ALv2](LICENSE.md) — Functional Source License. Free to
+use, read, modify, and self-host for anything except building a competing
+product or service; each version automatically becomes Apache-2.0 two years
+after release.

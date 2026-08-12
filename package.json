@@ -1,5 +1,6 @@
 {
   "name": "ownerswitch",
+  "license": "FSL-1.1-ALv2",
   "private": true,
   "packageManager": "pnpm@9.15.0",
   "scripts": {
