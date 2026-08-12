@@ -40,6 +40,28 @@ Using the **NC** contact is what makes it fail-safe: a cut wire or a yanked
 button reads the same as a press. (A normally-open contact would fail *silent*
 — don't use it.)
 
+## Two modes — the host is inside the threat model
+
+The host this button plugs into is exactly the machine the agent runs on, so
+the button must not be **software-mutable from that host**. `boot.py` decides
+the mode at power-up from a physical gesture the host cannot fake:
+
+| | ARMED (normal) | MAINTENANCE |
+| --- | --- | --- |
+| How | plug in with the e-stop **at rest** | **twist-latch the e-stop pressed**, then plug in |
+| `CIRCUITPY` drive | **hidden** — the host cannot rewrite the firmware | visible, for editing `code.py` |
+| REPL console | **disabled** — the host cannot Ctrl-C the monitoring loop | enabled, for debugging |
+| Serial devices | exactly **one** (the data channel) | two (console + data) |
+| HID / MIDI | disabled | disabled |
+
+While latched in maintenance mode the firmware still emits its fail-safe
+`KILL` — maintenance never silences the button.
+
+**Recovery, from cheapest to total:** forgot which mode you're in → unplug,
+latch the button, replug (maintenance). Filesystem wedged beyond that → hold
+**BOOTSEL** while plugging in, flash `flash_nuke.uf2` (full erase), then
+re-flash CircuitPython and re-copy the firmware.
+
 ## Flash CircuitPython, then copy the firmware
 
 1. Install **CircuitPython** on the Pico: hold **BOOTSEL** while plugging in the
@@ -47,20 +69,20 @@ button reads the same as a press. (A normally-open contact would fail *silent*
    (<https://circuitpython.org/board/raspberry_pi_pico/>) onto the `RPI-RP2`
    drive. The Pico reboots and reappears as a `CIRCUITPY` drive.
 2. Copy **`boot.py`** and **`code.py`** from this directory onto `CIRCUITPY`.
-3. Re-plug the Pico (a fresh power-up so `boot.py` takes effect). It now
-   exposes two USB serial devices: the REPL **console** and a dedicated
-   **data** channel — the daemon reads the data channel.
+3. Unplug. **Wire the button first** (previous section) — from now on, the
+   mode gate reads GP15 at every power-up.
+4. Re-plug with the button at rest → the Pico comes up **armed**: no drive,
+   no console, one clean serial device. (To edit the firmware again: unplug,
+   latch the button pressed, re-plug → `CIRCUITPY` is back.)
 
 ## Connect it to OwnerSwitch
 
-Find the Pico's serial device(s):
+Find the Pico's serial device — in armed mode there is exactly one:
 
 - **macOS:** `ls /dev/cu.usbmodem*`
 - **Linux:** `ls /dev/ttyACM*`
 
-Two devices appear (console + data). The **data** channel is the one that
-carries only `READY`/`KILL` — usually the second of the pair. Point the daemon
-at it:
+Point the daemon at it:
 
 ```bash
 # the device secret signs every kill request — never pass it as a flag
@@ -70,12 +92,13 @@ ownerswitch-button \
   --url http://localhost:4000 \
   --device-id my-desk-button \
   --source serial \
-  --device /dev/ttyACM1        # macOS: /dev/cu.usbmodemXXXX (the data channel)
+  --device /dev/ttyACM0        # macOS: /dev/cu.usbmodemXXXX
 ```
 
 Press the button → the daemon logs a confirmed kill. `Ctrl+C` exits.
-Close any serial monitor (Mu, `screen`, the Arduino monitor) first — only one
-program can hold the port.
+(In maintenance mode two serial devices appear; the **data** channel — the
+one carrying `READY`/`KILL` — is usually the second. Close any serial monitor
+first; only one program can hold the port.)
 
 ## What the firmware emits
 
@@ -84,11 +107,17 @@ program can hold the port.
 - `KILL` again on boot if it comes up already HIGH (booted into the pressed or
   wire-broken state), and re-asserted every second while HIGH.
 
-The daemon matches the trigger line **exactly** (default `KILL`) and de-dupes,
-and `POST /kill` is idempotent — so a re-assert or a missed line is harmless.
-A silent disconnect is reported by the daemon but **not** treated as a press,
-so a flaky USB cable doesn't kill on every hiccup; the firmware's own
-fail-safe still prints a real `KILL` while it has power.
+Emission is **non-blocking by construction**: writes carry a zero timeout and
+run through a small outbox, so a slow, stalled, or absent reader can never
+stall the monitoring loop (a stalled loop would defeat the boot-time
+fail-safe). Partially delivered lines stay queued; while the line is HIGH the
+1-second re-assert keeps offering a complete `KILL\n` until one lands. The
+daemon matches the trigger line **exactly** (default `KILL`), de-dupes, and
+`POST /kill` is idempotent — so re-asserts and missed lines are harmless. If
+nothing is reading the port yet, `READY` may be missed; the daemon does not
+depend on it. A silent disconnect is reported by the daemon but **not**
+treated as a press, so a flaky USB cable doesn't kill on every hiccup; the
+firmware's own fail-safe still prints a real `KILL` while it has power.
 
 ## Notes
 
@@ -97,3 +126,7 @@ fail-safe still prints a real `KILL` while it has power.
   state live.
 - The `--trigger` flag changes the line the daemon treats as a press if you
   adapt the firmware.
+- Honest limit: armed mode stops the *host* from rewriting the firmware over
+  USB. Anyone with **physical** access can latch the button and enter
+  maintenance — physical access has always been outside this boundary (they
+  could as easily unplug the button, which at least fails safe).
