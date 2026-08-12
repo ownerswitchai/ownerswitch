@@ -57,15 +57,20 @@ cannot extend: its entire write surface is the deny direction.
 | `OWNERSWITCH_ESCALATION_STATE_FILE` | with push | 0600 push-subscription store |
 | `OWNERSWITCH_TWILIO_ACCOUNT_SID` / `_AUTH_TOKEN` / `_FROM` | for SMS+voice | Twilio credentials and the provisioned number |
 | `OWNERSWITCH_OWNER_PHONE` | with Twilio | the owner's E.164 number |
+| `OWNERSWITCH_EMAIL_FROM` / `_EMAIL_TO` / `_OWNER_APP_URL` | for email | the email rung: sender, owner's inbox, and the https owner-app base the alert deep-links to (no one-click stop) |
+| `OWNERSWITCH_SES_REGION` / `_SES_ACCESS_KEY_ID` / `_SES_SECRET_ACCESS_KEY` | with email | Amazon SES v2 credentials (raw REST + SigV4, no SDK) |
 | `OWNERSWITCH_ESCALATION_WEBHOOK_BASE_URL` | with Twilio | public **https** base Twilio calls back |
 | `OWNERSWITCH_ESCALATION_HOST` / `_PORT` | no (default `127.0.0.1:4190`) | webhook listener |
 | `OWNERSWITCH_ESCALATION_POLL_MS` | no (default `5000`) | control-plane poll cadence |
 | `OWNERSWITCH_ESCALATION_MAX_VOICE_PER_10MIN` / `_MAX_SMS_PER_HOUR` / `_MAX_DAILY_SPEND_USD` | no (defaults 2 / 6 / 5) | ceilings — caps stop spending and let windows go `held`, fail closed |
 
 Channels assemble from what the environment provides: VAPID env → the
-push rung; Twilio env → the SMS and voice rungs. Half a configuration
-refuses to start; a configuration with no channel at all refuses too.
-Email has no shipped channel yet and therefore no rung.
+push rung; Twilio env → the SMS and voice rungs; SES env → the email
+rung (at 0:00 alongside push). Half a configuration refuses to start; a
+configuration with no channel at all refuses too. Email is the odd rung:
+it gets NO stop verb — it only deep-links into the owner app, where the
+veto and the ack are authenticated. A one-click veto link would let every
+URL-prefetching mail scanner stop actions at random.
 
 ## Run
 

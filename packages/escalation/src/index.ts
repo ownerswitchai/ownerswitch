@@ -35,6 +35,9 @@ export {
 } from "./channels/twilio.js";
 export type { TwilioConfig } from "./channels/twilio.js";
 
+export { createEmailChannel, createSesSender, EMAIL_COST_USD, sesSigV4Headers } from "./channels/email.js";
+export type { EmailChannelConfig, EmailSender, SesConfig } from "./channels/email.js";
+
 export {
   createWebPushChannel,
   encryptPushPayload,

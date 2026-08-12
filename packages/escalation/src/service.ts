@@ -9,6 +9,7 @@ import {
   type EnrolledOwnerDevice,
   type OwnerDeviceCredential,
 } from "@ownerswitchai/control-plane";
+import { createEmailChannel, createSesSender } from "./channels/email.js";
 import { createTwilioSmsChannel, createTwilioVoiceChannel, TWILIO_PATHS } from "./channels/twilio.js";
 import { createWebPushChannel, type PushSubscriptionJson } from "./channels/webpush.js";
 import { LadderEngine } from "./ladder.js";
@@ -133,6 +134,18 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     };
     channels.set("sms", createTwilioSmsChannel(twilioCfg));
     channels.set("voice", createTwilioVoiceChannel(twilioCfg));
+  }
+  if (cfg.email !== undefined) {
+    channels.set(
+      "email",
+      createEmailChannel({
+        from: cfg.email.from,
+        to: cfg.email.to,
+        ownerAppUrl: cfg.email.ownerAppUrl,
+        sendEmail: createSesSender({ ...cfg.email.ses, fetch: doFetch }),
+        now,
+      }),
+    );
   }
   for (const [kind, channel] of Object.entries(opts.channels ?? {})) {
     if (channel !== undefined) channels.set(kind as ChannelKind, channel);

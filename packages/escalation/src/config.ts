@@ -46,6 +46,13 @@ export interface EscalationEnvConfig {
   stateFile?: string;
   twilio?: { accountSid: string; authToken: string; from: string; to: string };
   vapid?: { publicKey: string; privateKey: string; subject: string };
+  email?: {
+    from: string;
+    to: string;
+    /** https base of the owner app; alerts deep-link here (no one-click stop) */
+    ownerAppUrl: string;
+    ses: { region: string; accessKeyId: string; secretAccessKey: string };
+  };
   rungs: LadderRung[];
   limits: RateLimits;
   /** control-plane poll cadence; default 5000 ms */
@@ -155,10 +162,40 @@ export function escalationConfigFromEnv(
         }
       : undefined;
 
-  if (twilio === undefined && vapid === undefined) {
+  const emailVars = [
+    env.OWNERSWITCH_EMAIL_FROM,
+    env.OWNERSWITCH_EMAIL_TO,
+    env.OWNERSWITCH_OWNER_APP_URL,
+    env.OWNERSWITCH_SES_REGION,
+    env.OWNERSWITCH_SES_ACCESS_KEY_ID,
+    env.OWNERSWITCH_SES_SECRET_ACCESS_KEY,
+  ];
+  const emailSet = emailVars.filter((v) => v !== undefined && v !== "").length;
+  if (emailSet > 0 && emailSet < 6) {
+    throw new Error(
+      "partial email configuration: set all of OWNERSWITCH_EMAIL_FROM, OWNERSWITCH_EMAIL_TO, " +
+        "OWNERSWITCH_OWNER_APP_URL, OWNERSWITCH_SES_REGION, OWNERSWITCH_SES_ACCESS_KEY_ID, " +
+        "OWNERSWITCH_SES_SECRET_ACCESS_KEY — or none",
+    );
+  }
+  const email =
+    emailSet === 6
+      ? {
+          from: env.OWNERSWITCH_EMAIL_FROM as string,
+          to: env.OWNERSWITCH_EMAIL_TO as string,
+          ownerAppUrl: env.OWNERSWITCH_OWNER_APP_URL as string,
+          ses: {
+            region: env.OWNERSWITCH_SES_REGION as string,
+            accessKeyId: env.OWNERSWITCH_SES_ACCESS_KEY_ID as string,
+            secretAccessKey: env.OWNERSWITCH_SES_SECRET_ACCESS_KEY as string,
+          },
+        }
+      : undefined;
+
+  if (twilio === undefined && vapid === undefined && email === undefined) {
     throw new Error(
       "no channel is configured — the escalation service would poll and never reach the owner. " +
-        "Configure Web Push (VAPID) and/or Twilio; see packages/escalation/README.md",
+        "Configure Web Push (VAPID), Twilio, and/or email (SES); see packages/escalation/README.md",
     );
   }
 
@@ -178,11 +215,12 @@ export function escalationConfigFromEnv(
     );
   }
 
-  // Rungs assemble from what exists (DESIGN.md §1 offsets). Email has no
-  // shipped channel yet, so it earns no rung — a rung that silently does
-  // nothing would be a lie in the audit trail.
+  // Rungs assemble from what exists (DESIGN.md §1 offsets): push + email at
+  // 0:00, SMS at 2:30, voice at 5:00. A channel with no config earns no rung
+  // — a rung that silently does nothing would be a lie in the audit trail.
   const rungs: LadderRung[] = [];
   if (vapid !== undefined) rungs.push({ afterMs: 0, channel: "push" });
+  if (email !== undefined) rungs.push({ afterMs: 0, channel: "email" });
   if (twilio !== undefined) {
     rungs.push({ afterMs: 2.5 * 60_000, channel: "sms" });
     rungs.push({ afterMs: 5 * 60_000, channel: "voice" });
@@ -211,6 +249,7 @@ export function escalationConfigFromEnv(
     ...(stateFile !== undefined && stateFile !== "" ? { stateFile } : {}),
     ...(twilio !== undefined ? { twilio } : {}),
     ...(vapid !== undefined ? { vapid } : {}),
+    ...(email !== undefined ? { email } : {}),
     rungs,
     limits,
     pollMs: intEnv(env, "OWNERSWITCH_ESCALATION_POLL_MS", DEFAULT_POLL_MS),
