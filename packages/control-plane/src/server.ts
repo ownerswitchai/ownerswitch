@@ -27,6 +27,7 @@ import {
   type DeviceCredential,
   type OwnerSession,
 } from "./auth.js";
+import { DeviceStandingFileStore } from "./device-standing.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
@@ -136,6 +137,21 @@ export interface ControlPlaneOptions {
    * case is a stop, so a forged one is safe.
    */
   ownerDeviceKeys?: Record<string, string>;
+  /**
+   * Where owner-device STANDING ({generation, revokedAt} per device) is
+   * persisted, so a revocation SURVIVES a control-plane restart — without
+   * this, the process's in-memory registry is rebuilt from the static SPKI
+   * keys file on boot and a revoked (stolen) phone comes back to life in
+   * good standing. Same persistence discipline as the kill state (atomic
+   * publish + init marker + fail-closed corrupt handling; device-standing.ts),
+   * and the same production stance: when owner devices are ENROLLED and dev
+   * is not set, this path is REQUIRED — the control plane refuses to start
+   * rather than run a permissive lane whose revocations evaporate. A corrupt
+   * or deleted standing file loads with EVERY device revoked (permissive
+   * lane dead, stop paths untouched). The escalation service reads the same
+   * file, so "revoked" holds across the system, not just this process.
+   */
+  ownerDeviceStandingFile?: string | null;
   /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
@@ -334,6 +350,14 @@ export interface ControlPlane {
   killSwitch: KillSwitch;
   /** Live veto windows by id; the gateway registers, the API vetoes/reads. */
   vetoWindows: Map<string, VetoWindow>;
+  /**
+   * The live owner-device registry (standing included) — exposed for
+   * observability and tests; treat as read-mostly. Revocation goes through
+   * POST /devices/:id/revoke, which also persists standing and sweeps
+   * evidence; mutating records here directly bypasses both (which is exactly
+   * what the release-time CAS tests simulate).
+   */
+  ownerDevices: Map<string, EnrolledOwnerDevice>;
 }
 
 /**
@@ -551,6 +575,68 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   const ownerDevices = new Map<string, EnrolledOwnerDevice>();
   for (const [deviceId, spki] of Object.entries(opts.ownerDeviceKeys ?? {})) {
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
+  }
+  // Durable standing: without it, every boot resurrects revoked phones from
+  // the static keys file. Production with enrolled devices REQUIRES the
+  // path; dev runs may omit it (ephemeral standing, like ephemeral kill
+  // state) — the same trade, opted into the same way.
+  if (ownerDevices.size > 0 && opts.dev !== true && !opts.ownerDeviceStandingFile) {
+    throw new Error(
+      "ownerDeviceKeys are enrolled but ownerDeviceStandingFile is not set. A revocation must " +
+        "survive a restart — without a durable standing registry, a revoked (stolen) phone comes " +
+        "back to life in good standing on the next boot. Set ownerDeviceStandingFile " +
+        "(env OWNERSWITCH_OWNER_DEVICE_STANDING_FILE), or dev: true for a deliberately ephemeral run.",
+    );
+  }
+  const standingStore = opts.ownerDeviceStandingFile
+    ? new DeviceStandingFileStore(opts.ownerDeviceStandingFile)
+    : null;
+  if (standingStore !== null && ownerDevices.size > 0) {
+    const loaded = standingStore.load();
+    if (loaded.outcome === "corrupt") {
+      // fail CLOSED: a standing file we cannot trust revokes every device —
+      // the permissive lane dies, windows walk to held, stop paths untouched.
+      console.error(
+        `[ownerswitch] device-standing registry is corrupt (${loaded.detail}) — ` +
+          "ALL owner devices boot REVOKED; the ack lane is dead until the registry is repaired",
+      );
+      for (const device of ownerDevices.values()) {
+        device.revokedAt = 0;
+        device.generation += 1;
+      }
+    } else if (loaded.outcome === "loaded") {
+      for (const [deviceId, standing] of Object.entries(loaded.state.devices)) {
+        const device = ownerDevices.get(deviceId);
+        if (device !== undefined) {
+          device.generation = standing.generation;
+          device.revokedAt = standing.revokedAt;
+        }
+      }
+    }
+  }
+  /** Persist the CURRENT standing of every enrolled device. */
+  function persistStanding(): { durable: boolean; detail?: string } {
+    if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
+    const devices: Record<string, { generation: number; revokedAt: number | null }> = {};
+    for (const [deviceId, device] of ownerDevices) {
+      devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
+    }
+    try {
+      return standingStore.save({ version: 1, devices });
+    } catch (err) {
+      return { durable: false, detail: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  /**
+   * The release-time witness check injected into every server-registered
+   * window (veto.ts tick()): the acking device must still exist, unrevoked,
+   * at the generation it acked under. Evidence with no witness identity
+   * cannot be validated and is refused — fail closed.
+   */
+  function witnessStanding(deviceId: string | null, generation: number | null): boolean {
+    if (deviceId === null || generation === null) return false;
+    const device = ownerDevices.get(deviceId);
+    return device !== undefined && device.revokedAt === null && device.generation === generation;
   }
   // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
   // consumed by the ack. Keyed by deliveryId; each binds the exact window,
@@ -1824,7 +1910,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     for (const window of vetoWindows.values()) {
       if (window.revokeDeliveryEvidence(id)) evidenceCleared += 1;
     }
-    sendJson(res, 200, { revoked: true, deviceId: id, generation: device.generation, evidenceCleared });
+    // The revocation holds IN MEMORY no matter what (severing must never fail
+    // on a disk problem — the dangerous direction is the phone STAYING
+    // trusted), and then persists to the standing registry. Like a kill, the
+    // response claims durability only when the persist actually succeeded:
+    // durable:false is the operator's cue that a crash could resurrect the
+    // device, to be surfaced, never silenced.
+    const persisted = persistStanding();
+    sendJson(res, 200, {
+      revoked: true,
+      deviceId: id,
+      generation: device.generation,
+      evidenceCleared,
+      durable: persisted.durable,
+      ...(persisted.durable ? {} : { durabilityDetail: persisted.detail }),
+    });
   }
 
   /**
@@ -2143,6 +2243,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // which gateway retries it or whether that gateway restarted meanwhile.
     const window = new VetoWindow(call, killSwitch.epoch, {
       now,
+      witnessStanding, // release-time CAS: no release on a dead witness
       ...(purpose !== undefined ? { purpose } : {}),
     });
     vetoWindows.set(id, window);
@@ -2348,5 +2449,5 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 404, { error: "not found" });
   }
 
-  return { handler, killSwitch, vetoWindows };
+  return { handler, killSwitch, vetoWindows, ownerDevices };
 }

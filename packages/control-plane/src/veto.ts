@@ -50,6 +50,18 @@ export interface VetoOptions {
   extensionMs?: number;
   /** the canonical purpose the registering gateway declared, if any */
   purpose?: VetoPurpose;
+  /**
+   * The release-time witness check: does the device named by the ack
+   * evidence STILL exist, in good standing, at the SAME generation it held
+   * when it acked? Consulted INSIDE tick() at the release decision itself —
+   * not only by the revocation handler's proactive sweep — so evidence from
+   * a witness revoked through ANY path (admin tooling, registry reload,
+   * another process's persisted standing) is invalid exactly where it would
+   * otherwise release. A missing checker (unit tests, non-owner-device
+   * windows) trusts the delivered bit as before; the server always injects
+   * one for windows it registers.
+   */
+  witnessStanding?: (deviceId: string | null, generation: number | null) => boolean;
   now?: () => number;
 }
 
@@ -67,6 +79,9 @@ export class VetoWindow {
   private approvalEpochValue: number | null = null;
   private readonly extensionMs: number;
   private readonly now: () => number;
+  private readonly witnessStanding:
+    | ((deviceId: string | null, generation: number | null) => boolean)
+    | undefined;
   readonly purpose: VetoPurpose | undefined;
   vetoedBy: string | null = null;
 
@@ -89,6 +104,7 @@ export class VetoWindow {
     this.extensionMs = opts.extensionMs ?? 6 * 60_000;
     this.deadline = this.now() + (opts.windowMs ?? 4 * 60_000);
     this.purpose = opts.purpose;
+    this.witnessStanding = opts.witnessStanding;
   }
 
   /**
@@ -175,6 +191,26 @@ export class VetoWindow {
   tick(): VetoStatus {
     if (this.status !== "pending" && this.status !== "extended") return this.status;
     if (this.now() < this.deadline) return this.status;
+
+    // THE RELEASE-TIME CAS: before "delivered" may become "released", the
+    // witnessing device must still exist, unrevoked, at the SAME generation
+    // it acked under — checked HERE, at the decision itself, not only by the
+    // revocation handler's proactive sweep (which stays as an accelerator:
+    // it clears evidence eagerly and preserves deadline-anchored releases
+    // for revocations arriving through the API). Any revocation path the
+    // sweep never saw — admin tooling, a standing reload, another process's
+    // persisted registry — is enforced here, and the failure direction is
+    // held/passkey, never a release on a dead witness.
+    if (
+      this.delivered &&
+      this.witnessStanding !== undefined &&
+      !this.witnessStanding(this.deliveredByDevice, this.deliveredByGenerationValue)
+    ) {
+      this.delivered = false;
+      this.deliveredByDevice = null;
+      this.deliveredByGenerationValue = null;
+      this.deliveredAtMs = null;
+    }
 
     if (this.delivered) {
       this.status = "released";

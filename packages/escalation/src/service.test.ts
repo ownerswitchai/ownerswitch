@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ownerDeviceSigPreimage } from "@ownerswitchai/shared";
 import {
   createControlPlane,
+  DeviceStandingFileStore,
   signDeviceRequest,
   VetoWindow,
   type ControlPlane,
@@ -297,12 +298,76 @@ describe("escalation service against a live control plane", () => {
     const signed = await enrollOwner("n-1");
     expect(signed.status).toBe(200);
     expect(service.subscription()).toEqual(subscription);
-    expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription });
+    expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription, enrolledBy: "owner-app" });
     expect(statSync(stateFile).mode & 0o777).toBe(0o600);
 
     // a replayed enrollment (same nonce) is refused
     const replay = await enrollOwner("n-1");
     expect(replay.status).toBe(401);
+  });
+
+  it("REVOCATION standing (shared registry): a revoked device cannot enroll, and its subscription goes inactive", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const stateFile = join(dir, "state.json");
+    const standingFile = join(dir, "standing.json");
+    const push = fakePush();
+    const service = createEscalationService({
+      config: { ...baseConfig("http://127.0.0.1:1", stateFile), ownerDeviceStandingFile: standingFile },
+      channels: { push: push.channel },
+      now: c.now,
+      log: () => {},
+    });
+    const url = await listen(service.webhookHandler, servers);
+
+    const subscription = {
+      endpoint: "https://push.example/send/abc",
+      keys: { p256dh: "BPub", auth: "QXV0aA" },
+    };
+    const body = JSON.stringify({ subscription });
+    const pathAndQuery = "/push/subscription";
+    const enroll = (nonce: string) => {
+      const at = c.now();
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-app",
+        method: "POST",
+        pathAndQuery,
+        bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+        timestamp: at,
+        nonce,
+      });
+      return fetch(`${url}${pathAndQuery}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-device-id": "owner-app",
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": ecSign("sha256", preimage, {
+            key: ownerKeypair.privateKey,
+            dsaEncoding: "ieee-p1363",
+          }).toString("base64url"),
+        },
+        body,
+      });
+    };
+
+    // good standing (registry absent = no revocation ever) — enrollment lands
+    expect((await enroll("s-1")).status).toBe(200);
+    expect(service.subscription()).toEqual(subscription);
+
+    // the CONTROL PLANE (another process) revokes the phone by writing the
+    // SHARED standing registry; this service saw no event at all
+    new DeviceStandingFileStore(standingFile).save({
+      version: 1,
+      devices: { "owner-app": { generation: 2, revokedAt: c.now() } },
+    });
+
+    // the subscription the revoked phone enrolled is now INACTIVE — the lost
+    // phone stops receiving decision-critical alerts...
+    expect(service.subscription()).toBeNull();
+    // ...and the revoked key cannot re-point the alert channel either
+    expect((await enroll("s-2")).status).toBe(403);
   });
 
   it("with no owner device enrolled, push enrollment is 501", async () => {

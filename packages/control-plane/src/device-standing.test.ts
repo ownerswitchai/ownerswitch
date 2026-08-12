@@ -1,0 +1,67 @@
+import { mkdtempSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { DeviceStandingFileStore, type PersistedDeviceStanding } from "./device-standing.js";
+
+const tmp = () => mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+
+const state = (devices: PersistedDeviceStanding["devices"]): PersistedDeviceStanding => ({
+  version: 1,
+  devices,
+});
+
+describe("DeviceStandingFileStore — durable revocation standing", () => {
+  it("round-trips standing atomically and reports durability", () => {
+    const store = new DeviceStandingFileStore(join(tmp(), "standing.json"));
+    expect(store.load()).toEqual({ outcome: "absent" });
+
+    const saved = store.save(state({ "owner-phone": { generation: 2, revokedAt: 1_234 } }));
+    expect(saved.durable).toBe(true);
+
+    const loaded = store.load();
+    expect(loaded.outcome).toBe("loaded");
+    if (loaded.outcome === "loaded") {
+      expect(loaded.state.devices["owner-phone"]).toEqual({ generation: 2, revokedAt: 1_234 });
+    }
+  });
+
+  it("DELETING the standing file after a write loads as corrupt — deletion must not resurrect", () => {
+    const file = join(tmp(), "standing.json");
+    const store = new DeviceStandingFileStore(file);
+    store.save(state({ d: { generation: 2, revokedAt: 99 } }));
+    unlinkSync(file); // the resurrection attempt
+    const loaded = store.load();
+    expect(loaded.outcome).toBe("corrupt"); // marker exists, file missing
+  });
+
+  it("a store with NEITHER file is a genuine first boot (absent), not corruption", () => {
+    const store = new DeviceStandingFileStore(join(tmp(), "standing.json"));
+    expect(store.load().outcome).toBe("absent");
+  });
+
+  it("rejects shapes it would not have written: extra keys, bad generations, colon device ids", () => {
+    const file = join(tmp(), "standing.json");
+    const bad = [
+      '{"version":2,"devices":{}}',
+      '{"version":1,"devices":{},"extra":1}',
+      '{"version":1,"devices":{"d":{"generation":0,"revokedAt":null}}}',
+      '{"version":1,"devices":{"d":{"generation":1,"revokedAt":null,"x":1}}}',
+      '{"version":1,"devices":{"a:b":{"generation":1,"revokedAt":null}}}',
+      "not json",
+    ];
+    for (const content of bad) {
+      writeFileSync(file, content);
+      expect(new DeviceStandingFileStore(file).load().outcome).toBe("corrupt");
+    }
+  });
+
+  it("refuses a symlink planted at the standing path", () => {
+    const dir = tmp();
+    const real = join(dir, "elsewhere.json");
+    writeFileSync(real, JSON.stringify(state({})));
+    const file = join(dir, "standing.json");
+    symlinkSync(real, file);
+    expect(new DeviceStandingFileStore(file).load().outcome).toBe("corrupt");
+  });
+});

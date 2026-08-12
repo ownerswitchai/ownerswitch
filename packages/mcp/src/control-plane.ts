@@ -50,6 +50,12 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *                                            credential that may confirm
  *                                            delivery; absent → /veto/:id/seen
  *                                            is 501 (fail closed)
+ *   OWNERSWITCH_OWNER_DEVICE_STANDING_FILE   durable {generation, revokedAt}
+ *                                            registry — REQUIRED when device
+ *                                            keys are enrolled, so a
+ *                                            revocation survives a restart;
+ *                                            shared with the escalation
+ *                                            service
  */
 
 function required(name: string): string {
@@ -98,6 +104,11 @@ function main(): void {
     ownerDeviceKeysFile !== undefined && ownerDeviceKeysFile !== ""
       ? loadOwnerDeviceKeysFile(ownerDeviceKeysFile)
       : {};
+  // Durable owner-device STANDING ({generation, revokedAt}) — REQUIRED by
+  // createControlPlane whenever owner devices are enrolled (dev:false): a
+  // revocation must survive a restart, or a stolen phone resurrects on the
+  // next boot. The escalation service points at the SAME file.
+  const ownerDeviceStandingFile = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -150,6 +161,9 @@ function main(): void {
   const controlPlane = createControlPlane({
     deviceSecret,
     ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
+    ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
+      ? { ownerDeviceStandingFile }
+      : {}),
     killStateFile,
     dev: false,
     grantKey,

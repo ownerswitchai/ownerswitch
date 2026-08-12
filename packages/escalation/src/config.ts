@@ -36,6 +36,16 @@ export interface EscalationEnvConfig {
    * redirect the owner's push channel. Absent/empty → enrollment is 501.
    */
   ownerDeviceKeys?: Record<string, string>;
+  /**
+   * The SAME durable standing registry the control plane writes
+   * ({deviceId → {generation, revokedAt}}, device-standing.ts). Re-read on
+   * every owner-device operation here, so a revocation on the control plane
+   * severs this service's surfaces too: a revoked phone can no longer update
+   * the push subscription, and a subscription it enrolled stops receiving
+   * alerts. Absent → standing is not consulted (dev), matching an ephemeral
+   * control plane. A corrupt registry reads as ALL devices revoked.
+   */
+  ownerDeviceStandingFile?: string;
   /** where the webhook server listens */
   listenHost: string;
   listenPort: number;
@@ -219,10 +229,14 @@ export function escalationConfigFromEnv(
     throw new Error("OWNERSWITCH_ESCALATION_MAX_DAILY_SPEND_USD must be a non-negative number");
   }
 
+  const ownerDeviceStandingFile = env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
   return {
     controlPlaneUrl,
     device,
     ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
+    ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
+      ? { ownerDeviceStandingFile }
+      : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),

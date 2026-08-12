@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
 import {
+  DeviceStandingFileStore,
   enrolledOwnerDeviceFromSpki,
   signDeviceRequest,
   verifyOwnerDeviceSignature,
@@ -74,28 +75,68 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
   }
 
+  // The SHARED durable standing registry the control plane writes. Re-read on
+  // every owner-device decision (the file is tiny, the operations are rare):
+  // a revocation on the control plane severs THIS service's surfaces at the
+  // very next request, without any cross-process notification channel.
+  // Absent file → good standing (a dev/ephemeral run); a CORRUPT registry
+  // reads as everyone-revoked — fail closed, alerts stop, stop paths (SMS,
+  // voice, the veto relay) are untouched.
+  const standingStore =
+    cfg.ownerDeviceStandingFile !== undefined
+      ? new DeviceStandingFileStore(cfg.ownerDeviceStandingFile)
+      : null;
+  function deviceInGoodStanding(deviceId: string): boolean {
+    if (standingStore === null) return true;
+    const loaded = standingStore.load();
+    if (loaded.outcome === "absent") return true; // no revocation ever recorded
+    if (loaded.outcome === "corrupt") return false; // trust nothing
+    const standing = loaded.state.devices[deviceId];
+    return standing === undefined || standing.revokedAt === null;
+  }
+
   /* ---------------- push subscription store (0600, atomic) ------------- */
 
-  let storedSubscription: PushSubscriptionJson | null = loadSubscription();
+  let storedSubscription: PushSubscriptionJson | null = null;
+  // who enrolled the subscription — a revocation of THAT device deactivates
+  // it (null on legacy stores written before this field existed)
+  let subscriptionEnrolledBy: string | null = null;
+  loadSubscription();
 
-  function loadSubscription(): PushSubscriptionJson | null {
-    if (cfg.stateFile === undefined) return null;
+  function loadSubscription(): void {
+    if (cfg.stateFile === undefined) return;
     try {
       const parsed: unknown = JSON.parse(readFileSync(cfg.stateFile, "utf8"));
-      const sub = (parsed as { subscription?: unknown }).subscription;
-      return isSubscription(sub) ? sub : null;
+      const record = parsed as { subscription?: unknown; enrolledBy?: unknown };
+      if (isSubscription(record.subscription)) {
+        storedSubscription = record.subscription;
+        subscriptionEnrolledBy = typeof record.enrolledBy === "string" ? record.enrolledBy : null;
+      }
     } catch {
-      return null; // absent or unreadable: no subscription until re-enrolled
+      /* absent or unreadable: no subscription until re-enrolled */
     }
   }
 
-  function persistSubscription(sub: PushSubscriptionJson): void {
+  /**
+   * The subscription the dispatcher may actually SEND to: none when the
+   * enrolling device has been revoked (the lost phone must not keep
+   * receiving decision-critical alerts). A legacy record with no enrolledBy
+   * (pre-standing) stays active — re-enrollment stamps it.
+   */
+  function activeSubscription(): PushSubscriptionJson | null {
+    return storedSubscription !== null &&
+      (subscriptionEnrolledBy === null || deviceInGoodStanding(subscriptionEnrolledBy))
+      ? storedSubscription
+      : null;
+  }
+
+  function persistSubscription(sub: PushSubscriptionJson, enrolledBy: string): void {
     if (cfg.stateFile === undefined) return;
     // atomic replace, private from birth: the subscription is a send
     // capability, and a half-written store must not exist even briefly
     mkdirSync(dirname(cfg.stateFile), { recursive: true, mode: 0o700 });
     const tmp = `${cfg.stateFile}.${randomBytes(6).toString("hex")}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ subscription: sub }, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({ subscription: sub, enrolledBy }, null, 2), { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, cfg.stateFile);
   }
@@ -119,7 +160,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         vapidPublicKey: cfg.vapid.publicKey,
         vapidPrivateKey: cfg.vapid.privateKey,
         subject: cfg.vapid.subject,
-        getSubscription: () => storedSubscription,
+        getSubscription: activeSubscription,
         fetch: doFetch,
         now,
       }),
@@ -326,6 +367,14 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         send(res, 401, "application/json", JSON.stringify({ error: "unauthorized" }));
         return;
       }
+      // The signature proves possession of the enrolled key; STANDING proves
+      // the control plane still trusts it. Re-read from the shared registry
+      // on every enrollment, so a revoked (stolen) phone cannot redirect the
+      // owner's alert channel even though this process never saw the revoke.
+      if (!deviceInGoodStanding(enrolledBy)) {
+        send(res, 403, "application/json", JSON.stringify({ error: "device revoked — enrollment refused" }));
+        return;
+      }
       let sub: unknown;
       try {
         sub = (JSON.parse(rawBody) as Record<string, unknown>).subscription;
@@ -338,7 +387,8 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         return;
       }
       storedSubscription = sub;
-      persistSubscription(sub);
+      subscriptionEnrolledBy = enrolledBy;
+      persistSubscription(sub, enrolledBy);
       log("push subscription enrolled");
       send(res, 200, "application/json", JSON.stringify({ ok: true }));
       return;
@@ -427,5 +477,16 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     res.end(body);
   }
 
-  return { tickOnce, webhookHandler, subscription: () => storedSubscription };
+  // The accessor answers what the PUSH CHANNEL would actually use — standing
+  // included — so the doctor and tests see the same truth the dispatcher does:
+  // a subscription whose enrolling device was revoked reads as none.
+  return {
+    tickOnce,
+    webhookHandler,
+    subscription: () =>
+      storedSubscription !== null &&
+      (subscriptionEnrolledBy === null || deviceInGoodStanding(subscriptionEnrolledBy))
+        ? storedSubscription
+        : null,
+  };
 }

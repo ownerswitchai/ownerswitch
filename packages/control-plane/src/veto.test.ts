@@ -25,6 +25,55 @@ describe("VetoWindow", () => {
     expect(w.tick()).toBe("released");
   });
 
+  it("RELEASE-TIME CAS: at the decision itself, a witness that lost standing cannot release", () => {
+    // the standing flips INVALID without any revokeDeliveryEvidence() sweep —
+    // this models a revocation path the proactive sweep never saw (admin
+    // tooling, a standing-registry reload, another process's persisted state)
+    const c = clock();
+    let standingValid = true;
+    const w = new VetoWindow(call, 0, {
+      windowMs: 1000,
+      extensionMs: 2000,
+      now: c.now,
+      witnessStanding: (deviceId, generation) =>
+        standingValid && deviceId === "phone-1" && generation === 1,
+    });
+    w.markDelivered("phone-1", 1);
+    standingValid = false; // revoked through a path tick() alone must catch
+    c.advance(1001);
+    expect(w.tick()).toBe("extended"); // NOT released — evidence invalid at the decision
+    expect(w.isDelivered).toBe(false);
+    c.advance(2001);
+    expect(w.tick()).toBe("held"); // and silence fails closed from there
+  });
+
+  it("RELEASE-TIME CAS: a generation mismatch alone (same device id) refuses the release", () => {
+    const c = clock();
+    const w = new VetoWindow(call, 0, {
+      windowMs: 1000,
+      now: c.now,
+      // the registry's CURRENT generation is 2; the ack was witnessed under 1
+      witnessStanding: (deviceId, generation) => deviceId === "phone-1" && generation === 2,
+    });
+    w.markDelivered("phone-1", 1);
+    c.advance(1001);
+    expect(w.tick()).toBe("extended");
+  });
+
+  it("RELEASE-TIME CAS: evidence with no witness identity cannot be validated and never releases", () => {
+    const c = clock();
+    // markDelivered() with no device/generation — the checker receives nulls,
+    // and a server-style checker refuses evidence it cannot attribute
+    const w = new VetoWindow(call, 0, {
+      windowMs: 1000,
+      now: c.now,
+      witnessStanding: (deviceId, generation) => deviceId !== null && generation !== null,
+    });
+    w.markDelivered();
+    c.advance(1001);
+    expect(w.tick()).toBe("extended");
+  });
+
   it("unreachable owner: extends once instead of releasing", () => {
     const c = clock();
     const w = new VetoWindow(call, 0, { windowMs: 1000, extensionMs: 2000, now: c.now });
