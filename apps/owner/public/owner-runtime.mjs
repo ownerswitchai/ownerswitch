@@ -70,9 +70,17 @@ export async function enrolledPublicKeySpki() {
   return exportPublicKeySpki(publicKey);
 }
 
-/** Device-signed fetch: sign the exact method+path+body, then send it. */
-async function signedFetch(baseUrl, path, method, body) {
+/**
+ * Device-signed fetch: sign the exact method+path+body, then send it. An
+ * optional `guard()` is re-checked AFTER the key is retrieved and IMMEDIATELY
+ * before signing — the permissive ack must not be produced if the review
+ * surface stopped being valid (hidden, blurred, framed, navigated away)
+ * during the async key access. A false/throwing guard aborts before any
+ * signature exists.
+ */
+async function signedFetch(baseUrl, path, method, body, guard) {
   const { privateKey } = await ensureDeviceKey();
+  if (guard && !guard()) throw new Error("aborted: review surface no longer valid before signing");
   const headers = await signRequestHeaders(privateKey, {
     deviceId: cfg().deviceId,
     method,
@@ -122,12 +130,15 @@ export async function resubscribeFromWorker(registration) {
 }
 
 /**
- * Fetch the window's renderable detail (device-signed GET), for the
- * foreground detail view to render. The read is what the ack later echoes.
+ * Fetch the window's foreground-detail (device-signed GET /veto/:id/detail):
+ * the RenderableAlertV1 the view must render AND a single-use delivery
+ * {deliveryId, revision, renderContentHash} the ack must echo. The ack proves
+ * "I rendered THIS content at THIS revision", so a blank or stale render can
+ * never confirm the window.
  */
-export async function fetchWindow(windowId) {
-  const res = await signedFetch(cfg().controlPlaneUrl, `/veto/${encodeURIComponent(windowId)}`, "GET");
-  if (!res.ok) throw new Error(`window read failed: HTTP ${res.status}`);
+export async function fetchDetail(windowId) {
+  const res = await signedFetch(cfg().controlPlaneUrl, `/veto/${encodeURIComponent(windowId)}/detail`, "GET");
+  if (!res.ok) throw new Error(`detail read failed: HTTP ${res.status}`);
   return res.json();
 }
 
@@ -138,17 +149,27 @@ export async function fetchWindow(windowId) {
  * server's verdict; a 409 inside the response floor means "re-ack against the
  * new deadline", a 501 means no owner device is enrolled server-side.
  */
-export async function sendSeenAck(windowId) {
-  const res = await signedFetch(cfg().controlPlaneUrl, `/veto/${encodeURIComponent(windowId)}/seen`, "POST", "");
-  return { status: res.status, body: await res.json().catch(() => ({})) };
+export async function sendSeenAck(windowId, ackBody, guard) {
+  const body = JSON.stringify(ackBody ?? {});
+  const res = await signedFetch(
+    cfg().controlPlaneUrl,
+    `/veto/${encodeURIComponent(windowId)}/seen`,
+    "POST",
+    body,
+    guard,
+  );
+  return { ok: res.ok, status: res.status, body: await res.json().catch(() => ({})) };
 }
 
 /**
  * The one-tap veto — the deliberate second action after the tap opened the
  * app. Device-signed, idempotent server-side (re-vetoing a vetoed window is a
- * successful no-op), so a retry after an uncertain send never double-stops.
+ * successful no-op). Returns `vetoed: true` ONLY when the server response
+ * explicitly confirms the window is vetoed — a 4xx/5xx is NOT success, so the
+ * UI must never report "stopped" on a rejected veto (it stays retryable).
  */
 export async function sendVeto(windowId) {
   const res = await signedFetch(cfg().controlPlaneUrl, `/veto/${encodeURIComponent(windowId)}`, "POST", "");
-  return { status: res.status, body: await res.json().catch(() => ({})) };
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, vetoed: res.ok && body.status === "vetoed", body };
 }

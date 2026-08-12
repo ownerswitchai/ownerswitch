@@ -48,4 +48,6 @@ export type {
   OwnerDeviceCredential,
   OwnerDeviceVerifyOptions,
 } from "./owner-device.js";
+export { loadOwnerDeviceKeysFile } from "./owner-device-file.js";
+export type { LoadOwnerDeviceKeysOptions } from "./owner-device-file.js";
 export type { DeviceCredential, DeviceVerifyOptions, OwnerSession, SessionOptions } from "./auth.js";

@@ -58,6 +58,7 @@ export class VetoWindow {
   private delivered = false;
   private deliveredByDevice: string | null = null;
   private deliveredAtMs: number | null = null;
+  private revisionValue = 1;
   private deadline: number;
   private releasedAtMs: number | null = null;
   private approvedByOwner: string | null = null;
@@ -162,6 +163,11 @@ export class VetoWindow {
     } else if (this.status === "pending") {
       this.status = "extended";
       this.deadline += this.extensionMs;
+      // The rendered content just changed (the deadline moved), so any
+      // foreground-detail delivery minted for the previous revision is now
+      // stale: an ack echoing revision N must not confirm the extended
+      // window. Bump so the server can reject it (apps/owner DESIGN.md §3).
+      this.revisionValue += 1;
     } else {
       this.status = "held"; // unreachable owner: escalate to active approval
     }
@@ -170,6 +176,16 @@ export class VetoWindow {
 
   get state(): VetoStatus {
     return this.status;
+  }
+
+  /**
+   * The window's showing revision — 1 at registration, +1 on extension (the
+   * one event that changes what the owner would render). A delivery ack must
+   * echo the revision it was minted for AND match this, so a detail fetched
+   * for revision N cannot confirm the window after it has advanced.
+   */
+  get revision(): number {
+    return this.revisionValue;
   }
 
   /** When silence next decides this window (ms). Moves once, on extension. */

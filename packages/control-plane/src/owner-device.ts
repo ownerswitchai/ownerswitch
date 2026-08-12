@@ -43,20 +43,55 @@ export interface OwnerDeviceVerifyOptions {
   seenNonces?: Map<string, number>;
 }
 
-/** Parse an enrolled device's public key from an SPKI PEM (or DER base64). */
+/**
+ * Parse an enrolled device's PUBLIC key from an SPKI PEM (or base64 DER),
+ * STRICTLY. This is an authorization root — whoever provisions it can flip
+ * the release-permitting delivered bit — so a PRIVATE key is refused
+ * outright: `createPublicKey(privatePem)` will happily DERIVE a public key
+ * from a PKCS#8/SEC1 private PEM, and accepting that would put signing
+ * material in a file meant to hold only public bytes (the same hole
+ * mcp/src/passkey-key.ts closes). We reject any `PRIVATE KEY` armor, require
+ * exactly one SPKI `PUBLIC KEY` block (or raw base64 DER), parse the DER with
+ * an explicit `{type:"spki"}` (a private DER fails the ASN.1 shape), and
+ * return a CANONICAL re-export so downstream binds bytes this parser produced.
+ */
 export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): EnrolledOwnerDevice {
   const trimmed = spki.trim();
-  const key = trimmed.includes("BEGIN")
-    ? createPublicKey(trimmed)
-    : createPublicKey({ key: Buffer.from(trimmed, "base64"), format: "der", type: "spki" });
+  if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(trimmed)) {
+    throw new Error(
+      `owner device "${deviceId}" was given a PRIVATE key — provide ONLY the SPKI public key. A ` +
+        "private key here would put signing authority in public-key configuration",
+    );
+  }
+  let der: Buffer;
+  if (trimmed.includes("BEGIN")) {
+    if ((trimmed.match(/-----BEGIN /g) ?? []).length !== 1) {
+      throw new Error(`owner device "${deviceId}" key must be exactly one PEM block`);
+    }
+    const match = /^-----BEGIN PUBLIC KEY-----\r?\n([A-Za-z0-9+/=\s]+?)-----END PUBLIC KEY-----\s*$/.exec(trimmed);
+    if (match === null) {
+      throw new Error(`owner device "${deviceId}" key is not a single SPKI "PUBLIC KEY" PEM block`);
+    }
+    der = Buffer.from(match[1].replace(/\s+/g, ""), "base64");
+  } else {
+    der = Buffer.from(trimmed, "base64");
+  }
+  let key: KeyObject;
+  try {
+    // explicit SPKI DER — NOT createPublicKey(pem), which derives from private
+    key = createPublicKey({ key: der, format: "der", type: "spki" });
+  } catch {
+    throw new Error(`owner device "${deviceId}" key does not parse as an SPKI public key`);
+  }
   if (key.asymmetricKeyType !== "ec") {
-    throw new Error("owner device key must be an ECDSA P-256 (prime256v1) public key");
+    throw new Error(`owner device "${deviceId}" key must be an ECDSA P-256 (prime256v1) public key`);
   }
   const curve = key.asymmetricKeyDetails?.namedCurve;
   if (curve !== "prime256v1") {
-    throw new Error(`owner device key must be on prime256v1 (P-256), got ${curve ?? "unknown"}`);
+    throw new Error(`owner device "${deviceId}" key must be on prime256v1 (P-256), got ${curve ?? "unknown"}`);
   }
-  return { deviceId, publicKey: key };
+  // canonical re-export: bind bytes this parser produced, not the input
+  return { deviceId, publicKey: createPublicKey(key.export({ type: "spki", format: "pem" })) };
 }
 
 /**
@@ -86,8 +121,10 @@ export function verifyOwnerDeviceSignature(
   }
 
   const { deviceId, timestamp, nonce, signature } = credential;
-  if (typeof deviceId !== "string" || deviceId === "" || deviceId.includes(".")) return null;
-  if (typeof nonce !== "string" || nonce === "" || nonce.includes(".")) return null;
+  // The nonce store key is `owner:<deviceId>:<nonce>` — reject the ":"
+  // separator in either field so two credentials can never alias one key.
+  if (typeof deviceId !== "string" || deviceId === "" || deviceId.includes(":")) return null;
+  if (typeof nonce !== "string" || nonce === "" || nonce.includes(":")) return null;
   if (typeof signature !== "string" || signature === "") return null;
   if (!Number.isSafeInteger(timestamp)) return null;
   if (Math.abs(now() - timestamp) > maxSkewMs) return null;

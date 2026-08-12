@@ -85,30 +85,62 @@
       });
   }
 
-  // The foreground detail view: on #alert=<windowId>, fetch the window, render
-  // its concrete summary as TEXT, and only from that render send the ack.
+  // A top-level, non-framed document is a precondition for producing ack
+  // evidence: `visibilityState === "visible"` and `hasFocus()` do NOT prove a
+  // reviewable surface if the app is a tiny/covered iframe. The deployment
+  // MUST also send `Content-Security-Policy: frame-ancestors 'none'` as an
+  // HTTP header (a meta tag cannot express it); this is the in-page belt.
+  function isTopLevel() {
+    try {
+      return window.top === window.self;
+    } catch (e) {
+      return false; // cross-origin framer → access throws → treat as framed
+    }
+  }
+
+  // The foreground detail view: on #alert=<windowId>, fetch the foreground
+  // detail, render its concrete fields as TEXT, and only from that render —
+  // guarded, top-level, visible, focused, unchanged — echo the delivery ack.
   function routeAlert() {
     var h = currentHash();
     if (h.tab !== "alert" || !h.arg) return;
     var windowId = h.arg;
+    if (!isTopLevel()) return; // never render/ack a framed review surface
+
     loadRuntime().then(function (rt) {
-      rt.fetchWindow(windowId)
-        .then(function (win) {
-          // render as TEXT
-          setText("kv-agent", win.agentId);
-          setText("kv-tool", win.tool);
-          setText("kv-action", win.summary || win.tool);
+      rt.fetchDetail(windowId)
+        .then(function (detail) {
+          // render as TEXT (agent-supplied strings are never markup)
+          setText("kv-agent", detail.agentId);
+          setText("kv-tool", detail.tool);
+          setText("kv-action", detail.summary || detail.tool);
           setText("kv-window", windowId);
           wireVeto(rt, windowId);
-          // Only pending/extended windows can be acked; the server enforces
-          // the full rule (revision, floor, class) and we simply report it.
-          if (win.status === "pending" || win.status === "extended") {
-            // ack after a paint completes and the view is visible/focused
+
+          if ((detail.status === "pending" || detail.status === "extended") && detail.deliveryId) {
+            // The guard is re-checked inside signedFetch, AFTER the key is
+            // retrieved and immediately before signing: if the surface stopped
+            // being a valid top-level, visible, focused view of THIS window,
+            // no signature is produced.
+            var stillValid = function () {
+              var cur = currentHash();
+              return (
+                isTopLevel() &&
+                document.visibilityState === "visible" &&
+                document.hasFocus() &&
+                cur.tab === "alert" &&
+                cur.arg === windowId
+              );
+            };
+            var ackBody = {
+              deliveryId: detail.deliveryId,
+              revision: detail.revision,
+              renderContentHash: detail.renderContentHash,
+            };
+            // wait for a real paint, then ack
             requestAnimationFrame(function () {
               requestAnimationFrame(function () {
-                if (document.visibilityState === "visible" && document.hasFocus()) {
-                  rt.sendSeenAck(windowId).catch(function () {});
-                }
+                if (stillValid()) rt.sendSeenAck(windowId, ackBody, stillValid).catch(function () {});
               });
             });
           }
@@ -124,20 +156,24 @@
     if (!btn) return;
     btn.disabled = false;
     btn.removeAttribute("aria-disabled");
-    btn.addEventListener(
-      "click",
-      function () {
-        btn.disabled = true;
-        rt.sendVeto(windowId)
-          .then(function () {
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      rt.sendVeto(windowId)
+        .then(function (result) {
+          // STOPPED only when the server explicitly confirms the window is
+          // vetoed — a 4xx/5xx is NOT success and stays retryable.
+          if (result.vetoed) {
             btn.textContent = "STOPPED";
-          })
-          .catch(function () {
-            btn.disabled = false; // failed send stays retryable (idempotent server-side)
-          });
-      },
-      { once: false },
-    );
+          } else {
+            btn.textContent = "VETO — retry";
+            btn.disabled = false;
+          }
+        })
+        .catch(function () {
+          btn.textContent = "VETO — retry";
+          btn.disabled = false; // network failure stays retryable (idempotent server-side)
+        });
+    });
   }
 
   routeAlert();

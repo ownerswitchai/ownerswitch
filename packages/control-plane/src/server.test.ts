@@ -1959,7 +1959,49 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     return window;
   };
 
-  it("POST /veto/:id/seen (owner-app-signed) flips delivered, records the device, and silence then releases", async () => {
+  /** Fetch the foreground detail (owner-app-signed) and return its delivery echo. */
+  const fetchDetail = async (url: string, windowId: string, c: { now: () => number }) => {
+    const p = `/veto/${windowId}/detail`;
+    const res = await fetch(`${url}${p}`, { headers: ownerAppHeaders("GET", p, "", c.now()) });
+    return { res, detail: (await res.json()) as Record<string, unknown> };
+  };
+
+  /** Full versioned ack: fetch detail, echo {deliveryId, revision, renderContentHash}, POST /seen. */
+  const ackWindow = async (url: string, windowId: string, c: { now: () => number }) => {
+    const { detail } = await fetchDetail(url, windowId, c);
+    const p = `/veto/${windowId}/seen`;
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    return fetch(`${url}${p}`, { method: "POST", headers: ownerAppHeaders("POST", p, ackBody, c.now()), body: ackBody });
+  };
+
+  it("GET /veto/:id/detail returns the renderable + a delivery; the echoed ack flips delivered and silence releases", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.agentId).toBe("agent-1");
+    expect(detail.tool).toBe("bash");
+    expect(detail.revision).toBe(1);
+    expect(typeof detail.deliveryId).toBe("string");
+    expect(typeof detail.renderContentHash).toBe("string");
+
+    const res = await ackWindow(url, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(true);
+    expect(window.isDelivered).toBe(true);
+    expect(window.deliveredBy).toBe("owner-app");
+
+    c.advance(4 * 60_000);
+    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "released" });
+  });
+
+  it("an ack with no delivery echo (blank ack) is refused — a blank render cannot confirm", async () => {
     const c = clock(1_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
@@ -1970,18 +2012,62 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      status: "pending",
-      delivered: true,
-      deadline: 1_000 + 4 * 60_000,
-    });
-    expect(window.isDelivered).toBe(true);
-    expect(window.deliveredBy).toBe("owner-app");
-    expect(window.deliveredAt).toBe(c.now());
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/delivery/);
+    expect(window.isDelivered).toBe(false);
+  });
 
-    c.advance(4 * 60_000);
-    expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "released" });
+  it("a delivery minted for revision N cannot confirm the window after it extends (stale delivery)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c, "v-1", 60_000); // short 1-min window (< 2-min delivery TTL)
+
+    const { detail } = await fetchDetail(url, "v-1", c); // revision 1
+    // window extends undelivered → revision bumps to 2, but the delivery is
+    // still UNEXPIRED (fetched <2 min ago), so it is REVISION that rejects it
+    c.advance(60_001);
+    expect(window.tick()).toBe("extended");
+    expect(window.revision).toBe(2);
+
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision, // stale revision 1
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/stale|advanced/);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("an expired delivery cannot confirm (2 min TTL), even while the window is still open", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c); // 4 min window
+    const { detail } = await fetchDetail(url, "v-1", c);
+
+    c.advance(2 * 60_000 + 1); // past DELIVERY_TTL_MS, still before the 4-min deadline (revision unchanged)
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/expired/);
+    expect(window.isDelivered).toBe(false);
   });
 
   it("the FLEET device secret cannot flip the permissive bit — only the owner-app secret", async () => {
@@ -2050,11 +2136,21 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const url = await start(cp);
     const window = openWindow(cp, c);
 
-    c.advance(4 * 60_000 - 30_000); // 30 s before the deadline — inside the floor
-    const res = await fetch(`${url}/veto/v-1/seen`, {
+    // fetch a fresh detail close to the floor (so the delivery is unexpired
+    // when the ack lands inside the floor), then advance into the floor
+    c.advance(4 * 60_000 - 90_000); // 2:30 in — delivery TTL runs to 4:30
+    const { detail } = await fetchDetail(url, "v-1", c);
+    c.advance(60_000); // now 30 s before the deadline — inside the floor
+    const p = "/veto/v-1/seen";
+    const floorBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
       method: "POST",
-      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
-      body: "",
+      headers: ownerAppHeaders("POST", p, floorBody, c.now()),
+      body: floorBody,
     });
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toMatch(/response floor/);
@@ -2063,12 +2159,8 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     c.advance(30_000); // deadline passes undelivered -> extended, not released
     expect(window.tick()).toBe("extended");
 
-    // against the NEW deadline there is time again; the re-ack counts
-    const again = await fetch(`${url}/veto/v-1/seen`, {
-      method: "POST",
-      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
-      body: "",
-    });
+    // against the NEW deadline there is time again; a FRESH detail's ack counts
+    const again = await ackWindow(url, "v-1", c);
     expect(again.status).toBe(200);
     expect(window.isDelivered).toBe(true);
   });
@@ -2080,6 +2172,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const window = openWindow(cp, c);
     window.markDelivered("owner-app");
 
+    // an already-delivered window re-acks idempotently, no fresh delivery needed
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
       headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
@@ -2314,16 +2407,9 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     expect(kill.status).toBe(200);
     expect(cp.killSwitch.killed).toBe(true);
 
-    // the deny direction is free: the delivery ack (owner-app-signed) and the
-    // device veto relay both work with no license
+    // the deny direction is free: the device veto relay works with no license
     const window = new VetoWindow({ agentId: "a", tool: "bash" }, cp.killSwitch.epoch, { now: c.now });
     cp.vetoWindows.set("v-free", window);
-    const seen = await fetch(`${url}/veto/v-free/seen`, {
-      method: "POST",
-      headers: ownerAppHeaders("POST", "/veto/v-free/seen", "", c.now()),
-      body: "",
-    });
-    expect(seen.status).toBe(200);
     const veto = await fetch(`${url}/veto/v-free`, {
       method: "POST",
       headers: deviceHeaders("", c.now()),

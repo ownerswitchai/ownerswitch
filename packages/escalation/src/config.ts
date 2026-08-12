@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { enrolledOwnerDeviceFromSpki } from "@ownerswitchai/control-plane";
+import { loadOwnerDeviceKeysFile } from "@ownerswitchai/control-plane";
 import { DEFAULT_LIMITS } from "./ladder.js";
 import type { LadderRung, RateLimits } from "./types.js";
 
@@ -78,29 +77,10 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return value;
 }
 
-/** Owner-app device public keys (deviceId → P-256 SPKI PEM) from a JSON file. */
+/** Owner-app device public keys (deviceId → P-256 SPKI PEM) from a hardened JSON file. */
 function loadOwnerDeviceKeys(file: string | undefined): Record<string, string> {
   if (file === undefined || file === "") return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
-  } catch (err) {
-    throw new Error(
-      `OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) is not readable JSON: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) must be a JSON object of deviceId → SPKI PEM`);
-  }
-  const keys: Record<string, string> = {};
-  for (const [deviceId, spki] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof spki !== "string" || spki === "") {
-      throw new Error(`owner device "${deviceId}" has no SPKI public key string`);
-    }
-    enrolledOwnerDeviceFromSpki(deviceId, spki); // fail the boot on a non-P-256 key
-    keys[deviceId] = spki;
-  }
-  return keys;
+  return loadOwnerDeviceKeysFile(file);
 }
 
 export function escalationConfigFromEnv(

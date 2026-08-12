@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import {
   createControlPlane,
-  enrolledOwnerDeviceFromSpki,
+  loadOwnerDeviceKeysFile,
   OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
 } from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
@@ -58,37 +58,6 @@ function required(name: string): string {
   return value;
 }
 
-/**
- * Load the enrolled owner-app device public keys from a JSON file mapping
- * `deviceId → ECDSA P-256 SPKI PEM`. Validated at boot: each entry must
- * parse as a P-256 key (enrolledOwnerDeviceFromSpki throws otherwise), so a
- * corrupt file fails the start rather than turning every future ack into a
- * silent 401. Absent path → no owner devices (delivery confirmation is 501).
- */
-function loadOwnerDeviceKeys(file: string | undefined): Record<string, string> {
-  if (file === undefined || file === "") return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
-  } catch (err) {
-    throw new Error(
-      `OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) is not readable JSON: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) must be a JSON object of deviceId → SPKI PEM`);
-  }
-  const keys: Record<string, string> = {};
-  for (const [deviceId, spki] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof spki !== "string" || spki === "") {
-      throw new Error(`owner device "${deviceId}" has no SPKI public key string`);
-    }
-    // fail the boot on a non-P-256 key, with the deviceId named
-    enrolledOwnerDeviceFromSpki(deviceId, spki);
-    keys[deviceId] = spki;
-  }
-  return keys;
-}
 
 /**
  * Refuse to start if a Node PRELOAD vector is present in the environment.
@@ -124,7 +93,11 @@ function main(): void {
   // delivery confirmation is 501 and windows walk to passkey approval (fail
   // closed). No shared secret exists here to leak or to collide with the
   // fleet secret — that whole failure mode is gone by construction.
-  const ownerDeviceKeys = loadOwnerDeviceKeys(process.env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim());
+  const ownerDeviceKeysFile = process.env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim();
+  const ownerDeviceKeys =
+    ownerDeviceKeysFile !== undefined && ownerDeviceKeysFile !== ""
+      ? loadOwnerDeviceKeysFile(ownerDeviceKeysFile)
+      : {};
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");

@@ -350,6 +350,13 @@ export const MAX_CEREMONY_RECORDS = 256;
  */
 export const MIN_VETO_RESPONSE_MS = 60_000;
 
+/**
+ * How long a minted foreground-detail delivery may be echoed by an ack. Short
+ * on purpose: the ack should follow the render within seconds, and a stale
+ * delivery must not confirm a window the owner looked at minutes ago.
+ */
+export const DELIVERY_TTL_MS = 2 * 60_000;
+
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
 
@@ -539,6 +546,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   for (const [deviceId, spki] of Object.entries(opts.ownerDeviceKeys ?? {})) {
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
   }
+  // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
+  // consumed by the ack. Keyed by deliveryId; each binds the exact window,
+  // revision, and rendered-content hash the device saw, so an ack can only
+  // confirm the CURRENT showing of THIS window, once (apps/owner DESIGN.md §3).
+  const ownerDeliveries = new Map<
+    string,
+    { windowId: string; revision: number; renderHash: string; expiresAt: number; consumed: boolean }
+  >();
   // Window ids whose single-use MergeGrant has already been minted. A window
   // authorizes exactly ONE merge: the first releasing read mints the grant
   // and records the id here; every later read of the same window is served
@@ -1466,6 +1481,80 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * deadline) the ack is refused, the window extends or holds on its own
    * clock, and the device is told to re-ack against the new deadline.
    */
+  /**
+   * The renderable the owner app displays and the ack echoes — a bounded,
+   * display-safe RenderableAlertV1. The hash is canonical over exactly these
+   * fields, so an ack proving "I rendered this hash at revision N" is proof of
+   * the concrete, current showing, not a blank one (apps/owner DESIGN.md §3).
+   */
+  function renderableFor(windowId: string, window: VetoWindow, status: VetoWireStatus) {
+    const boundedSafe = (text: string): string =>
+      // strip control chars and cap — the app renders via textContent, but the
+      // canonical hash must be over a stable, sane string
+      [...text].filter((ch) => ch >= " " && ch !== "").join("").slice(0, 200);
+    const purpose = window.purpose;
+    const summary =
+      purpose !== undefined ? `${purpose.connector}/${purpose.operation}` : window.call.tool;
+    return {
+      v: 1 as const,
+      windowId,
+      agentId: boundedSafe(window.call.agentId),
+      tool: boundedSafe(window.call.tool),
+      summary: boundedSafe(summary),
+      status,
+      revision: window.revision,
+      deadline: window.deadlineAt,
+    };
+  }
+
+  const renderHashOf = (renderable: unknown): string => sha256Hex(canonicalJson(renderable));
+
+  /**
+   * GET /veto/:id/detail — owner-device-signed. Returns the RenderableAlertV1
+   * the app must render AND mints a single-use foreground-detail delivery
+   * bound to {windowId, current revision, render hash}. The ack echoes that
+   * delivery; nothing else can produce ack evidence. Terminal windows return
+   * status only and mint no delivery (there is nothing left to confirm).
+   */
+  async function getVetoDetail(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const raw = await readRawBody(req);
+    if (ownerDevices.size === 0) {
+      sendJson(res, 501, { error: "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys)" });
+      return;
+    }
+    if (validOwnerDeviceIdFrom(req, raw) === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const window = vetoWindows.get(id);
+    if (!window) {
+      sendJson(res, 404, { error: `no veto window "${id}"` });
+      return;
+    }
+    const status = window.tick();
+    const renderable = renderableFor(id, window, status);
+    if (status !== "pending" && status !== "extended") {
+      // nothing to ack — render the terminal state, mint no delivery
+      sendJson(res, 200, { ...renderable, deliveryId: null });
+      return;
+    }
+    const renderHash = renderHashOf(renderable);
+    const deliveryId = `del_${randomBytes(12).toString("hex")}`;
+    ownerDeliveries.set(deliveryId, {
+      windowId: id,
+      revision: window.revision,
+      renderHash,
+      expiresAt: now() + DELIVERY_TTL_MS,
+      consumed: false,
+    });
+    sendJson(res, 200, {
+      ...renderable,
+      deliveryId,
+      renderContentHash: renderHash,
+      deliveryExpiresAt: now() + DELIVERY_TTL_MS,
+    });
+  }
+
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
     if (ownerDevices.size === 0) {
@@ -1487,26 +1576,56 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    // idempotent: a delivered window stays delivered; re-acks succeed
+    // idempotent: a delivered window stays delivered; re-acks succeed without
+    // requiring a fresh delivery (the permissive bit cannot un-flip)
     if (window.isDelivered) {
       sendJson(res, 200, { status: window.tick(), delivered: true, deadline: window.deadlineAt });
       return;
     }
+    const reject = (msg: string) => sendJson(res, 409, { error: msg });
     const status = window.tick();
     if (status !== "pending" && status !== "extended") {
-      sendJson(res, 409, { error: `cannot ack in status "${status}"` });
-      return;
+      return reject(`cannot ack in status "${status}"`);
+    }
+    const body = parseJsonBody(raw);
+    const deliveryId = typeof body.deliveryId === "string" ? body.deliveryId : "";
+    const echoedRevision = body.revision;
+    const echoedHash = typeof body.renderContentHash === "string" ? body.renderContentHash : "";
+
+    const delivery = ownerDeliveries.get(deliveryId);
+    // The versioned-delivery rule, judged in one synchronous transaction: a
+    // named, unexpired, unconsumed foreground-detail delivery for THIS window,
+    // whose revision and render hash still equal the window's CURRENT showing,
+    // and whose echoed revision/hash match. Anything else is refused — a stale
+    // detail (from before an extension) cannot confirm the advanced window.
+    if (delivery === undefined) return reject("unknown or expired delivery — fetch GET /veto/:id/detail first");
+    if (delivery.consumed) return reject("this delivery was already used to confirm — fetch a fresh detail");
+    if (now() >= delivery.expiresAt) {
+      ownerDeliveries.delete(deliveryId);
+      return reject("delivery expired — fetch a fresh detail");
+    }
+    if (delivery.windowId !== id) return reject("delivery is for a different window");
+
+    // revision CAS: the delivery, the echoed revision, and the window must all
+    // agree on the SAME current revision
+    if (delivery.revision !== window.revision || echoedRevision !== window.revision) {
+      return reject("stale delivery — the window advanced since it was rendered; re-fetch the detail");
+    }
+    // the render hash must match the delivery AND the window's current
+    // renderable (recomputed now), so the ack proves the concrete current view
+    const currentHash = renderHashOf(renderableFor(id, window, status));
+    if (delivery.renderHash !== currentHash || echoedHash !== currentHash) {
+      return reject("render hash mismatch — the detail does not match the current window");
     }
     if (now() > window.deadlineAt - MIN_VETO_RESPONSE_MS) {
-      sendJson(res, 409, {
-        error:
-          "ack arrived inside the minimum veto-response floor (60 s before the deadline) — not counted; " +
+      return reject(
+        "ack arrived inside the minimum veto-response floor (60 s before the deadline) — not counted; " +
           "the window will extend or hold, re-ack against the new deadline",
-      });
-      return;
+      );
     }
+    delivery.consumed = true; // single-use, consumed only on a fully valid ack
     window.markDelivered(deviceId);
-    sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt });
+    sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt, revision: window.revision });
   }
 
   /**
@@ -1986,6 +2105,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
     const vetoSeenMatch = /^\/veto\/([^/]+)\/seen$/.exec(path);
+    const vetoDetailMatch = /^\/veto\/([^/]+)\/detail$/.exec(path);
     const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
     const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
@@ -2013,6 +2133,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "GET" && path === "/veto/pending") return getVetoPending(req, res);
     if (method === "POST" && vetoSeenMatch) {
       return postVetoSeen(req, res, decodeURIComponent(vetoSeenMatch[1]));
+    }
+    if (method === "GET" && vetoDetailMatch) {
+      return getVetoDetail(req, res, decodeURIComponent(vetoDetailMatch[1]));
     }
     if (vetoMatch) {
       const id = decodeURIComponent(vetoMatch[1]);
