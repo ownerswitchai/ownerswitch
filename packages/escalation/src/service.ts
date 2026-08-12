@@ -75,13 +75,21 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
   }
 
-  // The SHARED durable standing registry the control plane writes. Re-read on
-  // every owner-device decision (the file is tiny, the operations are rare):
+  // The SHARED durable standing registry the control plane writes (and
+  // initializes at ITS boot with the full active snapshot). Re-read on every
+  // owner-device decision here (the file is tiny, the operations are rare):
   // a revocation on the control plane severs THIS service's surfaces at the
-  // very next request, without any cross-process notification channel.
-  // Absent file → good standing (a dev/ephemeral run); a CORRUPT registry
-  // reads as everyone-revoked — fail closed, alerts stop, stop paths (SMS,
-  // voice, the veto relay) are untouched.
+  // very next request, without any cross-process notification channel. No
+  // configured store (dev, no owner devices) → standing is not consulted.
+  // With a store configured, ONLY an explicit active record is trust:
+  //  - ABSENT registry → untrusted (the control plane has never initialized
+  //    it — a wrong path or an empty provisioned directory must read as "not
+  //    wired yet", never as "everyone active");
+  //  - a device with NO record → untrusted (enrollment lands in the registry
+  //    at the control plane's boot migration, not by implication here);
+  //  - CORRUPT → untrusted, everyone.
+  // Fail closed in every branch: alerts stop, stop paths (SMS, voice, the
+  // veto relay) are untouched.
   const standingStore =
     cfg.ownerDeviceStandingFile !== undefined
       ? new DeviceStandingFileStore(cfg.ownerDeviceStandingFile)
@@ -89,10 +97,9 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   function deviceInGoodStanding(deviceId: string): boolean {
     if (standingStore === null) return true;
     const loaded = standingStore.load();
-    if (loaded.outcome === "absent") return true; // no revocation ever recorded
-    if (loaded.outcome === "corrupt") return false; // trust nothing
+    if (loaded.outcome !== "loaded") return false; // absent or corrupt: no trust without a registry
     const standing = loaded.state.devices[deviceId];
-    return standing === undefined || standing.revokedAt === null;
+    return standing !== undefined && standing.revokedAt === null;
   }
 
   /* ---------------- push subscription store (0600, atomic) ------------- */
@@ -118,16 +125,24 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   }
 
   /**
-   * The subscription the dispatcher may actually SEND to: none when the
-   * enrolling device has been revoked (the lost phone must not keep
-   * receiving decision-critical alerts). A legacy record with no enrolledBy
-   * (pre-standing) stays active — re-enrollment stamps it.
+   * The subscription the dispatcher may actually SEND to. Under a standing
+   * regime (a registry is configured), a subscription is active ONLY when it
+   * names its enrolling device AND that device is in good standing:
+   *  - the enrolling device was revoked → inactive (the lost phone must not
+   *    keep receiving decision-critical alerts);
+   *  - a LEGACY record with no enrolledBy → inactive too. It cannot be tied
+   *    to any device, so a revocation can never sever it — waiting for the
+   *    lost phone to "voluntarily re-enroll" is not a revocation story. The
+   *    owner's app re-enrolls on its next open (subscribeAndEnroll is called
+   *    on every launch), which stamps the record and reactivates push.
+   * With no registry configured (dev), the stored subscription is served
+   * as-is — there is no standing to consult.
    */
   function activeSubscription(): PushSubscriptionJson | null {
-    return storedSubscription !== null &&
-      (subscriptionEnrolledBy === null || deviceInGoodStanding(subscriptionEnrolledBy))
-      ? storedSubscription
-      : null;
+    if (storedSubscription === null) return null;
+    if (standingStore === null) return storedSubscription;
+    if (subscriptionEnrolledBy === null) return null; // legacy: fail closed
+    return deviceInGoodStanding(subscriptionEnrolledBy) ? storedSubscription : null;
   }
 
   function persistSubscription(sub: PushSubscriptionJson, enrolledBy: string): void {
@@ -479,14 +494,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
 
   // The accessor answers what the PUSH CHANNEL would actually use — standing
   // included — so the doctor and tests see the same truth the dispatcher does:
-  // a subscription whose enrolling device was revoked reads as none.
-  return {
-    tickOnce,
-    webhookHandler,
-    subscription: () =>
-      storedSubscription !== null &&
-      (subscriptionEnrolledBy === null || deviceInGoodStanding(subscriptionEnrolledBy))
-        ? storedSubscription
-        : null,
-  };
+  // a subscription whose enrolling device was revoked (or a legacy record
+  // that names no device) reads as none.
+  return { tickOnce, webhookHandler, subscription: activeSubscription };
 }

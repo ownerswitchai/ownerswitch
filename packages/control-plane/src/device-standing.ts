@@ -26,6 +26,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   mkdirSync,
@@ -86,10 +87,29 @@ function asPersistedDeviceStanding(value: unknown): PersistedDeviceStanding | nu
   return { version: 1, devices: out };
 }
 
+export interface DeviceStandingStoreOptions {
+  /**
+   * Mode of the published standing file (and marker). Default 0600 — private
+   * to the control plane. Set 0640 for the DISTINCT-UID deployment model:
+   * the control plane owns and writes the file, the escalation service runs
+   * as a different user in a dedicated read-only group, the parent directory
+   * is 0750 owned by the control-plane user with that group. Standing is
+   * positive authorization state, so group WRITE is never granted here —
+   * only these two read models exist.
+   */
+  fileMode?: 0o600 | 0o640;
+}
+
 export class DeviceStandingFileStore {
   private warnedDirFsync = false;
+  private readonly fileMode: number;
 
-  constructor(readonly filePath: string) {}
+  constructor(
+    readonly filePath: string,
+    opts: DeviceStandingStoreOptions = {},
+  ) {
+    this.fileMode = opts.fileMode ?? 0o600;
+  }
 
   /** Once this exists, a MISSING standing file is corruption, not a fresh boot. */
   get markerPath(): string {
@@ -171,7 +191,11 @@ export class DeviceStandingFileStore {
     const data = Buffer.from(`${JSON.stringify(state, null, 2)}\n`, "utf8");
     let fd: number | undefined;
     try {
-      fd = openSync(tmp, CREATE_FLAGS, 0o600);
+      fd = openSync(tmp, CREATE_FLAGS, this.fileMode);
+      // umask may have masked bits at create — pin the EXACT mode on the fd
+      // before the rename publishes it, so the escalation group's read bit
+      // (0640 model) is present from the first visible instant.
+      fchmodSync(fd, this.fileMode);
       let written = 0;
       while (written < data.length) {
         written += writeSync(fd, data, written, data.length - written);
@@ -211,7 +235,7 @@ export class DeviceStandingFileStore {
     if (existsSync(this.markerPath)) return true;
     let fd: number | undefined;
     try {
-      fd = openSync(this.markerPath, CREATE_FLAGS, 0o600);
+      fd = openSync(this.markerPath, CREATE_FLAGS, this.fileMode);
       const note = Buffer.from(
         "This marker records that the OwnerSwitch device-standing store has been written.\n" +
           "While it exists, a missing standing file loads as CORRUPT (all devices revoked).\n",

@@ -103,7 +103,26 @@ export function escalationConfigFromEnv(
   };
   if (device.id.includes(".")) throw new Error('OWNERSWITCH_ESCALATION_DEVICE_ID must not contain "."');
 
-  const ownerDeviceKeys = loadOwnerDeviceKeys(env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim());
+  // The same production stance as the control plane, checked BEFORE the keys
+  // even load: enrolled owner devices WITHOUT the shared standing registry
+  // would leave this service trusting a phone the control plane has revoked
+  // (it would keep accepting the key and keep pushing alerts to it) — a
+  // configuration fail-open. Refuse to start instead; the control plane
+  // writes the file, this service only reads it.
+  const ownerDeviceKeysFile = env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim();
+  const standingFileEnv = env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
+  if (
+    ownerDeviceKeysFile !== undefined &&
+    ownerDeviceKeysFile !== "" &&
+    (standingFileEnv === undefined || standingFileEnv === "")
+  ) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_DEVICE_KEYS_FILE is set but OWNERSWITCH_OWNER_DEVICE_STANDING_FILE is not — " +
+        "without the shared standing registry a revoked phone stays trusted here. Point it at the " +
+        "same file the control plane persists standing to.",
+    );
+  }
+  const ownerDeviceKeys = loadOwnerDeviceKeys(ownerDeviceKeysFile);
 
   const sid = env.OWNERSWITCH_TWILIO_ACCOUNT_SID;
   const twilioVars = [
@@ -229,7 +248,7 @@ export function escalationConfigFromEnv(
     throw new Error("OWNERSWITCH_ESCALATION_MAX_DAILY_SPEND_USD must be a non-negative number");
   }
 
-  const ownerDeviceStandingFile = env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
+  const ownerDeviceStandingFile = standingFileEnv;
   return {
     controlPlaneUrl,
     device,

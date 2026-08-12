@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { canonicalJson, ownerDeviceSigPreimage, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
+import { DeviceStandingFileStore } from "./device-standing.js";
 import { generateLicenseKeys, mintLicense } from "./license.js";
 import {
   createControlPlane,
@@ -2636,6 +2637,162 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
         killStateFile: tempStateFile(),
       }),
     ).toThrow(/ownerDeviceStandingFile/);
+  });
+
+  it("PATH GUARD: a production standing path gets the kill-state discipline (relative and in-cwd refused)", () => {
+    const c = clock(1_000);
+    const base = {
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      killStateFile: tempStateFile(),
+    };
+    const silenced = console.error;
+    console.error = () => {};
+    try {
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingFile: "relative/standing.json" }),
+      ).toThrow(/relative path/);
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingFile: join(process.cwd(), "standing.json") }),
+      ).toThrow(/working directory/);
+    } finally {
+      console.error = silenced;
+    }
+  });
+
+  it("BOOT INIT: a configured-but-absent registry is durably initialized with the active snapshot; missing records are migrated", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "standing.json");
+
+    // absent → boot writes the full active snapshot BEFORE the lane operates
+    const cp1 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    void cp1;
+    const store = new DeviceStandingFileStore(standingFile);
+    const initialized = store.load();
+    expect(initialized.outcome).toBe("loaded");
+    if (initialized.outcome === "loaded") {
+      expect(initialized.state.devices["owner-app"]).toEqual({ generation: 1, revokedAt: null });
+    }
+
+    // a registry that lacks a record for an ENROLLED device gets it migrated
+    // durably at boot (explicit act), never implied at decision time
+    store.save({ version: 1, devices: { "some-other": { generation: 3, revokedAt: 5 } } });
+    const cp2 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    void cp2;
+    const migrated = store.load();
+    expect(migrated.outcome).toBe("loaded");
+    if (migrated.outcome === "loaded") {
+      expect(migrated.state.devices["owner-app"]).toEqual({ generation: 1, revokedAt: null });
+      expect(migrated.state.devices["some-other"]).toEqual({ generation: 3, revokedAt: 5 }); // preserved
+    }
+  });
+
+  it("QUARANTINE: a revoke whose persist FAILS answers 503, closes the whole lane, and a later durable retry reopens it", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "sub", "standing.json");
+    const phoneB = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const keys = {
+      ...OWNER_DEVICE_KEYS,
+      "owner-b": phoneB.publicKey.export({ format: "pem", type: "spki" }).toString(),
+    };
+    const cp = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: keys,
+      ownerDeviceStandingFile: standingFile,
+    });
+    const url = await start(cp);
+
+    // a window registered through the API (so the server's witnessStanding rides it)
+    const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
+    const reg = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    const { id } = (await reg.json()) as { id: string };
+    const window = cp.vetoWindows.get(id);
+    if (window === undefined) throw new Error("window not registered");
+    const ack1 = await ackWindow(url, id, c);
+    expect(ack1.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+
+    // BREAK persistence: the registry's parent directory becomes a plain file
+    rmSync(join(dir, "sub"), { recursive: true, force: true });
+    writeFileSync(join(dir, "sub"), "not a directory");
+
+    // the revoke is HONEST about the state: 503, revoked in memory, quarantined
+    const failed = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(failed.status).toBe(503);
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+    expect(failedBody.revoked).toBe(true);
+    expect(failedBody.quarantined).toBe(true);
+    expect(cp.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
+
+    // the WHOLE lane is closed while quarantined — for the UN-REVOKED device
+    // B too: its detail mints no delivery, and the already-acked window
+    // cannot release on silence. (owner-app itself is revoked → plain 401.)
+    const bFetchDetail = async (windowId: string) => {
+      const p = `/veto/${windowId}/detail`;
+      const at = c.now();
+      const nonce = `qb-${at}-${Math.random().toString(36).slice(2)}`;
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-b",
+        method: "GET",
+        pathAndQuery: p,
+        bodyHash: new Uint8Array(createHash("sha256").update("").digest()),
+        timestamp: at,
+        nonce,
+      });
+      const res = await fetch(`${url}${p}`, {
+        headers: {
+          "x-device-id": "owner-b",
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": ecSign("sha256", preimage, {
+            key: phoneB.privateKey,
+            dsaEncoding: "ieee-p1363",
+          }).toString("base64url"),
+        },
+      });
+      return { res, detail: (await res.json()) as Record<string, unknown> };
+    };
+    const during = await bFetchDetail(id);
+    expect(during.res.status).toBe(200);
+    expect(during.detail.deliveryId).toBeNull();
+    c.advance(4 * 60_000 + 1);
+    expect(window.tick()).not.toBe("released");
+
+    // RECOVERY: restore the directory, retry the (idempotent) revoke — the
+    // persist now lands durably and the quarantine lifts
+    rmSync(join(dir, "sub"));
+    const retried = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(retried.status).toBe(200);
+    const onDisk = new DeviceStandingFileStore(standingFile).load();
+    expect(onDisk.outcome).toBe("loaded");
+    if (onDisk.outcome === "loaded") {
+      expect(onDisk.state.devices["owner-app"]?.revokedAt).not.toBeNull();
+    }
+
+    // the lane is open again: device B can fetch a fresh window's delivery
+    const window2 = openWindow(cp, c, "v-post");
+    void window2;
+    const after = await bFetchDetail("v-post");
+    expect(after.res.status).toBe(200);
+    expect(typeof after.detail.deliveryId).toBe("string");
   });
 
   it("DECISION-POINT CAS on a server-registered window: a sweep-bypassing revocation still cannot release", async () => {

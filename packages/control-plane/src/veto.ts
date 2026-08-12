@@ -54,12 +54,15 @@ export interface VetoOptions {
    * The release-time witness check: does the device named by the ack
    * evidence STILL exist, in good standing, at the SAME generation it held
    * when it acked? Consulted INSIDE tick() at the release decision itself —
-   * not only by the revocation handler's proactive sweep — so evidence from
-   * a witness revoked through ANY path (admin tooling, registry reload,
-   * another process's persisted standing) is invalid exactly where it would
-   * otherwise release. A missing checker (unit tests, non-owner-device
-   * windows) trusts the delivered bit as before; the server always injects
-   * one for windows it registers.
+   * not only by the revocation handler's proactive sweep — so any in-process
+   * path that changed standing without running the sweep, standing loaded at
+   * boot from a previous lifetime, and a quarantined registry are all
+   * enforced exactly where they would otherwise release. (The control plane
+   * is the SINGLE standing writer at runtime; a write by another process to
+   * the shared file is honored at the next boot, not re-read per decision —
+   * see server.ts witnessStanding.) A missing checker (unit tests,
+   * non-owner-device windows) trusts the delivered bit as before; the server
+   * always injects one for windows it registers.
    */
   witnessStanding?: (deviceId: string | null, generation: number | null) => boolean;
   now?: () => number;
@@ -197,10 +200,10 @@ export class VetoWindow {
     // it acked under — checked HERE, at the decision itself, not only by the
     // revocation handler's proactive sweep (which stays as an accelerator:
     // it clears evidence eagerly and preserves deadline-anchored releases
-    // for revocations arriving through the API). Any revocation path the
-    // sweep never saw — admin tooling, a standing reload, another process's
-    // persisted registry — is enforced here, and the failure direction is
-    // held/passkey, never a release on a dead witness.
+    // for revocations arriving through the API). Any in-process standing
+    // change the sweep never saw, standing loaded at boot from a previous
+    // lifetime, and a quarantined registry are all enforced here, and the
+    // failure direction is held/passkey, never a release on a dead witness.
     if (
       this.delivered &&
       this.witnessStanding !== undefined &&

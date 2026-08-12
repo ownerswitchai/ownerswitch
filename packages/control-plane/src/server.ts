@@ -153,6 +153,16 @@ export interface ControlPlaneOptions {
    */
   ownerDeviceStandingFile?: string | null;
   /**
+   * Publish the standing file (and its marker) mode 0640 instead of 0600 —
+   * the DISTINCT-UID deployment model: the control plane owns and writes the
+   * registry; the escalation service runs as a different user in a dedicated
+   * read-only group; the parent directory is 0750 with that group. Without
+   * this, a separate-UID escalation service would read EACCES → corrupt →
+   * everyone-revoked (fail closed but non-functional). Group WRITE is never
+   * granted — standing is positive authorization state.
+   */
+  ownerDeviceStandingGroupReadable?: boolean;
+  /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
    *
@@ -282,6 +292,66 @@ export const DEFAULT_KILL_STATE_FILE = "ownerswitch-kill-state.json";
  * what is wrong and what the operator must do — a control plane that starts
  * with a tamperable state file is worse than one that refuses to start.
  */
+/**
+ * The production path discipline BOTH persistent security stores share (kill
+ * state and device standing): absolute path, outside the working directory,
+ * in a directory owned by the process user with no group/world write access.
+ * These files are AUTHORIZATION state — whoever can write the directory can
+ * replace them — so an unsafe path refuses the boot with a named fix.
+ * Group/world READ is not refused here: the standing file is deliberately
+ * shareable read-only with the escalation service's group (see
+ * ownerDeviceStandingGroupReadable).
+ */
+function guardProtectedStatePath(kind: string, file: string): string {
+  const refuse = (what: string, fix: string): never => {
+    const msg = `[ownerswitch] refusing to start: ${what}. ${fix} (Pass dev: true only for a development instance.)`;
+    console.error(msg);
+    throw new Error(msg);
+  };
+  if (!isAbsolute(file)) {
+    return refuse(
+      `${kind} "${file}" is a relative path`,
+      "Set an explicit absolute path — a relative path silently points at a different store whenever the working directory changes.",
+    );
+  }
+  const resolved = resolve(file);
+  const rel = relative(process.cwd(), resolved);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    return refuse(
+      `${kind} "${resolved}" resolves inside the working directory ${process.cwd()}`,
+      "The working directory is not a protected location. Put the state file in a dedicated directory such as /var/lib/ownerswitch/.",
+    );
+  }
+  const dir = dirname(resolved);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let stats;
+  try {
+    stats = statSync(dir);
+  } catch (err) {
+    return refuse(
+      `the ${kind} directory ${dir} cannot be inspected (${err instanceof Error ? err.message : String(err)})`,
+      `Create it first, owned by uid ${uid ?? "<process uid>"} with mode 0700: mkdir -p ${dir} && chmod 700 ${dir}.`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    return refuse(`${dir} is not a directory`, `Point ${kind} at a file inside a real, protected directory.`);
+  }
+  if ((stats.mode & 0o022) !== 0) {
+    return refuse(
+      `the ${kind} directory ${dir} is group- or world-writable (mode ${(stats.mode & 0o777).toString(8)})`,
+      `Anyone who can write this directory can tamper with ${kind}. Run: chmod 700 ${dir} (or 750 for a shared read-only group).`,
+    );
+  }
+  // POSIX-only check: without getuid (Windows) ownership cannot be compared.
+  if (uid !== undefined && stats.uid !== uid) {
+    return refuse(
+      `the ${kind} directory ${dir} is owned by uid ${stats.uid}, but the control plane runs as uid ${uid}`,
+      `The directory must belong to the user that runs the control plane. Run: chown ${uid} ${dir}.`,
+    );
+  }
+  return resolved;
+}
+
 function guardKillStatePath(file: string | null | undefined): string {
   const refuse = (what: string, fix: string): never => {
     const msg = `[ownerswitch] refusing to start: ${what}. ${fix} (Pass dev: true only for a development instance.)`;
@@ -300,48 +370,7 @@ function guardKillStatePath(file: string | null | undefined): string {
       "An ephemeral control plane forgets kills on restart. Set an absolute killStateFile.",
     );
   }
-  if (!isAbsolute(file)) {
-    return refuse(
-      `killStateFile "${file}" is a relative path`,
-      "Set an explicit absolute path — a relative path silently points at a different store whenever the working directory changes.",
-    );
-  }
-  const resolved = resolve(file);
-  const rel = relative(process.cwd(), resolved);
-  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
-    return refuse(
-      `killStateFile "${resolved}" resolves inside the working directory ${process.cwd()}`,
-      "The working directory is not a protected location. Put the state file in a dedicated directory such as /var/lib/ownerswitch/.",
-    );
-  }
-  const dir = dirname(resolved);
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  let stats;
-  try {
-    stats = statSync(dir);
-  } catch (err) {
-    return refuse(
-      `the kill-state directory ${dir} cannot be inspected (${err instanceof Error ? err.message : String(err)})`,
-      `Create it first, owned by uid ${uid ?? "<process uid>"} with mode 0700: mkdir -p ${dir} && chmod 700 ${dir}.`,
-    );
-  }
-  if (!stats.isDirectory()) {
-    return refuse(`${dir} is not a directory`, "Point killStateFile at a file inside a real, protected directory.");
-  }
-  if ((stats.mode & 0o022) !== 0) {
-    return refuse(
-      `the kill-state directory ${dir} is group- or world-writable (mode ${(stats.mode & 0o777).toString(8)})`,
-      `Anyone who can write this directory can tamper with kill state. Run: chmod 700 ${dir}.`,
-    );
-  }
-  // POSIX-only check: without getuid (Windows) ownership cannot be compared.
-  if (uid !== undefined && stats.uid !== uid) {
-    return refuse(
-      `the kill-state directory ${dir} is owned by uid ${stats.uid}, but the control plane runs as uid ${uid}`,
-      `The directory must belong to the user that runs the control plane. Run: chown ${uid} ${dir}.`,
-    );
-  }
-  return resolved;
+  return guardProtectedStatePath("kill-state", file);
 }
 
 export interface ControlPlane {
@@ -588,9 +617,46 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         "(env OWNERSWITCH_OWNER_DEVICE_STANDING_FILE), or dev: true for a deliberately ephemeral run.",
     );
   }
-  const standingStore = opts.ownerDeviceStandingFile
-    ? new DeviceStandingFileStore(opts.ownerDeviceStandingFile)
+  // The standing path is a SECURITY BOUNDARY (positive authorization state:
+  // rewriting revokedAt to null resurrects a stolen phone), so production
+  // gets the same path discipline as the kill state; dev trusts the caller.
+  const standingPath =
+    opts.ownerDeviceStandingFile && opts.dev !== true
+      ? guardProtectedStatePath("device-standing", opts.ownerDeviceStandingFile)
+      : (opts.ownerDeviceStandingFile ?? null);
+  const standingStore = standingPath
+    ? new DeviceStandingFileStore(standingPath, {
+        fileMode: opts.ownerDeviceStandingGroupReadable === true ? 0o640 : 0o600,
+      })
     : null;
+  // QUARANTINE: set whenever the registry on disk may disagree with memory in
+  // the PERMISSIVE direction (a revocation that could not be durably
+  // persisted). While set, no owner-device evidence is accepted and no
+  // release on silence happens — a crash/restart cannot silently return a
+  // revoked phone to trusted, because until durability is restored the lane
+  // is simply closed. Lifted the moment a persist succeeds.
+  let standingQuarantined = false;
+  // Standing records for devices NOT currently enrolled in the keys file —
+  // loaded at boot and preserved verbatim on every persist. Removing a key
+  // from the keys file must not erase its standing history: a phone that was
+  // revoked, removed, and whose key is later re-added boots REVOKED from
+  // this record, not fresh.
+  const unenrolledStanding: Record<string, { generation: number; revokedAt: number | null }> = {};
+  /** Persist the CURRENT standing of every enrolled device (+ retained history). */
+  function persistStanding(): { durable: boolean; detail?: string } {
+    if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
+    const devices: Record<string, { generation: number; revokedAt: number | null }> = {
+      ...unenrolledStanding,
+    };
+    for (const [deviceId, device] of ownerDevices) {
+      devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
+    }
+    try {
+      return standingStore.save({ version: 1, devices });
+    } catch (err) {
+      return { durable: false, detail: err instanceof Error ? err.message : String(err) };
+    }
+  }
   if (standingStore !== null && ownerDevices.size > 0) {
     const loaded = standingStore.load();
     if (loaded.outcome === "corrupt") {
@@ -604,36 +670,62 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         device.revokedAt = 0;
         device.generation += 1;
       }
-    } else if (loaded.outcome === "loaded") {
-      for (const [deviceId, standing] of Object.entries(loaded.state.devices)) {
-        const device = ownerDevices.get(deviceId);
-        if (device !== undefined) {
-          device.generation = standing.generation;
-          device.revokedAt = standing.revokedAt;
+    } else {
+      let needsInit = false;
+      if (loaded.outcome === "loaded") {
+        for (const [deviceId, standing] of Object.entries(loaded.state.devices)) {
+          const device = ownerDevices.get(deviceId);
+          if (device !== undefined) {
+            device.generation = standing.generation;
+            device.revokedAt = standing.revokedAt;
+          } else {
+            // not currently enrolled — keep the history so a later re-add of
+            // the key cannot launder a revocation (see unenrolledStanding)
+            unenrolledStanding[deviceId] = standing;
+          }
+        }
+        // an enrolled device with NO record is not implicitly trusted — it is
+        // MIGRATED: recorded durably right now, at boot, as an explicit act
+        // (adding the key to the 0600 keys file was the operator's enrolment;
+        // this writes the standing half). Decision-time lookups never default
+        // to trust (witnessStanding refuses unknown devices).
+        for (const deviceId of ownerDevices.keys()) {
+          if (!(deviceId in loaded.state.devices)) needsInit = true;
+        }
+      } else {
+        // absent: a CONFIGURED registry that has never been written. Implicit
+        // "everyone active" would make a wrong path, an empty provisioned
+        // directory, or a lost state+marker pair read as trust — so the full
+        // active snapshot is INITIALIZED durably before the lane may operate.
+        needsInit = true;
+      }
+      if (needsInit) {
+        const persisted = persistStanding();
+        if (!persisted.durable) {
+          throw new Error(
+            `[ownerswitch] cannot durably initialize the device-standing registry at ${standingPath}: ` +
+              `${persisted.detail ?? "unknown"} — refusing to start the owner-device lane on ` +
+              "standing that would not survive a restart",
+          );
         }
       }
-    }
-  }
-  /** Persist the CURRENT standing of every enrolled device. */
-  function persistStanding(): { durable: boolean; detail?: string } {
-    if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
-    const devices: Record<string, { generation: number; revokedAt: number | null }> = {};
-    for (const [deviceId, device] of ownerDevices) {
-      devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
-    }
-    try {
-      return standingStore.save({ version: 1, devices });
-    } catch (err) {
-      return { durable: false, detail: err instanceof Error ? err.message : String(err) };
     }
   }
   /**
    * The release-time witness check injected into every server-registered
    * window (veto.ts tick()): the acking device must still exist, unrevoked,
-   * at the generation it acked under. Evidence with no witness identity
-   * cannot be validated and is refused — fail closed.
+   * at the generation it acked under, and the standing registry must not be
+   * quarantined. Evidence with no witness identity cannot be validated and
+   * is refused — fail closed.
+   *
+   * SINGLE-WRITER RULE: at runtime this process is the ONLY standing writer
+   * (POST /devices/:id/revoke); the answer comes from the in-memory registry,
+   * which the revoke handler mutates before persisting. Another process's
+   * write to the shared file is honored at the NEXT BOOT (the load above) —
+   * it is not re-read per decision. The escalation service is a READER only.
    */
   function witnessStanding(deviceId: string | null, generation: number | null): boolean {
+    if (standingQuarantined) return false;
     if (deviceId === null || generation === null) return false;
     const device = ownerDevices.get(deviceId);
     return device !== undefined && device.revokedAt === null && device.generation === generation;
@@ -1720,9 +1812,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // Ackable content only for a still-open window; a terminal window has
     // nothing to confirm. A live window we cannot render decision-completely
     // yields null too — it mints no delivery and, never delivered, fails
-    // closed to held rather than releasing on silence.
+    // closed to held rather than releasing on silence. A QUARANTINED standing
+    // registry mints nothing either: an ack would be refused anyway, so the
+    // detail honestly renders without a delivery instead of arming one.
     const ackable =
-      status === "pending" || status === "extended" ? ackableContent(window) : null;
+      !standingQuarantined && (status === "pending" || status === "extended")
+        ? ackableContent(window)
+        : null;
     const disp = displayEnvelope(window, ackable);
     const base = {
       v: 1 as const,
@@ -1794,6 +1890,18 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return;
     }
     const reject = (msg: string) => sendJson(res, 409, { error: msg });
+    // While quarantined (a revocation exists that could not be durably
+    // persisted), NO evidence is accepted: the registry on disk may disagree
+    // with memory in the permissive direction, so the lane is closed until a
+    // persist succeeds — never a release built on standing a restart forgets.
+    if (standingQuarantined) {
+      sendJson(res, 503, {
+        error:
+          "the device-standing registry is quarantined (a revocation could not be durably " +
+          "persisted) — no delivery evidence is accepted until standing persistence recovers",
+      });
+      return;
+    }
     const status = window.tick();
     if (status !== "pending" && status !== "extended") {
       return reject(`cannot ack in status "${status}"`);
@@ -1897,7 +2005,26 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return;
     }
     if (device.revokedAt !== null) {
-      // idempotent — already severed, nothing left to clear
+      // Idempotent — already severed, nothing left to clear. But if an
+      // earlier persist FAILED (quarantine), this retry is the recovery
+      // path: attempt the persist again and lift the quarantine on success.
+      if (standingQuarantined && standingStore !== null) {
+        const retried = persistStanding();
+        if (retried.durable) {
+          standingQuarantined = false;
+        } else {
+          sendJson(res, 503, {
+            revoked: true,
+            deviceId: id,
+            generation: device.generation,
+            alreadyRevoked: true,
+            durable: false,
+            quarantined: true,
+            error: `revoked IN MEMORY ONLY — standing persistence still failing (${retried.detail ?? "unknown"}); the owner-device lane stays closed`,
+          });
+          return;
+        }
+      }
       sendJson(res, 200, { revoked: true, deviceId: id, generation: device.generation, alreadyRevoked: true });
       return;
     }
@@ -1910,13 +2037,35 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     for (const window of vetoWindows.values()) {
       if (window.revokeDeliveryEvidence(id)) evidenceCleared += 1;
     }
-    // The revocation holds IN MEMORY no matter what (severing must never fail
-    // on a disk problem — the dangerous direction is the phone STAYING
-    // trusted), and then persists to the standing registry. Like a kill, the
-    // response claims durability only when the persist actually succeeded:
-    // durable:false is the operator's cue that a crash could resurrect the
-    // device, to be surfaced, never silenced.
+    // The revocation holds IN MEMORY no matter what — severing must never
+    // fail on a disk problem; the dangerous direction is the phone STAYING
+    // trusted. Then it persists to the standing registry, and the RESPONSE
+    // tells the truth about which of those two states the system is in:
+    //  - persisted durably → 200, done;
+    //  - persist FAILED with a registry configured → 503 + QUARANTINE. The
+    //    revocation is live in this process, but a restart would load the
+    //    stale file and resurrect the phone — so until a persist succeeds,
+    //    the whole owner-device lane is closed (no acks, no releases), and
+    //    the 503 makes the failure impossible to mistake for success. A
+    //    plain 200/durable:false proved too easy to read as "done".
     const persisted = persistStanding();
+    if (standingStore !== null && !persisted.durable) {
+      standingQuarantined = true;
+      sendJson(res, 503, {
+        revoked: true,
+        deviceId: id,
+        generation: device.generation,
+        evidenceCleared,
+        durable: false,
+        quarantined: true,
+        error:
+          `revoked IN MEMORY ONLY — standing persistence failed (${persisted.detail ?? "unknown"}); ` +
+          "the owner-device lane is quarantined (no evidence accepted, no release on silence) until " +
+          "a retry of this revoke persists durably",
+      });
+      return;
+    }
+    standingQuarantined = false;
     sendJson(res, 200, {
       revoked: true,
       deviceId: id,

@@ -109,6 +109,9 @@ function main(): void {
   // revocation must survive a restart, or a stolen phone resurrects on the
   // next boot. The escalation service points at the SAME file.
   const ownerDeviceStandingFile = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
+  // 0640 publication for the distinct-UID model (escalation in a dedicated
+  // read-only group); default 0600 when CP and escalation share a user.
+  const standingGroupReadable = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE === "1";
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -164,6 +167,7 @@ function main(): void {
     ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
       ? { ownerDeviceStandingFile }
       : {}),
+    ...(standingGroupReadable ? { ownerDeviceStandingGroupReadable: true } : {}),
     killStateFile,
     dev: false,
     grantKey,

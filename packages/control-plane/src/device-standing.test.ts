@@ -1,4 +1,4 @@
-import { mkdtempSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -54,6 +54,23 @@ describe("DeviceStandingFileStore — durable revocation standing", () => {
       writeFileSync(file, content);
       expect(new DeviceStandingFileStore(file).load().outcome).toBe("corrupt");
     }
+  });
+
+  it("publishes 0600 by default and 0640 in the group-readable (distinct-UID) model", () => {
+    const dirA = tmp();
+    const privateStore = new DeviceStandingFileStore(join(dirA, "standing.json"));
+    privateStore.save(state({ d: { generation: 1, revokedAt: null } }));
+    expect(statSync(join(dirA, "standing.json")).mode & 0o777).toBe(0o600);
+
+    const dirB = tmp();
+    const sharedStore = new DeviceStandingFileStore(join(dirB, "standing.json"), { fileMode: 0o640 });
+    sharedStore.save(state({ d: { generation: 1, revokedAt: null } }));
+    // the escalation group's read bit is present on the PUBLISHED file (and
+    // the marker), pinned with fchmod before the rename — umask cannot mask it
+    expect(statSync(join(dirB, "standing.json")).mode & 0o777).toBe(0o640);
+    expect(statSync(sharedStore.markerPath).mode & 0o777).toBe(0o640);
+    // group WRITE is never granted in either model
+    expect(statSync(join(dirB, "standing.json")).mode & 0o022).toBe(0);
   });
 
   it("refuses a symlink planted at the standing path", () => {

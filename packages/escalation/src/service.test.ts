@@ -1,5 +1,5 @@
 import { createHash, createHmac, generateKeyPairSync, sign as ecSign } from "node:crypto";
-import { readFileSync, mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,7 @@ import {
 } from "@ownerswitchai/control-plane";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEscalationService, type EscalationService } from "./service.js";
-import type { EscalationEnvConfig } from "./config.js";
+import { escalationConfigFromEnv, type EscalationEnvConfig } from "./config.js";
 import type { Channel, EscalationAlert } from "./types.js";
 
 const DEVICE_SECRET = "escalation-shared-secret";
@@ -352,13 +352,26 @@ describe("escalation service against a live control plane", () => {
       });
     };
 
-    // good standing (registry absent = no revocation ever) — enrollment lands
+    // an ABSENT registry is NOT trust: the control plane has never
+    // initialized it, so nothing here may treat the device as active
+    expect((await enroll("s-0")).status).toBe(403);
+
+    // the CONTROL PLANE initializes the registry at its boot (active snapshot)
+    const registry = new DeviceStandingFileStore(standingFile);
+    registry.save({ version: 1, devices: { "owner-app": { generation: 1, revokedAt: null } } });
+
+    // explicit active record — enrollment lands
     expect((await enroll("s-1")).status).toBe(200);
     expect(service.subscription()).toEqual(subscription);
 
+    // a device with NO record in a loaded registry is untrusted too
+    registry.save({ version: 1, devices: { "some-other": { generation: 1, revokedAt: null } } });
+    expect(service.subscription()).toBeNull();
+    expect((await enroll("s-1b")).status).toBe(403);
+
     // the CONTROL PLANE (another process) revokes the phone by writing the
     // SHARED standing registry; this service saw no event at all
-    new DeviceStandingFileStore(standingFile).save({
+    registry.save({
       version: 1,
       devices: { "owner-app": { generation: 2, revokedAt: c.now() } },
     });
@@ -368,6 +381,51 @@ describe("escalation service against a live control plane", () => {
     expect(service.subscription()).toBeNull();
     // ...and the revoked key cannot re-point the alert channel either
     expect((await enroll("s-2")).status).toBe(403);
+  });
+
+  it("UPGRADE: a legacy subscription (no enrolledBy) is INACTIVE under a standing regime until re-enrolled", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const stateFile = join(dir, "state.json");
+    const standingFile = join(dir, "standing.json");
+    const subscription = {
+      endpoint: "https://push.example/send/legacy",
+      keys: { p256dh: "BPub", auth: "QXV0aA" },
+    };
+    // the pre-standing on-disk format: no enrolledBy at all
+    writeFileSync(stateFile, JSON.stringify({ subscription }), { mode: 0o600 });
+    // the device is even ACTIVE in the registry — but the legacy record names
+    // no device, so no revocation could ever sever it; it must not be trusted
+    new DeviceStandingFileStore(standingFile).save({
+      version: 1,
+      devices: { "owner-app": { generation: 1, revokedAt: null } },
+    });
+    const push = fakePush();
+    const service = createEscalationService({
+      config: { ...baseConfig("http://127.0.0.1:1", stateFile), ownerDeviceStandingFile: standingFile },
+      channels: { push: push.channel },
+      now: c.now,
+      log: () => {},
+    });
+    expect(service.subscription()).toBeNull(); // fail closed: re-enrollment stamps it
+  });
+
+  it("PRODUCTION GUARD: owner device keys without the standing registry refuse to start", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const env = {
+      OWNERSWITCH_DEVICE_SECRET: "s".repeat(64),
+      OWNERSWITCH_OWNER_DEVICE_KEYS_FILE: join(dir, "keys.json"),
+      // OWNERSWITCH_OWNER_DEVICE_STANDING_FILE deliberately unset
+    };
+    // the guard fires BEFORE the keys file is even opened
+    expect(() => escalationConfigFromEnv(env)).toThrow(/STANDING_FILE/);
+    // with the registry named, the config proceeds PAST the standing guard —
+    // the next failure (if any) is about the keys file itself, never standing
+    try {
+      escalationConfigFromEnv({ ...env, OWNERSWITCH_OWNER_DEVICE_STANDING_FILE: join(dir, "standing.json") });
+    } catch (err) {
+      expect(String(err)).not.toMatch(/STANDING_FILE/);
+    }
   });
 
   it("with no owner device enrolled, push enrollment is 501", async () => {
