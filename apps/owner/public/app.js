@@ -34,6 +34,13 @@
     if (el) el.textContent = value == null ? "" : String(value);
   }
 
+  // Read a rendered node BACK for the ack's DOM check — null when the node is
+  // missing, so a review surface without its fields can never produce evidence.
+  function getText(id) {
+    var el = document.getElementById(id);
+    return el ? el.textContent : null;
+  }
+
   var config = self.OWNERSWITCH_CONFIG;
 
   if (!config) {
@@ -152,9 +159,12 @@
         .then(function (detail) {
           if (gen !== renderGen) return; // superseded while loading
           // render as TEXT (agent-supplied strings are never markup)
+          // ACKABLE windows render the envelope fields EXACTLY (the ack's DOM
+          // read-back must equal them); a non-ackable/terminal window may use
+          // the tool as a display fallback for an empty summary.
           setText("kv-agent", detail.agentId);
           setText("kv-tool", detail.tool);
-          setText("kv-action", detail.summary || detail.tool);
+          setText("kv-action", detail.deliveryId ? detail.summary : detail.summary || detail.tool);
           setText("kv-window", windowId);
           wireVeto(rt, windowId, gen);
 
@@ -174,15 +184,25 @@
                 cur.arg === windowId
               );
             };
-            var ackBody = {
-              deliveryId: detail.deliveryId,
-              revision: detail.revision,
-              renderContentHash: detail.renderContentHash,
-            };
-            // wait for a real paint, then ack
+            // wait for a real paint, then read the DOM BACK and let the
+            // evidence gate decide: the envelope must validate, the recomputed
+            // hash must equal the server's, and the painted nodes must still
+            // carry exactly the envelope fields. No ack body -> no ack.
             requestAnimationFrame(function () {
               requestAnimationFrame(function () {
-                if (stillValid()) rt.sendSeenAck(windowId, ackBody, stillValid).catch(function () {});
+                if (!stillValid()) return;
+                var domTexts = {
+                  agentId: getText("kv-agent"),
+                  tool: getText("kv-tool"),
+                  summary: getText("kv-action"),
+                };
+                rt.ackBodyForRender(detail, domTexts)
+                  .then(function (ackBody) {
+                    if (ackBody && stillValid()) {
+                      rt.sendSeenAck(windowId, ackBody, stillValid).catch(function () {});
+                    }
+                  })
+                  .catch(function () {});
               });
             });
           }

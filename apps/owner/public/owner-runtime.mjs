@@ -14,6 +14,7 @@
  * rest) — it signs but never serializes.
  */
 import { exportPublicKeySpki, generateOwnerDeviceKey, nonce, signRequestHeaders } from "./owner-crypto.mjs";
+import { renderContentHash, validateRenderableAlert } from "./renderable-alert.mjs";
 
 const DB = "ownerswitch";
 const STORE = "keys";
@@ -145,6 +146,42 @@ export async function fetchDetail(windowId) {
   const res = await signedFetch(cfg().controlPlaneUrl, `/veto/${encodeURIComponent(windowId)}/detail`, "GET");
   if (!res.ok) throw new Error(`detail read failed: HTTP ${res.status}`);
   return res.json();
+}
+
+/**
+ * The evidence gate in front of the ack: build the V1 envelope from the
+ * detail's OWN fields, validate it, RECOMPUTE its hash, and require the
+ * painted DOM to still carry exactly those fields — only then is there an ack
+ * body to send. Returns the {deliveryId, revision, renderContentHash} echo, or
+ * null when the render is not evidence:
+ *  - no deliveryId (the window is terminal or non-ackable server-side);
+ *  - the envelope fails V1 conformance (an oversized or bidi-carrying field
+ *    reached the client somehow — never ack what could lie on screen);
+ *  - the RECOMPUTED hash differs from the server's renderContentHash (the ack
+ *    must prove "I rendered these bytes", not parrot a hash from the same
+ *    payload that carried the text — a tampered or desynced detail acks
+ *    nothing);
+ *  - the DOM texts read back after the paint differ from the envelope (the
+ *    view was mutated between render and ack, or the render never landed).
+ * Pure over its inputs (detail + the read-back texts) and exported for the
+ * regression tests; app.js reads the DOM and calls this after the two-rAF.
+ */
+export async function ackBodyForRender(detail, domTexts) {
+  if (!detail || typeof detail.deliveryId !== "string" || detail.deliveryId === "") return null;
+  const alert = { v: 1, agentId: detail.agentId, tool: detail.tool, summary: detail.summary };
+  if (validateRenderableAlert(alert) !== null) return null;
+  const recomputed = await renderContentHash(alert);
+  if (recomputed !== detail.renderContentHash) return null;
+  if (
+    !domTexts ||
+    domTexts.agentId !== alert.agentId ||
+    domTexts.tool !== alert.tool ||
+    domTexts.summary !== alert.summary
+  ) {
+    return null;
+  }
+  // echo the RECOMPUTED hash — provably derived from the rendered fields
+  return { deliveryId: detail.deliveryId, revision: detail.revision, renderContentHash: recomputed };
 }
 
 /**
