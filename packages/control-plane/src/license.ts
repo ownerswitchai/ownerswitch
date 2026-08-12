@@ -47,7 +47,7 @@ export const LICENSE_PREFIX = "osl1";
  * constant, are what bind a fork.
  */
 export const OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAqwfjngoxSBib0t+TnWLgXDU4hKuiYKRpynv0jVYvenw=
+MCowBQYDK2VwAyEAx5MDgCa7MRj5tJf1E9Woha81sedqnHhFIFsVQNTplgM=
 -----END PUBLIC KEY-----
 `;
 
