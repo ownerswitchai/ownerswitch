@@ -574,10 +574,15 @@ new revision with new deliveries. Conformance is enforced where the
 text is *minted*:
 
 - **Per-field length limits** — `agentId` ≤ 64, `tool` ≤ 64, `summary`
-  ≤ 200 Unicode code points — chosen so a conforming alert fits
-  un-truncated inside common lock-screen budgets. If it fits by
-  construction, "the OS cut off the decisive part" stops being an
-  attack surface.
+  ≤ 200 Unicode code points — chosen to make lock-screen truncation
+  *unlikely*. Stated as an assumption, not a proof: visible width
+  depends on glyphs, fonts, emoji, and accessibility settings, and the
+  Notifications API reports no truncation result, so no code-point
+  budget can *prove* the decisive part was visible on a surface the app
+  does not control. The limits shrink the attack surface; what closes
+  it is structural — notifications are alert-only and never produce
+  evidence, and the ack comes only from the foreground detail view
+  (§3, versioned delivery; §4).
 - **Control characters are rejected, not escaped**: all C0/C1
   controls, including CR, LF, and TAB — every field is a single line —
   and every explicit bidirectional embedding, override, and isolate
