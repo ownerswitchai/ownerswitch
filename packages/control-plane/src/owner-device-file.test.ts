@@ -75,6 +75,16 @@ describe("enrolledOwnerDeviceFromSpki — strict public-key parsing", () => {
     expect(() => enrolledOwnerDeviceFromSpki("d", spkiDer.toString("base64url"))).not.toThrow();
   });
 
+  it("a PEM body must be RFC 7468 standard padded base64 — base64url inside armor is refused", () => {
+    const kp = p256();
+    const spkiDer = kp.publicKey.export({ format: "der", type: "spki" }) as Buffer;
+    const urlBody = spkiDer.toString("base64url");
+    const pem = `-----BEGIN PUBLIC KEY-----\n${urlBody}\n-----END PUBLIC KEY-----\n`;
+    // base64url is the raw browser-export grammar, not the PEM grammar — no
+    // producer emits it inside armor, so accepting it would only widen parsing
+    expect(() => enrolledOwnerDeviceFromSpki("d", pem)).toThrow(/canonical base64|not a single SPKI/);
+  });
+
   it("rejects a non-P-256 key and multiple PEM blocks", () => {
     const ed = generateKeyPairSync("ed25519");
     expect(() => enrolledOwnerDeviceFromSpki("d", ed.publicKey.export({ format: "pem", type: "spki" }).toString())).toThrow(

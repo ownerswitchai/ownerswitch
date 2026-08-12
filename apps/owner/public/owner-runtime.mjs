@@ -179,18 +179,37 @@ export async function sendVeto(windowId) {
   return { ok: res.ok, status: res.status, vetoed: res.ok && body.status === "vetoed", body };
 }
 
+export const VETO_BUTTON_LABEL = "VETO";
+
+/**
+ * ARM the (shared) veto button for the CURRENT review — a FULL canonical reset,
+ * so it can never inherit a prior window's "STOPPED"/"VETO — retry" text after
+ * an A-success then a navigation to B (the button element is reused across
+ * windows). Enabled, labelled VETO, aria-disabled cleared. Mutates in place;
+ * exported so the deployed app and its regression test share one definition.
+ */
+export function armVetoButton(btn) {
+  btn.textContent = VETO_BUTTON_LABEL;
+  btn.disabled = false;
+  if (typeof btn.removeAttribute === "function") btn.removeAttribute("aria-disabled");
+}
+
 /**
  * What a veto RESPONSE may do to the (shared) veto button, guarded by the
- * render generation the click was armed under. Pure and generation-checked so
- * a stale response for window A cannot paint the button after the view moved to
- * B: a click on A arms `armedGen`; navigating to B bumps the app's render
- * generation; A's late response then sees `armedGen !== currentGen` and returns
- * "superseded" — the caller touches nothing. Only an explicitly confirmed veto
+ * render generation AND the current windowId the click was armed under. Pure
+ * and doubly-checked so a stale response for window A cannot paint the button
+ * after the view moved to B: a click on A arms `armedGen`/`armedWindowId`;
+ * navigating to B bumps the render generation and changes the current windowId;
+ * A's late response then returns "superseded" — the caller touches nothing.
+ * (Generation alone would suffice today, since a route change bumps it; the
+ * explicit windowId is defense in depth against any future path that advances
+ * one without the other.) Only an explicitly confirmed veto
  * (`result.vetoed === true`) yields "stopped"; everything else is "retry".
  * Exported for the deployed app AND its regression test (app.js is a classic
  * script and cannot be imported, so the decision lives here where it can be).
  */
-export function vetoResultAction(armedGen, currentGen, result) {
+export function vetoResultAction(armedGen, currentGen, result, armedWindowId, currentWindowId) {
   if (armedGen !== currentGen) return "superseded";
+  if (armedWindowId !== undefined && armedWindowId !== currentWindowId) return "superseded";
   return result && result.vetoed === true ? "stopped" : "retry";
 }

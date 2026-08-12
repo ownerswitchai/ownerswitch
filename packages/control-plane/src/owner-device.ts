@@ -73,8 +73,10 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
   // while the 0644 registry text still carries the whole private key in base64.
   // The exact-DER check below cannot see that; a canonical round-trip can.
   let bodyText: string;
+  let isPem = false;
   let der: Buffer;
   if (trimmed.includes("BEGIN")) {
+    isPem = true;
     if ((trimmed.match(/-----BEGIN /g) ?? []).length !== 1) {
       throw new Error(`owner device "${deviceId}" key must be exactly one PEM block`);
     }
@@ -126,7 +128,13 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
   // while smuggling the private key in the file. A canonical encoding is clean
   // and complete, so the concatenation — strictly longer — can equal neither
   // form and is refused here.
-  if (bodyText !== canonicalDer.toString("base64") && bodyText !== canonicalDer.toString("base64url")) {
+  // A PEM body is RFC 7468 standard padded base64 ONLY; the base64url form is
+  // for raw browser exports (exportPublicKeySpki) — accepting it inside PEM
+  // armor would widen the grammar for no producer.
+  const canonicalOk = isPem
+    ? bodyText === canonicalDer.toString("base64")
+    : bodyText === canonicalDer.toString("base64") || bodyText === canonicalDer.toString("base64url");
+  if (!canonicalOk) {
     throw new Error(
       `owner device "${deviceId}" key is not canonical base64 — trailing or non-standard ` +
         "characters after the SPKI public key (a second key may be smuggled in the encoding)",

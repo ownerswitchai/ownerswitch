@@ -67,7 +67,21 @@
     syncTabs();
     routeAlert();
   });
-  document.addEventListener("visibilitychange", invalidateRender);
+  // Leaving the surface (hidden/blur/pagehide) INVALIDATES the current review —
+  // a pending ack armed under the old generation must not fire. RETURNING to it
+  // (visible/focus) must then RECONCILE, not sit on a stale, silently no-op
+  // control: re-route so the alert is re-fetched and re-rendered at a fresh
+  // generation (new delivery, re-armed veto, re-sent ack). Without this a
+  // window that extended (revision bumped) while hidden would keep showing the
+  // old deadline and a dead VETO button.
+  document.addEventListener("visibilitychange", function () {
+    invalidateRender();
+    if (document.visibilityState === "visible") routeAlert();
+  });
+  window.addEventListener("focus", function () {
+    invalidateRender();
+    routeAlert();
+  });
   window.addEventListener("pagehide", invalidateRender);
   window.addEventListener("blur", invalidateRender);
   syncTabs();
@@ -121,6 +135,11 @@
     var gen = ++renderGen;
     var btn = document.querySelector("#alert .veto-btn");
     if (btn) {
+      // FULL canonical reset — not just disabled. The button is SHARED across
+      // windows, so a prior window's "STOPPED"/"VETO — retry" text must be
+      // wiped now, before B's detail loads: otherwise B's active button could
+      // read "STOPPED" while B is not stopped at all.
+      btn.textContent = "VETO";
       btn.disabled = true;
       btn.onclick = null;
     }
@@ -177,8 +196,9 @@
   function wireVeto(rt, windowId, gen) {
     var btn = document.querySelector("#alert .veto-btn");
     if (!btn) return;
-    btn.disabled = false;
-    btn.removeAttribute("aria-disabled");
+    // ARM the current review with a FULL canonical reset (label + enabled +
+    // aria) — arming must never leave a prior window's text behind.
+    rt.armVetoButton(btn);
     // ASSIGN (not addEventListener): one active handler, so a click after the
     // view moved to another window cannot fire a stale window's veto.
     btn.onclick = function () {
@@ -188,12 +208,13 @@
         .then(function (result) {
           // The response for window A must not paint the SHARED button after
           // the view moved to B: the click handler was replaced, but this
-          // in-flight promise still closes over the old button. The generation-
-          // guarded decision (tested in owner-runtime) reports "superseded" so
-          // a stale STOPPED can never tell the owner B is stopped when only A
-          // was; "stopped" only on an explicitly confirmed veto (a 4xx/5xx is
-          // NOT success and stays retryable).
-          var action = rt.vetoResultAction(gen, renderGen, result);
+          // in-flight promise still closes over the old button. The guarded
+          // decision (tested in owner-runtime) reports "superseded" once the
+          // render generation OR the current windowId has advanced, so a stale
+          // STOPPED can never tell the owner B is stopped when only A was;
+          // "stopped" only on an explicitly confirmed veto (a 4xx/5xx is NOT
+          // success and stays retryable).
+          var action = rt.vetoResultAction(gen, renderGen, result, windowId, currentHash().arg);
           if (action === "superseded") return;
           if (action === "stopped") {
             btn.textContent = "STOPPED";
@@ -203,7 +224,8 @@
           }
         })
         .catch(function () {
-          if (gen !== renderGen) return; // superseded — do not touch B's button
+          // superseded (generation OR window advanced) — do not touch B's button
+          if (gen !== renderGen || currentHash().arg !== windowId) return;
           btn.textContent = "VETO — retry";
           btn.disabled = false; // network failure stays retryable (idempotent server-side)
         });

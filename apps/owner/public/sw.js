@@ -76,17 +76,21 @@ self.addEventListener("notificationclick", (event) => {
           // showing, before this notification's target navigation lands. The
           // route change bumps the render generation and abandons that ack.
           //
-          // And if the navigation FAILS, we must NOT focus this client on its
-          // stale view: that surfaces some other window's review (whose ack may
-          // still be pending) as if it were the one the owner tapped. Fall
-          // through to openWindow(target) instead, which lands on the right one.
+          // Focus ONLY the client navigate() resolves with, and only if it is
+          // non-null: WindowClient.navigate() can fulfil with null (the context
+          // is no longer controllable), and it can reject. In BOTH cases the
+          // original `client` may still be on some OTHER window's review (whose
+          // ack is pending) — focusing it would surface the wrong window as the
+          // one the owner tapped. So on null/rejection/focus-failure, fall
+          // through to openWindow(target), which lands on the right one.
           try {
-            await client.navigate(target);
+            const navigated = await client.navigate(target);
+            if (!navigated) break; // resolved null — cannot safely focus; open fresh
+            await navigated.focus();
+            return;
           } catch (e) {
             break; // navigation refused — do not focus a stale surface
           }
-          await client.focus();
-          return;
         }
       }
       if (self.clients.openWindow) await self.clients.openWindow(target);
