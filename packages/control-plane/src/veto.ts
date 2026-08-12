@@ -57,6 +57,7 @@ export class VetoWindow {
   private status: VetoStatus = "pending";
   private delivered = false;
   private deliveredByDevice: string | null = null;
+  private deliveredByGenerationValue: number | null = null;
   private deliveredAtMs: number | null = null;
   private revisionValue = 1;
   private deadline: number;
@@ -96,15 +97,38 @@ export class VetoWindow {
    * after a SIM swap it's proof the attacker's handset got the bytes,
    * not that the owner did. See packages/escalation/DESIGN.md §3.
    */
-  markDelivered(deviceId?: string): void {
+  markDelivered(deviceId?: string, deviceGeneration?: number): void {
     // First ack wins the attribution: a "released on silence" must be
-    // explainable from one recorded (device, time) pair, not the last of
-    // many retries.
+    // explainable from one recorded (device, generation, time) triple, not
+    // the last of many retries.
     if (!this.delivered) {
       this.delivered = true;
       this.deliveredByDevice = deviceId ?? null;
+      this.deliveredByGenerationValue = deviceGeneration ?? null;
       this.deliveredAtMs = this.now();
     }
+  }
+
+  /**
+   * The ONE event that may clear delivered evidence: the witnessing device
+   * was REVOKED. The release decision is deadline-anchored (see tick), so
+   * this first advances the clock — a window whose deadline already passed
+   * with valid evidence has RELEASED (silence became approval while the
+   * witness was still trusted) and stays released; evidence on a still-open
+   * window from the revoked device is cleared, so the window walks
+   * extend→held (fail closed) instead of releasing on a dead witness. A
+   * different device's evidence is untouched. Returns whether evidence was
+   * cleared.
+   */
+  revokeDeliveryEvidence(deviceId: string): boolean {
+    const status = this.tick(); // decide any already-due release FIRST
+    if (status !== "pending" && status !== "extended") return false;
+    if (!this.delivered || this.deliveredByDevice !== deviceId) return false;
+    this.delivered = false;
+    this.deliveredByDevice = null;
+    this.deliveredByGenerationValue = null;
+    this.deliveredAtMs = null;
+    return true;
   }
 
   /**
@@ -201,6 +225,11 @@ export class VetoWindow {
   /** The enrolled device whose ack flipped delivered, or null. */
   get deliveredBy(): string | null {
     return this.deliveredByDevice;
+  }
+
+  /** The revocation generation the witnessing device held at ack, or null. */
+  get deliveredByGeneration(): number | null {
+    return this.deliveredByGenerationValue;
   }
 
   /** When the ack landed (ms), or null. */

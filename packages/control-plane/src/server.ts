@@ -554,9 +554,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
   // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
   // consumed by the ack. Keyed by deliveryId; each binds the exact window,
-  // revision, rendered-content hash, and the hash of the exact call bytes
-  // (callHash) the device saw, so an ack can only confirm the CURRENT showing
-  // of THIS window and THIS call, once (apps/owner DESIGN.md §3).
+  // revision, rendered-content hash, the hash of the exact call bytes
+  // (callHash), AND the fetching device at its revocation generation — so an
+  // ack can only confirm the CURRENT showing of THIS window and THIS call,
+  // once, from the SAME still-trusted device that fetched the detail
+  // (apps/owner DESIGN.md §3).
   const ownerDeliveries = new Map<
     string,
     {
@@ -564,6 +566,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       revision: number;
       renderHash: string;
       callHash: string;
+      deviceId: string;
+      deviceGeneration: number;
       expiresAt: number;
       consumed: boolean;
     }
@@ -1616,7 +1620,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 501, { error: "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys)" });
       return;
     }
-    if (validOwnerDeviceIdFrom(req, raw) === null) {
+    const fetchingDeviceId = validOwnerDeviceIdFrom(req, raw);
+    if (fetchingDeviceId === null) {
       sendUnauthorized(res);
       return;
     }
@@ -1655,6 +1660,10 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       revision: window.revision,
       renderHash,
       callHash: callHashOf(window),
+      deviceId: fetchingDeviceId,
+      // the generation this delivery is minted under — a later revocation
+      // bumps the device's generation and this delivery dies with it
+      deviceGeneration: ownerDevices.get(fetchingDeviceId)?.generation ?? 0,
       expiresAt: now() + DELIVERY_TTL_MS,
       consumed: false,
     });
@@ -1721,6 +1730,16 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return reject("delivery expired — fetch a fresh detail");
     }
     if (delivery.windowId !== id) return reject("delivery is for a different window");
+    // The delivery belongs to the device that FETCHED the detail, at the
+    // generation it then held: another device cannot spend it (one device's
+    // render is not another's evidence), and a revocation in between bumps
+    // the generation so the orphaned delivery can never confirm anything.
+    if (delivery.deviceId !== deviceId) return reject("delivery belongs to a different device");
+    const ackingDevice = ownerDevices.get(deviceId);
+    if (ackingDevice === undefined || delivery.deviceGeneration !== ackingDevice.generation) {
+      ownerDeliveries.delete(deliveryId);
+      return reject("delivery was minted under a superseded device generation — fetch a fresh detail");
+    }
 
     // revision CAS: the delivery, the echoed revision, and the window must all
     // agree on the SAME current revision
@@ -1751,8 +1770,61 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       );
     }
     delivery.consumed = true; // single-use, consumed only on a fully valid ack
-    window.markDelivered(deviceId);
+    window.markDelivered(deviceId, ackingDevice.generation);
     sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt, revision: window.revision });
+  }
+
+  /**
+   * POST /devices/:id/revoke — sever an owner device's standing (a lost or
+   * stolen phone). Auth keeps the asymmetry of the switch: like /kill, this
+   * REMOVES authority, so a fleet device signature, an owner session, or a
+   * loopback caller may all revoke — revocation must never fail because auth
+   * was misconfigured, and at worst it forces windows onto the held/passkey
+   * path (fail closed, never fail open). NOT accepted: the owner-device
+   * signature of the target itself as the only credential — a thief holding
+   * the phone must not be able to silently sever the owner's own lane and
+   * mask it, so revocation rides the fleet/owner/host credential classes.
+   * (The full design adds a fresh UV assertion, purpose "device-revoke",
+   * once the enrollment ceremony lands — this endpoint is its deny-only
+   * core.)
+   *
+   * Atomically, in one synchronous section: the device record is marked
+   * revoked and its generation bumped (everything minted under the old one
+   * dies at its next check), its unspent foreground-detail deliveries are
+   * purged, and every still-open window whose delivered evidence names this
+   * device has that evidence CLEARED — the release decision is
+   * deadline-anchored, so a window whose deadline already passed with the
+   * evidence valid stays released, and every open one walks extend→held
+   * instead of releasing on a dead witness. Idempotent: re-revoking is a
+   * successful no-op (the relay may blind-retry).
+   */
+  async function postDeviceRevoke(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const raw = await readRawBody(req);
+    const authenticated = hasValidDeviceSignature(req, raw) || ownerSessionFrom(req) !== null;
+    if (!authenticated && !isLoopbackAddress(req.socket.remoteAddress)) {
+      sendUnauthorized(res);
+      return;
+    }
+    const device = ownerDevices.get(id);
+    if (device === undefined) {
+      sendJson(res, 404, { error: `no enrolled owner device "${id}"` });
+      return;
+    }
+    if (device.revokedAt !== null) {
+      // idempotent — already severed, nothing left to clear
+      sendJson(res, 200, { revoked: true, deviceId: id, generation: device.generation, alreadyRevoked: true });
+      return;
+    }
+    device.revokedAt = now();
+    device.generation += 1;
+    for (const [deliveryId, delivery] of ownerDeliveries) {
+      if (delivery.deviceId === id) ownerDeliveries.delete(deliveryId);
+    }
+    let evidenceCleared = 0;
+    for (const window of vetoWindows.values()) {
+      if (window.revokeDeliveryEvidence(id)) evidenceCleared += 1;
+    }
+    sendJson(res, 200, { revoked: true, deviceId: id, generation: device.generation, evidenceCleared });
   }
 
   /**
@@ -2236,6 +2308,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
     const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
+    const deviceRevokeMatch = /^\/devices\/([^/]+)\/revoke$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
@@ -2247,6 +2320,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
+    if (method === "POST" && deviceRevokeMatch) {
+      return postDeviceRevoke(req, res, decodeURIComponent(deviceRevokeMatch[1]));
+    }
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
     if (method === "POST" && restoreChallengeMatch) {
       return postRestoreChallenge(req, res, decodeURIComponent(restoreChallengeMatch[1]));

@@ -23,6 +23,16 @@ export interface EnrolledOwnerDevice {
   deviceId: string;
   /** the device's ECDSA P-256 public key, SPKI PEM or DER (base64) */
   publicKey: KeyObject;
+  /**
+   * Revocation generation — 1 at enrolment, bumped atomically by revocation.
+   * Everything minted FOR this device (foreground-detail deliveries, the ack
+   * evidence a window holds) records the generation it was minted under and is
+   * re-checked against the CURRENT one at use — so revoking a device kills
+   * what it minted at the next decision point, not at some expiry.
+   */
+  generation: number;
+  /** set once by revocation; a revoked device authenticates NOTHING */
+  revokedAt: number | null;
 }
 
 export interface OwnerDeviceCredential {
@@ -141,7 +151,12 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
     );
   }
   // bind bytes this parser produced, not the input
-  return { deviceId, publicKey: createPublicKey({ key: canonicalDer, format: "der", type: "spki" }) };
+  return {
+    deviceId,
+    publicKey: createPublicKey({ key: canonicalDer, format: "der", type: "spki" }),
+    generation: 1,
+    revokedAt: null,
+  };
 }
 
 /**
@@ -181,6 +196,9 @@ export function verifyOwnerDeviceSignature(
 
   const device = devices.get(deviceId);
   if (device === undefined) return null;
+  // A revoked device authenticates NOTHING — checked before any verify so its
+  // key never validates another byte, whatever it signs.
+  if (device.revokedAt !== null) return null;
 
   let preimage: Uint8Array;
   try {

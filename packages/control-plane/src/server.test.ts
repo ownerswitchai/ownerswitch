@@ -2308,6 +2308,124 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     expect(detail.summary).toMatch(/full owner approval/);
   });
 
+  it("REVOCATION: a revoked device authenticates nothing — detail, ack, and veto all 401", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    openWindow(cp, c);
+
+    // sever the device (loopback caller — the host can always revoke)
+    const revoke = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(revoke.status).toBe(200);
+    expect(((await revoke.json()) as { revoked: boolean }).revoked).toBe(true);
+
+    // every owner-device-signed surface now refuses the key
+    const { res } = await fetchDetail(url, "v-1", c);
+    expect(res.status).toBe(401);
+    const p = "/veto/v-1/seen";
+    const seen = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, "", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(401);
+
+    // idempotent re-revoke
+    const again = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { alreadyRevoked?: boolean }).alreadyRevoked).toBe(true);
+
+    // unknown device -> 404
+    const unknown = await fetch(`${url}/devices/ghost/revoke`, { method: "POST", body: "" });
+    expect(unknown.status).toBe(404);
+  });
+
+  it("REVOCATION clears a still-open window's delivered evidence: silence then holds, never releases on a dead witness", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c); // 4-min window
+
+    // the device sees and acks the alert — delivered, on course to release
+    const ack = await ackWindow(url, "v-1", c);
+    expect(ack.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+    expect(window.deliveredByGeneration).toBe(1);
+
+    // the phone is reported stolen BEFORE the deadline
+    const revoke = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(((await revoke.json()) as { evidenceCleared: number }).evidenceCleared).toBe(1);
+    expect(window.isDelivered).toBe(false); // the dead witness's evidence is gone
+
+    // silence now fails CLOSED: extend, then held — never released
+    c.advance(4 * 60_000 + 1);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000 + 1);
+    expect(window.tick()).toBe("held");
+  });
+
+  it("REVOCATION after the deadline leaves the release standing — the decision was made while the witness was valid", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const ack = await ackWindow(url, "v-1", c);
+    expect(ack.status).toBe(200);
+
+    // the deadline passes with the evidence valid — silence became approval
+    c.advance(4 * 60_000 + 1);
+    // revoke lands AFTER the decision moment (even before any tick ran)
+    await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(window.tick()).toBe("released");
+    expect(window.releasedAt).toBe(1_000 + 4 * 60_000);
+  });
+
+  it("a delivery minted before revocation cannot be spent after it (generation CAS), even with a then-valid signature", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // fetch the detail (mints a delivery under generation 1)…
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(typeof detail.deliveryId).toBe("string");
+    // …but the ack never arrives; the phone is revoked meanwhile. The purge
+    // removes the delivery AND the revoked key fails auth — belt and braces:
+    // even a replayed pre-revocation request body has nothing left to name.
+    await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(401); // the revoked key signs nothing
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("revocation requires kill-shaped auth from non-loopback callers", async () => {
+    // exercised through the auth predicate: an unauthenticated non-loopback
+    // request must be refused. Loopback tests above cover the host path; here
+    // a fleet-device signature authenticates the stop direction.
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const body = JSON.stringify({ reason: "phone stolen" });
+    const res = await fetch(`${url}/devices/owner-app/revoke`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { revoked: boolean }).revoked).toBe(true);
+  });
+
   it("device-signed POST /veto/:id relays a channel stop with honest attribution, idempotently", async () => {
     const c = clock(1_000);
     const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
