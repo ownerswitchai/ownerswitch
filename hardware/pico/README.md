@@ -44,21 +44,28 @@ button reads the same as a press. (A normally-open contact would fail *silent*
 
 The host this button plugs into is exactly the machine the agent runs on, so
 the button must not be **software-mutable from that host**. `boot.py` decides
-the mode at power-up from a physical gesture the host cannot fake:
+the mode at power-up from a **dedicated maintenance jumper** — a physical act
+the host cannot fake, and one that is never part of normal operation:
 
 | | ARMED (normal) | MAINTENANCE |
 | --- | --- | --- |
-| How | plug in with the e-stop **at rest** | **twist-latch the e-stop pressed**, then plug in |
+| How | plug in (no jumper) | jumper **GP14 → GND** (physical pins 19 → 18, right next to the button's pins), then plug in |
 | `CIRCUITPY` drive | **hidden** — the host cannot rewrite the firmware | visible, for editing `code.py` |
 | REPL console | **disabled** — the host cannot Ctrl-C the monitoring loop | enabled, for debugging |
 | Serial devices | exactly **one** (the data channel) | two (console + data) |
 | HID / MIDI | disabled | disabled |
 
-While latched in maintenance mode the firmware still emits its fail-safe
-`KILL` — maintenance never silences the button.
+**Why a separate jumper and not the e-stop:** GP15 HIGH is the fail-safe
+*asserted* state — the button latched pressed, or a cut wire. Resetting or
+power-cycling the Pico while KILL is legitimately asserted is a perfectly
+normal event, and it must come back up **armed**, not with a writable drive
+handed to the host it exists to stop. So the e-stop never selects the mode;
+only the jumper does — and a broken or absent jumper fails to ARMED, the safe
+direction. In maintenance mode the firmware still runs and still emits its
+fail-safe `KILL`.
 
-**Recovery, from cheapest to total:** forgot which mode you're in → unplug,
-latch the button, replug (maintenance). Filesystem wedged beyond that → hold
+**Recovery, from cheapest to total:** need to edit the firmware → unplug,
+jumper GP14→GND, replug (maintenance). Filesystem wedged beyond that → hold
 **BOOTSEL** while plugging in, flash `flash_nuke.uf2` (full erase), then
 re-flash CircuitPython and re-copy the firmware.
 
@@ -69,11 +76,10 @@ re-flash CircuitPython and re-copy the firmware.
    (<https://circuitpython.org/board/raspberry_pi_pico/>) onto the `RPI-RP2`
    drive. The Pico reboots and reappears as a `CIRCUITPY` drive.
 2. Copy **`boot.py`** and **`code.py`** from this directory onto `CIRCUITPY`.
-3. Unplug. **Wire the button first** (previous section) — from now on, the
-   mode gate reads GP15 at every power-up.
-4. Re-plug with the button at rest → the Pico comes up **armed**: no drive,
-   no console, one clean serial device. (To edit the firmware again: unplug,
-   latch the button pressed, re-plug → `CIRCUITPY` is back.)
+3. Unplug and **wire the button** (previous section).
+4. Re-plug (no jumper on GP14) → the Pico comes up **armed**: no drive, no
+   console, one clean serial device. (To edit the firmware again: unplug,
+   jumper **GP14 → GND**, re-plug → `CIRCUITPY` is back.)
 
 ## Connect it to OwnerSwitch
 
@@ -127,6 +133,6 @@ firmware's own fail-safe still prints a real `KILL` while it has power.
 - The `--trigger` flag changes the line the daemon treats as a press if you
   adapt the firmware.
 - Honest limit: armed mode stops the *host* from rewriting the firmware over
-  USB. Anyone with **physical** access can latch the button and enter
-  maintenance — physical access has always been outside this boundary (they
-  could as easily unplug the button, which at least fails safe).
+  USB. Anyone with **physical** access can fit the maintenance jumper —
+  physical access has always been outside this boundary (they could as easily
+  unplug the button, which at least fails safe).

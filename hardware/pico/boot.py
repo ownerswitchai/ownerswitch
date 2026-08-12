@@ -4,9 +4,14 @@
 # is meant to stop. Runs once at power-on / reset, before USB enumerates.
 #
 # 1. Expose a DEDICATED USB serial "data" channel for the KILL signal.
-# 2. Decide the mode by a PHYSICAL gesture the host cannot fake:
+# 2. Decide the mode from a DEDICATED maintenance jumper — deliberately NOT
+#    from the e-stop line. GP15 HIGH is the fail-safe ASSERTED state (button
+#    latched pressed, or a broken wire): a Pico reset or power-cycle while
+#    KILL is legitimately asserted is a NORMAL event, and it must come back
+#    up ARMED, not with a writable drive handed to the hostile host. So the
+#    e-stop can never select the mode; only the jumper can.
 #
-#    ARMED (normal): e-stop at rest (GP15 LOW) when power arrives.
+#    ARMED (normal): no jumper.
 #      - CIRCUITPY mass storage DISABLED: the host this button plugs into is
 #        exactly the machine the agent runs on — a writable firmware volume
 #        would let a compromised host rewrite code.py and make the next
@@ -15,11 +20,14 @@
 #        into the REPL, stopping the monitoring loop — same failure class.
 #      - Exactly one serial device appears: the data channel.
 #
-#    MAINTENANCE: e-stop LATCHED PRESSED (GP15 HIGH) when power arrives —
-#    twist-latch the button, then plug in USB.
+#    MAINTENANCE: jumper GP14 (physical pin 19) to GND (physical pin 18 — the
+#    pin right next to it, the same GND the button uses) BEFORE plugging in.
 #      - CIRCUITPY drive and REPL console stay enabled for editing/debugging.
-#      - Only hands on the hardware can produce this state; the firmware
-#        still emits its fail-safe KILL while latched.
+#      - Grounding a bare header pin takes hands on the hardware; the host
+#        cannot produce it, and unlike the e-stop it is never part of any
+#        normal operating state. A broken/absent jumper fails to ARMED — the
+#        safe direction.
+#      - The firmware still runs and still emits its fail-safe KILL.
 #
 # HID and MIDI are disabled in BOTH modes: the button is a serial device,
 # never a keyboard or instrument the host could be confused into trusting.
@@ -30,13 +38,14 @@ import usb_cdc
 import usb_hid
 import usb_midi
 
-# Maintenance gate: NC contact between GP15 and GND, internal pull-up.
-# Rest = LOW; latched-pressed (or open wire) = HIGH.
-_pin = digitalio.DigitalInOut(board.GP15)
-_pin.direction = digitalio.Direction.INPUT
-_pin.pull = digitalio.Pull.UP
-_maintenance = _pin.value  # HIGH -> maintenance
-_pin.deinit()  # release GP15 for code.py
+# Maintenance jumper: GP14 with internal pull-up. Open (no jumper) = HIGH =
+# armed; jumpered to GND = LOW = maintenance. GP15 (the e-stop) is left
+# untouched here on purpose — see the header.
+_jumper = digitalio.DigitalInOut(board.GP14)
+_jumper.direction = digitalio.Direction.INPUT
+_jumper.pull = digitalio.Pull.UP
+_maintenance = not _jumper.value  # LOW (grounded) -> maintenance
+_jumper.deinit()
 
 usb_hid.disable()
 usb_midi.disable()
