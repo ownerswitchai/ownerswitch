@@ -168,6 +168,43 @@ describe("serial press source", () => {
     await source.stop();
   });
 
+  it("a FAULT line reaches onFault and is NEVER a press; every other line stays ignored", async () => {
+    const serial = new FakeSerial();
+    const presses = vi.fn();
+    const faults = vi.fn();
+    const source = createSerialSource({
+      device: "/dev/fake",
+      open: () => serial,
+      reconnectMs: 0,
+      onFault: faults,
+    });
+    source.onPress(presses);
+    await source.start();
+
+    serial.emit("data", Buffer.from("READY-DUAL\n")); // dual-mode banner: ignored
+    serial.emit("data", Buffer.from("FAU")); // split across reads, like KILL
+    serial.emit("data", Buffer.from("LT\n"));
+    expect(faults).toHaveBeenCalledTimes(1);
+    expect(presses).not.toHaveBeenCalled();
+
+    serial.emit("data", Buffer.from("FAULT\nKILL\n")); // both in one chunk: one each
+    expect(faults).toHaveBeenCalledTimes(2);
+    expect(presses).toHaveBeenCalledTimes(1);
+
+    serial.emit("data", Buffer.from("fault\n")); // case-sensitive
+    expect(faults).toHaveBeenCalledTimes(2);
+    await source.stop();
+  });
+
+  it("refuses a fault line that equals the trigger — one line, one meaning", () => {
+    expect(() =>
+      createSerialSource({ device: "/dev/fake", trigger: "KILL", faultLine: "KILL" }),
+    ).toThrow(/must differ/);
+    expect(() => createSerialSource({ device: "/dev/fake", faultLine: "" })).toThrow(
+      /non-empty single line/,
+    );
+  });
+
   it("rejects an empty or multiline trigger (a blank line must never press)", () => {
     expect(() => createSerialSource({ device: "/dev/fake", trigger: "" })).toThrow(
       /non-empty single line/,

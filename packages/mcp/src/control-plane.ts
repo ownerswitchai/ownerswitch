@@ -101,7 +101,15 @@ function main(): void {
       );
     }
     const token = process.env.OWNERSWITCH_LICENSE?.trim();
-    licensing = { vendorPublicKeyPem, ...(token !== undefined && token !== "" ? { token } : {}) };
+    // deployment-bound licenses need this to match what the vendor minted;
+    // the honeytoken registry already treats it as the deployment's
+    // immutable name, so licensing reuses it rather than inventing another
+    const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID?.trim();
+    licensing = {
+      vendorPublicKeyPem,
+      ...(token !== undefined && token !== "" ? { token } : {}),
+      ...(deploymentId !== undefined && deploymentId !== "" ? { deploymentId } : {}),
+    };
   }
 
   // dev:false — createControlPlane enforces the production kill-state path

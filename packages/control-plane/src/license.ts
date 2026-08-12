@@ -47,6 +47,18 @@ export interface LicensePayload {
   plan: LicensePlan;
   /** who this was issued to — a company or a person, shown in errors/logs */
   licensee: string;
+  /**
+   * THEFT CONTAINMENT, opt-in: when present, the license verifies ONLY on
+   * the control plane configured with the same OWNERSWITCH_DEPLOYMENT_ID
+   * (the same immutable id the honeytoken registry pins). A leaked token
+   * then licenses nothing anywhere else. Worth stating what theft can and
+   * cannot do either way: a license is NOT an authorization credential —
+   * restoring YOUR fleet still demands YOUR owner session, passkey and the
+   * 2GO ceremony; a stolen token at most runs a STRANGER'S deployment
+   * under your name (piracy, handled by binding + the license terms),
+   * never a restore of yours.
+   */
+  deploymentId?: string;
   /** unix ms */
   issuedAt: number;
   /** unix ms; restores keep working until expiresAt + RESTORE_GRACE_MS */
@@ -87,6 +99,8 @@ export function verifyLicense(
   token: string,
   vendorPublicKeyPem: string,
   now: number,
+  /** this deployment's OWNERSWITCH_DEPLOYMENT_ID, for bound licenses */
+  expectedDeploymentId?: string,
 ): LicenseVerdict {
   const parts = token.split(".");
   if (parts.length !== 3 || parts[0] !== LICENSE_PREFIX) {
@@ -108,6 +122,17 @@ export function verifyLicense(
     assertPayload(payload);
   } catch (err) {
     return { ok: false, reason: `license payload invalid: ${err instanceof Error ? err.message : "malformed"}` };
+  }
+  if (payload.deploymentId !== undefined && payload.deploymentId !== expectedDeploymentId) {
+    // a stolen bound token dies here: right signature, wrong deployment
+    return {
+      ok: false,
+      reason:
+        `license is bound to deployment "${payload.deploymentId}" — this control plane is ` +
+        (expectedDeploymentId === undefined
+          ? "not configured with a deployment id (set OWNERSWITCH_DEPLOYMENT_ID)"
+          : `"${expectedDeploymentId}"`),
+    };
   }
   if (now < payload.issuedAt) {
     return { ok: false, reason: "license is not yet valid (issuedAt is in the future)" };
@@ -133,6 +158,9 @@ function assertPayload(payload: LicensePayload): void {
   }
   if (typeof payload.licensee !== "string" || payload.licensee === "") {
     throw new Error("licensee required");
+  }
+  if (payload.deploymentId !== undefined && (typeof payload.deploymentId !== "string" || payload.deploymentId === "")) {
+    throw new Error("deploymentId must be a non-empty string when present");
   }
   if (!Number.isInteger(payload.issuedAt) || !Number.isInteger(payload.expiresAt)) {
     throw new Error("issuedAt/expiresAt must be integer unix ms");

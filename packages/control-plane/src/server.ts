@@ -216,6 +216,13 @@ export interface ControlPlaneOptions {
     vendorPublicKeyPem: string;
     /** the deployment's OWNERSWITCH_LICENSE token; absent = unlicensed */
     token?: string;
+    /**
+     * This deployment's immutable id (OWNERSWITCH_DEPLOYMENT_ID — the same
+     * one the honeytoken registry pins). A license minted with a
+     * deploymentId verifies only where the ids match, so a stolen token
+     * licenses nothing anywhere else (license.ts, theft containment).
+     */
+    deploymentId?: string;
   };
 }
 
@@ -460,7 +467,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // plane whose restores WILL be refused should say so at startup, not
   // during the incident. (license.ts holds the doctrine.)
   if (opts.licensing !== undefined) {
-    const verdict = verifyLicense(opts.licensing.token ?? "", opts.licensing.vendorPublicKeyPem, now());
+    const verdict = verifyLicense(
+      opts.licensing.token ?? "",
+      opts.licensing.vendorPublicKeyPem,
+      now(),
+      opts.licensing.deploymentId,
+    );
     if (!verdict.ok) {
       console.error(
         `[ownerswitch] UNLICENSED for 2GO restore: ${verdict.reason} — the kill switch, vetoes and ` +
@@ -890,6 +902,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         opts.licensing.token ?? "",
         opts.licensing.vendorPublicKeyPem,
         now(),
+        opts.licensing.deploymentId,
       );
       if (!verdict.ok) {
         sendJson(res, 402, {

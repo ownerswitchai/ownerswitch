@@ -32,6 +32,15 @@ telemetry, air-gap friendly. An expired license keeps restoring for a
 ransom note over a killed fleet. Past the grace the fleet stays safely
 stopped until renewal — fail closed, like everything else here.
 
+**Theft containment:** a license is not an authorization credential —
+restoring a fleet still demands that fleet's owner session, passkey and
+the 2GO ceremony, so a stolen token can never restore *your* systems; at
+worst it runs a stranger's deployment under your name. Mint with
+`--deployment <id>` to close even that: a bound token verifies only on
+the control plane whose `OWNERSWITCH_DEPLOYMENT_ID` matches, and dies
+anywhere else. The `jti` on every token is the hook for a revocation
+list if one is ever needed.
+
 Vendor tooling: `ownerswitch-license keygen | mint | inspect`
 (`src/license-cli.ts`); key material travels by file path, never argv.
 Dev/quickstart instances (no licensing option) are ungated.

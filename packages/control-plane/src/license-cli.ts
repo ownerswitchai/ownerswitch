@@ -15,8 +15,10 @@ import { generateLicenseKeys, mintLicense, verifyLicense, type LicensePlan } fro
  *       license-signing.key.pem (0600) and license-verifying.pub.pem
  *
  *   ownerswitch-license mint --key <private.pem> --licensee "Name" \
- *       [--plan team|enterprise] [--days 365]
- *       sign a license and print the token to stdout
+ *       [--plan team|enterprise] [--days 365] [--deployment <id>]
+ *       sign a license and print the token to stdout. --deployment binds it
+ *       to one OWNERSWITCH_DEPLOYMENT_ID — a stolen bound token licenses
+ *       nothing anywhere else; prefer it whenever the customer has an id.
  *
  *   ownerswitch-license inspect --pub <public.pem> --token <osl1...>
  *       verify a token and print its payload + state
@@ -58,6 +60,7 @@ if (command === "mint") {
   if (plan !== "team" && plan !== "enterprise") fail('--plan must be "team" or "enterprise"');
   const days = Number(flag("days") ?? 365);
   if (!Number.isFinite(days) || days <= 0) fail("--days must be a positive number");
+  const deploymentId = flag("deployment");
   const issuedAt = Date.now();
   const token = mintLicense(
     {
@@ -65,6 +68,7 @@ if (command === "mint") {
       jti: `lic_${randomBytes(8).toString("hex")}`,
       plan,
       licensee,
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
       issuedAt,
       expiresAt: issuedAt + Math.round(days * 86_400_000),
     },

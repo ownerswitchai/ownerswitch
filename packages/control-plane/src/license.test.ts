@@ -64,6 +64,26 @@ describe("license mint + verify", () => {
     if (!verdict.ok) expect(verdict.reason).toMatch(/not yet valid/);
   });
 
+  it("a deployment-bound license verifies only where the ids match — theft containment", () => {
+    const bound = mintLicense(payload({ deploymentId: "dep-alpha" }), keys.privateKeyPem);
+
+    // the rightful deployment
+    expect(verifyLicense(bound, keys.publicKeyPem, 2_000, "dep-alpha")).toMatchObject({
+      ok: true,
+      state: "valid",
+    });
+    // stolen: replayed on another deployment, or one with no id at all
+    const wrong = verifyLicense(bound, keys.publicKeyPem, 2_000, "dep-bravo");
+    expect(wrong.ok).toBe(false);
+    if (!wrong.ok) expect(wrong.reason).toMatch(/bound to deployment/);
+    expect(verifyLicense(bound, keys.publicKeyPem, 2_000).ok).toBe(false);
+
+    // an UNBOUND license still works anywhere (the opt-out stays possible)
+    const unbound = mintLicense(payload(), keys.privateKeyPem);
+    expect(verifyLicense(unbound, keys.publicKeyPem, 2_000, "dep-alpha").ok).toBe(true);
+    expect(verifyLicense(unbound, keys.publicKeyPem, 2_000).ok).toBe(true);
+  });
+
   it("mint refuses malformed payloads outright", () => {
     expect(() => mintLicense(payload({ plan: "gold" as never }), keys.privateKeyPem)).toThrow(/plan/);
     expect(() => mintLicense(payload({ licensee: "" }), keys.privateKeyPem)).toThrow(/licensee/);
