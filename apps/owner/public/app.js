@@ -159,16 +159,23 @@
         .then(function (detail) {
           if (gen !== renderGen) return; // superseded while loading
           // render as TEXT (agent-supplied strings are never markup)
-          // ACKABLE windows render the envelope fields EXACTLY (the ack's DOM
-          // read-back must equal them); a non-ackable/terminal window may use
-          // the tool as a display fallback for an empty summary.
-          setText("kv-agent", detail.agentId);
-          setText("kv-tool", detail.tool);
-          setText("kv-action", detail.deliveryId ? detail.summary : detail.summary || detail.tool);
+          // ACKABLE windows render the nested envelope's fields EXACTLY (the
+          // ack's DOM read-back must equal them); a non-ackable/terminal
+          // window renders the flat display fields, tool as summary fallback.
+          var envelope = detail.renderable;
+          if (envelope) {
+            setText("kv-agent", envelope.agentId);
+            setText("kv-tool", envelope.tool);
+            setText("kv-action", envelope.summary);
+          } else {
+            setText("kv-agent", detail.agentId);
+            setText("kv-tool", detail.tool);
+            setText("kv-action", detail.summary || detail.tool);
+          }
           setText("kv-window", windowId);
           wireVeto(rt, windowId, gen);
 
-          if ((detail.status === "pending" || detail.status === "extended") && detail.deliveryId) {
+          if ((detail.status === "pending" || detail.status === "extended") && detail.deliveryId && envelope) {
             // The guard is re-checked inside signedFetch AFTER the key is
             // retrieved and again immediately before the fetch: if the surface
             // stopped being a valid top-level, visible, focused, CURRENT-
@@ -184,22 +191,31 @@
                 cur.arg === windowId
               );
             };
+            // The FULL evidence guard: the surface guard above AND a fresh DOM
+            // read-back equal to the hashed envelope. Passed into signedFetch,
+            // it is re-evaluated after the key retrieval and after the
+            // WebCrypto sign — a DOM mutated during the async digest/sign
+            // window aborts the ack before any signature leaves the page.
+            var readDom = function () {
+              return {
+                agentId: getText("kv-agent"),
+                tool: getText("kv-tool"),
+                summary: getText("kv-action"),
+              };
+            };
+            var evidenceStillValid = rt.evidenceGuard(envelope, readDom, stillValid);
             // wait for a real paint, then read the DOM BACK and let the
-            // evidence gate decide: the envelope must validate, the recomputed
-            // hash must equal the server's, and the painted nodes must still
-            // carry exactly the envelope fields. No ack body -> no ack.
+            // evidence gate decide: the wire envelope must validate (version
+            // included), the recomputed hash must equal the server's, and the
+            // painted nodes must carry exactly the envelope fields. No ack
+            // body -> no ack.
             requestAnimationFrame(function () {
               requestAnimationFrame(function () {
-                if (!stillValid()) return;
-                var domTexts = {
-                  agentId: getText("kv-agent"),
-                  tool: getText("kv-tool"),
-                  summary: getText("kv-action"),
-                };
-                rt.ackBodyForRender(detail, domTexts)
+                if (!evidenceStillValid()) return;
+                rt.ackBodyForRender(detail, readDom())
                   .then(function (ackBody) {
-                    if (ackBody && stillValid()) {
-                      rt.sendSeenAck(windowId, ackBody, stillValid).catch(function () {});
+                    if (ackBody && evidenceStillValid()) {
+                      rt.sendSeenAck(windowId, ackBody, evidenceStillValid).catch(function () {});
                     }
                   })
                   .catch(function () {});

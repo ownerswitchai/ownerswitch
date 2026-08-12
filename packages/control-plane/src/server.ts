@@ -1660,6 +1660,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     });
     sendJson(res, 200, {
       ...base,
+      // The EXACT envelope the hash is over, nested and verbatim — the client
+      // validates and hashes THIS object (wire version included), renders its
+      // fields, and reads them back from the DOM before acking. The flat
+      // fields above are display metadata; the contract object is this one.
+      renderable: ackable,
       deliveryId,
       renderContentHash: renderHash,
       deliveryExpiresAt: now() + DELIVERY_TTL_MS,

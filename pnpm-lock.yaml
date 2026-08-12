@@ -26,6 +26,10 @@ importers:
       '@ownerswitchai/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+    devDependencies:
+      '@ownerswitchai/control-plane':
+        specifier: workspace:*
+        version: link:../../packages/control-plane
 
   packages/button:
     dependencies:

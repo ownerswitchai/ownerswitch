@@ -9,6 +9,9 @@
   "dependencies": {
     "@ownerswitchai/shared": "workspace:*"
   },
+  "devDependencies": {
+    "@ownerswitchai/control-plane": "workspace:*"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

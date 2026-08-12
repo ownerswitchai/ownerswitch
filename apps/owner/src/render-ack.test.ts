@@ -5,7 +5,7 @@ import {
 } from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
 // The DEPLOYED browser modules, imported directly (plain ESM, run in Node too).
-import { ackBodyForRender, type RenderedDomTexts } from "../public/owner-runtime.mjs";
+import { ackBodyForRender, evidenceGuard, type RenderedDomTexts } from "../public/owner-runtime.mjs";
 import {
   canonicalRenderableAlert as browserCanonical,
   renderContentHash as browserHash,
@@ -59,8 +59,10 @@ describe("public/renderable-alert.mjs — drift-pinned to @ownerswitchai/shared"
 });
 
 describe("ackBodyForRender — the evidence gate in front of /veto/:id/seen", () => {
-  const detailFor = (alert: typeof ok) => ({
+  // the wire shape: flat display fields PLUS the nested contract envelope
+  const detailFor = (alert: Record<string, unknown>) => ({
     ...alert,
+    renderable: alert,
     windowId: "v-1",
     status: "pending",
     revision: 1,
@@ -85,6 +87,18 @@ describe("ackBodyForRender — the evidence gate in front of /veto/:id/seen", ()
     expect(await ackBodyForRender(detail, domFor(ok))).toBeNull();
   });
 
+  it("validates the WIRE envelope verbatim — a v:2 renderable with V1-shaped fields is refused", async () => {
+    // the gate must refuse a version it does not implement, never rewrite it
+    // to v:1 and hash its own construction
+    const v2 = { ...ok, v: 2 };
+    const detail = { ...detailFor(ok), renderable: v2 };
+    expect(await ackBodyForRender(detail, domFor(ok))).toBeNull();
+    // and a detail with NO nested envelope at all cannot ack
+    const bare: Record<string, unknown> = { ...detailFor(ok) };
+    delete bare.renderable;
+    expect(await ackBodyForRender(bare, domFor(ok))).toBeNull();
+  });
+
   it("refuses when the server's hash does not match the RECOMPUTED one — a parroted hash is not evidence", async () => {
     // the server (or a middle box) sends text A but the hash of text B
     const detail = { ...detailFor(ok), renderContentHash: serverHash({ ...ok, summary: "something else" }) };
@@ -92,8 +106,11 @@ describe("ackBodyForRender — the evidence gate in front of /veto/:id/seen", ()
   });
 
   it("refuses a non-conformant envelope — a bidi override in a field can lie on screen", async () => {
+    // built by hand: the honest server can never mint this (its own
+    // canonicalization refuses non-conformance), so this detail models a
+    // compromised or impersonated control plane
     const evil = { ...ok, summary: `pay${String.fromCodePoint(0x202e)}ee` };
-    const detail = { ...detailFor(ok), summary: evil.summary, renderContentHash: serverHash(ok) };
+    const detail = { ...detailFor(ok), renderable: evil };
     expect(await ackBodyForRender(detail, domFor(evil))).toBeNull();
   });
 
@@ -104,5 +121,29 @@ describe("ackBodyForRender — the evidence gate in front of /veto/:id/seen", ()
     // a missing node reads back null — likewise refused
     expect(await ackBodyForRender(detail, { ...domFor(ok), agentId: null })).toBeNull();
     expect(await ackBodyForRender(detail, null)).toBeNull();
+  });
+});
+
+describe("evidenceGuard — DOM equality re-checked all the way to the send", () => {
+  it("flips false the moment the DOM stops matching, even with the base guard true", () => {
+    let dom: RenderedDomTexts = { agentId: ok.agentId, tool: ok.tool, summary: ok.summary };
+    const guard = evidenceGuard(ok, () => dom, () => true);
+    expect(guard()).toBe(true);
+    // the summary node is mutated DURING the async digest/sign window
+    dom = { ...dom, summary: "tampered" };
+    expect(guard()).toBe(false);
+  });
+
+  it("stays false when the base surface guard fails, whatever the DOM says", () => {
+    const dom: RenderedDomTexts = { agentId: ok.agentId, tool: ok.tool, summary: ok.summary };
+    const guard = evidenceGuard(ok, () => dom, () => false);
+    expect(guard()).toBe(false);
+  });
+
+  it("a throwing DOM read is refusal, not evidence", () => {
+    const guard = evidenceGuard(ok, () => {
+      throw new Error("document gone");
+    });
+    expect(guard()).toBe(false);
   });
 });

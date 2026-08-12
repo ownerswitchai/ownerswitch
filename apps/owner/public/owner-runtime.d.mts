@@ -33,6 +33,12 @@ export interface SeenAckBody {
 }
 
 export function ackBodyForRender(detail: unknown, domTexts: RenderedDomTexts | null): Promise<SeenAckBody | null>;
+export function domTextsMatch(alert: unknown, domTexts: RenderedDomTexts | null): boolean;
+export function evidenceGuard(
+  alert: unknown,
+  readDomTexts: () => RenderedDomTexts | null,
+  baseGuard?: () => boolean,
+): () => boolean;
 export function sendSeenAck(windowId: string, ackBody: unknown, guard?: () => boolean): Promise<SeenAckResult>;
 export function sendVeto(windowId: string): Promise<VetoResult>;
 

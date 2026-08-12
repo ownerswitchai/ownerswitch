@@ -168,20 +168,48 @@ export async function fetchDetail(windowId) {
  */
 export async function ackBodyForRender(detail, domTexts) {
   if (!detail || typeof detail.deliveryId !== "string" || detail.deliveryId === "") return null;
-  const alert = { v: 1, agentId: detail.agentId, tool: detail.tool, summary: detail.summary };
+  // Validate the WIRE object verbatim — detail.renderable, version included.
+  // Never rebuild the envelope from picked fields with a client-written v:1:
+  // that would "validate" an object of our own making, and a v2 wire envelope
+  // with V1-shaped fields would slide through as V1 (the gate must refuse a
+  // version it does not implement, not rewrite it).
+  const alert = detail.renderable;
   if (validateRenderableAlert(alert) !== null) return null;
   const recomputed = await renderContentHash(alert);
   if (recomputed !== detail.renderContentHash) return null;
-  if (
-    !domTexts ||
-    domTexts.agentId !== alert.agentId ||
-    domTexts.tool !== alert.tool ||
-    domTexts.summary !== alert.summary
-  ) {
-    return null;
-  }
+  if (!domTextsMatch(alert, domTexts)) return null;
   // echo the RECOMPUTED hash — provably derived from the rendered fields
   return { deliveryId: detail.deliveryId, revision: detail.revision, renderContentHash: recomputed };
+}
+
+/** The painted nodes carry exactly the envelope's fields — nothing else acks. */
+export function domTextsMatch(alert, domTexts) {
+  return (
+    !!alert &&
+    !!domTexts &&
+    domTexts.agentId === alert.agentId &&
+    domTexts.tool === alert.tool &&
+    domTexts.summary === alert.summary
+  );
+}
+
+/**
+ * The FULL evidence guard the ack send re-checks all the way down: the base
+ * surface guard (generation, windowId, top-level, visible, focused) AND a
+ * fresh DOM read-back equal to the hashed envelope. signedFetch re-evaluates
+ * this after the key is retrieved AND after the WebCrypto sign, immediately
+ * before the fetch — so a DOM mutated during the async digest/sign window
+ * aborts the ack before any signature leaves the page.
+ */
+export function evidenceGuard(alert, readDomTexts, baseGuard) {
+  return () => {
+    if (baseGuard && !baseGuard()) return false;
+    try {
+      return domTextsMatch(alert, readDomTexts());
+    } catch {
+      return false;
+    }
+  };
 }
 
 /**
