@@ -78,7 +78,12 @@ export const MIN_VETO_RESPONSE_MS_FLOOR = 60_000;
  * embedding/override/isolate controls (LRE RLE LRO RLO PDF LRI RLI FSI
  * PDI) are refused server-side. Clients render each field in its own
  * bidi isolate and never ack a truncated render. Limits are Unicode
- * code points, sized to fit un-truncated in common lock-screen budgets.
+ * code points, sized to make lock-screen truncation UNLIKELY — an
+ * assumption about platform surfaces, not a guarantee: visible width
+ * depends on glyphs, fonts, and accessibility settings, and the
+ * Notifications API reports no truncation result. Which is one more
+ * reason notifications are alert-only and never ack evidence — the ack
+ * comes only from the foreground detail view (DESIGN.md §3, §4).
  */
 export const RENDERABLE_ALERT_V1_LIMITS = {
   agentId: 64,

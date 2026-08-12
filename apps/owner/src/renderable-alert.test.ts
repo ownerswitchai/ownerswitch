@@ -25,6 +25,11 @@ const C0_C1_CONTROLS = [0x00, 0x09, 0x0a, 0x0d, 0x1f, 0x7f, 0x85, 0x9f].map((cp)
 const BIDI_CONTROLS = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].map(
   (cp) => String.fromCodePoint(cp),
 );
+// What a hand-maintained list of the nine would miss — the rest of
+// Bidi_Control (ALM, LRM, RLM) and other invisibles (SOFT HYPHEN, ZWSP):
+const INVISIBLE_EXTRAS = [0x061c, 0x200e, 0x200f, 0x00ad, 0x200b].map((cp) =>
+  String.fromCodePoint(cp),
+);
 const RLO = String.fromCodePoint(0x202e);
 const EMOJI = String.fromCodePoint(0x1f600); // 1 code point, 2 UTF-16 units
 
@@ -77,10 +82,48 @@ describe("validateRenderableAlert", () => {
     }
   });
 
+  it("rejects the FULL Bidi_Control and Default_Ignorable classes, not just the nine embedding controls", () => {
+    // U+061C ALM, U+200E LRM, U+200F RLM, U+00AD SOFT HYPHEN, U+200B ZWSP
+    for (const bad of INVISIBLE_EXTRAS) {
+      expect(validateRenderableAlert({ ...ok, summary: `pay${bad}ee` })).toEqual({
+        field: "summary",
+        reason: "forbidden-character",
+      });
+    }
+  });
+
   it("allows legitimate RTL letters — isolated at display, not stripped", () => {
     // Hebrew "shalom" — letters, not controls; the client bidi-isolates them
     const shalom = String.fromCodePoint(0x05e9, 0x05dc, 0x05d5, 0x05dd);
     expect(validateRenderableAlert({ ...ok, summary: `${shalom} world` })).toBeNull();
+  });
+
+  it("validates the runtime V1 envelope, not just the text fields", () => {
+    // unsupported version: a function that hashes V1 must never hash v2
+    expect(validateRenderableAlert({ ...ok, v: 2 })).toEqual({
+      field: "v",
+      reason: "unsupported-version",
+    });
+    // non-string and missing fields
+    expect(validateRenderableAlert({ ...ok, tool: 42 })).toEqual({
+      field: "tool",
+      reason: "not-a-string",
+    });
+    const missing: Record<string, unknown> = { ...ok };
+    delete missing.summary;
+    expect(validateRenderableAlert(missing)).toEqual({
+      field: "summary",
+      reason: "not-a-string",
+    });
+    // unexpected properties are refused at the mint boundary
+    expect(validateRenderableAlert({ ...ok, extra: "x" })).toEqual({
+      field: "envelope",
+      reason: "unexpected-property",
+    });
+    // non-objects are refused outright
+    for (const bad of [null, undefined, "alert", 7, [ok]]) {
+      expect(validateRenderableAlert(bad)).toEqual({ field: "envelope", reason: "malformed" });
+    }
   });
 });
 
@@ -122,9 +165,11 @@ describe("canonicalRenderableAlert + renderContentHash", () => {
     expect(await renderContentHash({ ...ok })).toBe(hash);
   });
 
-  it("refuses to hash a non-conforming alert", async () => {
+  it("refuses to hash a non-conforming alert or a non-V1 envelope", async () => {
     await expect(renderContentHash({ ...ok, summary: "x".repeat(201) })).rejects.toThrow(
       /too-long/,
     );
+    await expect(renderContentHash({ ...ok, v: 2 })).rejects.toThrow(/unsupported-version/);
+    await expect(renderContentHash({ ...ok, extra: 1 })).rejects.toThrow(/unexpected-property/);
   });
 });
