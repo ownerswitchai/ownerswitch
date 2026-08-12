@@ -2,7 +2,13 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
-import { signDeviceRequest, verifyDeviceSignature } from "@ownerswitchai/control-plane";
+import {
+  enrolledOwnerDeviceFromSpki,
+  signDeviceRequest,
+  verifyOwnerDeviceSignature,
+  type EnrolledOwnerDevice,
+  type OwnerDeviceCredential,
+} from "@ownerswitchai/control-plane";
 import { createTwilioSmsChannel, createTwilioVoiceChannel, TWILIO_PATHS } from "./channels/twilio.js";
 import { createWebPushChannel, type PushSubscriptionJson } from "./channels/webpush.js";
 import { LadderEngine } from "./ladder.js";
@@ -59,6 +65,13 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   const now = opts.now ?? Date.now;
   const doFetch = opts.fetchImpl ?? fetch;
   const log = opts.log ?? ((line: string) => console.error(`[ownerswitch-escalation] ${line}`));
+
+  // Enrolled owner-app device public keys — the credential push enrollment is
+  // gated on. Built once; a bad key would have failed the config load.
+  const ownerDevices = new Map<string, EnrolledOwnerDevice>();
+  for (const [deviceId, spki] of Object.entries(cfg.ownerDeviceKeys ?? {})) {
+    ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
+  }
 
   /* ---------------- push subscription store (0600, atomic) ------------- */
 
@@ -267,26 +280,36 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     }
 
     // enrollment: the owner app registers its push subscription, signed with
-    // the OWNER APP's own secret — NOT the fleet device secret this service
-    // holds. Enrollment picks who receives every future alert, so gating it
-    // on the fleet secret would let any fleet-secret holder redirect the
-    // owner's push channel to their own endpoint. Absent an owner-app secret,
-    // enrollment is simply unavailable (501).
+    // the OWNER APP's ASYMMETRIC device key (ECDSA P-256) — NOT the fleet
+    // device secret this service holds. Enrollment picks who receives every
+    // future alert, so gating it on the fleet secret would let any
+    // fleet-secret holder redirect the owner's push channel to their own
+    // endpoint; an asymmetric signature the service can only VERIFY (never
+    // produce) closes that. Absent an enrolled owner device, enrollment is
+    // simply unavailable (501).
     if (method === "POST" && path === "/push/subscription") {
-      if (cfg.ownerAppSecret === undefined) {
+      if (ownerDevices.size === 0) {
         send(
           res,
           501,
           "application/json",
           JSON.stringify({
             error:
-              "push enrollment is not available: no owner-app credential is configured " +
-              "(OWNERSWITCH_OWNER_APP_SECRET)",
+              "push enrollment is not available: no owner-app device is enrolled " +
+              "(OWNERSWITCH_OWNER_DEVICE_KEYS_FILE)",
           }),
         );
         return;
       }
-      if (!validSignature(req, rawBody, cfg.ownerAppSecret)) {
+      const enrolledBy = verifyOwnerDeviceSignature(
+        ownerCredentialFrom(req),
+        (req.method ?? "").toUpperCase(),
+        req.url ?? "",
+        rawBody,
+        ownerDevices,
+        { now, seenNonces },
+      );
+      if (enrolledBy === null) {
         send(res, 401, "application/json", JSON.stringify({ error: "unauthorized" }));
         return;
       }
@@ -360,22 +383,18 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     send(res, 200, "text/xml", `<?xml version="1.0" encoding="UTF-8"?><Response/>`);
   }
 
-  function validSignature(req: IncomingMessage, rawBody: string, secret: string): boolean {
+  /** The owner-app device credential from the request headers, for verification. */
+  function ownerCredentialFrom(req: IncomingMessage): OwnerDeviceCredential {
     const header = (name: string) => {
       const value = req.headers[name];
       return Array.isArray(value) ? value[0] : value;
     };
-    const deviceId = header("x-device-id");
-    const timestamp = header("x-device-timestamp");
-    const nonce = header("x-device-nonce");
-    const signature = header("x-device-signature");
-    if (!deviceId || !timestamp || !nonce || !signature) return false;
-    return verifyDeviceSignature(
-      { deviceId, timestamp: Number(timestamp), nonce, signature },
-      rawBody,
-      secret,
-      { now, seenNonces },
-    );
+    return {
+      deviceId: header("x-device-id") ?? "",
+      timestamp: Number(header("x-device-timestamp") ?? NaN),
+      nonce: header("x-device-nonce") ?? "",
+      signature: header("x-device-signature") ?? "",
+    };
   }
   const seenNonces = new Map<string, number>();
 

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import {
   createControlPlane,
+  enrolledOwnerDeviceFromSpki,
   OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
 } from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
@@ -41,12 +42,52 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *                                            vendor key (self-hosted forks)
  *   OWNERSWITCH_DEPLOYMENT_ID                required by deployment-bound
  *                                            licenses (theft containment)
+ *
+ * Owner-app delivery ack (apps/owner):
+ *   OWNERSWITCH_OWNER_DEVICE_KEYS_FILE       JSON {deviceId: ECDSA P-256 SPKI
+ *                                            PEM} enrolling the owner app's
+ *                                            device public keys — the only
+ *                                            credential that may confirm
+ *                                            delivery; absent → /veto/:id/seen
+ *                                            is 501 (fail closed)
  */
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
   if (value === undefined || value === "") throw new Error(`${name} is required`);
   return value;
+}
+
+/**
+ * Load the enrolled owner-app device public keys from a JSON file mapping
+ * `deviceId → ECDSA P-256 SPKI PEM`. Validated at boot: each entry must
+ * parse as a P-256 key (enrolledOwnerDeviceFromSpki throws otherwise), so a
+ * corrupt file fails the start rather than turning every future ack into a
+ * silent 401. Absent path → no owner devices (delivery confirmation is 501).
+ */
+function loadOwnerDeviceKeys(file: string | undefined): Record<string, string> {
+  if (file === undefined || file === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) is not readable JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) must be a JSON object of deviceId → SPKI PEM`);
+  }
+  const keys: Record<string, string> = {};
+  for (const [deviceId, spki] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof spki !== "string" || spki === "") {
+      throw new Error(`owner device "${deviceId}" has no SPKI public key string`);
+    }
+    // fail the boot on a non-P-256 key, with the deviceId named
+    enrolledOwnerDeviceFromSpki(deviceId, spki);
+    keys[deviceId] = spki;
+  }
+  return keys;
 }
 
 /**
@@ -76,20 +117,14 @@ function main(): void {
   const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
   const host = process.env.OWNERSWITCH_CONTROL_PLANE_HOST ?? "127.0.0.1";
   const deviceSecret = required("OWNERSWITCH_DEVICE_SECRET");
-  // The owner app's OWN secret — distinct from the fleet device secret, and
-  // the only credential that may flip the release-permitting delivered bit
-  // (POST /veto/:id/seen). Optional: absent, delivery confirmation is 501 and
-  // windows walk to passkey approval (fail closed). It must NOT equal the
-  // fleet secret — that would re-merge the two credential classes the split
-  // exists to keep apart.
-  const ownerAppSecret = process.env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
-  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === deviceSecret) {
-    throw new Error(
-      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner-app " +
-        "delivery-ack credential is deliberately separate from the fleet device secret; reusing the " +
-        "fleet secret lets any fleet component (or a same-uid agent) forge the owner's 'I saw it'",
-    );
-  }
+  // Enrolled owner-app devices — the ONLY credential that may flip the
+  // release-permitting delivered bit (POST /veto/:id/seen). ASYMMETRIC:
+  // a JSON file mapping deviceId → ECDSA P-256 SPKI PEM (the phone's PUBLIC
+  // key; the private half never leaves the device). Optional: absent,
+  // delivery confirmation is 501 and windows walk to passkey approval (fail
+  // closed). No shared secret exists here to leak or to collide with the
+  // fleet secret — that whole failure mode is gone by construction.
+  const ownerDeviceKeys = loadOwnerDeviceKeys(process.env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim());
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -141,7 +176,7 @@ function main(): void {
   // assertion. A misconfiguration refuses to start with a named reason.
   const controlPlane = createControlPlane({
     deviceSecret,
-    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
+    ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
     killStateFile,
     dev: false,
     grantKey,

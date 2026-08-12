@@ -1,8 +1,9 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync, sign as ecSign } from "node:crypto";
 import { readFileSync, mkdtempSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ownerDeviceSigPreimage } from "@ownerswitchai/shared";
 import {
   createControlPlane,
   signDeviceRequest,
@@ -71,12 +72,15 @@ const TWILIO = {
   to: "+36301234567",
 };
 
-const OWNER_APP_SECRET = "owner-app-shared-secret";
+// The owner app's asymmetric device key (non-extractable P-256 in production).
+const ownerKeypair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const OWNER_DEVICE_SPKI = ownerKeypair.publicKey.export({ format: "pem", type: "spki" }).toString();
+const OWNER_DEVICE_KEYS: Record<string, string> = { "owner-app": OWNER_DEVICE_SPKI };
 
 const baseConfig = (cpUrl: string, stateFile: string): EscalationEnvConfig => ({
   controlPlaneUrl: cpUrl,
   device: { id: "escalation", secret: DEVICE_SECRET },
-  ownerAppSecret: OWNER_APP_SECRET,
+  ownerDeviceKeys: OWNER_DEVICE_KEYS,
   listenHost: "127.0.0.1",
   listenPort: 0,
   webhookBaseUrl: "https://esc.example",
@@ -231,7 +235,7 @@ describe("escalation service against a live control plane", () => {
     expect(window.state).toBe("pending");
   });
 
-  it("push enrollment requires the OWNER-APP secret (not the fleet secret), persists 0600, refuses replays", async () => {
+  it("push enrollment requires the OWNER-APP device signature (not the fleet secret), persists 0600, refuses replays", async () => {
     const { c, service, stateFile } = await setup();
     const url = await listen(service.webhookHandler, servers);
     const subscription = {
@@ -239,47 +243,73 @@ describe("escalation service against a live control plane", () => {
       keys: { p256dh: "BPub", auth: "QXV0aA" },
     };
     const body = JSON.stringify({ subscription });
+    const pathAndQuery = "/push/subscription";
 
-    const enroll = (secret: string, nonce: string, at = c.now()) =>
-      fetch(`${url}/push/subscription`, {
+    // owner-app asymmetric signature over the exact request
+    const ownerSig = (nonce: string, at: number) => {
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-app",
+        method: "POST",
+        pathAndQuery,
+        bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+        timestamp: at,
+        nonce,
+      });
+      return ecSign("sha256", preimage, { key: ownerKeypair.privateKey, dsaEncoding: "ieee-p1363" }).toString(
+        "base64url",
+      );
+    };
+    const enrollOwner = (nonce: string, at = c.now()) =>
+      fetch(`${url}${pathAndQuery}`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-device-id": "owner-app",
           "x-device-timestamp": String(at),
           "x-device-nonce": nonce,
-          "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce }, body, secret),
+          "x-device-signature": ownerSig(nonce, at),
         },
         body,
       });
 
-    const unsigned = await fetch(`${url}/push/subscription`, { method: "POST", body });
+    const unsigned = await fetch(`${url}${pathAndQuery}`, { method: "POST", body });
     expect(unsigned.status).toBe(401);
     expect(service.subscription()).toBeNull();
 
-    // the FLEET device secret (which this escalation service itself holds)
+    // the FLEET device secret (an HMAC the escalation service itself holds)
     // must NOT be able to redirect the owner's push channel
-    const viaFleet = await enroll(DEVICE_SECRET, "fleet-1");
+    const at = c.now();
+    const viaFleet = await fetch(`${url}${pathAndQuery}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-device-id": "owner-app",
+        "x-device-timestamp": String(at),
+        "x-device-nonce": "fleet-1",
+        "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce: "fleet-1" }, body, DEVICE_SECRET),
+      },
+      body,
+    });
     expect(viaFleet.status).toBe(401);
     expect(service.subscription()).toBeNull();
 
-    // the owner-app secret enrolls
-    const signed = await enroll(OWNER_APP_SECRET, "n-1");
+    // the owner's device signature enrolls
+    const signed = await enrollOwner("n-1");
     expect(signed.status).toBe(200);
     expect(service.subscription()).toEqual(subscription);
     expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription });
     expect(statSync(stateFile).mode & 0o777).toBe(0o600);
 
     // a replayed enrollment (same nonce) is refused
-    const replay = await enroll(OWNER_APP_SECRET, "n-1");
+    const replay = await enrollOwner("n-1");
     expect(replay.status).toBe(401);
   });
 
-  it("with no owner-app secret configured, push enrollment is 501", async () => {
+  it("with no owner device enrolled, push enrollment is 501", async () => {
     const c = clock();
     const push = fakePush();
     const stateFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-esc-")), "state.json");
-    const { ownerAppSecret: _drop, ...noOwnerApp } = baseConfig("http://127.0.0.1:1", stateFile);
+    const { ownerDeviceKeys: _drop, ...noOwnerApp } = baseConfig("http://127.0.0.1:1", stateFile);
     const service = createEscalationService({
       config: noOwnerApp,
       channels: { push: push.channel },

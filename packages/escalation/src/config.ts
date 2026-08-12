@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { enrolledOwnerDeviceFromSpki } from "@ownerswitchai/control-plane";
 import { DEFAULT_LIMITS } from "./ladder.js";
 import type { LadderRung, RateLimits } from "./types.js";
 
@@ -26,14 +28,15 @@ export interface EscalationEnvConfig {
   controlPlaneUrl: string;
   device: { id: string; secret: string };
   /**
-   * The OWNER APP's own secret (distinct from `device.secret`), required to
-   * enroll a push subscription (POST /push/subscription). Enrollment picks
-   * who receives every future alert, so it must not ride the fleet device
-   * secret the escalation service itself holds — otherwise a fleet-secret
-   * holder could redirect the owner's push channel to their own endpoint.
-   * Absent → enrollment is 501 and no subscription can be set over HTTP.
+   * The owner app's enrolled device PUBLIC keys (deviceId → ECDSA P-256 SPKI
+   * PEM), required to authenticate a push-subscription enrollment
+   * (POST /push/subscription). Enrollment picks who receives every future
+   * alert, so it is gated on the owner's ASYMMETRIC device signature — the
+   * same non-extractable key that signs the delivery ack — not the fleet
+   * device secret this service holds. A fleet-secret holder therefore cannot
+   * redirect the owner's push channel. Absent/empty → enrollment is 501.
    */
-  ownerAppSecret?: string;
+  ownerDeviceKeys?: Record<string, string>;
   /** where the webhook server listens */
   listenHost: string;
   listenPort: number;
@@ -68,6 +71,31 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return value;
 }
 
+/** Owner-app device public keys (deviceId → P-256 SPKI PEM) from a JSON file. */
+function loadOwnerDeviceKeys(file: string | undefined): Record<string, string> {
+  if (file === undefined || file === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) is not readable JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`OWNERSWITCH_OWNER_DEVICE_KEYS_FILE (${file}) must be a JSON object of deviceId → SPKI PEM`);
+  }
+  const keys: Record<string, string> = {};
+  for (const [deviceId, spki] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof spki !== "string" || spki === "") {
+      throw new Error(`owner device "${deviceId}" has no SPKI public key string`);
+    }
+    enrolledOwnerDeviceFromSpki(deviceId, spki); // fail the boot on a non-P-256 key
+    keys[deviceId] = spki;
+  }
+  return keys;
+}
+
 export function escalationConfigFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): EscalationEnvConfig {
@@ -78,14 +106,7 @@ export function escalationConfigFromEnv(
   };
   if (device.id.includes(".")) throw new Error('OWNERSWITCH_ESCALATION_DEVICE_ID must not contain "."');
 
-  const ownerAppSecret = env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
-  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === device.secret) {
-    throw new Error(
-      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner app's " +
-        "push-enrollment credential is deliberately separate from the fleet device secret the " +
-        "escalation service holds",
-    );
-  }
+  const ownerDeviceKeys = loadOwnerDeviceKeys(env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim());
 
   const sid = env.OWNERSWITCH_TWILIO_ACCOUNT_SID;
   const twilioVars = [
@@ -183,7 +204,7 @@ export function escalationConfigFromEnv(
   return {
     controlPlaneUrl,
     device,
-    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
+    ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),

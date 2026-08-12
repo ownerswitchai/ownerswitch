@@ -1,9 +1,15 @@
-import { createHmac, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  generateKeyPairSync,
+  randomUUID,
+  sign as ecSign,
+} from "node:crypto";
 import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
+import { canonicalJson, ownerDeviceSigPreimage, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
 import { generateLicenseKeys, mintLicense } from "./license.js";
@@ -21,7 +27,13 @@ const clock = (start = 0) => {
 };
 
 const DEVICE_SECRET = "button-secret";
-const OWNER_APP_SECRET = "owner-app-secret";
+
+// The owner app's asymmetric device key: a non-extractable P-256 key on the
+// phone in production; here a test keypair whose SPKI is enrolled and whose
+// private half signs the delivery ack (owner-device.ts).
+const ownerKeypair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const OWNER_DEVICE_SPKI = ownerKeypair.publicKey.export({ format: "pem", type: "spki" }).toString();
+const OWNER_DEVICE_KEYS: Record<string, string> = { "owner-app": OWNER_DEVICE_SPKI };
 
 /** Headers for a device-signed request over `body`, signed "now". */
 const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
@@ -36,22 +48,38 @@ const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random(
   ),
 });
 
-/** Headers signed with the OWNER APP's own secret — the delivery-ack credential. */
+/**
+ * Headers signed with the OWNER APP's asymmetric device key — the delivery-ack
+ * credential (ECDSA P-256, r||s, over the method+path+body preimage). The
+ * signed path must be the exact request target, so the caller passes it.
+ */
 const ownerAppHeaders = (
+  method: string,
+  pathAndQuery: string,
   body: string,
   at: number,
   nonce = `oa-${at}-${Math.random().toString(36).slice(2)}`,
-) => ({
-  "content-type": "application/json",
-  "x-device-id": "owner-app",
-  "x-device-timestamp": String(at),
-  "x-device-nonce": nonce,
-  "x-device-signature": signDeviceRequest(
-    { deviceId: "owner-app", timestamp: at, nonce },
-    body,
-    OWNER_APP_SECRET,
-  ),
-});
+) => {
+  const preimage = ownerDeviceSigPreimage({
+    deviceId: "owner-app",
+    method,
+    pathAndQuery,
+    bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+    timestamp: at,
+    nonce,
+  });
+  const signature = ecSign("sha256", preimage, {
+    key: ownerKeypair.privateKey,
+    dsaEncoding: "ieee-p1363",
+  }).toString("base64url");
+  return {
+    "content-type": "application/json",
+    "x-device-id": "owner-app",
+    "x-device-timestamp": String(at),
+    "x-device-nonce": nonce,
+    "x-device-signature": signature,
+  };
+};
 
 const bearer = (token: string) => ({
   "content-type": "application/json",
@@ -1933,13 +1961,13 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("POST /veto/:id/seen (owner-app-signed) flips delivered, records the device, and silence then releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -1958,7 +1986,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("the FLEET device secret cannot flip the permissive bit — only the owner-app secret", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
@@ -1981,7 +2009,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(501);
@@ -1997,7 +2025,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("POST /veto/:id/seen without a valid signature -> 401; no session variant exists", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
@@ -2018,14 +2046,14 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("an ack inside the 60 s response floor is refused and the window extends, never releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
     c.advance(4 * 60_000 - 30_000); // 30 s before the deadline — inside the floor
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(409);
@@ -2038,7 +2066,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     // against the NEW deadline there is time again; the re-ack counts
     const again = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(again.status).toBe(200);
@@ -2047,14 +2075,14 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("re-acking a delivered window is an idempotent success; a terminal window refuses", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
     window.markDelivered("owner-app");
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -2065,7 +2093,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     window.veto("adam");
     const deliveredTerminal = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(deliveredTerminal.status).toBe(200);
@@ -2075,7 +2103,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     openWindow(cp, c, "v-2").veto("adam");
     const terminal = await fetch(`${url}/veto/v-2/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-2/seen", "", c.now()),
       body: "",
     });
     expect(terminal.status).toBe(409);
@@ -2273,7 +2301,7 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
       cp = ephemeral({
         now: c.now,
         deviceSecret: DEVICE_SECRET,
-        ownerAppSecret: OWNER_APP_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
         licensing: { vendorPublicKeyPem: keys.publicKeyPem }, // no token
       });
     } finally {
@@ -2292,7 +2320,7 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     cp.vetoWindows.set("v-free", window);
     const seen = await fetch(`${url}/veto/v-free/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-free/seen", "", c.now()),
       body: "",
     });
     expect(seen.status).toBe(200);

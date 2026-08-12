@@ -24,6 +24,11 @@ import {
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
+import {
+  enrolledOwnerDeviceFromSpki,
+  verifyOwnerDeviceSignature,
+  type EnrolledOwnerDevice,
+} from "./owner-device.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
 import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
@@ -84,11 +89,12 @@ import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
  *                     a session may approve) OR device signature (deny-only:
  *                     the escalation ladder's relayed channel stops and the
  *                     owner app's one-tap veto; idempotent on re-veto).
- *  - POST /veto/:id/seen — OWNER-APP signature required (ownerAppSecret, a
- *                     distinct credential from the fleet deviceSecret — this
- *                     is the permissive delivered bit, so no fleet component
- *                     or same-uid agent may forge it); 501 when no owner-app
- *                     secret is enrolled. The production caller of
+ *  - POST /veto/:id/seen — OWNER-APP ASYMMETRIC signature required (ECDSA
+ *                     P-256 over the request, enrolled via ownerDeviceKeys —
+ *                     the phone's non-extractable key; the fleet deviceSecret
+ *                     cannot sign it and no leaked server secret can forge it,
+ *                     because this is the permissive delivered bit); 501 when
+ *                     no owner device is enrolled. The production caller of
  *                     markDelivered(). Refused inside the 60 s response floor
  *                     before the deadline (MIN_VETO_RESPONSE_MS).
  *  - GET  /veto/pending — device signature required; the open-window listing
@@ -108,24 +114,22 @@ export interface ControlPlaneOptions {
   /** Shared secret the physical button / kill triggers sign requests with. */
   deviceSecret?: string;
   /**
-   * The OWNER APP's OWN device secret — a DISTINCT credential from
-   * `deviceSecret`, provisioned only to the enrolled owner app and held by
-   * nothing else (not the gateway, not the button, not the escalation
-   * service). It authenticates exactly one thing: the delivery ack
-   * (`POST /veto/:id/seen`), which flips the permissive `delivered` bit that
-   * lets silence RELEASE a window (veto.ts). That bit is the one place the
-   * veto lane trusts a device to speak for the owner, so it must not ride
-   * the fleet-wide `deviceSecret` — under the same-uid threat model an agent
-   * can forge that (packages/mcp/THREAT-MODEL.md), and forging the ack would
-   * silently convert "held, owner-gated" into "released, runs" while also
-   * standing the escalation ladder down. Absent → `/veto/:id/seen` is 501 and
-   * delivery confirmation stays UNWIRED: every untouched window walks
-   * pending → extended → held → passkey approval, the fail-closed default
-   * (exactly the pre-escalation behavior). The deny-only device endpoints
-   * (`/kill`, the veto relay, `/veto/pending`, the pacing read) keep using
-   * `deviceSecret`: their worst case is a stop, so a forged one is safe.
+   * The enrolled OWNER-APP devices, as `deviceId → SPKI public key` (PEM or
+   * base64 DER). These are the ONLY credential that may flip the permissive
+   * `delivered` bit — the delivery ack (`POST /veto/:id/seen`) that lets
+   * silence RELEASE a window (veto.ts). Verification is ASYMMETRIC (ECDSA
+   * P-256, owner-device.ts): the owner's phone holds a NON-EXTRACTABLE
+   * private key, this map holds only the public halves. So — unlike a
+   * shared HMAC secret — a leaked server-side value cannot forge the owner's
+   * "I saw it", and neither can any fleet component or same-uid agent
+   * (packages/mcp/THREAT-MODEL.md). Absent/empty → `/veto/:id/seen` is 501
+   * and delivery confirmation stays UNWIRED: every untouched window walks
+   * pending → extended → held → passkey approval, the fail-closed default.
+   * The deny-only device endpoints (`/kill`, the veto relay, `/veto/pending`,
+   * the pacing read) keep using the fleet `deviceSecret` HMAC: their worst
+   * case is a stop, so a forged one is safe.
    */
-  ownerAppSecret?: string;
+  ownerDeviceKeys?: Record<string, string>;
   /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
@@ -407,6 +411,16 @@ function deviceCredentialFrom(req: IncomingMessage): DeviceCredential | null {
   return { deviceId, timestamp: Number(timestamp), nonce, signature };
 }
 
+/** The owner-app device credential (same headers; the signature is ECDSA r||s base64url). */
+function ownerDeviceCredentialFrom(req: IncomingMessage) {
+  const deviceId = headerValue(req, "x-device-id");
+  const timestamp = headerValue(req, "x-device-timestamp");
+  const nonce = headerValue(req, "x-device-nonce");
+  const signature = headerValue(req, "x-device-signature");
+  if (!deviceId || !timestamp || !nonce || !signature) return null;
+  return { deviceId, timestamp: Number(timestamp), nonce, signature };
+}
+
 function bearerToken(req: IncomingMessage): string | null {
   // the auth-scheme is case-insensitive (RFC 9110 §11.1); the token is not
   const match = /^Bearer (.+)$/i.exec(headerValue(req, "authorization") ?? "");
@@ -518,6 +532,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   );
   const vetoWindows = new Map<string, VetoWindow>();
   const seenNonces = new Map<string, number>();
+  // Enrolled owner-app devices (deviceId → P-256 public key), built once at
+  // startup. A bad key fails the boot with a named reason rather than turning
+  // every future ack into a silent 401.
+  const ownerDevices = new Map<string, EnrolledOwnerDevice>();
+  for (const [deviceId, spki] of Object.entries(opts.ownerDeviceKeys ?? {})) {
+    ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
+  }
   // Window ids whose single-use MergeGrant has already been minted. A window
   // authorizes exactly ONE merge: the first releasing read mints the grant
   // and records the id here; every later read of the same window is served
@@ -609,14 +630,24 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   /**
-   * The deviceId behind a valid signature made with the OWNER APP's own
-   * secret — the only credential that may drive a PERMISSIVE outcome
-   * (`markDelivered()`). Verified against `ownerAppSecret`, never the
-   * fleet `deviceSecret`, so a fleet-secret holder (a same-uid agent, the
-   * gateway, the escalation service) cannot forge the owner's "I saw it".
+   * The deviceId behind a valid OWNER-APP signature — the only credential
+   * that may drive a PERMISSIVE outcome (`markDelivered()`). ASYMMETRIC:
+   * ECDSA P-256 over the canonical preimage (method + path+query + body hash
+   * + timestamp + nonce), verified against the enrolled device's PUBLIC key
+   * (owner-device.ts). No server-side secret exists to leak or forge, and no
+   * fleet-secret holder can sign it. The signed path+query must be the exact
+   * request target as sent, so the signature is bound to THIS route and body.
    */
-  function validOwnerAppDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
-    return validSignatureAgainst(req, rawBody, opts.ownerAppSecret);
+  function validOwnerDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
+    if (ownerDevices.size === 0) return null;
+    const credential = ownerDeviceCredentialFrom(req);
+    if (credential === null) return null;
+    const method = (req.method ?? "").toUpperCase();
+    const pathAndQuery = req.url ?? "";
+    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDevices, {
+      now,
+      seenNonces,
+    });
   }
 
   function validSignatureAgainst(
@@ -1417,13 +1448,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * POST /veto/:id/seen — the production caller of markDelivered(), and the
    * ONLY caller (escalation DESIGN.md §3): the enrolled device reports the
    * alert was rendered in front of a human. Authenticated with the OWNER
-   * APP's own secret (`ownerAppSecret`), NEVER the fleet `deviceSecret` —
-   * this is the PERMISSIVE bit of the veto lane (it lets silence release a
-   * held call), so it must ride a credential no fleet component and no
-   * same-uid agent holds. Nothing a carrier, a webhook, an owner session, or
-   * a fleet-signed request may flip it.
+   * APP's ASYMMETRIC device signature (ECDSA P-256 over the request; the
+   * phone holds a non-extractable private key, this plane holds only the
+   * public key), NEVER the fleet `deviceSecret` — this is the PERMISSIVE bit
+   * of the veto lane (it lets silence release a held call), so it must ride
+   * a credential no fleet component, no same-uid agent, and no leaked
+   * server-side secret can produce. Nothing a carrier, a webhook, an owner
+   * session, or a fleet-signed request may flip it.
    *
-   * When no owner-app secret is enrolled the endpoint is 501 and delivery
+   * When no owner device is enrolled the endpoint is 501 and delivery
    * confirmation stays UNWIRED — every window then walks to held → passkey
    * approval, the fail-closed default, rather than trusting a weaker
    * credential to speak for the owner.
@@ -1435,16 +1468,16 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    */
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (opts.ownerAppSecret === undefined) {
+    if (ownerDevices.size === 0) {
       sendJson(res, 501, {
         error:
-          "delivery confirmation is not wired: no owner-app credential is enrolled on this control " +
+          "delivery confirmation is not wired: no owner-app device is enrolled on this control " +
           "plane, so no device may flip the release-permitting 'delivered' bit — windows walk to " +
-          "held (passkey approval) instead. Provision ownerAppSecret (OWNERSWITCH_OWNER_APP_SECRET).",
+          "held (passkey approval) instead. Enroll an owner device public key (ownerDeviceKeys).",
       });
       return;
     }
-    const deviceId = validOwnerAppDeviceIdFrom(req, raw);
+    const deviceId = validOwnerDeviceIdFrom(req, raw);
     if (deviceId === null) {
       sendUnauthorized(res);
       return;
