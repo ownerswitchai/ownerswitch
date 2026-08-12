@@ -230,7 +230,11 @@ export interface SerialSourceOptions {
 /** The reference firmware prints this on the e-stop's press edge. */
 export const DEFAULT_SERIAL_TRIGGER = "KILL";
 
-/** Cap the unterminated-line buffer so a wedged device can't grow it without bound. */
+/**
+ * Cap the unterminated-line buffer so a wedged device can't grow it without
+ * bound. Counted in UTF-16 code units after decoding, not incoming bytes —
+ * memory stays bounded either way (within a small constant factor).
+ */
 const SERIAL_BUFFER_CAP = 4096;
 
 function defaultSerialOpen(device: string): SerialPortStream {
@@ -253,7 +257,13 @@ function defaultSerialSchedule(fn: () => void, ms: number): CancelReconnect {
  */
 export function createSerialSource(opts: SerialSourceOptions): PressSource {
   const { device } = opts;
-  const trigger = opts.trigger ?? DEFAULT_SERIAL_TRIGGER;
+  // Trim to match the per-line trim below; refuse a trigger that could never
+  // match (multiline) or would match a BLANK line (empty) — an empty trigger
+  // would turn every keepalive newline into a press.
+  const trigger = (opts.trigger ?? DEFAULT_SERIAL_TRIGGER).trim();
+  if (trigger === "" || /[\r\n]/.test(trigger)) {
+    throw new Error("serial trigger must be a non-empty single line");
+  }
   const reconnectMs = opts.reconnectMs ?? 2_000;
   const openDevice = opts.open ?? defaultSerialOpen;
   const schedule = opts.schedule ?? defaultSerialSchedule;

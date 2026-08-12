@@ -168,6 +168,34 @@ describe("serial press source", () => {
     await source.stop();
   });
 
+  it("rejects an empty or multiline trigger (a blank line must never press)", () => {
+    expect(() => createSerialSource({ device: "/dev/fake", trigger: "" })).toThrow(
+      /non-empty single line/,
+    );
+    expect(() => createSerialSource({ device: "/dev/fake", trigger: "   " })).toThrow(
+      /non-empty single line/,
+    );
+    expect(() => createSerialSource({ device: "/dev/fake", trigger: "KILL\nNOW" })).toThrow(
+      /non-empty single line/,
+    );
+  });
+
+  it("trims a padded trigger so it can actually match the trimmed line", async () => {
+    const serial = new FakeSerial();
+    const source = createSerialSource({
+      device: "/dev/fake",
+      trigger: " STOP ",
+      open: () => serial,
+      reconnectMs: 0,
+    });
+    const presses = vi.fn();
+    source.onPress(presses);
+    await source.start();
+    serial.emit("data", Buffer.from("STOP\n"));
+    expect(presses).toHaveBeenCalledTimes(1);
+    await source.stop();
+  });
+
   it("honours a custom trigger and describes itself", async () => {
     const serial = new FakeSerial();
     const source = createSerialSource({
