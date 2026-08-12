@@ -86,6 +86,7 @@
   .wform input{flex:1;min-width:200px;font-family:var(--sans);font-size:15px;padding:12px 14px;
                border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink)}
   .wform input:focus{outline:2px solid var(--ink);outline-offset:-1px}
+  .wform .hp{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none}
   .wnote{font-family:var(--mono);font-size:13.5px;margin-top:14px;min-height:18px;
          opacity:0;transition:opacity .3s;line-height:1.5}
   .wnote.show{opacity:1}
@@ -170,7 +171,12 @@
     <div class="waitlist" id="waitlist">
       <h2>Get the STOP first.</h2>
       <p>The private beta opens in waves. Leave your email — we'll send an invite.</p>
-      <form class="wform" id="wform" action="https://formspree.io/f/moeadpok" method="POST">
+      <form class="wform" id="wform" action="https://api.web3forms.com/submit" method="POST">
+        <input type="hidden" name="access_key" value="WEB3FORMS_ACCESS_KEY">
+        <input type="hidden" name="subject" value="OwnerSwitch — new private-beta waitlist signup">
+        <input type="hidden" name="from_name" value="OwnerSwitch waitlist">
+        <!-- honeypot: real people never fill this; bots do (kept out of layout) -->
+        <input type="checkbox" name="botcheck" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true">
         <input type="email" name="email" placeholder="you@company.com" required aria-label="Email address">
         <button class="btn red" type="submit">Request an invite</button>
       </form>
@@ -262,17 +268,16 @@
       body: new FormData(form),
       headers: { 'Accept': 'application/json' }
     }).then(function(res){
-      if (res.ok){
-        form.style.display = 'none';
-        say('✓ You\'re on the list. Watch your inbox for an invite.', 'ok');
-      } else {
-        return res.json().then(function(data){
-          var m = (data && data.errors && data.errors.length)
-            ? data.errors.map(function(x){ return x.message; }).join(', ')
-            : 'Something went wrong. Please try again.';
-          say(m, 'err'); btn.disabled = false; btn.textContent = label;
-        });
-      }
+      return res.json().catch(function(){ return {}; }).then(function(data){
+        // Web3Forms returns { success: true } on accept, { success:false, message } on reject.
+        if (data && data.success){
+          form.style.display = 'none';
+          say('✓ You\'re on the list. Watch your inbox for an invite.', 'ok');
+        } else {
+          say((data && data.message) || 'Something went wrong. Please try again.', 'err');
+          btn.disabled = false; btn.textContent = label;
+        }
+      });
     }).catch(function(){
       say('Network error. Check your connection and try again.', 'err');
       btn.disabled = false; btn.textContent = label;
