@@ -13,6 +13,44 @@ import { DEVICE_SIG_LABEL, ENROLL_POP_LABEL } from "./types.js";
 const SHA256_LEN = 32;
 
 /**
+ * The design pins pathAndQuery as "the request path and query EXACTLY AS SENT
+ * (byte-exact, percent-encoding preserved)" — so the value signed here must
+ * BE serialized request-target bytes, not something that merely serializes to
+ * them. A raw-Unicode "/x?q=é" would UTF-8-sign bytes the wire never carries
+ * (it sends "/x?q=%C3%A9"), and lowercase percent-hex would let two spellings
+ * of one target both verify. Accepted: origin-form only — starts with "/",
+ * printable ASCII (no spaces, no controls, nothing above 0x7E), no "#"
+ * fragment, and every "%" beginning a complete UPPERCASE-hex escape (the
+ * canonical case, RFC 3986 §6.2.2.1, and what encodeURIComponent emits).
+ */
+function assertCanonicalPathAndQuery(pathAndQuery: string): void {
+  if (!pathAndQuery.startsWith("/")) {
+    throw new Error('pathAndQuery must be origin-form — it must start with "/"');
+  }
+  for (let i = 0; i < pathAndQuery.length; i++) {
+    const code = pathAndQuery.charCodeAt(i);
+    if (code < 0x21 || code > 0x7e) {
+      throw new Error(
+        "pathAndQuery must be the serialized request target: printable ASCII only, " +
+          "no spaces — percent-encode everything else exactly as it will be sent",
+      );
+    }
+  }
+  if (pathAndQuery.includes("#")) {
+    throw new Error("pathAndQuery must not carry a fragment — a fragment is never sent");
+  }
+  const escapes = pathAndQuery.matchAll(/%.{0,2}/g);
+  for (const m of escapes) {
+    if (!/^%[0-9A-F]{2}$/.test(m[0])) {
+      throw new Error(
+        `pathAndQuery has a non-canonical percent escape ${JSON.stringify(m[0])} — ` +
+          "escapes must be complete and uppercase-hex",
+      );
+    }
+  }
+}
+
+/**
  * Fields of a cheap-lane device signature (DESIGN.md §3, DEVICE_SIG_LABEL).
  * The preimage binds the method, the path AND query, and the body — so a
  * signature for `GET /veto/w1` is useless for `POST /veto/w1` or `GET /veto/w2`.
@@ -21,7 +59,12 @@ export interface DeviceSigFields {
   deviceId: string;
   /** HTTP method — signed upper-cased, so "get" and "GET" can never disagree. */
   method: string;
-  /** request path AND query, byte-exact as sent (percent-encoding preserved). */
+  /**
+   * Request path AND query, byte-exact as sent — the ALREADY-SERIALIZED
+   * origin-form request target: leading "/", printable ASCII only, no
+   * fragment, complete uppercase-hex percent escapes. Raw Unicode is
+   * refused: it would sign bytes the wire never carries.
+   */
   pathAndQuery: string;
   /**
    * SHA-256 of the EXACT body bytes (32 bytes). An empty body is the hash of
@@ -44,9 +87,10 @@ export function deviceSigPreimage(fields: DeviceSigFields): Uint8Array {
   if (fields.bodyHash.length !== SHA256_LEN) {
     throw new RangeError(`bodyHash must be a ${SHA256_LEN}-byte SHA-256 digest`);
   }
-  if (!Number.isInteger(fields.timestamp)) {
-    throw new RangeError("timestamp must be an integer (ms since epoch)");
+  if (!Number.isSafeInteger(fields.timestamp)) {
+    throw new RangeError("timestamp must be a safe integer (ms since epoch)");
   }
+  assertCanonicalPathAndQuery(fields.pathAndQuery);
   return lengthPrefixed([
     utf8(DEVICE_SIG_LABEL),
     utf8(fields.deviceId),

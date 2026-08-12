@@ -54,13 +54,23 @@ export function base64urlEncode(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** base64url decode (RFC 4648 §5); refuses non-alphabet input rather than guessing. */
+/**
+ * base64url decode (RFC 4648 §5) — CANONICAL: exactly one accepted encoding
+ * per byte string. Refuses non-alphabet input, impossible lengths (mod 4 = 1),
+ * and any encoding with non-zero unused pad bits ("AB", "-x", …) — those
+ * decode to the same bytes as their canonical spelling ("AA", "-w"), and two
+ * accepted spellings of one signed value is exactly the ambiguity this
+ * module exists to kill. Enforced by round-trip: re-encoding must reproduce
+ * the input byte-for-byte.
+ */
 export function base64urlDecode(text: string): Uint8Array {
   if (!BASE64URL.test(text)) throw new Error("invalid base64url");
+  if (text.length % 4 === 1) throw new Error("invalid base64url length");
   const padding = text.length % 4 === 0 ? "" : "=".repeat(4 - (text.length % 4));
   const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/") + padding);
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  if (base64urlEncode(out) !== text) throw new Error("non-canonical base64url");
   return out;
 }
 

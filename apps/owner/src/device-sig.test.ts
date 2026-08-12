@@ -42,6 +42,20 @@ describe("base64url", () => {
     expect(() => base64urlDecode("pad=ding")).toThrow(/base64url/);
     expect(() => base64urlDecode("plus+slash/")).toThrow(/base64url/);
   });
+
+  it("is canonically strict — one accepted spelling per byte string", () => {
+    // canonical spellings decode...
+    expect(hex(base64urlDecode("AA"))).toBe("00");
+    expect(hex(base64urlDecode("-w"))).toBe("fb");
+    // ...their pad-bit variants (same bytes, different spelling) are refused
+    expect(() => base64urlDecode("AB")).toThrow(/non-canonical/);
+    expect(() => base64urlDecode("AC")).toThrow(/non-canonical/);
+    expect(() => base64urlDecode("AD")).toThrow(/non-canonical/);
+    expect(() => base64urlDecode("-x")).toThrow(/non-canonical/);
+    // and a length that no byte string encodes to is refused outright
+    expect(() => base64urlDecode("A")).toThrow(/length/);
+    expect(() => base64urlDecode("AAAAB")).toThrow(/length/);
+  });
 });
 
 describe("sha256", () => {
@@ -93,9 +107,30 @@ describe("deviceSigPreimage", () => {
     expect(hex(withEmpty)).not.toBe(hex(deviceSigPreimage(base)));
   });
 
-  it("rejects a body hash that is not 32 bytes and a non-integer timestamp", () => {
+  it("rejects a body hash that is not 32 bytes and a non-safe-integer timestamp", () => {
     expect(() => deviceSigPreimage({ ...base, bodyHash: new Uint8Array(16) })).toThrow(/32-byte/);
     expect(() => deviceSigPreimage({ ...base, timestamp: 1.5 })).toThrow(/integer/);
+    expect(() => deviceSigPreimage({ ...base, timestamp: 2 ** 53 })).toThrow(/integer/);
+  });
+
+  it("accepts only the serialized ASCII request target for pathAndQuery", () => {
+    // canonical, already-percent-encoded targets sign
+    expect(() =>
+      deviceSigPreimage({ ...base, pathAndQuery: "/x?q=%C3%A9" }),
+    ).not.toThrow();
+    // raw Unicode would sign bytes the wire never carries ("/x?q=é" is SENT
+    // as "/x?q=%C3%A9") — refused, not silently UTF-8'd
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?q=é" })).toThrow(/ASCII/);
+    // lowercase percent-hex is a second spelling of the same target — refused
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?q=%c3%a9" })).toThrow(
+      /non-canonical percent/,
+    );
+    // incomplete escapes, fragments, spaces, and non-origin-form are refused
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?q=%C" })).toThrow(/percent/);
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?q=%ZZ" })).toThrow(/percent/);
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x#frag" })).toThrow(/fragment/);
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "/x?a b" })).toThrow(/ASCII/);
+    expect(() => deviceSigPreimage({ ...base, pathAndQuery: "veto/w1" })).toThrow(/origin-form/);
   });
 });
 
