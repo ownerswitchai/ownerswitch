@@ -14,7 +14,7 @@ const payload = (overrides: Partial<LicensePayload> = {}): LicensePayload => ({
   v: 1,
   jti: "lic_1",
   plan: "team",
-  licensee: "Grupa Rapid Kft.",
+  licensee: "Example Co.",
   issuedAt: 1_000,
   expiresAt: 1_000 + 365 * 86_400_000,
   ...overrides,
