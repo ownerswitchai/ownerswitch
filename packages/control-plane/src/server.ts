@@ -27,7 +27,7 @@ import {
   type DeviceCredential,
   type OwnerSession,
 } from "./auth.js";
-import { DeviceStandingFileStore } from "./device-standing.js";
+import { canonicalTrustedStandingPath, DeviceStandingFileStore } from "./device-standing.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
@@ -162,6 +162,15 @@ export interface ControlPlaneOptions {
    * granted — standing is positive authorization state.
    */
   ownerDeviceStandingGroupReadable?: boolean;
+  /**
+   * The numeric gid the published standing file must belong to — the
+   * escalation read-only group of the 0640 model, applied with fchown before
+   * the rename and VERIFIED after publication. Without it, fchmod(0640)
+   * grants read to whatever the control plane's default group happens to be,
+   * which is generally NOT the escalation service's group — the distinct-UID
+   * model would silently not exist. Env: OWNERSWITCH_OWNER_DEVICE_STANDING_GID.
+   */
+  ownerDeviceStandingGid?: number;
   /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
@@ -619,14 +628,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
   // The standing path is a SECURITY BOUNDARY (positive authorization state:
   // rewriting revokedAt to null resurrects a stolen phone), so production
-  // gets the same path discipline as the kill state; dev trusts the caller.
+  // gets the kill-state discipline PLUS the keys-file discipline: the
+  // directory-level checks, then realpath + a full trusted-ancestry walk,
+  // and the CANONICAL resolved path is what the store opens from then on —
+  // a post-boot rename or symlink swap of an ancestor cannot silently
+  // redirect the registry. Dev trusts the caller.
   const standingPath =
     opts.ownerDeviceStandingFile && opts.dev !== true
-      ? guardProtectedStatePath("device-standing", opts.ownerDeviceStandingFile)
+      ? canonicalTrustedStandingPath(
+          guardProtectedStatePath("device-standing", opts.ownerDeviceStandingFile),
+        )
       : (opts.ownerDeviceStandingFile ?? null);
   const standingStore = standingPath
     ? new DeviceStandingFileStore(standingPath, {
         fileMode: opts.ownerDeviceStandingGroupReadable === true ? 0o640 : 0o600,
+        ...(opts.ownerDeviceStandingGid !== undefined ? { group: opts.ownerDeviceStandingGid } : {}),
       })
     : null;
   // QUARANTINE: set whenever the registry on disk may disagree with memory in
@@ -725,6 +741,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * it is not re-read per decision. The escalation service is a READER only.
    */
   function witnessStanding(deviceId: string | null, generation: number | null): boolean {
+    // While KILLED, no witness stands: a kill may exist precisely because a
+    // revocation could not be persisted (see the revoke handler), so the
+    // post-restart process — where the in-memory quarantine is gone — must
+    // still refuse every release. Windows are additionally epoch-bound, but
+    // this keeps the evidence chain itself closed too.
+    if (killSwitch.killed) return false;
     if (standingQuarantined) return false;
     if (deviceId === null || generation === null) return false;
     const device = ownerDevices.get(deviceId);
@@ -1813,10 +1835,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // nothing to confirm. A live window we cannot render decision-completely
     // yields null too — it mints no delivery and, never delivered, fails
     // closed to held rather than releasing on silence. A QUARANTINED standing
-    // registry mints nothing either: an ack would be refused anyway, so the
-    // detail honestly renders without a delivery instead of arming one.
+    // registry mints nothing either, and neither does a KILLED control plane
+    // (a kill may exist because a revocation could not persist — see the
+    // revoke handler): an ack would be refused anyway, so the detail honestly
+    // renders without a delivery instead of arming one.
     const ackable =
-      !standingQuarantined && (status === "pending" || status === "extended")
+      !standingQuarantined && !killSwitch.killed && (status === "pending" || status === "extended")
         ? ackableContent(window)
         : null;
     const disp = displayEnvelope(window, ackable);
@@ -1891,14 +1915,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     const reject = (msg: string) => sendJson(res, 409, { error: msg });
     // While quarantined (a revocation exists that could not be durably
-    // persisted), NO evidence is accepted: the registry on disk may disagree
-    // with memory in the permissive direction, so the lane is closed until a
-    // persist succeeds — never a release built on standing a restart forgets.
-    if (standingQuarantined) {
+    // persisted) or KILLED (possibly BECAUSE of exactly that, persisted
+    // across the restart by the kill store), NO evidence is accepted: the
+    // registry on disk may disagree with memory in the permissive direction,
+    // so the lane is closed — never a release built on standing a restart
+    // forgets.
+    if (standingQuarantined || killSwitch.killed) {
       sendJson(res, 503, {
         error:
-          "the device-standing registry is quarantined (a revocation could not be durably " +
-          "persisted) — no delivery evidence is accepted until standing persistence recovers",
+          "no delivery evidence is accepted right now: the control plane is " +
+          (killSwitch.killed ? "KILLED" : "standing-quarantined (a revocation could not be durably persisted)") +
+          " — the owner-device lane reopens after recovery/restore",
       });
       return;
     }
@@ -2042,15 +2069,31 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // trusted. Then it persists to the standing registry, and the RESPONSE
     // tells the truth about which of those two states the system is in:
     //  - persisted durably → 200, done;
-    //  - persist FAILED with a registry configured → 503 + QUARANTINE. The
-    //    revocation is live in this process, but a restart would load the
-    //    stale file and resurrect the phone — so until a persist succeeds,
-    //    the whole owner-device lane is closed (no acks, no releases), and
-    //    the 503 makes the failure impossible to mistake for success. A
-    //    plain 200/durable:false proved too easy to read as "done".
+    //  - persist FAILED with a registry configured → 503 + QUARANTINE, and a
+    //    DURABLE KILL. The in-memory quarantine closes the lane in THIS
+    //    process, but it dies with the process — a supervisor restart would
+    //    load the stale (still-active) standing file and resurrect the
+    //    phone. So the failure also engages the kill switch, whose OWN store
+    //    is a separate, already-trusted path with a fail-closed degrade():
+    //    the next boot comes up KILLED, where no delivery is minted, no ack
+    //    is accepted, and no window releases (its epoch is superseded). The
+    //    operator repairs the registry, re-runs the revoke (idempotent, now
+    //    durable), and restores via 2GO — the kill reason names exactly this
+    //    sequence. The 503 makes the failure impossible to mistake for
+    //    success; a plain 200/durable:false proved too easy to read as done.
     const persisted = persistStanding();
     if (standingStore !== null && !persisted.durable) {
       standingQuarantined = true;
+      killSwitch.engage(
+        "api",
+        `device-standing persistence FAILED while revoking "${id}" (${persisted.detail ?? "unknown"}) — ` +
+          "fail-closed kill so a restart cannot resurrect the device from the stale registry. " +
+          "Repair the standing path, re-run the revoke, then restore via 2GO.",
+      );
+      // the same voids a kill from any other source performs (see postKill)
+      approvalChallenges.clear();
+      loginChallenges.clear();
+      restoreChallenges.clear();
       sendJson(res, 503, {
         revoked: true,
         deviceId: id,
@@ -2058,10 +2101,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         evidenceCleared,
         durable: false,
         quarantined: true,
+        killed: true,
         error:
           `revoked IN MEMORY ONLY — standing persistence failed (${persisted.detail ?? "unknown"}); ` +
-          "the owner-device lane is quarantined (no evidence accepted, no release on silence) until " +
-          "a retry of this revoke persists durably",
+          "the owner-device lane is quarantined and the KILL SWITCH is engaged (durably), so a " +
+          "restart boots killed instead of resurrecting the device. Repair the registry, retry " +
+          "this revoke, then restore via 2GO.",
       });
       return;
     }

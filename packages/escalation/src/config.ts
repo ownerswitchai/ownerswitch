@@ -46,6 +46,15 @@ export interface EscalationEnvConfig {
    * control plane. A corrupt registry reads as ALL devices revoked.
    */
   ownerDeviceStandingFile?: string;
+  /**
+   * The control plane's uid, for the distinct-UID model: the standing path's
+   * real ancestry must be owned by root, THIS process, or this explicitly
+   * named uid (never guessed from the filesystem). Unset when CP and
+   * escalation share a user. Env: OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID.
+   */
+  ownerDeviceStandingTrustedUid?: number;
+  /** test-only: skip the trusted-ancestry walk (public tmp roots fail it by design) */
+  unsafeAllowUntrustedStandingPathForTests?: boolean;
   /** where the webhook server listens */
   listenHost: string;
   listenPort: number;
@@ -249,6 +258,15 @@ export function escalationConfigFromEnv(
   }
 
   const ownerDeviceStandingFile = standingFileEnv;
+  const trustedUidRaw = env.OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID?.trim();
+  let ownerDeviceStandingTrustedUid: number | undefined;
+  if (trustedUidRaw !== undefined && trustedUidRaw !== "") {
+    const parsed = Number(trustedUidRaw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID must be a non-negative integer uid");
+    }
+    ownerDeviceStandingTrustedUid = parsed;
+  }
   return {
     controlPlaneUrl,
     device,
@@ -256,6 +274,7 @@ export function escalationConfigFromEnv(
     ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
       ? { ownerDeviceStandingFile }
       : {}),
+    ...(ownerDeviceStandingTrustedUid !== undefined ? { ownerDeviceStandingTrustedUid } : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),

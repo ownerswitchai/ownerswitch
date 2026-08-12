@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
 import {
+  canonicalTrustedStandingPath,
   DeviceStandingFileStore,
   enrolledOwnerDeviceFromSpki,
   signDeviceRequest,
@@ -90,9 +91,22 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   //  - CORRUPT → untrusted, everyone.
   // Fail closed in every branch: alerts stop, stop paths (SMS, voice, the
   // veto relay) are untouched.
+  // The path is canonicalized and its REAL ancestry proven trusted before
+  // first use — the reader must not follow a swapped ancestor to an
+  // attacker's registry any more than the writer may (the distinct-UID
+  // model names the control plane's uid explicitly via config).
   const standingStore =
     cfg.ownerDeviceStandingFile !== undefined
-      ? new DeviceStandingFileStore(cfg.ownerDeviceStandingFile)
+      ? new DeviceStandingFileStore(
+          canonicalTrustedStandingPath(cfg.ownerDeviceStandingFile, {
+            ...(cfg.ownerDeviceStandingTrustedUid !== undefined
+              ? { alsoTrustUids: [cfg.ownerDeviceStandingTrustedUid] }
+              : {}),
+            ...(cfg.unsafeAllowUntrustedStandingPathForTests === true
+              ? { unsafeAllowUntrustedAncestryForTests: true }
+              : {}),
+          }),
+        )
       : null;
   function deviceInGoodStanding(deviceId: string): boolean {
     if (standingStore === null) return true;

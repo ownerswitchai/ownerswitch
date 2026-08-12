@@ -2,7 +2,11 @@ import { mkdtempSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DeviceStandingFileStore, type PersistedDeviceStanding } from "./device-standing.js";
+import {
+  canonicalTrustedStandingPath,
+  DeviceStandingFileStore,
+  type PersistedDeviceStanding,
+} from "./device-standing.js";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
 
@@ -71,6 +75,32 @@ describe("DeviceStandingFileStore — durable revocation standing", () => {
     expect(statSync(sharedStore.markerPath).mode & 0o777).toBe(0o640);
     // group WRITE is never granted in either model
     expect(statSync(join(dirB, "standing.json")).mode & 0o022).toBe(0);
+  });
+
+  it("pins the file to an EXPLICIT gid (fchown before rename) and verifies the published boundary", () => {
+    const gid = typeof process.getgid === "function" ? process.getgid() : 0;
+    const dir = tmp();
+    const file = join(dir, "standing.json");
+    const store = new DeviceStandingFileStore(file, { fileMode: 0o640, group: gid });
+    const saved = store.save(state({ d: { generation: 1, revokedAt: null } }));
+    expect(saved.durable).toBe(true);
+    const published = statSync(file);
+    expect(published.gid).toBe(gid);
+    expect(published.mode & 0o777).toBe(0o640);
+    // the marker carries the same pinned mode (the fchmod the review found missing)
+    expect(statSync(store.markerPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("canonicalTrustedStandingPath REFUSES a chain with an untrusted-writable ancestor (public /tmp)", () => {
+    // tmpdir chains through /tmp (mode 1777): a world-writable ancestor lets
+    // the registry be replaced wholesale, so the walk refuses it
+    const file = join(tmp(), "standing.json");
+    expect(() => canonicalTrustedStandingPath(file)).toThrow(/world-writable|group- or world-writable/);
+    // relative paths never reach the walk
+    expect(() => canonicalTrustedStandingPath("relative/standing.json")).toThrow(/absolute/);
+    // the test escape hatch resolves the CANONICAL path (realpathed parent)
+    const canonical = canonicalTrustedStandingPath(file, { unsafeAllowUntrustedAncestryForTests: true });
+    expect(canonical.endsWith("/standing.json")).toBe(true);
   });
 
   it("refuses a symlink planted at the standing path", () => {

@@ -112,6 +112,17 @@ function main(): void {
   // 0640 publication for the distinct-UID model (escalation in a dedicated
   // read-only group); default 0600 when CP and escalation share a user.
   const standingGroupReadable = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE === "1";
+  // The escalation read-only group's numeric gid — fchowned onto the file
+  // before publication and verified after; without it, 0640 grants read to
+  // whatever the CP's default group is, not the escalation service's.
+  const standingGidRaw = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_GID?.trim();
+  let standingGid: number | undefined;
+  if (standingGidRaw !== undefined && standingGidRaw !== "") {
+    standingGid = Number(standingGidRaw);
+    if (!Number.isInteger(standingGid) || standingGid < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_GID must be a non-negative integer gid");
+    }
+  }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -168,6 +179,7 @@ function main(): void {
       ? { ownerDeviceStandingFile }
       : {}),
     ...(standingGroupReadable ? { ownerDeviceStandingGroupReadable: true } : {}),
+    ...(standingGid !== undefined ? { ownerDeviceStandingGid: standingGid } : {}),
     killStateFile,
     dev: false,
     grantKey,

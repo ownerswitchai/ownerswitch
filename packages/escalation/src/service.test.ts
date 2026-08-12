@@ -313,7 +313,11 @@ describe("escalation service against a live control plane", () => {
     const standingFile = join(dir, "standing.json");
     const push = fakePush();
     const service = createEscalationService({
-      config: { ...baseConfig("http://127.0.0.1:1", stateFile), ownerDeviceStandingFile: standingFile },
+      config: {
+        ...baseConfig("http://127.0.0.1:1", stateFile),
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
       channels: { push: push.channel },
       now: c.now,
       log: () => {},
@@ -402,12 +406,34 @@ describe("escalation service against a live control plane", () => {
     });
     const push = fakePush();
     const service = createEscalationService({
-      config: { ...baseConfig("http://127.0.0.1:1", stateFile), ownerDeviceStandingFile: standingFile },
+      config: {
+        ...baseConfig("http://127.0.0.1:1", stateFile),
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
       channels: { push: push.channel },
       now: c.now,
       log: () => {},
     });
     expect(service.subscription()).toBeNull(); // fail closed: re-enrollment stamps it
+  });
+
+  it("PATH BOUNDARY: the reader refuses a standing path whose real ancestry is untrusted", () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const push = fakePush();
+    // no unsafe test flag: the canonical walk runs and /tmp (1777) refuses
+    expect(() =>
+      createEscalationService({
+        config: {
+          ...baseConfig("http://127.0.0.1:1", join(dir, "state.json")),
+          ownerDeviceStandingFile: join(dir, "standing.json"),
+        },
+        channels: { push: push.channel },
+        now: c.now,
+        log: () => {},
+      }),
+    ).toThrow(/world-writable|group- or world-writable/);
   });
 
   it("PRODUCTION GUARD: owner device keys without the standing registry refuse to start", () => {

@@ -2656,6 +2656,15 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       expect(() =>
         createControlPlane({ ...base, ownerDeviceStandingFile: join(process.cwd(), "standing.json") }),
       ).toThrow(/working directory/);
+      // and past the directory checks, the FULL real-ancestry walk runs: a
+      // chain through world-writable /tmp is refused even though the
+      // immediate parent (mkdtemp, 0700, owned) looks fine
+      expect(() =>
+        createControlPlane({
+          ...base,
+          ownerDeviceStandingFile: join(mkdtempSync(join(tmpdir(), "ownerswitch-standing-")), "standing.json"),
+        }),
+      ).toThrow(/world-writable|group- or world-writable/);
     } finally {
       console.error = silenced;
     }
@@ -2734,12 +2743,17 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     rmSync(join(dir, "sub"), { recursive: true, force: true });
     writeFileSync(join(dir, "sub"), "not a directory");
 
-    // the revoke is HONEST about the state: 503, revoked in memory, quarantined
+    // the revoke is HONEST about the state: 503, revoked in memory,
+    // quarantined — and the DURABLE kill switch engaged (v11): the failure
+    // must survive a restart, so it is recorded in the kill store, not only
+    // in this process's memory
     const failed = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
     expect(failed.status).toBe(503);
     const failedBody = (await failed.json()) as Record<string, unknown>;
     expect(failedBody.revoked).toBe(true);
     expect(failedBody.quarantined).toBe(true);
+    expect(failedBody.killed).toBe(true);
+    expect(cp.killSwitch.killed).toBe(true);
     expect(cp.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
 
     // the WHOLE lane is closed while quarantined — for the UN-REVOKED device
@@ -2776,8 +2790,8 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     c.advance(4 * 60_000 + 1);
     expect(window.tick()).not.toBe("released");
 
-    // RECOVERY: restore the directory, retry the (idempotent) revoke — the
-    // persist now lands durably and the quarantine lifts
+    // RECOVERY step 1: restore the directory, retry the (idempotent) revoke —
+    // the persist now lands durably and the standing quarantine lifts
     rmSync(join(dir, "sub"));
     const retried = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
     expect(retried.status).toBe(200);
@@ -2787,12 +2801,16 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       expect(onDisk.state.devices["owner-app"]?.revokedAt).not.toBeNull();
     }
 
-    // the lane is open again: device B can fetch a fresh window's delivery
+    // RECOVERY step 2 is the owner's, not this test's: the kill engaged by
+    // the failed persist stays in force until a 2GO restore — so the lane
+    // remains CLOSED even though standing is durable again. Deliberate: the
+    // failure was a security event; reopening is a human ceremony.
+    expect(cp.killSwitch.killed).toBe(true);
     const window2 = openWindow(cp, c, "v-post");
     void window2;
     const after = await bFetchDetail("v-post");
     expect(after.res.status).toBe(200);
-    expect(typeof after.detail.deliveryId).toBe("string");
+    expect(after.detail.deliveryId).toBeNull(); // still killed → still no delivery
   });
 
   it("DECISION-POINT CAS on a server-registered window: a sweep-bypassing revocation still cannot release", async () => {
@@ -2827,6 +2845,105 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     c.advance(4 * 60_000 + 1);
     expect(window.tick()).toBe("extended"); // NOT released
     expect(window.isDelivered).toBe(false);
+  });
+
+  it("DURABLE KILL on failed revoke persist: even a restart onto STALE-ACTIVE standing yields zero delivery/ack/release", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "sub", "standing.json");
+    const killFile = join(dir, "kill-state.json");
+    const silence = () => {
+      const original = console.error;
+      console.error = () => {};
+      return () => (console.error = original);
+    };
+
+    // first process: real (dev-mode) kill persistence + standing registry
+    let restore = silence();
+    let cp1;
+    try {
+      cp1 = createControlPlane({
+        now: c.now,
+        dev: true,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        ownerDeviceStandingFile: standingFile,
+        killStateFile: killFile,
+        acceptSessionOnlyApprovalRisk: true,
+      });
+    } finally {
+      restore();
+    }
+    const url1 = await start(cp1);
+
+    // break standing persistence AFTER boot init (dir/sub becomes a file)
+    rmSync(join(dir, "sub"), { recursive: true, force: true });
+    writeFileSync(join(dir, "sub"), "not a directory");
+
+    // the failed-persist revoke engages the DURABLE kill switch
+    const failed = await fetch(`${url1}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(failed.status).toBe(503);
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+    expect(failedBody.killed).toBe(true);
+    expect(cp1.killSwitch.killed).toBe(true);
+    server?.close();
+    server = undefined;
+
+    // model the review's exact scenario: the DISK kept the STALE, still-ACTIVE
+    // standing (the revocation never landed there)
+    rmSync(join(dir, "sub"));
+    new DeviceStandingFileStore(standingFile).save({
+      version: 1,
+      devices: { "owner-app": { generation: 1, revokedAt: null } },
+    });
+
+    // second process: standing loads ACTIVE — but the kill store remembers
+    restore = silence();
+    let cp2;
+    try {
+      cp2 = createControlPlane({
+        now: c.now,
+        dev: true,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        ownerDeviceStandingFile: standingFile,
+        killStateFile: killFile,
+        acceptSessionOnlyApprovalRisk: true,
+      });
+    } finally {
+      restore();
+    }
+    expect(cp2.killSwitch.killed).toBe(true); // the kill survived the restart
+    expect(cp2.ownerDevices.get("owner-app")?.revokedAt).toBeNull(); // stale-active, as feared
+    const url2 = await start(cp2);
+    openWindow(cp2, c);
+
+    // ZERO delivery: the detail mints nothing while killed
+    const { res, detail } = await fetchDetail(url2, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(detail.deliveryId).toBeNull();
+    // ZERO ack: /seen is closed while killed
+    const p = "/veto/v-1/seen";
+    const seen = await fetch(`${url2}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, "", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(503);
+    // ZERO release: the witness check refuses everything while killed —
+    // even artificially delivered evidence cannot release
+    const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
+    const reg = await fetch(`${url2}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    const { id } = (await reg.json()) as { id: string };
+    const window2 = cp2.vetoWindows.get(id);
+    if (window2 === undefined) throw new Error("window not registered");
+    window2.markDelivered("owner-app", 1); // even if evidence somehow existed
+    c.advance(4 * 60_000 + 1);
+    expect(window2.tick()).not.toBe("released");
   });
 
   it("device-signed POST /veto/:id relays a channel stop with honest attribution, idempotently", async () => {
