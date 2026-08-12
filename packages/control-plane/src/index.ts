@@ -41,4 +41,11 @@ export {
   verifyDeviceSignature,
   verifyOwnerSession,
 } from "./auth.js";
+
+export { enrolledOwnerDeviceFromSpki, verifyOwnerDeviceSignature } from "./owner-device.js";
+export type {
+  EnrolledOwnerDevice,
+  OwnerDeviceCredential,
+  OwnerDeviceVerifyOptions,
+} from "./owner-device.js";
 export type { DeviceCredential, DeviceVerifyOptions, OwnerSession, SessionOptions } from "./auth.js";

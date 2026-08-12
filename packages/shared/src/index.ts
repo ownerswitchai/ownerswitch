@@ -69,3 +69,11 @@ export type {
   SignedMergeGrant,
   VerifyGrantOptions,
 } from "./merge-grant.js";
+export {
+  assertCanonicalPathAndQuery,
+  lengthPrefixed,
+  OWNER_DEVICE_SIG_LABEL,
+  ownerDeviceSigPreimage,
+  utf8,
+} from "./owner-device-sig.js";
+export type { OwnerDeviceSigFields } from "./owner-device-sig.js";
