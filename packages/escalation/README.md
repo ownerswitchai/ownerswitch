@@ -50,7 +50,8 @@ cannot extend: its entire write surface is the deny direction.
 | variable | required | meaning |
 | --- | --- | --- |
 | `OWNERSWITCH_CONTROL_PLANE_URL` | no (default `http://127.0.0.1:4181`) | the control plane |
-| `OWNERSWITCH_DEVICE_SECRET` | yes | shared device-HMAC secret |
+| `OWNERSWITCH_DEVICE_SECRET` | yes | shared fleet device-HMAC secret (poll + veto relay) |
+| `OWNERSWITCH_OWNER_APP_SECRET` | for push enrollment | the owner app's OWN secret, distinct from the fleet secret — gates `POST /push/subscription` so no fleet-secret holder can redirect the owner's push channel; absent → enrollment is 501 |
 | `OWNERSWITCH_ESCALATION_DEVICE_ID` | no (default `escalation`) | this service's device id |
 | `OWNERSWITCH_VAPID_PUBLIC_KEY` / `_PRIVATE_KEY` / `_SUBJECT` | for push | mint with `ownerswitch-escalation vapid-keys` |
 | `OWNERSWITCH_ESCALATION_STATE_FILE` | with push | 0600 push-subscription store |

@@ -71,9 +71,12 @@ const TWILIO = {
   to: "+36301234567",
 };
 
+const OWNER_APP_SECRET = "owner-app-shared-secret";
+
 const baseConfig = (cpUrl: string, stateFile: string): EscalationEnvConfig => ({
   controlPlaneUrl: cpUrl,
   device: { id: "escalation", secret: DEVICE_SECRET },
+  ownerAppSecret: OWNER_APP_SECRET,
   listenHost: "127.0.0.1",
   listenPort: 0,
   webhookBaseUrl: "https://esc.example",
@@ -228,7 +231,7 @@ describe("escalation service against a live control plane", () => {
     expect(window.state).toBe("pending");
   });
 
-  it("push subscription enrollment is device-signed and persisted 0600; bad signatures get 401", async () => {
+  it("push enrollment requires the OWNER-APP secret (not the fleet secret), persists 0600, refuses replays", async () => {
     const { c, service, stateFile } = await setup();
     const url = await listen(service.webhookHandler, servers);
     const subscription = {
@@ -237,48 +240,58 @@ describe("escalation service against a live control plane", () => {
     };
     const body = JSON.stringify({ subscription });
 
+    const enroll = (secret: string, nonce: string, at = c.now()) =>
+      fetch(`${url}/push/subscription`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-device-id": "owner-app",
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce }, body, secret),
+        },
+        body,
+      });
+
     const unsigned = await fetch(`${url}/push/subscription`, { method: "POST", body });
     expect(unsigned.status).toBe(401);
     expect(service.subscription()).toBeNull();
 
-    const timestamp = c.now();
-    const signed = await fetch(`${url}/push/subscription`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-device-id": "owner-app",
-        "x-device-timestamp": String(timestamp),
-        "x-device-nonce": "n-1",
-        "x-device-signature": signDeviceRequest(
-          { deviceId: "owner-app", timestamp, nonce: "n-1" },
-          body,
-          DEVICE_SECRET,
-        ),
-      },
-      body,
-    });
+    // the FLEET device secret (which this escalation service itself holds)
+    // must NOT be able to redirect the owner's push channel
+    const viaFleet = await enroll(DEVICE_SECRET, "fleet-1");
+    expect(viaFleet.status).toBe(401);
+    expect(service.subscription()).toBeNull();
+
+    // the owner-app secret enrolls
+    const signed = await enroll(OWNER_APP_SECRET, "n-1");
     expect(signed.status).toBe(200);
     expect(service.subscription()).toEqual(subscription);
     expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription });
     expect(statSync(stateFile).mode & 0o777).toBe(0o600);
 
     // a replayed enrollment (same nonce) is refused
-    const replay = await fetch(`${url}/push/subscription`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-device-id": "owner-app",
-        "x-device-timestamp": String(timestamp),
-        "x-device-nonce": "n-1",
-        "x-device-signature": signDeviceRequest(
-          { deviceId: "owner-app", timestamp, nonce: "n-1" },
-          body,
-          DEVICE_SECRET,
-        ),
-      },
-      body,
-    });
+    const replay = await enroll(OWNER_APP_SECRET, "n-1");
     expect(replay.status).toBe(401);
+  });
+
+  it("with no owner-app secret configured, push enrollment is 501", async () => {
+    const c = clock();
+    const push = fakePush();
+    const stateFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-esc-")), "state.json");
+    const { ownerAppSecret: _drop, ...noOwnerApp } = baseConfig("http://127.0.0.1:1", stateFile);
+    const service = createEscalationService({
+      config: noOwnerApp,
+      channels: { push: push.channel },
+      now: c.now,
+      log: () => {},
+    });
+    const url = await listen(service.webhookHandler, servers);
+    const res = await fetch(`${url}/push/subscription`, {
+      method: "POST",
+      body: JSON.stringify({ subscription: {} }),
+    });
+    expect(res.status).toBe(501);
   });
 
   it("an unreachable control plane pauses the ladder instead of crashing it", async () => {

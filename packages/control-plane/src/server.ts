@@ -84,10 +84,13 @@ import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
  *                     a session may approve) OR device signature (deny-only:
  *                     the escalation ladder's relayed channel stops and the
  *                     owner app's one-tap veto; idempotent on re-veto).
- *  - POST /veto/:id/seen — device signature required, no other variant; the
- *                     enrolled device's delivery ack — the production caller
- *                     of markDelivered(). Refused inside the 60 s response
- *                     floor before the deadline (MIN_VETO_RESPONSE_MS).
+ *  - POST /veto/:id/seen — OWNER-APP signature required (ownerAppSecret, a
+ *                     distinct credential from the fleet deviceSecret — this
+ *                     is the permissive delivered bit, so no fleet component
+ *                     or same-uid agent may forge it); 501 when no owner-app
+ *                     secret is enrolled. The production caller of
+ *                     markDelivered(). Refused inside the 60 s response floor
+ *                     before the deadline (MIN_VETO_RESPONSE_MS).
  *  - GET  /veto/pending — device signature required; the open-window listing
  *                     the escalation ladder polls, with deadlines and
  *                     delivered bits.
@@ -104,6 +107,25 @@ export interface ControlPlaneOptions {
   now?: () => number;
   /** Shared secret the physical button / kill triggers sign requests with. */
   deviceSecret?: string;
+  /**
+   * The OWNER APP's OWN device secret — a DISTINCT credential from
+   * `deviceSecret`, provisioned only to the enrolled owner app and held by
+   * nothing else (not the gateway, not the button, not the escalation
+   * service). It authenticates exactly one thing: the delivery ack
+   * (`POST /veto/:id/seen`), which flips the permissive `delivered` bit that
+   * lets silence RELEASE a window (veto.ts). That bit is the one place the
+   * veto lane trusts a device to speak for the owner, so it must not ride
+   * the fleet-wide `deviceSecret` — under the same-uid threat model an agent
+   * can forge that (packages/mcp/THREAT-MODEL.md), and forging the ack would
+   * silently convert "held, owner-gated" into "released, runs" while also
+   * standing the escalation ladder down. Absent → `/veto/:id/seen` is 501 and
+   * delivery confirmation stays UNWIRED: every untouched window walks
+   * pending → extended → held → passkey approval, the fail-closed default
+   * (exactly the pre-escalation behavior). The deny-only device endpoints
+   * (`/kill`, the veto relay, `/veto/pending`, the pacing read) keep using
+   * `deviceSecret`: their worst case is a stop, so a forged one is safe.
+   */
+  ownerAppSecret?: string;
   /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
@@ -583,10 +605,29 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * attributed to the relaying credential.
    */
   function validDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
-    if (opts.deviceSecret === undefined) return null;
+    return validSignatureAgainst(req, rawBody, opts.deviceSecret);
+  }
+
+  /**
+   * The deviceId behind a valid signature made with the OWNER APP's own
+   * secret — the only credential that may drive a PERMISSIVE outcome
+   * (`markDelivered()`). Verified against `ownerAppSecret`, never the
+   * fleet `deviceSecret`, so a fleet-secret holder (a same-uid agent, the
+   * gateway, the escalation service) cannot forge the owner's "I saw it".
+   */
+  function validOwnerAppDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
+    return validSignatureAgainst(req, rawBody, opts.ownerAppSecret);
+  }
+
+  function validSignatureAgainst(
+    req: IncomingMessage,
+    rawBody: string,
+    secret: string | undefined,
+  ): string | null {
+    if (secret === undefined) return null;
     const credential = deviceCredentialFrom(req);
     if (credential === null) return null;
-    return verifyDeviceSignature(credential, rawBody, opts.deviceSecret, { now, seenNonces })
+    return verifyDeviceSignature(credential, rawBody, secret, { now, seenNonces })
       ? credential.deviceId
       : null;
   }
@@ -1375,11 +1416,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   /**
    * POST /veto/:id/seen — the production caller of markDelivered(), and the
    * ONLY caller (escalation DESIGN.md §3): the enrolled device reports the
-   * alert was rendered in front of a human. Strictly device-signed — no
-   * session variant, no open variant — because this is the PERMISSIVE bit of
-   * the veto lane: it is what lets silence release a held call, so it must
-   * ride the one path the telephony provider never touches. Nothing a
-   * carrier, a webhook, or an owner session asserts may flip it.
+   * alert was rendered in front of a human. Authenticated with the OWNER
+   * APP's own secret (`ownerAppSecret`), NEVER the fleet `deviceSecret` —
+   * this is the PERMISSIVE bit of the veto lane (it lets silence release a
+   * held call), so it must ride a credential no fleet component and no
+   * same-uid agent holds. Nothing a carrier, a webhook, an owner session, or
+   * a fleet-signed request may flip it.
+   *
+   * When no owner-app secret is enrolled the endpoint is 501 and delivery
+   * confirmation stays UNWIRED — every window then walks to held → passkey
+   * approval, the fail-closed default, rather than trusting a weaker
+   * credential to speak for the owner.
    *
    * A last-second ack must never convert straight into a release the owner
    * had no time to answer: inside the response floor (60 s before the
@@ -1388,7 +1435,16 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    */
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    const deviceId = validDeviceIdFrom(req, raw);
+    if (opts.ownerAppSecret === undefined) {
+      sendJson(res, 501, {
+        error:
+          "delivery confirmation is not wired: no owner-app credential is enrolled on this control " +
+          "plane, so no device may flip the release-permitting 'delivered' bit — windows walk to " +
+          "held (passkey approval) instead. Provision ownerAppSecret (OWNERSWITCH_OWNER_APP_SECRET).",
+      });
+      return;
+    }
+    const deviceId = validOwnerAppDeviceIdFrom(req, raw);
     if (deviceId === null) {
       sendUnauthorized(res);
       return;

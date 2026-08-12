@@ -25,6 +25,15 @@ import type { LadderRung, RateLimits } from "./types.js";
 export interface EscalationEnvConfig {
   controlPlaneUrl: string;
   device: { id: string; secret: string };
+  /**
+   * The OWNER APP's own secret (distinct from `device.secret`), required to
+   * enroll a push subscription (POST /push/subscription). Enrollment picks
+   * who receives every future alert, so it must not ride the fleet device
+   * secret the escalation service itself holds — otherwise a fleet-secret
+   * holder could redirect the owner's push channel to their own endpoint.
+   * Absent → enrollment is 501 and no subscription can be set over HTTP.
+   */
+  ownerAppSecret?: string;
   /** where the webhook server listens */
   listenHost: string;
   listenPort: number;
@@ -68,6 +77,15 @@ export function escalationConfigFromEnv(
     secret: requireEnv(env, "OWNERSWITCH_DEVICE_SECRET"),
   };
   if (device.id.includes(".")) throw new Error('OWNERSWITCH_ESCALATION_DEVICE_ID must not contain "."');
+
+  const ownerAppSecret = env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
+  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === device.secret) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner app's " +
+        "push-enrollment credential is deliberately separate from the fleet device secret the " +
+        "escalation service holds",
+    );
+  }
 
   const sid = env.OWNERSWITCH_TWILIO_ACCOUNT_SID;
   const twilioVars = [
@@ -165,6 +183,7 @@ export function escalationConfigFromEnv(
   return {
     controlPlaneUrl,
     device,
+    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),

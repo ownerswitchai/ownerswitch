@@ -76,6 +76,20 @@ function main(): void {
   const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
   const host = process.env.OWNERSWITCH_CONTROL_PLANE_HOST ?? "127.0.0.1";
   const deviceSecret = required("OWNERSWITCH_DEVICE_SECRET");
+  // The owner app's OWN secret — distinct from the fleet device secret, and
+  // the only credential that may flip the release-permitting delivered bit
+  // (POST /veto/:id/seen). Optional: absent, delivery confirmation is 501 and
+  // windows walk to passkey approval (fail closed). It must NOT equal the
+  // fleet secret — that would re-merge the two credential classes the split
+  // exists to keep apart.
+  const ownerAppSecret = process.env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
+  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === deviceSecret) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner-app " +
+        "delivery-ack credential is deliberately separate from the fleet device secret; reusing the " +
+        "fleet secret lets any fleet component (or a same-uid agent) forge the owner's 'I saw it'",
+    );
+  }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -127,6 +141,7 @@ function main(): void {
   // assertion. A misconfiguration refuses to start with a named reason.
   const controlPlane = createControlPlane({
     deviceSecret,
+    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
     killStateFile,
     dev: false,
     grantKey,

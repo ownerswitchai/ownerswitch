@@ -266,11 +266,27 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
       return;
     }
 
-    // enrollment: the owner app registers its push subscription,
-    // device-signed — an unauthenticated endpoint here would let anyone
-    // become the recipient of every future alert
+    // enrollment: the owner app registers its push subscription, signed with
+    // the OWNER APP's own secret — NOT the fleet device secret this service
+    // holds. Enrollment picks who receives every future alert, so gating it
+    // on the fleet secret would let any fleet-secret holder redirect the
+    // owner's push channel to their own endpoint. Absent an owner-app secret,
+    // enrollment is simply unavailable (501).
     if (method === "POST" && path === "/push/subscription") {
-      if (!validDeviceSignature(req, rawBody)) {
+      if (cfg.ownerAppSecret === undefined) {
+        send(
+          res,
+          501,
+          "application/json",
+          JSON.stringify({
+            error:
+              "push enrollment is not available: no owner-app credential is configured " +
+              "(OWNERSWITCH_OWNER_APP_SECRET)",
+          }),
+        );
+        return;
+      }
+      if (!validSignature(req, rawBody, cfg.ownerAppSecret)) {
         send(res, 401, "application/json", JSON.stringify({ error: "unauthorized" }));
         return;
       }
@@ -344,7 +360,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     send(res, 200, "text/xml", `<?xml version="1.0" encoding="UTF-8"?><Response/>`);
   }
 
-  function validDeviceSignature(req: IncomingMessage, rawBody: string): boolean {
+  function validSignature(req: IncomingMessage, rawBody: string, secret: string): boolean {
     const header = (name: string) => {
       const value = req.headers[name];
       return Array.isArray(value) ? value[0] : value;
@@ -357,7 +373,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     return verifyDeviceSignature(
       { deviceId, timestamp: Number(timestamp), nonce, signature },
       rawBody,
-      cfg.device.secret,
+      secret,
       { now, seenNonces },
     );
   }

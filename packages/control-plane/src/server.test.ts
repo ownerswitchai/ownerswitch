@@ -21,6 +21,7 @@ const clock = (start = 0) => {
 };
 
 const DEVICE_SECRET = "button-secret";
+const OWNER_APP_SECRET = "owner-app-secret";
 
 /** Headers for a device-signed request over `body`, signed "now". */
 const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
@@ -32,6 +33,23 @@ const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random(
     { deviceId: "btn-1", timestamp: at, nonce },
     body,
     DEVICE_SECRET,
+  ),
+});
+
+/** Headers signed with the OWNER APP's own secret — the delivery-ack credential. */
+const ownerAppHeaders = (
+  body: string,
+  at: number,
+  nonce = `oa-${at}-${Math.random().toString(36).slice(2)}`,
+) => ({
+  "content-type": "application/json",
+  "x-device-id": "owner-app",
+  "x-device-timestamp": String(at),
+  "x-device-nonce": nonce,
+  "x-device-signature": signDeviceRequest(
+    { deviceId: "owner-app", timestamp: at, nonce },
+    body,
+    OWNER_APP_SECRET,
   ),
 });
 
@@ -1913,15 +1931,15 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     return window;
   };
 
-  it("POST /veto/:id/seen (device-signed) flips delivered, records the device, and silence then releases", async () => {
+  it("POST /veto/:id/seen (owner-app-signed) flips delivered, records the device, and silence then releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -1931,16 +1949,55 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       deadline: 1_000 + 4 * 60_000,
     });
     expect(window.isDelivered).toBe(true);
-    expect(window.deliveredBy).toBe("btn-1");
+    expect(window.deliveredBy).toBe("owner-app");
     expect(window.deliveredAt).toBe(c.now());
 
     c.advance(4 * 60_000);
     expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "released" });
   });
 
+  it("the FLEET device secret cannot flip the permissive bit — only the owner-app secret", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // a valid FLEET-signed request (the gateway's / a same-uid agent's
+    // credential) is rejected: it may stop, never confirm-delivered
+    const viaFleet = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: deviceHeaders("", c.now()),
+      body: "",
+    });
+    expect(viaFleet.status).toBe(401);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("with no owner-app secret enrolled, /veto/:id/seen is 501 and delivery stays unwired (fail closed)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET }); // no ownerAppSecret
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(501);
+    expect(((await res.json()) as { error: string }).error).toMatch(/not wired/);
+    expect(window.isDelivered).toBe(false);
+
+    // and the window then walks to held, never released, on silence
+    c.advance(4 * 60_000);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000);
+    expect(window.tick()).toBe("held");
+  });
+
   it("POST /veto/:id/seen without a valid signature -> 401; no session variant exists", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
@@ -1961,14 +2018,14 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("an ack inside the 60 s response floor is refused and the window extends, never releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
     c.advance(4 * 60_000 - 30_000); // 30 s before the deadline — inside the floor
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(res.status).toBe(409);
@@ -1981,7 +2038,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     // against the NEW deadline there is time again; the re-ack counts
     const again = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(again.status).toBe(200);
@@ -1990,14 +2047,14 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("re-acking a delivered window is an idempotent success; a terminal window refuses", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
     const url = await start(cp);
     const window = openWindow(cp, c);
-    window.markDelivered("btn-1");
+    window.markDelivered("owner-app");
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -2008,7 +2065,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     window.veto("adam");
     const deliveredTerminal = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(deliveredTerminal.status).toBe(200);
@@ -2018,7 +2075,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     openWindow(cp, c, "v-2").veto("adam");
     const terminal = await fetch(`${url}/veto/v-2/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(terminal.status).toBe(409);
@@ -2216,6 +2273,7 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
       cp = ephemeral({
         now: c.now,
         deviceSecret: DEVICE_SECRET,
+        ownerAppSecret: OWNER_APP_SECRET,
         licensing: { vendorPublicKeyPem: keys.publicKeyPem }, // no token
       });
     } finally {
@@ -2228,12 +2286,13 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     expect(kill.status).toBe(200);
     expect(cp.killSwitch.killed).toBe(true);
 
-    // the veto lane is free: register (device-signed), ack seen, veto
+    // the deny direction is free: the delivery ack (owner-app-signed) and the
+    // device veto relay both work with no license
     const window = new VetoWindow({ agentId: "a", tool: "bash" }, cp.killSwitch.epoch, { now: c.now });
     cp.vetoWindows.set("v-free", window);
     const seen = await fetch(`${url}/veto/v-free/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: ownerAppHeaders("", c.now()),
       body: "",
     });
     expect(seen.status).toBe(200);
