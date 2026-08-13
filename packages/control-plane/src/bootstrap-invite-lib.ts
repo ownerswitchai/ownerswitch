@@ -51,9 +51,13 @@ export async function runBootstrapInvite(
   const token = randomBytes(32).toString("base64url");
   const tokenHash = createHash("sha256").update(token, "utf8").digest("base64url");
 
+  // availability hardening: the peer is a trusted component, but a broken
+  // one must not balloon this process — cap the response in wire bytes
+  const MAX_RESPONSE_BYTES = 64 * 1024;
   const responseLine = await new Promise<string | Error>((resolve) => {
     const socket = connect(socketPath);
     let buffered = "";
+    let receivedBytes = 0;
     socket.setTimeout(5_000, () => {
       socket.destroy();
       resolve(new Error("timed out talking to the bootstrap socket"));
@@ -62,6 +66,12 @@ export async function runBootstrapInvite(
       socket.write(`${JSON.stringify({ tokenHash, ownerId, deviceName })}\n`);
     });
     socket.on("data", (chunk) => {
+      receivedBytes += chunk.length;
+      if (receivedBytes > MAX_RESPONSE_BYTES) {
+        socket.destroy();
+        resolve(new Error("oversized response from the control plane"));
+        return;
+      }
       buffered += chunk.toString("utf8");
     });
     socket.on("error", (err) => {

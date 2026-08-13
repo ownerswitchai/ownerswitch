@@ -290,7 +290,7 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     const registry = registryAt(path);
     registry.initialize();
     const hostile = {
-      version: 1,
+      version: 2,
       bootstrapGeneration: 1,
       owners: {},
       devices: {
@@ -473,6 +473,45 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     const refused = registry.commitEnrollment({}, OPTS());
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.inviteSurvives).toBe(true);
+  });
+
+  it("V1 -> V2 MIGRATION: a genuine pre-owners registry loads, mints handles durably, and they stay stable across restarts", () => {
+    const path = join(freshDir(), "devices.json");
+    // build a GENUINE v1 file the v18-v21 code would have written: enroll a
+    // device through the CURRENT code, then strip the owners table and set
+    // version 1 — field-for-field the old shape
+    const registry = registryAt(path);
+    registry.initialize();
+    const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-1", SECRET));
+    expect(registry.commitEnrollment(enrollmentSubmission(phone(), fixtureInvite(minted), SECRET), OPTS()).ok).toBe(true);
+    const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const legacy = {
+      version: 1,
+      bootstrapGeneration: current.bootstrapGeneration,
+      devices: current.devices,
+    };
+    writeFileSync(path, JSON.stringify(legacy), { mode: 0o600 });
+
+    // restart over the v1 file: migration mints an owner handle and publishes v2
+    const migrated = registryAt(path);
+    expect(migrated.initialize().ok).toBe(true);
+    expect(migrated.activeDeviceCount).toBe(1);
+    expect(migrated.bootstrapGeneration).toBe(2); // preserved, not reset
+    const handle = migrated.ownerUserId("owner-adam");
+    expect(handle).not.toBeNull();
+    // the file on disk is v2 now
+    const upgraded = JSON.parse(readFileSync(path, "utf8")) as { version: number; owners: Record<string, { userId: string }> };
+    expect(upgraded.version).toBe(2);
+    expect(upgraded.owners["owner-adam"].userId).toBe(handle);
+
+    // and ANOTHER restart serves the SAME handle — minted once, durable
+    const again = registryAt(path);
+    expect(again.initialize().ok).toBe(true);
+    expect(again.ownerUserId("owner-adam")).toBe(handle);
+
+    // a v1 file that would NOT have validated under the old code is corrupt, not migrated
+    writeFileSync(path, JSON.stringify({ ...legacy, extra: true }), { mode: 0o600 });
+    expect(registryAt(path).initialize().ok).toBe(false);
   });
 
   it("PACKAGE SURFACE: no invite store, no witness, no low-level spend — the registry is the only door", () => {

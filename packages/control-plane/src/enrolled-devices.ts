@@ -110,7 +110,7 @@ export interface PersistedEnrolledDevice {
 }
 
 export interface PersistedEnrolledDevices {
-  version: 1;
+  version: 2;
   /**
    * The bootstrap generation — bumped in the SAME atomic publish as a
    * successful bootstrap enrolment, so the bootstrap lane self-closes
@@ -132,12 +132,25 @@ export interface PersistedEnrolledDevices {
 export type EnrolledDevicesLoad =
   | { outcome: "absent" }
   | { outcome: "loaded"; state: PersistedEnrolledDevices }
+  | {
+      /**
+       * A well-formed PRE-OWNERS registry (schema v1, written by the
+       * unreleased v18–v21 line): everything except the per-owner user
+       * handles. Served to NOBODY — initialize() migrates it to v2 (one
+       * durable publish, same durability rules as every other write) and
+       * only the migrated state is ever used.
+       */
+      outcome: "legacy-v1";
+      state: { bootstrapGeneration: number; devices: Record<string, PersistedEnrolledDevice> };
+    }
   | { outcome: "corrupt"; detail: string };
 
 /** Generous ceiling for a household-scale device registry; bounds a hostile file. */
 export const MAX_ENROLLED_DEVICES_FILE_BYTES = 512 * 1024;
 /** Active-device ceiling (flood backstop) — households, not fleets. */
 export const MAX_ACTIVE_DEVICES = 64;
+/** Owner-handle ceiling — the same order of magnitude, same reasoning. */
+export const MAX_OWNERS = 128;
 /** The marker is a short fixed note; anything bigger was not written by us. */
 const MAX_MARKER_BYTES = 4096;
 /** the EXACT marker body this store writes — anything else is not our marker */
@@ -188,7 +201,7 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const { version, bootstrapGeneration, devices, owners, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length > 0) return null;
-  if (version !== 1) return null;
+  if (version !== 2) return null;
   if (
     typeof bootstrapGeneration !== "number" ||
     !Number.isSafeInteger(bootstrapGeneration) ||
@@ -295,9 +308,34 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     seenUserIds.add(userId);
     ownerEntries.push([ownerId, { userId }] as const);
   }
+  if (ownerEntries.length > MAX_OWNERS) return null;
   const ownersOut: Record<string, { userId: string }> = Object.create(null);
   for (const [ownerId, handle] of ownerEntries) ownersOut[ownerId] = handle;
-  return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries), owners: ownersOut };
+  return { version: 2, bootstrapGeneration, devices: nullProtoDevices(entries), owners: ownersOut };
+}
+
+/**
+ * The UNRELEASED v1 shape (v18–v21): exactly the v2 shape minus `owners`.
+ * Parsed by wrapping the same strict validator — the device table gets the
+ * identical field-by-field treatment, and only a file that would have
+ * validated under the old code reads as legacy.
+ */
+function asLegacyV1(value: unknown): { bootstrapGeneration: number; devices: Record<string, PersistedEnrolledDevice> } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 3 || keys[0] !== "bootstrapGeneration" || keys[1] !== "devices" || keys[2] !== "version") {
+    return null;
+  }
+  if (record.version !== 1) return null;
+  const upgraded = asPersistedEnrolledDevices({
+    version: 2,
+    bootstrapGeneration: record.bootstrapGeneration,
+    devices: record.devices,
+    owners: {},
+  });
+  if (upgraded === null) return null;
+  return { bootstrapGeneration: upgraded.bootstrapGeneration, devices: upgraded.devices };
 }
 
 export interface EnrolledDeviceStoreOptions {
@@ -496,8 +534,12 @@ export class EnrolledDeviceFileStore {
       return { outcome: "corrupt", detail: `cannot parse ${this.filePath}: ${message(err)}` };
     }
     const state = asPersistedEnrolledDevices(parsed);
+    let legacy: ReturnType<typeof asLegacyV1> = null;
     if (state === null) {
-      return { outcome: "corrupt", detail: `unexpected shape in ${this.filePath}` };
+      legacy = asLegacyV1(parsed);
+      if (legacy === null) {
+        return { outcome: "corrupt", detail: `unexpected shape in ${this.filePath}` };
+      }
     }
     if (marker === "absent") {
       // a registry with state but no marker: the marker must be
@@ -532,7 +574,8 @@ export class EnrolledDeviceFileStore {
           "UNPROVEN and will not be served (a power cut could resurface older state)",
       };
     }
-    return { outcome: "loaded", state };
+    if (legacy !== null) return { outcome: "legacy-v1", state: legacy };
+    return { outcome: "loaded", state: state as PersistedEnrolledDevices };
   }
 
   save(state: PersistedEnrolledDevices): SaveResult {
@@ -755,10 +798,51 @@ export class EnrolledDeviceRegistry {
       this.#corruptDetail = null;
       return { ok: true };
     }
+    if (loaded.outcome === "legacy-v1") {
+      // V1 -> V2 MIGRATION, before anything is served: mint a durable opaque
+      // user handle for every owner the device table names, publish the
+      // migrated registry with the same durable-or-refuse / quarantine-on-
+      // unproven rules as every other write, and only then serve. Handles
+      // minted here are the ones every later mint and restart will see.
+      const owners: Record<string, { userId: string }> = Object.create(null);
+      const taken = new Set<string>();
+      for (const device of Object.values(loaded.state.devices)) {
+        if (Object.hasOwn(owners, device.ownerId)) continue;
+        let userId = randomBytes(32).toString("base64url");
+        while (taken.has(userId)) userId = randomBytes(32).toString("base64url");
+        taken.add(userId);
+        owners[device.ownerId] = { userId };
+      }
+      const migrated: PersistedEnrolledDevices = {
+        version: 2,
+        bootstrapGeneration: loaded.state.bootstrapGeneration,
+        devices: loaded.state.devices,
+        owners,
+      };
+      let saved: SaveResult;
+      try {
+        saved = this.#store.save(migrated);
+      } catch (err) {
+        const detail = `v1 -> v2 registry migration persist failed: ${message(err)}`;
+        this.#quarantine(detail);
+        return { ok: false, detail };
+      }
+      if (!saved.durable) {
+        const detail = `v1 -> v2 registry migration not durable: ${saved.detail}`;
+        this.#quarantine(detail);
+        return { ok: false, detail };
+      }
+      console.error(
+        `[ownerswitch] enrolled-device registry migrated v1 -> v2 (${Object.keys(owners).length} owner handle(s) minted durably)`,
+      );
+      this.#state = migrated;
+      this.#corruptDetail = null;
+      return { ok: true };
+    }
     // genuine first boot: bootstrap generation starts at 1, persisted NOW —
     // from here on a missing file is corruption, not a fresh start
     const initial: PersistedEnrolledDevices = {
-      version: 1,
+      version: 2,
       bootstrapGeneration: 1,
       devices: nullProtoDevices([]),
       owners: Object.create(null) as Record<string, { userId: string }>,
@@ -876,6 +960,9 @@ export class EnrolledDeviceRegistry {
   #ensureOwnerUserId(ownerId: string): string {
     const state = this.#usableState();
     if (Object.hasOwn(state.owners, ownerId)) return state.owners[ownerId].userId;
+    if (Object.keys(state.owners).length >= MAX_OWNERS) {
+      throw new Error(`owner-handle ceiling reached (${MAX_OWNERS}) — nothing mints for new owners`);
+    }
     let userId = randomBytes(32).toString("base64url");
     const taken = new Set(Object.values(state.owners).map((handle) => handle.userId));
     while (taken.has(userId)) userId = randomBytes(32).toString("base64url");
@@ -1043,7 +1130,7 @@ export class EnrolledDeviceRegistry {
     // the next durable state: the device, and — bootstrap — the generation
     // bump, in the SAME publish: the lane closes durably with the admit
     const next: PersistedEnrolledDevices = {
-      version: 1,
+      version: 2,
       bootstrapGeneration:
         outcome.invite.origin.kind === "bootstrap"
           ? state.bootstrapGeneration + 1
