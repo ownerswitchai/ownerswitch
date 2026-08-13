@@ -2,7 +2,7 @@ import { createHash, generateKeyPairSync, randomBytes, sign as ecSign } from "no
 import { describe, expect, it } from "vitest";
 import { cborEncode } from "./cbor-fixture.js";
 import { verifyOwnerAssertion } from "./webauthn.js";
-import { spkiToPem, verifyOwnerRegistration, type WebAuthnRegistrationWire } from "./webauthn-register.js";
+import { storedSpkiToPem, verifyOwnerRegistration, type WebAuthnRegistrationWire } from "./webauthn-register.js";
 
 /**
  * Build a SYNTHETIC registration exactly as a platform authenticator would —
@@ -97,9 +97,11 @@ describe("verifyOwnerRegistration — the enrolment ceremony's registration half
         (keypair.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString("base64url"),
       );
       // …and the one conversion to PEM at the assertion-verify edge round-trips
-      expect(spkiToPem(verdict.publicKeySpki)).toBe(
-        keypair.publicKey.export({ type: "spki", format: "pem" }).toString(),
-      );
+      const pem = storedSpkiToPem(verdict.publicKeySpki);
+      expect(pem.ok).toBe(true);
+      if (pem.ok) {
+        expect(pem.pem).toBe(keypair.publicKey.export({ type: "spki", format: "pem" }).toString());
+      }
     }
   });
 
@@ -212,7 +214,9 @@ describe("verifyOwnerRegistration — the enrolment ceremony's registration half
         signature: ecSign("sha256", signed, privateKey).toString("base64url"), // DER, as verifyOwnerAssertion takes
       };
     };
-    const passkey = { credentialId: verdict.credentialId, publicKeyPem: spkiToPem(verdict.publicKeySpki) };
+    const pem = storedSpkiToPem(verdict.publicKeySpki);
+    if (!pem.ok) throw new Error("unreachable");
+    const passkey = { credentialId: verdict.credentialId, publicKeyPem: pem.pem };
     const possession = verifyOwnerAssertion(makeAssertion(keypair.privateKey), {
       passkey,
       rpId: RP_ID,

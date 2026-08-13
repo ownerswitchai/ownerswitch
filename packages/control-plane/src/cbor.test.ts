@@ -48,12 +48,15 @@ describe("cborDecode — the strict WebAuthn subset", () => {
     // {"a":1,"a":2}
     const dup = Buffer.from([0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02]);
     expect(() => cborDecodeExact(new Uint8Array(dup))).toThrow(/duplicate/);
-    // {1:2, "1":3} — an integer key and its decimal-string twin must collide
+    // a TEXT key spelling an integer could impersonate a COSE integer label
+    // ("3" passing for alg 3) — refused outright, alone or as a twin
     const twin = Buffer.concat([
       Buffer.from([0xa2, 0x01, 0x02]),
       Buffer.from([0x61, 0x31, 0x03]),
     ]);
-    expect(() => cborDecodeExact(new Uint8Array(twin))).toThrow(/duplicate/);
+    expect(() => cborDecodeExact(new Uint8Array(twin))).toThrow(/impersonates/);
+    const aloneTextDigit = Buffer.from([0xa1, 0x61, 0x33, 0x02]); // {"3": 2}
+    expect(() => cborDecodeExact(new Uint8Array(aloneTextDigit))).toThrow(/impersonates/);
   });
 
   it("refuses truncated input, trailing bytes, invalid UTF-8, and depth bombs", () => {

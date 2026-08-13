@@ -119,8 +119,15 @@ function decodeItem(reader: Reader, depth: number): CborValue {
       for (let i = 0; i < count; i++) {
         const key = decodeItem(reader, depth + 1);
         let name: string;
-        if (typeof key === "string") name = key;
-        else if (typeof key === "number" && Number.isSafeInteger(key)) name = String(key);
+        if (typeof key === "string") {
+          // a TEXT key that spells an integer would collide with the decimal
+          // form INTEGER keys decode to — a text "3" could impersonate COSE
+          // label 3. No legitimate WebAuthn/COSE text key is numeric; refuse.
+          if (/^-?\d+$/.test(key)) {
+            throw new Error(`CBOR: text map key ${JSON.stringify(key)} impersonates an integer label`);
+          }
+          name = key;
+        } else if (typeof key === "number" && Number.isSafeInteger(key)) name = String(key);
         else throw new Error("CBOR: map keys must be text strings or integers");
         if (name === "__proto__" || name === "constructor" || name === "prototype") {
           throw new Error(`CBOR: map key ${JSON.stringify(name)} is refused (prototype pollution)`);

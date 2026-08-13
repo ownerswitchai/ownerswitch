@@ -1,7 +1,12 @@
 import { createHash, generateKeyPairSync, sign as ecSign } from "node:crypto";
 import { ownerEnrollPopPreimage } from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
-import { InviteStore, type InviteSpendWitness } from "./invite.js";
+import {
+  INTERNAL_SPEND_BRAND,
+  InviteStore,
+  SpendAuthorization,
+  type InviteSpendWitness,
+} from "./invite.js";
 import { enrolledOwnerDeviceFromSpki, verifyEnrollProofOfPossession } from "./owner-device.js";
 
 const clock = (start = 1_000) => {
@@ -15,12 +20,18 @@ const SECRET_2 = Buffer.from("s2".repeat(12)).toString("base64url");
 const SECRET_3 = Buffer.from("s3".repeat(12)).toString("base64url");
 const commit = (secret: string) => createHash("sha256").update(secret, "utf8").digest("base64url");
 
+// store-level tests mint the authorization directly with the in-package
+// brand; API consumers cannot (index.ts does not export the brand) — the
+// only public path to a spend is performEnrollment
+const auth = (inviteId: string) => SpendAuthorization.mintInternal(INTERNAL_SPEND_BRAND, inviteId);
+
 const record = (inviteId: string, secret: string, kind: "bootstrap" | "device" = "bootstrap") => ({
   inviteId,
   tokenHash: commit(secret),
   ownerId: "owner-adam",
   deviceName: "Adam's phone",
   challenge: Buffer.from("ch".repeat(16)).toString("base64url"),
+  assertionChallenge: Buffer.from("ac".repeat(16)).toString("base64url"),
   killEpoch: 0,
   origin:
     kind === "bootstrap"
@@ -30,8 +41,10 @@ const record = (inviteId: string, secret: string, kind: "bootstrap" | "device" =
 
 /** A witness where everything is still live — each test flips ONE fact. */
 const LIVE: InviteSpendWitness = {
+  killed: false,
   killEpoch: 0,
   bootstrapGeneration: 1,
+  activeDeviceCount: 0,
   deviceStanding: (deviceId, generation) => deviceId === "phone-1" && generation === 1,
 };
 
@@ -43,21 +56,21 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     // the record carries the hash, never the secret
     expect(JSON.stringify(minted)).not.toContain(SECRET_1);
 
-    expect(store.consume("inv-1", SECRET_1, LIVE).ok).toBe(true);
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(true);
     // burned: the same preimage opens nothing twice
-    expect(store.consume("inv-1", SECRET_1, LIVE).ok).toBe(false);
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(false);
   });
 
   it("a FAILED attempt does not burn the invite; a non-canonical secret never reaches the comparison", () => {
     const c = clock();
     const store = new InviteStore({ now: c.now });
     store.register(record("inv-1", SECRET_1));
-    expect(store.consume("inv-1", SECRET_2, LIVE).ok).toBe(false); // wrong preimage
-    const short = store.consume("inv-1", "1234", LIVE); // human-typed junk: refused by FORMAT
+    expect(store.consume("inv-1", SECRET_2, LIVE, auth("inv-1")).ok).toBe(false); // wrong preimage
+    const short = store.consume("inv-1", "1234", LIVE, auth("inv-1")); // human-typed junk: refused by FORMAT
     expect(short.ok).toBe(false);
     if (!short.ok) expect(short.reason).toMatch(/canonical token/);
     // still alive for the real preimage
-    expect(store.consume("inv-1", SECRET_1, LIVE).ok).toBe(true);
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(true);
   });
 
   it("KILL EPOCH: an invite minted before a kill is dead after it — even after a restore", () => {
@@ -65,11 +78,11 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     const store = new InviteStore({ now: c.now });
     store.register(record("inv-1", SECRET_1)); // minted at epoch 0
     // a kill (and restore) advanced the epoch; the invite must not survive it
-    const spent = store.consume("inv-1", SECRET_1, { ...LIVE, killEpoch: 1 });
+    const spent = store.consume("inv-1", SECRET_1, { ...LIVE, killEpoch: 1 }, auth("inv-1"));
     expect(spent.ok).toBe(false);
     if (!spent.ok) expect(spent.reason).toMatch(/kill epoch/);
     // and it is GONE, not retryable at the old epoch
-    expect(store.consume("inv-1", SECRET_1, LIVE).ok).toBe(false);
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(false);
   });
 
   it("ISSUER STANDING: a revoked or generation-bumped minting device kills its unspent invites", () => {
@@ -77,17 +90,19 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     const store = new InviteStore({ now: c.now });
     store.register(record("inv-1", SECRET_1, "device")); // minted by phone-1@gen1
     // phone-1 was revoked (or re-enrolled at a new generation) before the spend
-    const revoked = store.consume("inv-1", SECRET_1, { ...LIVE, deviceStanding: () => false });
+    const revoked = store.consume("inv-1", SECRET_1, { ...LIVE, deviceStanding: () => false }, auth("inv-1"));
     expect(revoked.ok).toBe(false);
     if (!revoked.ok) expect(revoked.reason).toMatch(/no longer in standing/);
 
     // generation mismatch alone refuses too — the witness receives the
     // MINTING generation and must match it exactly
     store.register(record("inv-2", SECRET_2, "device"));
-    const bumped = store.consume("inv-2", SECRET_2, {
-      ...LIVE,
-      deviceStanding: (deviceId, generation) => deviceId === "phone-1" && generation === 2,
-    });
+    const bumped = store.consume(
+      "inv-2",
+      SECRET_2,
+      { ...LIVE, deviceStanding: (deviceId, generation) => deviceId === "phone-1" && generation === 2 },
+      auth("inv-2"),
+    );
     expect(bumped.ok).toBe(false);
   });
 
@@ -95,7 +110,7 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     const c = clock();
     const store = new InviteStore({ now: c.now });
     store.register(record("inv-1", SECRET_1)); // bootstrapGeneration 1
-    const stale = store.consume("inv-1", SECRET_1, { ...LIVE, bootstrapGeneration: 2 });
+    const stale = store.consume("inv-1", SECRET_1, { ...LIVE, bootstrapGeneration: 2 }, auth("inv-1"));
     expect(stale.ok).toBe(false);
     if (!stale.ok) expect(stale.reason).toMatch(/bootstrap generation/);
   });
@@ -107,12 +122,12 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     store.register(record("boot-2", SECRET_2, "bootstrap"));
     store.register(record("dev-1", SECRET_3, "device"));
 
-    expect(store.consume("boot-1", SECRET_1, LIVE).ok).toBe(true);
+    expect(store.consume("boot-1", SECRET_1, LIVE, auth("boot-1")).ok).toBe(true);
     // the RACE the review named: boot-2's spend arrives right after — there is
     // no window between consume and any separate invalidation call
-    expect(store.consume("boot-2", SECRET_2, LIVE).ok).toBe(false);
+    expect(store.consume("boot-2", SECRET_2, LIVE, auth("boot-2")).ok).toBe(false);
     // device-minted flow untouched
-    expect(store.consume("dev-1", SECRET_3, LIVE).ok).toBe(true);
+    expect(store.consume("dev-1", SECRET_3, LIVE, auth("dev-1")).ok).toBe(true);
   });
 
   it("expires by TTL, sweeps, and enforces the live-invite cap", () => {
@@ -122,7 +137,7 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     store.register(record("inv-2", SECRET_2));
     expect(() => store.register(record("inv-3", SECRET_3))).toThrow(/too many/);
     c.advance(60_001);
-    expect(store.consume("inv-1", SECRET_1, LIVE).ok).toBe(false); // expired
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(false); // expired
     store.register(record("inv-3", SECRET_3)); // the sweep freed the cap
     expect(store.size).toBe(1);
   });
@@ -145,6 +160,91 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
         origin: { kind: "device", deviceId: "phone-1", deviceGeneration: 0 },
       }),
     ).toThrow(/generation/);
+  });
+
+  it("SPEND AUTHORIZATION: no proof-chain capability, no burn — and it binds to ONE invite", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1));
+    // an authorization minted for a DIFFERENT invite spends nothing
+    const wrong = store.consume("inv-1", SECRET_1, LIVE, auth("inv-2"));
+    expect(wrong.ok).toBe(false);
+    if (!wrong.ok) expect(wrong.reason).toMatch(/authorization/);
+    // a forged object with the right shape is not the class — refused
+    const forged = { inviteId: "inv-1" } as unknown as SpendAuthorization;
+    expect(store.consume("inv-1", SECRET_1, LIVE, forged).ok).toBe(false);
+    // and the brand cannot be guessed: minting with a random symbol throws
+    expect(() => SpendAuthorization.mintInternal(Symbol("guess"), "inv-1")).toThrow(/verifier/);
+    // the real chain still works
+    expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(true);
+  });
+
+  it("KILLED: an engaged kill switch refuses every spend, whatever the epoch says", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1));
+    const killed = store.consume("inv-1", SECRET_1, { ...LIVE, killed: true }, auth("inv-1"));
+    expect(killed.ok).toBe(false);
+    if (!killed.ok) expect(killed.reason).toMatch(/kill switch/);
+  });
+
+  it("BOOTSTRAP + ACTIVE DEVICE: a bootstrap invite enrolls only into an EMPTY registry", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1)); // bootstrap, generation current
+    const occupied = store.consume("inv-1", SECRET_1, { ...LIVE, activeDeviceCount: 1 }, auth("inv-1"));
+    expect(occupied.ok).toBe(false);
+    if (!occupied.ok) expect(occupied.reason).toMatch(/EMPTY registry/);
+  });
+
+  it("REENTRANCY: a consume() re-entered from inside deviceStanding() cannot double-spend", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1, "device"));
+    let inner: ReturnType<InviteStore["consume"]> | null = null;
+    const outer = store.consume(
+      "inv-1",
+      SECRET_1,
+      {
+        ...LIVE,
+        deviceStanding: () => {
+          // the hostile callback re-enters the same spend — the record was
+          // RESERVED before this callback ran, so the inner call finds nothing
+          inner = store.consume("inv-1", SECRET_1, LIVE, auth("inv-1"));
+          return true;
+        },
+      },
+      auth("inv-1"),
+    );
+    expect(outer.ok).toBe(true);
+    expect(inner).not.toBeNull();
+    expect((inner as unknown as { ok: boolean }).ok).toBe(false); // exactly ONE success
+  });
+
+  it("INPUT ALIASING: mutating the caller's origin object after register() changes nothing in the store", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    const input = record("inv-1", SECRET_1, "device");
+    store.register(input);
+    // the caller rewrites its own object — a stale issuer trying to look current
+    (input.origin as { deviceGeneration: number }).deviceGeneration = 99;
+    // the STORE's copy still demands the minting generation (1)
+    const spent = store.consume(
+      "inv-1",
+      SECRET_1,
+      { ...LIVE, deviceStanding: (_id, generation) => generation === 1 },
+      auth("inv-1"),
+    );
+    expect(spent.ok).toBe(true);
+  });
+
+  it("EPOCH SWEEP: invalidateSupersededEpoch frees dead invites from the cap immediately", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1)); // epoch 0
+    store.register({ ...record("inv-2", SECRET_2), killEpoch: 1 });
+    expect(store.invalidateSupersededEpoch(1)).toBe(1); // inv-1 dies with epoch 0
+    expect(store.size).toBe(1);
   });
 
   it("hands out FROZEN copies — a caller cannot mutate the store's authority state", () => {

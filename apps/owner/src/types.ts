@@ -168,6 +168,16 @@ export interface EnrollmentInvite {
   };
   /** creation challenge for navigator.credentials.create() */
   challenge: Base64Url;
+  /**
+   * The ceremony's SECOND challenge: immediately after create(), the app
+   * performs a fresh `navigator.credentials.get()` with the NEW credential
+   * over this challenge and submits the assertion in the enrolment request
+   * (possessionAssertion). With attestation "none" nothing in the creation
+   * output is signed, so THIS assertion is what proves the phone holds the
+   * new private key and a human passed user verification. Minted with the
+   * invite, single-use with it.
+   */
+  assertionChallenge: Base64Url;
 }
 
 /**
@@ -200,6 +210,14 @@ export interface EnrollmentRequest {
   /** human label shown in the device list, e.g. "Adam's phone" */
   deviceName: string;
   registration: WebAuthnRegistration;
+  /**
+   * The fresh webauthn.get assertion with the NEWLY created credential,
+   * over the invite's assertionChallenge — the possession-and-UV proof
+   * attestation "none" cannot give (see EnrollmentInvite.assertionChallenge).
+   * REQUIRED: the control plane's enrolment core refuses to spend an invite
+   * without it (performEnrollment, enrollment.ts).
+   */
+  possessionAssertion: WebAuthnAssertion;
   /**
    * Exportable SPKI public key of the SECOND WebCrypto keypair (ECDSA
    * P-256) whose PRIVATE key the app creates non-extractable

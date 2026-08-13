@@ -160,12 +160,19 @@ tightens it back up. So it is designed first.
    not the owner's ceremony — §4, clickjacking); `rpIdHash` and the
    **UP and UV flags** live in the authenticator data *inside the
    attestation object*; the credential's algorithm must be ES256
-   (COSE `-7`) on P-256. It verifies the proof
+   (COSE `-7`) on P-256. Because attestation is `"none"`, nothing in
+   the creation output is *signed* — so the registration check is
+   structural, and the ceremony demands a second proof: a **fresh
+   `webauthn.get` assertion with the newly created credential**, over
+   the invite's second challenge (`assertionChallenge`), verified
+   against the key the registration produced. *That* assertion is what
+   proves the phone holds the new private key and a human passed user
+   verification. It then verifies the cheap-lane proof
    of possession with the submitted key, re-checks the invite's issuing
    device is still active at its recorded generation (or, for a
    bootstrap invite, that there are still **zero** active devices and
    the invite's bootstrap generation is current), and only on a fully
-   successful registration burns the invite — atomically, exactly once:
+   successful chain burns the invite — atomically, exactly once:
    two racing spends admit at most one device, a failed or malformed
    attempt (including a failed proof) consumes nothing, and a
    stranger's garbage cannot burn the capability the owner is holding
@@ -175,9 +182,13 @@ tightens it back up. So it is designed first.
    holding *both* credentials — the WebAuthn credential and the
    cheap-lane public key belong to the same record, governed by the
    same revocation generation, so revocation severs one identity, not
-   half of two. The record: credential id, COSE public key, cheap-lane
-   SPKI key, signature counter, transports, device name, `ownerId`,
-   `enrolledAt`, and a **revocation generation** starting at 0.
+   half of two. The record: credential id, the WebAuthn public key
+   re-exported as **canonical SPKI DER (base64url)** — one stored key
+   format everywhere, from the registration verdict through the
+   registry to the assertion verifier — the cheap-lane SPKI key,
+   signature counter, transports, device name, `ownerId`,
+   `enrolledAt`, and a **revocation generation** starting at 1 (the
+   standing registry's convention; a revocation bumps it).
 6. **Push subscription.** After notification permission is granted, the
    app registers its Web Push subscription
    (`PUT /devices/:id/push-subscription`, device-signed). The `:id` is
@@ -232,7 +243,8 @@ design stops code resident on the device from asking the key to sign
 while it runs.
 
 **What proves it at enrolment time: possession of a live invite.**
-Nothing else. The WebAuthn ceremony proves the phone holds the new
+Nothing else. The paired WebAuthn ceremony — creation plus the fresh
+assertion over the second challenge — proves the phone holds the new
 private key (and that a human passed user verification); it does not
 prove *whose* phone it is. The invite's out-of-band channel — the
 operator's screen to the owner's camera, in person — is the actual

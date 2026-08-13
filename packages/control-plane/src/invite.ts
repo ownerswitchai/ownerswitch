@@ -29,6 +29,29 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
+/**
+ * The spend-authorization BRAND — deliberately NOT exported from the package
+ * root (index.ts): the only module that may mint a SpendAuthorization is
+ * enrollment.ts, whose performEnrollment() runs the full proof chain
+ * (registration -> possession assertion -> cheap-lane PoP) first. That makes
+ * "consume an invite without the proofs" a type error AND a runtime error
+ * for every consumer of the package API — the unbypassable-core contract.
+ * @internal
+ */
+export const INTERNAL_SPEND_BRAND: unique symbol = Symbol("ownerswitch.enrollment.spend");
+
+/** Proof that the full enrolment verification chain ran for ONE invite. */
+export class SpendAuthorization {
+  private constructor(readonly inviteId: string) {}
+  /** @internal — enrollment.ts only; guarded by the module-private brand */
+  static mintInternal(brand: symbol, inviteId: string): SpendAuthorization {
+    if (brand !== INTERNAL_SPEND_BRAND) {
+      throw new Error("SpendAuthorization can only be minted by the enrollment verifier");
+    }
+    return new SpendAuthorization(inviteId);
+  }
+}
+
 export type InviteOrigin =
   | {
       kind: "bootstrap";
@@ -52,6 +75,13 @@ export interface InviteRecord {
   deviceName: string;
   /** base64url WebAuthn creation challenge minted alongside the invite */
   challenge: string;
+  /**
+   * base64url challenge for the ceremony's SECOND proof: the fresh
+   * webauthn.get assertion with the newly created credential — the
+   * possession-and-UV evidence attestation "none" cannot give (see
+   * enrollment.ts). Minted with the invite, single-use with it.
+   */
+  assertionChallenge: string;
   /** the kill epoch in force at mint — the invite dies with it */
   killEpoch: number;
   expiresAt: number;
@@ -65,10 +95,19 @@ export interface InviteRecord {
  * the standing registry exists to kill.
  */
 export interface InviteSpendWitness {
+  /** is the kill switch ENGAGED right now? true refuses every spend */
+  killed: boolean;
   /** the CURRENT kill epoch — must equal the one recorded at mint */
   killEpoch: number;
   /** the CURRENT bootstrap generation (bootstrap-minted invites) */
   bootstrapGeneration: number;
+  /**
+   * How many devices are enrolled AND unrevoked right now. The pinned
+   * bootstrap invariant (DESIGN.md §2) is generation-current AND ZERO
+   * active devices — a bootstrap invite must not add a second root next
+   * to a live phone.
+   */
+  activeDeviceCount: number;
   /**
    * Is this device still enrolled, unrevoked, at EXACTLY this generation?
    * (device-minted invites; the server passes its witnessStanding)
@@ -134,10 +173,20 @@ export class InviteStore {
     if (this.invites.has(record.inviteId)) {
       throw new Error(`invite "${record.inviteId}" already exists`);
     }
-    if (!/^[A-Za-z0-9_-]{43}$/.test(record.tokenHash)) {
-      // base64url SHA-256 is exactly 43 chars unpadded; anything else is not
-      // a commitment this store can compare in constant time
-      throw new Error("tokenHash must be an unpadded base64url SHA-256 (43 chars)");
+    // canonical base64url SHA-256, checked by ROUND-TRIP, not regex alone:
+    // base64url's final character carries unused bits, so two different
+    // 43-char strings can decode to the same 32 bytes — only the canonical
+    // re-encoding is accepted as a commitment
+    const decodedHash = Buffer.from(record.tokenHash, "base64url");
+    if (
+      !/^[A-Za-z0-9_-]{43}$/.test(record.tokenHash) ||
+      decodedHash.length !== 32 ||
+      decodedHash.toString("base64url") !== record.tokenHash
+    ) {
+      throw new Error("tokenHash must be the canonical unpadded base64url of a SHA-256 (43 chars)");
+    }
+    if (record.challenge === "" || record.assertionChallenge === "") {
+      throw new Error("an invite carries BOTH ceremony challenges (creation + possession assertion)");
     }
     if (record.ownerId === "") throw new Error("ownerId must be non-empty");
     if (!Number.isSafeInteger(record.killEpoch) || record.killEpoch < 0) {
@@ -159,7 +208,14 @@ export class InviteStore {
     if (this.invites.size >= this.maxInvites) {
       throw new Error(`too many live invites (${this.maxInvites}) — spend or let them expire`);
     }
-    const full: InviteRecord = { ...record, expiresAt: this.now() + this.ttlMs };
+    // DEEP copy into the map: the store's authority state must be its OWN —
+    // a caller holding the input object must not be able to rewrite the
+    // stored origin's kind/generation after registration
+    const full: InviteRecord = {
+      ...record,
+      origin: { ...record.origin },
+      expiresAt: this.now() + this.ttlMs,
+    };
     this.invites.set(full.inviteId, full);
     return frozenCopy(full);
   }
@@ -176,22 +232,47 @@ export class InviteStore {
   }
 
   /**
-   * Check-and-burn, in ONE synchronous step: the submitted SECRET must be
-   * the preimage of the stored commitment (constant-time over the hashes),
-   * the invite live, its kill epoch CURRENT, and its issuer STILL STANDING
-   * (bootstrap generation unchanged / minting device unrevoked at the same
-   * generation) — then it is gone before anything can race a second spend,
-   * and a successful bootstrap spend burns every bootstrap sibling in the
-   * same step. Call only after every other enrolment proof has passed.
+   * Check-and-burn, in ONE synchronous step, and ONLY under a
+   * SpendAuthorization minted by the enrollment verifier — the proof that
+   * registration, the fresh possession assertion, and the cheap-lane PoP
+   * all passed for THIS invite (enrollment.ts; the minting brand is not
+   * exported from the package root, so no handler can spend an invite
+   * around the proof chain). The submitted SECRET must be the preimage of
+   * the stored commitment (constant-time over the hashes) and the invite
+   * live; then the record is REMOVED — reserved — BEFORE any caller-
+   * provided witness callback runs, so a reentrant consume() from inside
+   * deviceStanding() finds nothing and exactly one spend can ever succeed.
+   * The live-authority checks then run against the reserved record: kill
+   * switch DISENGAGED, current kill epoch, and — bootstrap — current
+   * bootstrap generation AND zero active devices (the pinned DESIGN §2
+   * invariant), or — device-minted — the issuer standing at EXACTLY its
+   * minting generation. Any authority failure leaves the invite burned
+   * (dead epochs and dead issuers do not revive), while a wrong secret
+   * left it alive above. A successful bootstrap spend burns every
+   * bootstrap sibling in the same step.
    */
-  consume(inviteId: string, tokenSecret: string, witness: InviteSpendWitness): InviteConsume {
+  consume(
+    inviteId: string,
+    tokenSecret: string,
+    witness: InviteSpendWitness,
+    authorization: SpendAuthorization,
+  ): InviteConsume {
+    if (!(authorization instanceof SpendAuthorization) || authorization.inviteId !== inviteId) {
+      return { ok: false, reason: "spend refused: no enrollment-verifier authorization for this invite" };
+    }
     const record = this.invites.get(inviteId);
     if (record === undefined) return { ok: false, reason: "unknown or already-spent invite" };
     if (this.now() >= record.expiresAt) {
       this.invites.delete(inviteId);
       return { ok: false, reason: "invite expired" };
     }
-    if (!SECRET_FORMAT.test(tokenSecret)) {
+    // canonical opaque token: the exact base64url alphabet, and a round-trip
+    // so non-canonical final-character bits never reach the comparison
+    const decodedSecret = Buffer.from(tokenSecret, "base64url");
+    if (
+      !/^[A-Za-z0-9_-]{22,128}$/.test(tokenSecret) ||
+      decodedSecret.toString("base64url") !== tokenSecret
+    ) {
       return { ok: false, reason: "invite secret is not a canonical token (base64url, >= 22 chars)" };
     }
     const submitted = createHash("sha256").update(tokenSecret, "utf8").digest();
@@ -199,21 +280,29 @@ export class InviteStore {
     if (submitted.length !== committed.length || !timingSafeEqual(submitted, committed)) {
       return { ok: false, reason: "invite secret does not match the commitment" };
     }
-    // AUTHORITY, live, in the same synchronous section as the burn:
+    // RESERVE before any callback: from here the invite is gone, whatever
+    // happens next — a reentrant consume() cannot race a second success,
+    // and every authority failure below stays burned.
+    this.invites.delete(inviteId);
+    if (witness.killed) {
+      return { ok: false, reason: "the kill switch is engaged — nothing enrolls while killed" };
+    }
     if (record.killEpoch !== witness.killEpoch) {
-      this.invites.delete(inviteId); // dead with its epoch — nothing revives it
       return { ok: false, reason: "invite was minted under a superseded kill epoch" };
     }
     if (record.origin.kind === "bootstrap") {
       if (record.origin.bootstrapGeneration !== witness.bootstrapGeneration) {
-        this.invites.delete(inviteId);
         return { ok: false, reason: "invite was minted under a superseded bootstrap generation" };
       }
+      if (witness.activeDeviceCount !== 0) {
+        return {
+          ok: false,
+          reason: "bootstrap invites enroll only into an EMPTY registry — an active device exists",
+        };
+      }
     } else if (!witness.deviceStanding(record.origin.deviceId, record.origin.deviceGeneration)) {
-      this.invites.delete(inviteId);
       return { ok: false, reason: "the inviting device is no longer in standing at its minting generation" };
     }
-    this.invites.delete(inviteId); // burn — atomic with the checks above
     if (record.origin.kind === "bootstrap") {
       // FIRST PHONE WINS, atomically: no second bootstrap secret — spent
       // between this consume and any later bookkeeping — may enroll a
@@ -223,6 +312,22 @@ export class InviteStore {
       }
     }
     return { ok: true, record: frozenCopy(record) };
+  }
+
+  /**
+   * KILL HOOK: a kill (or restore) advanced the epoch — every invite minted
+   * under any other epoch is dead anyway; sweep it now so it does not sit
+   * in the cap until TTL. Returns how many were removed.
+   */
+  invalidateSupersededEpoch(currentEpoch: number): number {
+    let removed = 0;
+    for (const [id, record] of this.invites) {
+      if (record.killEpoch !== currentEpoch) {
+        this.invites.delete(id);
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   get size(): number {

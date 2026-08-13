@@ -88,22 +88,48 @@ export type RegistrationVerdict =
     }
   | { ok: false; reason: string };
 
-/** The one conversion the PEM-taking assertion verifier needs. */
-export function spkiToPem(publicKeySpki: string): string {
-  return createPublicKey({
-    key: Buffer.from(publicKeySpki, "base64url"),
-    format: "der",
-    type: "spki",
-  })
-    .export({ type: "spki", format: "pem" })
-    .toString();
+/**
+ * The one conversion the PEM-taking assertion verifier needs — held to the
+ * SAME strictness as every other stored-key parse in this repo, because
+ * registry data is still bytes on a disk: canonical base64url round-trip
+ * (the permissive decoder repairs what it should refuse), parse as SPKI,
+ * re-export DER must equal the input byte-for-byte (Node's parser accepts
+ * trailing DER, so SPKI‖0x00 or SPKI‖PKCS8 would otherwise convert), and
+ * the key must be EC on P-256. Structured refusal, never a throw — corrupt
+ * registry data is a reason, not a 500.
+ */
+export function storedSpkiToPem(publicKeySpki: string): { ok: true; pem: string } | { ok: false; reason: string } {
+  const der = fromB64url(publicKeySpki);
+  if (der === null || der.length === 0) return { ok: false, reason: "stored key is not canonical base64url" };
+  let key;
+  try {
+    key = createPublicKey({ key: der, format: "der", type: "spki" });
+  } catch {
+    return { ok: false, reason: "stored key does not parse as SPKI" };
+  }
+  if (key.asymmetricKeyType !== "ec" || key.asymmetricKeyDetails?.namedCurve !== "prime256v1") {
+    return { ok: false, reason: "stored key is not EC P-256" };
+  }
+  const canonical = key.export({ type: "spki", format: "der" }) as Buffer;
+  if (!canonical.equals(der)) {
+    return { ok: false, reason: "stored key has trailing bytes after the SPKI — refusing smuggled data" };
+  }
+  return { ok: true, pem: key.export({ type: "spki", format: "pem" }).toString() };
 }
 
 /** Nothing in a legitimate registration is near these; a bigger field is an attack. */
 const MAX_CREDENTIAL_ID_CHARS = 2048;
 const MAX_CLIENT_DATA_CHARS = 16 * 1024;
 const MAX_ATTESTATION_CHARS = 128 * 1024;
-const WIRE_KEYS: ReadonlySet<string> = new Set(["credentialId", "clientDataJSON", "attestationObject"]);
+const WIRE_KEYS: ReadonlySet<string> = new Set([
+  "credentialId",
+  "clientDataJSON",
+  "attestationObject",
+  // pinned contract (types.ts WebAuthnRegistration): an OPTIONAL hint,
+  // "stored as a hint, never as proof" — accepted and shape-checked below,
+  // never verified
+  "transports",
+]);
 
 const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
@@ -173,6 +199,18 @@ function verifyOwnerRegistrationInner(
   if (credentialIdField.length > MAX_CREDENTIAL_ID_CHARS) return refuse("credentialId is oversized");
   if (clientDataField.length > MAX_CLIENT_DATA_CHARS) return refuse("clientDataJSON is oversized");
   if (attestationField.length > MAX_ATTESTATION_CHARS) return refuse("attestationObject is oversized");
+  // transports (optional): a bounded array of short strings, a HINT stored
+  // but never trusted (types.ts) — shape-checked so junk cannot ride it
+  if ("transports" in record && record.transports !== undefined) {
+    const transports = record.transports;
+    if (
+      !Array.isArray(transports) ||
+      transports.length > 8 ||
+      transports.some((entry) => typeof entry !== "string" || entry === "" || entry.length > 32)
+    ) {
+      return refuse("transports must be a small array of short strings (a hint, never proof)");
+    }
+  }
   const registration: WebAuthnRegistrationWire = {
     credentialId: credentialIdField,
     clientDataJSON: clientDataField,

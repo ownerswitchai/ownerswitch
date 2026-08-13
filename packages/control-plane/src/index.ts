@@ -49,14 +49,25 @@ export {
 } from "./owner-device.js";
 export { cborDecodeExact, cborDecodeFirst } from "./cbor.js";
 export type { CborDecodeResult, CborValue } from "./cbor.js";
-export { verifyOwnerRegistration } from "./webauthn-register.js";
+export { storedSpkiToPem, verifyOwnerRegistration } from "./webauthn-register.js";
 export type {
   RegistrationVerdict,
   VerifyRegistrationOptions,
   WebAuthnRegistrationWire,
 } from "./webauthn-register.js";
-export { InviteStore } from "./invite.js";
-export type { InviteConsume, InviteOrigin, InviteRecord, InviteStoreOptions } from "./invite.js";
+// NOTE: INTERNAL_SPEND_BRAND and SpendAuthorization.mintInternal are
+// deliberately NOT exported here — the only package-API path to an invite
+// spend is performEnrollment, which runs the full proof chain first.
+export { InviteStore, SpendAuthorization } from "./invite.js";
+export type {
+  InviteConsume,
+  InviteOrigin,
+  InviteRecord,
+  InviteSpendWitness,
+  InviteStoreOptions,
+} from "./invite.js";
+export { performEnrollment } from "./enrollment.js";
+export type { EnrollmentOutcome, PerformEnrollmentOptions } from "./enrollment.js";
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,
