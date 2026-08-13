@@ -37,7 +37,10 @@ import {
 } from "@ownerswitchai/honeytoken";
 import { assertKillLimitRiskAccepted, ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
-import { isLimitKillConfirmation } from "./limit-kill-confirmation.js";
+import {
+  isLimitKillConfirmation,
+  parseLimitKillConfirmation,
+} from "./limit-kill-confirmation.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
 import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
@@ -227,10 +230,13 @@ async function runGateway(argv: string[]): Promise<void> {
         deviceId: device.id,
         secret: device.secret,
         // delivery confirmation advances the trip lifecycle: the kill landed
-        onDelivered: (trip) => {
-          if (trip.tier === "kill" && trip.source === "limit") {
-            limitTracker?.confirmKillDelivered();
-          }
+        onDelivered: (trip, confirmation) => {
+          if (trip.tier !== "kill" || trip.source !== "limit") return;
+          // The control plane's OWN commit epoch anchors the latch: the
+          // epoch line is shared, so only this number distinguishes our
+          // kill's world from a neighbouring kill's.
+          const confirmed = parseLimitKillConfirmation(confirmation.body, effectiveAgentId);
+          if (confirmed !== null) limitTracker?.confirmKillDelivered(confirmed.epoch);
         },
       })
     : undefined;

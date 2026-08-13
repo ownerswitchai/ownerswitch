@@ -68,14 +68,20 @@ export interface LatchedLimitTrip {
   at: number;
   confirmed: boolean;
   /**
-   * The lowest control-plane kill epoch whose answer can possibly include
-   * THIS trip's scoped kill: the last epoch observed before the trip, plus
-   * one (every scoped kill bumps the epoch). Any `/status` answer at or
-   * below the pre-trip epoch is a pre-kill snapshot — its empty
-   * `killedAgents` says nothing about our kill, and reading it as the
-   * owner's restore would be fail-open. Undefined only when the tracker
-   * had never observed an epoch at trip time (no live lookup yet); then
-   * the floor is learned from the first answer that LISTS the agent.
+   * The lowest control-plane kill epoch whose answer can speak about THIS
+   * trip's scoped kill. Any answer below it is a snapshot of a world where
+   * our kill had not landed — its empty `killedAgents` says nothing about
+   * us, and reading it as the owner's restore would be fail-open.
+   *
+   * It starts as a PROVISIONAL lower bound (this call's own pre-dispatch
+   * epoch + 1: our kill must bump past what we saw) and is RAISED, never
+   * lowered, as better evidence arrives:
+   *  - the control plane's own commit epoch from the kill response — the
+   *    authoritative anchor, because the epoch line is SHARED and some
+   *    other agent's kill may have taken the epoch we guessed;
+   *  - the epoch of any answer that actually LISTS us killed.
+   * Undefined only when the trip had no epoch to start from; then the
+   * floor is learned from the first admissible evidence above.
    */
   epochFloor?: number;
 }
@@ -161,13 +167,19 @@ export class LimitTracker {
    * return the rules this observation tripped. The caller decides what a
    * trip means (refuse + report kill, or report alert and continue).
    */
-  observeCall(call: ToolCall): LimitTrip[] {
-    return this.observe(call, ["calls", "amount"]);
+  observeCall(call: ToolCall, opts: { epoch?: number } = {}): LimitTrip[] {
+    return this.observe(call, ["calls", "amount"], opts.epoch);
   }
 
-  /** Count a counted call whose execution FAILED (errors metric). */
-  observeError(call: ToolCall): LimitTrip[] {
-    return this.observe(call, ["errors"]);
+  /**
+   * Count a counted call whose execution FAILED (errors metric).
+   * `epoch` is THIS call's own pre-dispatch kill epoch — the baseline any
+   * trip it fires is anchored to. Passing the call's own reading (rather
+   * than reading shared state) is what keeps concurrent calls from
+   * anchoring each other's trips.
+   */
+  observeError(call: ToolCall, opts: { epoch?: number } = {}): LimitTrip[] {
+    return this.observe(call, ["errors"], opts.epoch);
   }
 
   /**
@@ -208,36 +220,31 @@ export class LimitTracker {
     opts: { epoch?: number; durable?: boolean } = {},
   ): void {
     const { epoch, durable = true } = opts;
-    if (epoch !== undefined) this.lastObservedEpoch = epoch;
+    this.rememberEpoch(epoch);
     if (!durable) return; // says nothing trustworthy in either direction
-    const listed =
-      this.latch.phase !== "armed" && killedAgents.includes(this.latch.record.agentId);
+    if (this.latch.phase === "armed") return;
 
-    if (this.latch.phase === "unconfirmed" && listed) {
-      // The authoritative confirmation: the kill is IN this answer, so this
-      // answer's epoch is exactly the floor every later answer must clear.
-      // Set it BEFORE confirming — confirmKillDelivered copies the record.
-      if (epoch !== undefined) this.latch.record.epochFloor = epoch;
-      this.confirmKillDelivered();
+    const floor = this.latch.record.epochFloor;
+    const listed = killedAgents.includes(this.latch.record.agentId);
+    // An answer BELOW the floor predates our kill — whether it lists us
+    // (a previous, since-restored kill of the same agent) or not (a
+    // neighbouring kill's epoch). Either way it cannot speak about this
+    // trip, in either direction.
+    const admissible = floor === undefined || (epoch !== undefined && epoch >= floor);
+    if (!admissible) return;
+
+    if (listed) {
+      // Seen killed at this epoch: confirm if we were waiting, and narrow
+      // the floor to here — nothing older can be about this kill anymore.
+      this.raiseFloor(epoch);
+      if (this.latch.phase === "unconfirmed") this.confirmKillDelivered(epoch);
       return;
     }
     if (this.latch.phase !== "confirmed") return;
-    if (listed) {
-      // Still killed. If the floor is unknown (confirmed by DELIVERY alone,
-      // before any epoch was observed), learn it here: seeing the kill in
-      // force at this epoch means every answer from this epoch on is fresh
-      // enough to speak about it.
-      if (this.latch.record.epochFloor === undefined && epoch !== undefined) {
-        this.latch.record.epochFloor = epoch;
-      }
-      return;
-    }
 
-    const floor = this.latch.record.epochFloor;
     // Without a floor we cannot tell a stale pre-kill answer from a
     // restore, and cannot prove our kill was ever visible — hold.
-    if (floor === undefined) return;
-    if (epoch === undefined || epoch < floor) return; // stale/unknown: hold
+    if (floor === undefined || epoch === undefined) return;
 
     this.latch = { phase: "armed" };
     for (const state of this.states) {
@@ -247,15 +254,45 @@ export class LimitTracker {
     }
   }
 
-  /** The kill report's delivery confirmed — same transition as being seen listed. */
-  confirmKillDelivered(): void {
+  /**
+   * The kill report's delivery confirmed by the control plane itself.
+   * `epoch` is the COMMIT epoch from that response — the authoritative
+   * anchor for this specific kill, and the only thing that can tell our
+   * kill's epoch from a neighbouring kill's. Passing it raises the floor;
+   * omitting it (a caller with no epoch in hand) leaves the provisional
+   * bound in place, which is weaker but never lower.
+   */
+  confirmKillDelivered(epoch?: number): void {
     if (this.latch.phase !== "unconfirmed") return;
-    this.latch = { phase: "confirmed", record: { ...this.latch.record, confirmed: true } };
+    const record = { ...this.latch.record, confirmed: true };
+    this.latch = { phase: "confirmed", record };
+    this.raiseFloor(epoch);
+    this.rememberEpoch(epoch);
   }
 
-  private observe(call: ToolCall, metrics: readonly string[]): LimitTrip[] {
+  /** Floors only ever go UP: newer evidence narrows, never widens. */
+  private raiseFloor(epoch: number | undefined): void {
+    if (epoch === undefined || this.latch.phase === "armed") return;
+    const current = this.latch.record.epochFloor;
+    if (current === undefined || epoch > current) this.latch.record.epochFloor = epoch;
+  }
+
+  /** Epoch memory is monotone: a late, older answer cannot walk it back. */
+  private rememberEpoch(epoch: number | undefined): void {
+    if (epoch === undefined) return;
+    if (this.lastObservedEpoch === undefined || epoch > this.lastObservedEpoch) {
+      this.lastObservedEpoch = epoch;
+    }
+  }
+
+  private observe(
+    call: ToolCall,
+    metrics: readonly string[],
+    epochAtCall?: number,
+  ): LimitTrip[] {
     const trips: LimitTrip[] = [];
     const at = this.now();
+    this.rememberEpoch(epochAtCall);
     for (const state of this.states) {
       const { rule } = state;
       if (!metrics.includes(rule.metric)) continue;
@@ -287,7 +324,7 @@ export class LimitTracker {
           // FAIL CLOSED: an unmetered spend must surface at the FIRST call —
           // a typo'd path, a schema drift or a float becomes a loud trip at
           // deploy time, never thirty silently uncounted payouts.
-          this.trip(trips, { rule, total: before, cause: "amount-unreadable" }, call);
+          this.trip(trips, { rule, total: before, cause: "amount-unreadable" }, call, epochAtCall);
           continue;
         }
         value = amount;
@@ -300,7 +337,7 @@ export class LimitTracker {
         // FAIL CLOSED: past safe-integer range addition starts rounding and
         // an overspend could read as no spend. max is capped far below the
         // clamp (MAX_LIMIT_MAX), so a clamped total is over every legal max.
-        this.trip(trips, { rule, total, cause: "total-overflow" }, call);
+        this.trip(trips, { rule, total, cause: "total-overflow" }, call, epochAtCall);
         // the clamp persists so the rule stays visibly exceeded
         if (rule.windowMs === undefined) state.lifetimeTotal = Number.MAX_SAFE_INTEGER;
         else this.saturate(state, at);
@@ -316,19 +353,24 @@ export class LimitTracker {
           // Saturate: bound memory NOW, alert exactly once, resume counting
           // only after the whole window has expired.
           this.saturate(state, at);
-          this.trip(trips, { rule, total, cause: "tracking-overflow" }, call);
+          this.trip(trips, { rule, total, cause: "tracking-overflow" }, call, epochAtCall);
           continue;
         }
       }
       if (before <= rule.max && total > rule.max) {
-        this.trip(trips, { rule, total, cause: "threshold-crossed" }, call);
+        this.trip(trips, { rule, total, cause: "threshold-crossed" }, call, epochAtCall);
       }
     }
     return trips;
   }
 
-  /** Record a trip; kill-action trips latch and persist as UNCONFIRMED. */
-  private trip(trips: LimitTrip[], trip: LimitTrip, call: ToolCall): void {
+  /** Record a trip; kill-action trips latch as UNCONFIRMED. */
+  private trip(
+    trips: LimitTrip[],
+    trip: LimitTrip,
+    call: ToolCall,
+    epochAtCall?: number,
+  ): void {
     trips.push(trip);
     if (trip.rule.action !== "kill" || this.latch.phase !== "armed") return;
     const record: LatchedLimitTrip = {
@@ -337,11 +379,14 @@ export class LimitTracker {
       reason: limitTripReason(trip, call.agentId),
       at: this.now(),
       confirmed: false,
-      // the kill this trip is about to fire will bump the epoch, so only an
-      // answer strictly past the last one we saw can reflect it
-      ...(this.lastObservedEpoch !== undefined
-        ? { epochFloor: this.lastObservedEpoch + 1 }
-        : {}),
+      // PROVISIONAL floor from THIS call's own reading: the kill we are
+      // about to fire must bump past the epoch this call saw. It is only a
+      // lower bound — the shared epoch line means another agent's kill can
+      // take that number — so the response's commit epoch raises it below.
+      ...(() => {
+        const baseline = epochAtCall ?? this.lastObservedEpoch;
+        return baseline !== undefined ? { epochFloor: baseline + 1 } : {};
+      })(),
     };
     this.latch = { phase: "unconfirmed", record };
   }

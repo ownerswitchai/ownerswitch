@@ -68,8 +68,12 @@ prevented.
 
 The durable record of a tripped kill is the control plane's persisted scoped kill —
 delivered synchronously on the crossing refusal, with the response
-validated (the agent echoed back, no degraded persistence, redirects
-refused) before the latch reads it as confirmed — to the one store the
+validated (the agent echoed back, its commit epoch carried, no degraded
+persistence, redirects refused) before the latch reads it as confirmed.
+That commit epoch matters because the epoch line is shared: without it a
+neighbouring agent's kill epoch could pass for this kill's world and a
+stale snapshot could look like the owner's restore. The record goes to
+the one store the
 agent cannot reach (a gateway-side file would be the agent's own file
 under the stdio deployment's shared uid, so none is kept). Stated
 honestly: the counters themselves are gateway-process state (one budget

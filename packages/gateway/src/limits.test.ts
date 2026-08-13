@@ -271,6 +271,67 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     expect(tracker.killTripped).toBeUndefined();
   });
 
+  it("a NEIGHBOURING kill's epoch cannot release us: the commit epoch anchors the latch", () => {
+    // The epoch line is SHARED. Baseline E, so the provisional floor is E+1
+    // — but another agent's kill takes E+1, and a snapshot from THAT world
+    // legitimately lacks our agent (our kill has not landed yet). Only the
+    // control plane's own commit epoch (E+2) can tell the two apart.
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 10 }); // baseline 10 → provisional floor 11
+    tracker.confirmKillDelivered(12); // OUR kill actually committed at 12
+    expect(tracker.killTripped?.confirmed).toBe(true);
+
+    // the neighbour's-epoch snapshot, arriving late, does NOT release us
+    tracker.observeKillState([], { epoch: 11 });
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+
+    tracker.observeKillState([], { epoch: 12 }); // our world: the real restore
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("a PREVIOUS kill-cycle's late 'listed' answer cannot confirm a new trip", () => {
+    // an old, since-restored kill of the SAME agent, whose status answer is
+    // still in flight when the agent trips again
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 5 }); // new trip: floor 6
+    tracker.observeKillState(["a1"], { epoch: 5 }); // the stale listing from the OLD kill
+    expect(tracker.killTripped?.confirmed).toBe(false); // not our evidence
+
+    // ...and it did not lower the floor either: an epoch-5 absence holds
+    tracker.observeKillState([], { epoch: 5 });
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+
+    // our own kill lands and confirms properly
+    tracker.observeKillState(["a1"], { epoch: 6 });
+    expect(tracker.killTripped?.confirmed).toBe(true);
+    tracker.observeKillState([], { epoch: 6 });
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("floors only ever rise: an out-of-order answer cannot widen the release window", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 3 }); // floor 4
+    tracker.observeKillState(["a1"], { epoch: 9 }); // seen killed far later → floor 9
+    expect(tracker.killTripped?.confirmed).toBe(true);
+    for (const stale of [4, 5, 8]) {
+      tracker.observeKillState([], { epoch: stale });
+      expect(tracker.killTripped?.ruleId, `epoch ${stale}`).toBe("hard");
+    }
+    tracker.observeKillState([], { epoch: 9 });
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("a concurrent call's epoch cannot re-anchor another call's trip", () => {
+    // each observation carries ITS OWN call's pre-dispatch epoch; a later
+    // call reading a moved epoch must not retro-anchor an existing trip
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 2 }); // trip: floor 3
+    tracker.observeCall(call("y"), { epoch: 7 }); // a concurrent call, already over max
+    tracker.confirmKillDelivered(3);
+    tracker.observeKillState([], { epoch: 3 }); // our commit epoch: genuine restore
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
   it("an epoch-less or floor-less answer holds the latch rather than guessing", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x")); // no epoch ever observed → no floor

@@ -337,7 +337,10 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         // lands late must not read as the owner's restore, and a control
         // plane with degraded persistence proves nothing durable at all
         ...(observedKill.epoch !== undefined ? { epoch: observedKill.epoch } : {}),
-        durable: observedKill.durable !== false,
+        // fail-closed reading: only an explicit `true` counts as durable, so
+        // a client that never populates the field cannot make a degraded
+        // control plane look trustworthy
+        durable: observedKill.durable === true,
       });
     }
     // A SCOPED kill of this gateway's agent is a lockdown too, not a policy
@@ -417,7 +420,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     // tries to make happen, and an attempt-then-refusal loop must drain a
     // budget rather than probe it for free. A kill-action trip refuses THIS
     // call too: the crossing call is the one the budget says must not run.
-    await observeCallLimits(call);
+    await observeCallLimits(call, mintEpoch);
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {
       try {
@@ -432,7 +435,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           !(err instanceof OwnerSwitchRefusal) ||
           err.code === OwnerSwitchErrorCode.ExecutionFailed
         ) {
-          await observeErrorLimits(call);
+          await observeErrorLimits(call, mintEpoch);
         }
         throw err;
       }
@@ -446,12 +449,12 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         CallToolResultSchema,
       )) as CallToolResult;
     } catch (err) {
-      await observeErrorLimits(call);
+      await observeErrorLimits(call, mintEpoch);
       throw err;
     }
     // an upstream tool reporting its own failure counts against the error
     // budget exactly like a transport failure — the agent's action failed
-    if (result.isError === true) await observeErrorLimits(call);
+    if (result.isError === true) await observeErrorLimits(call, mintEpoch);
     return result;
   }
 
@@ -462,7 +465,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    * returns. Alert trips only flag, and alert DELIVERY is best effort: a
    * broken reporter must not block a call an alert rule never blocks.
    */
-  async function observeCallLimits(call: ToolCall): Promise<void> {
+  async function observeCallLimits(call: ToolCall, epoch: number | undefined): Promise<void> {
     const limits = options.limits;
     if (limits === undefined) return;
     // ADMISSION, synchronously: re-read the latch HERE, in the same block
@@ -480,7 +483,9 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         `limit "${latched.ruleId}" tripped for agent "${agentId}" — this agent is stopped`,
       );
     }
-    const trips = limits.tracker.observeCall(call);
+    // THIS call's own pre-dispatch epoch anchors any trip it fires — never
+    // a shared field a concurrent call could have moved underneath it.
+    const trips = limits.tracker.observeCall(call, { ...(epoch !== undefined ? { epoch } : {}) });
     let killTrip: LimitTrip | undefined;
     for (const trip of trips) {
       if (trip.rule.action === "kill") {
@@ -519,11 +524,14 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    * reports the scoped kill and latches, so the NEXT call is refused at the
    * top of the handler.
    */
-  async function observeErrorLimits(call: ToolCall): Promise<void> {
+  async function observeErrorLimits(call: ToolCall, epoch: number | undefined): Promise<void> {
     const limits = options.limits;
     if (limits === undefined) return;
     try {
-      for (const trip of limits.tracker.observeError(call)) {
+      const observed = limits.tracker.observeError(call, {
+        ...(epoch !== undefined ? { epoch } : {}),
+      });
+      for (const trip of observed) {
         if (trip.rule.action === "kill") await limits.reportKill(trip);
         else limits.reportAlert(trip);
       }
