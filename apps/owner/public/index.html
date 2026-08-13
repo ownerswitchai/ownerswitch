@@ -113,6 +113,16 @@
           <button class="revoke" disabled aria-disabled="true">revoke</button>
         </div>
       </div>
+      <div class="card" id="enroll-card">
+        <h2>Enroll this device</h2>
+        <p class="muted">Paste the invite from the host CLI or the inviting
+        phone (it never travels through a server). The invite is single-use
+        and expires in minutes.</p>
+        <textarea id="enroll-input" rows="4" spellcheck="false" autocomplete="off"
+          placeholder='{"inviteId":"inv_…","token":"…", …}'></textarea>
+        <button id="enroll-button" type="button">Enroll</button>
+        <p id="enroll-status" role="status"></p>
+      </div>
       <p class="muted">A device enrolls by spending a single-use invite and
       minting its keys — a passkey and a cheap-lane signing key it proves
       it holds. Everything this app claims traces back to that moment —
