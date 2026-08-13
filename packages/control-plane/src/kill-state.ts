@@ -35,13 +35,8 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import {
-  isValidAgentId,
-  KILL_SOURCES,
-  MAX_KILLED_AGENTS,
-  type KillEvent,
-  type KillSource,
-} from "./kill.js";
+import { isValidAgentId, MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
+import { KILL_SOURCES, type KillEvent, type KillSource } from "./kill.js";
 
 export interface PersistedKillState {
   version: 1;
@@ -162,7 +157,14 @@ function asPersistedKillState(value: unknown): PersistedKillState | null {
     }
     const entries = Object.entries(agentKills);
     if (entries.length === 0 || entries.length > MAX_KILLED_AGENTS) return null;
-    scoped = {};
+    // Null prototype, deliberately: JSON.parse hands us OWN keys (its
+    // "__proto__" is a data property), but a plain-assignment copy into a
+    // `{}` literal would go through the inherited __proto__ SETTER — the
+    // entry would vanish from Object.entries() and a persisted scoped kill
+    // would silently fail to come back after a restart. isValidAgentId
+    // already refuses the prototype-footgun names outright; the null
+    // prototype is the belt that holds even if that list ever drifts.
+    scoped = Object.create(null) as Record<string, KillEvent>;
     for (const [agentId, rawEvent] of entries) {
       if (!isValidAgentId(agentId)) return null;
       const event = asKillEvent(rawEvent);

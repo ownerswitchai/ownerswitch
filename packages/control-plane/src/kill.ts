@@ -31,32 +31,39 @@ export type KillSource = "button" | "honeytoken" | "app" | "voice" | "api";
 export const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voice", "api"];
 
 /**
- * Bounds for SCOPED (per-agent) kills. They exist because scoped-kill
- * entries persist in the kill-state file, which load() refuses over
- * MAX_KILL_STATE_FILE_BYTES: unbounded ids, reasons or agent counts would
- * let a kill flood write a state file tomorrow's boot rejects. The counts
- * are sized so the worst-case file stays far under that ceiling.
- *
- * At the agent-count cap a scoped kill is NEVER refused — it escalates to
- * the global kill instead (see engageAgent): out of room to stop one agent,
- * stop them all. Fail-closed has no capacity limit.
+ * The agentId contract lives in @ownerswitchai/shared — ONE validator for
+ * the gateway config, the scoped-kill surfaces, the state-file loader and
+ * the /status parser, so an agent that can act is always an agent that can
+ * be scope-killed. Re-exported here so control-plane consumers keep one
+ * import site.
  */
-export const MAX_KILLED_AGENTS = 64;
-export const MAX_AGENT_ID_CHARS = 128;
-export const MAX_SCOPED_KILL_REASON_CHARS = 256;
+export { isValidAgentId, MAX_AGENT_ID_CHARS, MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
+import { MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
 
 /**
- * A valid agent id for scoped kills: 1–128 printable-ASCII chars with no
- * leading/trailing whitespace. It appears verbatim in the state file, the
- * unauthenticated /status body and audit surfaces, so the charset is kept
- * boring by construction — no control characters, no Unicode confusables.
+ * Ceiling on a SCOPED kill's persisted reason, in UTF-16 code units, after
+ * control characters are stripped. The bound is about the state file: every
+ * scoped entry persists, and the loader refuses files over
+ * MAX_KILL_STATE_FILE_BYTES — so the per-entry worst case must be known in
+ * BYTES, not characters. Stripping controls first means JSON.stringify
+ * never \u-escapes a reason character (2 escaped bytes worst case for
+ * quote/backslash, 4 raw bytes worst case for astral); 128 chars therefore
+ * serialize to at most ~512 bytes, and 64 worst-case entries (max ids, max
+ * astral reasons, every flag set) stay comfortably under the 64 KiB read
+ * ceiling — pinned by a regression test in kill-state.test.ts.
  */
-export function isValidAgentId(value: string): boolean {
-  return (
-    value.length >= 1 &&
-    value.length <= MAX_AGENT_ID_CHARS &&
-    /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value)
-  );
+export const MAX_SCOPED_KILL_REASON_CHARS = 128;
+
+/**
+ * The persistable form of a scoped-kill reason: control characters
+ * (U+0000–U+001F, U+007F — the ones JSON inflates six-fold and logs choke
+ * on) become spaces, then the result is capped. Deterministic and lossy in
+ * the boring direction; the audit entry stores the same sanitized form, so
+ * what the file says is what the log says.
+ */
+export function sanitizeScopedKillReason(reason: string): string {
+  // eslint-disable-next-line no-control-regex
+  return reason.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, MAX_SCOPED_KILL_REASON_CHARS);
 }
 
 export interface KillEvent {
@@ -187,34 +194,41 @@ export class KillSwitch {
    * The caller validates the id (isValidAgentId); this method only bounds
    * what it stores. At MAX_KILLED_AGENTS the stop is not refused — it
    * escalates to the global kill, because stopping must never fail on a
-   * capacity ceiling.
+   * capacity ceiling. The return value says which switch actually flipped:
+   * `{ escalated: true }` means the GLOBAL kill is now in force and this
+   * agentId was NOT recorded as scope-killed (a later global restore will
+   * not leave it stopped) — surfaces must report that honestly rather than
+   * echoing a scoped kill that did not happen.
    */
   engageAgent(
     agentId: string,
     source: KillSource,
     reason?: string,
     opts: { unauthenticated?: boolean } = {},
-  ): void {
+  ): { escalated: boolean } {
+    const sanitized = reason === undefined ? undefined : sanitizeScopedKillReason(reason);
     if (!this.agentKillMap.has(agentId) && this.agentKillMap.size >= MAX_KILLED_AGENTS) {
       this.engage(
         source,
         `scoped-kill capacity (${MAX_KILLED_AGENTS} agents) exceeded at agent "${agentId}" — ` +
-          `escalated to a global kill${reason !== undefined ? `; original reason: ${reason}` : ""}`,
+          `escalated to a global kill${sanitized !== undefined ? `; original reason: ${sanitized}` : ""}`,
         opts,
       );
-      return;
+      return { escalated: true };
     }
     this.epochCounter += 1;
     const event: KillEvent = {
       source,
-      // bounded because it persists per agent in the kill-state file
-      ...(reason !== undefined ? { reason: reason.slice(0, MAX_SCOPED_KILL_REASON_CHARS) } : {}),
+      // sanitized + bounded because it persists per agent in the kill-state
+      // file, whose loader enforces a hard byte ceiling (kill-state.ts)
+      ...(sanitized !== undefined ? { reason: sanitized } : {}),
       at: this.now(),
       ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
     };
     this.log.push({ type: "agent-kill", agentId, event });
     this.agentKillMap.set(agentId, event);
     this.persist();
+    return { escalated: false };
   }
 
   /** True while `agentId` is scope-killed (the global switch is separate). */

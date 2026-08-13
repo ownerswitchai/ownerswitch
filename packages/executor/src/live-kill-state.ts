@@ -25,6 +25,8 @@ export function liveKillStateFromControlPlane(
     const state = await client.fetchKillState();
     if (state.killed) return { killed: true, epoch: state.epoch ?? -1 };
     if (state.epoch === undefined) return { killed: true, epoch: -1 };
-    return { killed: false, epoch: state.epoch };
+    // The scoped-kill list rides through so refuseTicket can hold a ticket
+    // against ITS agent's kill state directly, not only via the epoch.
+    return { killed: false, epoch: state.epoch, killedAgents: state.killedAgents };
   };
 }

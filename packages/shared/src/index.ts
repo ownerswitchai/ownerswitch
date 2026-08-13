@@ -48,6 +48,7 @@ export interface Verdict {
   reason: string;
 }
 
+export { isValidAgentId, MAX_AGENT_ID_CHARS, MAX_KILLED_AGENTS } from "./agent-id.js";
 export {
   canonicalJson,
   sha256Hex,

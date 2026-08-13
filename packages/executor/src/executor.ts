@@ -24,6 +24,18 @@ export interface LiveKillState {
   /** monotone count of kill engagements; restore never resets it */
   epoch: number;
   /**
+   * Agents under a SCOPED kill, when the source can carry it (the /status
+   * path does; the broker's signed kill-state channel does not — its wire
+   * shape is unchanged). Optional and belt-only BY the epoch design: every
+   * scoped kill bumps the global epoch, so a ticket whose killEpoch still
+   * matches was minted after the newest kill of any kind — its agent was
+   * not scope-killed at mint, and no kill has landed since. The direct
+   * check below closes nothing the epoch leaves open today; it exists so a
+   * future ticket source that binds epochs differently still cannot run a
+   * scope-killed agent's ticket past a check that had the list in hand.
+   */
+  killedAgents?: readonly string[];
+  /**
    * Present when the lookup carried a grant-liveness PROBE (a jti): true
    * iff the control plane still vouches for that specific grant — it
    * minted it, remembers it, and its window has NOT been vetoed since.
@@ -90,6 +102,14 @@ export function refuseTicket(
 ): Refusal | null {
   if (live.killed) {
     return { code: "kill-engaged", reason: "kill switch engaged — nothing executes" };
+  }
+  // Same code, scoped account: for the ticket's own agent a scoped kill IS
+  // the kill switch. (Belt to the epoch check below — see LiveKillState.)
+  if (live.killedAgents !== undefined && live.killedAgents.includes(ticket.agentId)) {
+    return {
+      code: "kill-engaged",
+      reason: `agent "${ticket.agentId}" is scope-killed — its tickets do not execute`,
+    };
   }
   if (ticket.killEpoch !== live.epoch) {
     return {

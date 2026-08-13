@@ -9,6 +9,7 @@ import {
 const FAIL_CLOSED = {
   killed: true,
   reason: "control plane unreachable — fail closed",
+  killedAgents: [],
 };
 
 const jsonResponse =
@@ -178,6 +179,33 @@ describe("createControlPlaneClient", () => {
           jsonResponse({ killed: false, epoch: 0, killedAgents: ["x".repeat(2000)] }),
         ).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("accepts only the shared wire contract: over-cap counts and invalid ids fail closed", async () => {
+      // 65 entries: one past MAX_KILLED_AGENTS — no real control plane emits it
+      await expect(
+        client(
+          jsonResponse({
+            killed: false,
+            epoch: 0,
+            killedAgents: Array.from({ length: 65 }, (_, i) => `agent-${i}`),
+          }),
+        ).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
+      for (const bad of ["__proto__", "ütközés", " padded ", "a".repeat(129)]) {
+        await expect(
+          client(jsonResponse({ killed: false, epoch: 0, killedAgents: [bad] })).fetchKillState(),
+        ).resolves.toEqual(FAIL_CLOSED);
+      }
+    });
+
+    it("fails closed on a response body too large to be a real /status answer", async () => {
+      const huge: typeof fetch = async () =>
+        new Response(`{"killed":false,"epoch":0,"killedAgents":[],"pad":"${"x".repeat(300 * 1024)}"}`, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      await expect(client(huge).fetchKillState()).resolves.toEqual(FAIL_CLOSED);
     });
   });
 });

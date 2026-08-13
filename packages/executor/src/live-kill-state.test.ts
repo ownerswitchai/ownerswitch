@@ -18,7 +18,7 @@ const clientServing = (body: unknown, status = 200) =>
 describe("liveKillStateFromControlPlane", () => {
   it("reads killed and epoch off GET /status through the real gateway client", async () => {
     const fetchLive = liveKillStateFromControlPlane(clientServing({ killed: false, epoch: 7, killedAgents: [] }));
-    expect(await fetchLive()).toEqual({ killed: false, epoch: 7 });
+    expect(await fetchLive()).toEqual({ killed: false, epoch: 7, killedAgents: [] });
   });
 
   it("a kill on /status reads as killed, epoch intact for the audit trail", async () => {
@@ -51,7 +51,7 @@ describe("liveKillStateFromControlPlane", () => {
     // the narrowing itself is fail-closed: "not killed, epoch unknown" must
     // not be able to authorize the ticket-epoch check
     const fetchLive = liveKillStateFromControlPlane({
-      fetchKillState: async () => ({ killed: false }),
+      fetchKillState: async () => ({ killed: false, killedAgents: [] }),
     });
     expect(await fetchLive()).toEqual({ killed: true, epoch: -1 });
   });

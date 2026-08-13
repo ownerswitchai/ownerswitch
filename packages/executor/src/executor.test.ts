@@ -54,6 +54,31 @@ describe("Executor", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("refuses a ticket whose OWN agent is scope-killed, as kill-engaged, backend never called", async () => {
+    const { calls, backend } = recordingBackend();
+    // Belt to the epoch design: when the live answer carries the scoped
+    // list, the ticket's agent is held against it directly.
+    const executor = new Executor(backend, {
+      fetchLiveKillState: async () => ({ killed: false, epoch: 3, killedAgents: ["a1"] }),
+      now: () => 1_000,
+    });
+    const outcome = await executor.run(TICKET);
+    expect(outcome.status).toBe("refused");
+    if (outcome.status === "refused") {
+      expect(outcome.refusal.code).toBe("kill-engaged");
+      expect(outcome.refusal.reason).toContain('"a1"');
+      expect(outcome.refusal.reason).toContain("scope-killed");
+    }
+    expect(calls).toHaveLength(0);
+
+    // another agent's scoped kill does not hold this ticket
+    const other = new Executor(recordingBackend().backend, {
+      fetchLiveKillState: async () => ({ killed: false, epoch: 3, killedAgents: ["someone-else"] }),
+      now: () => 1_000,
+    });
+    expect((await other.run(TICKET)).status).toBe("executed");
+  });
+
   it("a kill landing between the re-check and dispatch is caught by the pre-dispatch check", async () => {
     const { calls, backend } = recordingBackend();
 

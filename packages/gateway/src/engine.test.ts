@@ -15,35 +15,35 @@ const policy: Policy = {
 
 describe("evaluate", () => {
   it("kill switch denies everything, even allowed tools", () => {
-    const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true, reason: "honeytoken tripped" });
+    const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true, reason: "honeytoken tripped", killedAgents: [] });
     expect(v.decision).toBe("deny");
     expect(v.reason).toContain("honeytoken");
   });
 
   it("money movement requires approval", () => {
-    expect(evaluate({ agentId: "a1", tool: "stripe.payout" }, policy, { killed: false }).decision).toBe("approve");
+    expect(evaluate({ agentId: "a1", tool: "stripe.payout" }, policy, { killed: false, killedAgents: [] }).decision).toBe("approve");
   });
 
   it("merges go through the veto window", () => {
-    expect(evaluate({ agentId: "a1", tool: "github.merge_pr" }, policy, { killed: false }).decision).toBe("veto");
+    expect(evaluate({ agentId: "a1", tool: "github.merge_pr" }, policy, { killed: false, killedAgents: [] }).decision).toBe("veto");
   });
 
   it("args pattern escalates destructive bash", () => {
-    const v = evaluate({ agentId: "a1", tool: "bash", args: { cmd: "rm -rf /prod" } }, policy, { killed: false });
+    const v = evaluate({ agentId: "a1", tool: "bash", args: { cmd: "rm -rf /prod" } }, policy, { killed: false, killedAgents: [] });
     expect(v.decision).toBe("approve");
     expect(v.ruleId).toBe("r3");
   });
 
   it("plain bash only needs the veto window", () => {
-    expect(evaluate({ agentId: "a1", tool: "bash", args: { cmd: "ls" } }, policy, { killed: false }).decision).toBe("veto");
+    expect(evaluate({ agentId: "a1", tool: "bash", args: { cmd: "ls" } }, policy, { killed: false, killedAgents: [] }).decision).toBe("veto");
   });
 
   it("reads are allowed instantly", () => {
-    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false }).decision).toBe("allow");
+    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false, killedAgents: [] }).decision).toBe("allow");
   });
 
   it("unknown tools hit the fail-closed default", () => {
-    const v = evaluate({ agentId: "a1", tool: "totally.new.tool" }, policy, { killed: false });
+    const v = evaluate({ agentId: "a1", tool: "totally.new.tool" }, policy, { killed: false, killedAgents: [] });
     expect(v.decision).toBe("approve");
     expect(v.ruleId).toBeNull();
   });
@@ -79,23 +79,28 @@ describe("scoped kill", () => {
     expect(v.reason).toContain("kill switch engaged");
   });
 
-  it("an absent list scopes nothing out (hand-built kill states stay valid)", () => {
-    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false }).decision).toBe(
-      "allow",
-    );
-  });
-
   it("an empty list scopes nothing out", () => {
     expect(
       evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false, killedAgents: [] })
         .decision,
     ).toBe("allow");
   });
+
+  it("the list cannot be omitted — same compile-error stance as kill state itself", () => {
+    // An optional list would let a caller that forgot to thread it through
+    // silently un-scope every scoped kill. "No scoped state" must be an
+    // explicit `killedAgents: []` at the call site.
+    const omitted = () =>
+      // @ts-expect-error killedAgents is required enforcement input
+      evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false });
+    // Untyped (JS) callers crash instead of silently getting permission.
+    expect(omitted).toThrow(TypeError);
+  });
 });
 
 describe("kill state is required", () => {
   it("a bare { killed: true } denies even an allowed tool", () => {
-    const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true });
+    const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true, killedAgents: [] });
     expect(v.decision).toBe("deny");
     expect(v.ruleId).toBeNull();
   });

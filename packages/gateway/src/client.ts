@@ -1,4 +1,10 @@
-import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
+import {
+  isValidAgentId,
+  MAX_KILLED_AGENTS,
+  type Policy,
+  type ToolCall,
+  type Verdict,
+} from "@ownerswitchai/shared";
 import { evaluate, type KillState } from "./engine.js";
 
 /**
@@ -26,10 +32,10 @@ import { evaluate, type KillState } from "./engine.js";
  * strictness. `/status` always serves it (possibly empty); a body where it
  * is missing or malformed fails the entire lookup closed rather than being
  * read as "no agent is scope-killed", which would silently disarm every
- * scoped kill at exactly the gateway that must enforce it. Bounds below are
- * deliberately looser than what the control plane will ever emit (it caps
- * both count and id length far lower) — they bound memory against a hostile
- * or corrupted body, not define the wire contract.
+ * scoped kill at exactly the gateway that must enforce it. The accepted
+ * shape IS the wire contract from @ownerswitchai/shared: at most
+ * MAX_KILLED_AGENTS entries, every one a valid agent id — anything a real
+ * control plane could never have emitted reads as an untrustworthy answer.
  */
 export interface ControlPlaneClientOptions {
   baseUrl: string;
@@ -46,19 +52,25 @@ export interface ControlPlaneClient {
 const failClosed = (): KillState => ({
   killed: true,
   reason: "control plane unreachable — fail closed",
+  killedAgents: [],
 });
 
-/** Memory bounds for a hostile/corrupted body — see the class doc above. */
-const MAX_KILLED_AGENTS_ACCEPTED = 4096;
-const MAX_AGENT_ID_CHARS_ACCEPTED = 1024;
+/**
+ * Hard cap on the /status body read into memory. A legitimate body is a few
+ * hundred bytes; 256 KiB is orders of magnitude of headroom while making a
+ * hostile or misrouted endpoint's response a fail-closed answer, not an
+ * allocation. Enforced BEFORE JSON.parse, so parse cost is bounded too.
+ */
+const MAX_STATUS_BODY_BYTES = 256 * 1024;
 
-/** Strict parse of the scoped-kill list; null means fail the lookup closed. */
+/**
+ * Strict parse of the scoped-kill list against the shared agentId contract;
+ * null means fail the lookup closed.
+ */
 function parseKilledAgents(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > MAX_KILLED_AGENTS_ACCEPTED) return null;
+  if (!Array.isArray(value) || value.length > MAX_KILLED_AGENTS) return null;
   for (const entry of value) {
-    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_AGENT_ID_CHARS_ACCEPTED) {
-      return null;
-    }
+    if (typeof entry !== "string" || !isValidAgentId(entry)) return null;
   }
   return value as string[];
 }
@@ -84,7 +96,18 @@ export function createControlPlaneClient(
         headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
       });
       if (!res.ok) return failClosed();
-      const body: unknown = await res.json();
+      // Read as text and bound it BEFORE parsing: a response no real control
+      // plane could have produced must become a fail-closed answer, not an
+      // unbounded parse. (`text.length` counts UTF-16 units — a lower bound
+      // on bytes, which is the safe direction for a ceiling check.)
+      const text = await res.text();
+      if (text.length > MAX_STATUS_BODY_BYTES) return failClosed();
+      let body: unknown;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return failClosed();
+      }
       if (typeof body !== "object" || body === null) return failClosed();
       const { killed, reason, epoch, killedAgents } = body as {
         killed?: unknown;

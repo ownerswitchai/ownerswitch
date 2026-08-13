@@ -1163,18 +1163,23 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         });
         return;
       }
-      killSwitch.engageAgent(agentId, source, reason, { unauthenticated: !authenticated });
+      const { escalated } = killSwitch.engageAgent(agentId, source, reason, {
+        unauthenticated: !authenticated,
+      });
       // A scoped kill bumps the global epoch (kill.ts states why), so the
       // same belt applies as below: challenges minted into the old epoch are
       // dead anyway — clear them so the maps hold no corpses.
       approvalChallenges.clear();
       loginChallenges.clear();
       restoreChallenges.clear();
-      // engageAgent may have ESCALATED to a global kill at capacity —
-      // `killed` reports whichever switch is actually in force now.
+      // At capacity the stop ESCALATED to the global kill and this agentId
+      // was NOT recorded as scope-killed — a later global restore will not
+      // leave it stopped. Say which switch actually flipped; echoing
+      // `killedAgent` for a scoped kill that did not happen would be a lie
+      // the caller acts on.
       sendJson(res, 200, {
         killed: killSwitch.killed,
-        killedAgent: agentId,
+        ...(escalated ? { escalatedToGlobal: true as const } : { killedAgent: agentId }),
         ...degradedFields(),
       });
       return;
@@ -2506,7 +2511,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   function toolCallFrom(value: unknown): ToolCall | null {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     const { agentId, tool, args } = value as Record<string, unknown>;
-    if (typeof agentId !== "string" || agentId === "") return null;
+    // The shared agentId contract, enforced at registration: an id this
+    // surface accepted but POST /kill {agentId} would refuse would be an
+    // agent with review windows and no scoped stop. One validator, one
+    // answer, everywhere (the gateway refuses to START with such an id).
+    if (typeof agentId !== "string" || !isValidAgentId(agentId)) return null;
     if (typeof tool !== "string" || tool === "") return null;
     if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
       return null;

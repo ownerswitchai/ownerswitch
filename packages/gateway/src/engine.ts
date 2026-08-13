@@ -18,13 +18,18 @@ export interface KillState {
    * Agents under a SCOPED kill: every call whose `agentId` appears here is
    * denied, while the rest of the fleet keeps running under policy. The
    * global `killed` above stays supreme — when it is true this list is
-   * irrelevant, everything is denied. Optional for the same reason `epoch`
-   * is: hand-built `KillState` values (tests, callers with no scoped-kill
-   * source) stay valid, and an absent list simply scopes nothing out.
-   * `createControlPlaneClient`'s fetched answers always populate it or fail
-   * the whole lookup closed (see client.ts).
+   * irrelevant, everything is denied.
+   *
+   * REQUIRED, no default — deliberately unlike `epoch` (which evaluate()
+   * never consults) and exactly like the `kill` parameter itself: this
+   * field is enforcement input. An optional list would let any caller that
+   * forgot to thread it through silently un-scope every scoped kill —
+   * fail-open at the one layer that must not be. A caller with no scoped
+   * state must write `killedAgents: []` itself, making the assumption
+   * visible at the call site. `createControlPlaneClient`'s fetched answers
+   * always populate it or fail the whole lookup closed (see client.ts).
    */
-  killedAgents?: readonly string[];
+  killedAgents: readonly string[];
   /**
    * The control plane's kill epoch — a monotone count of every kill this
    * deployment has ever had; a restore never resets it. `evaluate()` itself
@@ -86,7 +91,7 @@ export function evaluate(
 
   // Scoped kill: outranked only by the global switch, and outranks every
   // policy rule — an `allow` lane must not keep a killed agent acting.
-  if (kill.killedAgents !== undefined && kill.killedAgents.includes(call.agentId)) {
+  if (kill.killedAgents.includes(call.agentId)) {
     return {
       decision: "deny",
       ruleId: null,

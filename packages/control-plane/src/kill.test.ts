@@ -14,6 +14,7 @@ import {
   KillSwitch,
   MAX_KILLED_AGENTS,
   MAX_SCOPED_KILL_REASON_CHARS,
+  sanitizeScopedKillReason,
 } from "./kill.js";
 
 const auth = { ceremonyId: "c1", ownerId: "adam", completedAt: 2000 };
@@ -390,6 +391,29 @@ describe("scoped (per-agent) kills", () => {
     expect(saved?.reason).toHaveLength(MAX_SCOPED_KILL_REASON_CHARS);
   });
 
+  it("sanitizes the persisted reason: control characters become spaces, never \\u escapes", () => {
+    // A control char JSON-escapes to 6 bytes; 128 of them would triple the
+    // per-entry byte budget the state-file ceiling is sized for. Stripping
+    // at write time keeps the worst case in BYTES known, and keeps log
+    // lines and owner surfaces injection-free.
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "line1\nline2\u0000\u001b[31mred\u007f");
+    const saved = store.saved.at(-1)?.agentKills?.["agent-7"];
+    expect(saved?.reason).toBe("line1 line2  [31mred ");
+    expect(sanitizeScopedKillReason("\u0007".repeat(300))).toBe(" ".repeat(MAX_SCOPED_KILL_REASON_CHARS));
+  });
+
+  it("reports which switch flipped: scoped kills return escalated:false, the cap overflow true", () => {
+    const k = new KillSwitch(() => 1000);
+    expect(k.engageAgent("agent-0", "api")).toEqual({ escalated: false });
+    for (let i = 1; i < MAX_KILLED_AGENTS; i += 1) k.engageAgent(`agent-${i}`, "api");
+    expect(k.engageAgent("agent-0", "api")).toEqual({ escalated: false }); // re-kill: no new entry
+    expect(k.engageAgent("agent-overflow", "api")).toEqual({ escalated: true });
+    expect(k.agentKilled("agent-overflow")).toBe(false); // the GLOBAL switch answered instead
+    expect(k.killed).toBe(true);
+  });
+
   it("at capacity a scoped kill is NEVER refused — it escalates to the global kill", () => {
     const k = new KillSwitch(() => 1000);
     for (let i = 0; i < MAX_KILLED_AGENTS; i += 1) k.engageAgent(`agent-${i}`, "api");
@@ -414,5 +438,11 @@ describe("scoped (per-agent) kills", () => {
     expect(isValidAgentId("a".repeat(129))).toBe(false);
     expect(isValidAgentId("newline\nagent")).toBe(false);
     expect(isValidAgentId("ütközés")).toBe(false);
+    // prototype-footgun names are refused even though the charset fits:
+    // agent ids are object keys in JS consumers (state file, id-indexed
+    // clients), where these names pollute or shadow
+    expect(isValidAgentId("__proto__")).toBe(false);
+    expect(isValidAgentId("constructor")).toBe(false);
+    expect(isValidAgentId("prototype")).toBe(false);
   });
 });

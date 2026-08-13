@@ -125,7 +125,7 @@ async function deviceSignedPost(
 }
 
 function decisionFor(call: ToolCall, policy: Policy, killed: boolean): Decision {
-  return evaluate(call, policy, { killed }).decision;
+  return evaluate(call, policy, { killed, killedAgents: [] }).decision;
 }
 
 /** The exact commands to un-kill a plane via the real 2GO ceremony. */
@@ -225,7 +225,7 @@ export async function runVerify(
   }
 
   const defaultCall: ToolCall = { agentId: AGENT_ID, tool: DEFAULT_PROBE_TOOL };
-  const defaultVerdict = evaluate(defaultCall, policy, { killed: false });
+  const defaultVerdict = evaluate(defaultCall, policy, { killed: false, killedAgents: [] });
   if (defaultVerdict.ruleId !== null) {
     steps.push({
       name: "default decision",

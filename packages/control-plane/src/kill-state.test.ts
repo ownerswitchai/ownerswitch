@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { KillStateFileStore, MAX_KILL_STATE_FILE_BYTES, type PersistedKillState } from "./kill-state.js";
+import { MAX_SCOPED_KILL_REASON_CHARS } from "./kill.js";
 
 /**
  * Arms a one-shot short write for the NEXT writeSync(fd, buffer, ...) call
@@ -179,6 +180,49 @@ describe("KillStateFileStore", () => {
         "agent-9": { source: "api", at: 900, unauthenticated: true },
       },
     };
+    expect(store.save(state)).toEqual({ durable: true });
+    expect(store.load()).toEqual({ outcome: "loaded", state });
+  });
+
+  it("a __proto__ agent key is refused at load — never a prototype-pollution copy", () => {
+    // JSON.parse hands back an OWN "__proto__" data property, so without the
+    // shared-contract refusal (and the loader's null-prototype copy) this
+    // file would validate while the entry silently vanished from the loaded
+    // state — a scoped kill that fails to come back after a restart.
+    const path = tempPath();
+    writeFileSync(
+      path,
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"__proto__":{"source":"app","at":1}}}',
+      "utf8",
+    );
+    expect(new KillStateFileStore(path).load().outcome).toBe("corrupt"); // boots killed, never fail-open
+  });
+
+  it("64 worst-case scoped entries still round-trip under the byte ceiling", () => {
+    // The durability invariant the reason bound exists for: any state the
+    // writer can produce, the loader must accept. Max-length ids, max-length
+    // astral-plane reasons (4 UTF-8 bytes per char, the JSON worst case once
+    // controls are stripped at write time), every flag set.
+    const store = new KillStateFileStore(tempPath());
+    const agentKills: Record<string, import("./kill.js").KillEvent> = {};
+    for (let i = 0; i < 64; i += 1) {
+      const id = `${String(i).padStart(4, "0")}-${"a".repeat(123)}`; // 128 chars, distinct
+      agentKills[id] = {
+        source: "honeytoken",
+        reason: "\u{1F6A8}".repeat(MAX_SCOPED_KILL_REASON_CHARS / 2), // astral: 2 units each
+        at: Number.MAX_SAFE_INTEGER,
+        unauthenticated: true,
+      };
+    }
+    const state: PersistedKillState = {
+      version: 1,
+      killed: true,
+      epoch: Number.MAX_SAFE_INTEGER,
+      lastKill: { source: "button", reason: "x".repeat(1024), at: 1, unauthenticated: true },
+      agentKills,
+    };
+    const bytes = Buffer.byteLength(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+    expect(bytes).toBeLessThan(MAX_KILL_STATE_FILE_BYTES);
     expect(store.save(state)).toEqual({ durable: true });
     expect(store.load()).toEqual({ outcome: "loaded", state });
   });

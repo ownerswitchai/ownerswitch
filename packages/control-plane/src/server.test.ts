@@ -3524,6 +3524,34 @@ describe("scoped (per-agent) kills over HTTP", () => {
     expect(await (await fetch(`${url}/veto/v-other`)).json()).toEqual({ status: "spent" });
   });
 
+  it("at capacity the response says escalatedToGlobal — never a scoped kill that did not happen", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    for (let i = 0; i < 64; i += 1) cp.killSwitch.engageAgent(`agent-${i}`, "api");
+    const res = await scopedKill(url, "agent-overflow", "one too many");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ killed: true, escalatedToGlobal: true });
+    expect(cp.killSwitch.agentKilled("agent-overflow")).toBe(false); // the global switch answered
+  });
+
+  it("veto registration enforces the shared agentId contract — an unstoppable agent gets no window", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+
+    for (const bad of ["__proto__", "ütközés", "a".repeat(129)]) {
+      const body = JSON.stringify({ call: { agentId: bad, tool: "stripe.payout" } });
+      const res = await fetch(`${url}/veto`, {
+        method: "POST",
+        headers: deviceHeaders(body, c.now()),
+        body,
+      });
+      expect(res.status).toBe(400);
+    }
+  });
+
   it("scoped kills persist across a restart, killedAgents intact", async () => {
     const c = clock(1_000);
     const stateFile = tempStateFile();
