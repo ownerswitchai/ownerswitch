@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -512,6 +512,69 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     // a v1 file that would NOT have validated under the old code is corrupt, not migrated
     writeFileSync(path, JSON.stringify({ ...legacy, extra: true }), { mode: 0o600 });
     expect(registryAt(path).initialize().ok).toBe(false);
+  });
+
+  it("MIGRATION CEILING: 129 distinct historical owners refuse BEFORE any publish; 128 migrate and reload", () => {
+    const spki = () =>
+      (generateKeyPairSync("ec", { namedCurve: "prime256v1" }).publicKey.export({
+        type: "spki",
+        format: "der",
+      }) as Buffer).toString("base64url");
+    const legacyWith = (ownerCount: number) => {
+      const devices: Record<string, unknown> = {};
+      for (let i = 0; i < ownerCount; i += 1) {
+        devices[`dev_old_${i}`] = {
+          deviceId: `dev_old_${i}`,
+          ownerId: `owner-${i}`,
+          deviceName: "old phone",
+          credentialId: randomBytes(16).toString("base64url"),
+          publicKeySpki: spki(),
+          cheapLaneKeySpki: spki(),
+          signCount: 0,
+          generation: 1,
+          revokedAt: 1, // historical: revoked, so the ACTIVE ceiling is untouched
+          enrolledAt: 1,
+        };
+      }
+      return { version: 1, bootstrapGeneration: 3, devices };
+    };
+
+    // 129 distinct owners: a VALID v1 file, but the owner-handle ceiling
+    // refuses the migration before anything is generated or published
+    const overPath = join(freshDir(), "devices.json");
+    writeFileSync(overPath, JSON.stringify(legacyWith(129)), { mode: 0o600 });
+    const over = registryAt(overPath);
+    const refused = over.initialize();
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.detail).toMatch(/129 distinct owners exceed the 128/);
+    expect(over.usable).toBe(false);
+    // NOTHING was published: the file is still version 1
+    expect((JSON.parse(readFileSync(overPath, "utf8")) as { version: number }).version).toBe(1);
+
+    // exactly AT the ceiling: migrates, publishes v2, and a restart loads it
+    const atPath = join(freshDir(), "devices.json");
+    writeFileSync(atPath, JSON.stringify(legacyWith(128)), { mode: 0o600 });
+    const at = registryAt(atPath);
+    expect(at.initialize().ok).toBe(true);
+    expect(at.ownerUserId("owner-0")).not.toBeNull();
+    const reloaded = registryAt(atPath);
+    expect(reloaded.initialize().ok).toBe(true);
+    expect(reloaded.ownerUserId("owner-127")).toBe(at.ownerUserId("owner-127"));
+  });
+
+  it("REFERENTIAL INTEGRITY: a v2 file whose device names an owner without a handle is corrupt — no second identity can ever be minted", () => {
+    const path = join(freshDir(), "devices.json");
+    const registry = registryAt(path);
+    registry.initialize();
+    const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-1", SECRET));
+    expect(registry.commitEnrollment(enrollmentSubmission(phone(), fixtureInvite(minted), SECRET), OPTS()).ok).toBe(true);
+    // tamper: drop the owner's handle while the device still names the owner
+    const raw = JSON.parse(readFileSync(path, "utf8")) as { owners: Record<string, unknown> };
+    raw.owners = {};
+    writeFileSync(path, JSON.stringify(raw), { mode: 0o600 });
+    const reloadedInit = registryAt(path).initialize();
+    expect(reloadedInit.ok).toBe(false);
+    if (!reloadedInit.ok) expect(reloadedInit.detail).toMatch(/unexpected shape/);
   });
 
   it("PACKAGE SURFACE: no invite store, no witness, no low-level spend — the registry is the only door", () => {

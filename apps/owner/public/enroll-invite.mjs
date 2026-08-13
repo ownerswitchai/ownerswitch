@@ -179,14 +179,36 @@ export function creationOptionsFromInvite(invite) {
  * the committed deviceName, the identifiers). A payload the validator
  * rejects never reaches create().
  */
-export async function beginEnrollmentCeremony(payload, credentials) {
+export async function beginEnrollmentCeremony(payload, credentials, now = Date.now) {
   const invite = parseEnrollmentInvite(payload);
   if (invite === null) {
     return { ok: false, reason: "not a valid enrollment invite — refusing the ceremony" };
   }
-  const credential = await credentials.create({ publicKey: creationOptionsFromInvite(invite) });
+  // an EXPIRED invite must not raise the platform prompt at all: the server
+  // would refuse the spend anyway, and a credential created for a dead
+  // invite is pure orphaned state on the phone
+  if (invite.expiresAt <= now()) {
+    return { ok: false, reason: "this invite has expired — mint a fresh one" };
+  }
+  if (
+    credentials === null ||
+    credentials === undefined ||
+    typeof credentials.create !== "function"
+  ) {
+    return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
+  }
+  // the REAL navigator.credentials.create() reports a user cancel or a
+  // timeout as a REJECTED promise (NotAllowedError), not as null — every
+  // rejection folds into the same fixed refusal, echoing no exception text
+  // and leaving no partial ceremony state behind
+  let credential;
+  try {
+    credential = await credentials.create({ publicKey: creationOptionsFromInvite(invite) });
+  } catch {
+    return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
+  }
   if (credential === null || credential === undefined) {
-    return { ok: false, reason: "credential creation was refused or dismissed" };
+    return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
   }
   return {
     ok: true,

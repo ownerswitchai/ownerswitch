@@ -35,5 +35,9 @@ export type BeginEnrollmentResult =
 
 export function beginEnrollmentCeremony(
   payload: unknown,
-  credentials: { create(options: { publicKey: EnrollmentCreationOptions }): Promise<unknown> },
+  credentials:
+    | { create(options: { publicKey: EnrollmentCreationOptions }): Promise<unknown> }
+    | null
+    | undefined,
+  now?: () => number,
 ): Promise<BeginEnrollmentResult>;

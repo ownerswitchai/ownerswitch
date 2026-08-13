@@ -165,7 +165,55 @@ describe("public/enroll-invite.mjs — drift-pinned to @ownerswitchai/shared", (
       create: vi.fn().mockResolvedValue(null),
     });
     expect(dismissed.ok).toBe(false);
-    if (!dismissed.ok) expect(dismissed.reason).toMatch(/refused or dismissed/);
+    if (!dismissed.ok) expect(dismissed.reason).toMatch(/refused, unavailable, or dismissed/);
+  });
+
+  it("a REJECTED create() — the real cancel/timeout shape — folds into the same fixed refusal, never an escaping exception", async () => {
+    const payload = realPayload();
+    // the browser's actual cancel: a rejected promise with NotAllowedError
+    const notAllowed = Object.assign(new Error("The operation either timed out or was not allowed."), {
+      name: "NotAllowedError",
+    });
+    const cancelled = await beginEnrollmentCeremony(payload, {
+      create: vi.fn().mockRejectedValue(notAllowed),
+    });
+    expect(cancelled.ok).toBe(false);
+    if (!cancelled.ok) {
+      expect(cancelled.reason).toBe("credential creation was refused, unavailable, or dismissed");
+      // FIXED string: no exception text, no credential fragments echoed
+      expect(cancelled.reason).not.toMatch(/timed out|NotAllowed/);
+    }
+    // a generic rejection is the same refusal
+    const generic = await beginEnrollmentCeremony(payload, {
+      create: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+    expect(generic.ok).toBe(false);
+    // a MISSING or broken CredentialsContainer refuses without throwing
+    expect((await beginEnrollmentCeremony(payload, undefined)).ok).toBe(false);
+    expect((await beginEnrollmentCeremony(payload, null)).ok).toBe(false);
+    expect(
+      (await beginEnrollmentCeremony(payload, {} as unknown as { create: () => Promise<unknown> })).ok,
+    ).toBe(false);
+    // none of the refusals produced any success-shaped partial state
+    for (const outcome of [cancelled, generic]) {
+      expect("credential" in outcome).toBe(false);
+      expect("token" in outcome).toBe(false);
+    }
+  });
+
+  it("an EXPIRED invite refuses BEFORE the platform prompt — create() is never raised for a dead invite", async () => {
+    const create = vi.fn().mockResolvedValue({ id: "never" });
+    const expired = await beginEnrollmentCeremony(
+      { ...realPayload(), expiresAt: 1 },
+      { create },
+    );
+    expect(expired.ok).toBe(false);
+    if (!expired.ok) expect(expired.reason).toMatch(/expired/);
+    expect(create).not.toHaveBeenCalled();
+    // an explicit clock makes the boundary exact: at expiresAt it is dead
+    const payload = realPayload();
+    const atBoundary = await beginEnrollmentCeremony(payload, { create }, () => payload.expiresAt);
+    expect(atBoundary.ok).toBe(false);
   });
 
   it("base64urlToBytes is canonical: repairable spellings decode to null", () => {
