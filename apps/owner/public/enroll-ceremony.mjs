@@ -130,10 +130,10 @@ export async function completeEnrollmentCeremony(payload, deps) {
   /* 0 — the deployment-configured origin is the trust anchor */
   const origin = trustedOrigin(baseUrl);
   if (origin === null) {
+    // no survival claim: nothing about the server was observable from here
     return {
       ok: false,
       reason: "control-plane URL is not a trusted origin (https, no path) — refusing the ceremony",
-      inviteSurvives: true,
     };
   }
 
@@ -143,7 +143,8 @@ export async function completeEnrollmentCeremony(payload, deps) {
      the secret; the SERVER's record is what the prompts will see. */
   const pasted = parseEnrollmentInvite(payload);
   if (pasted === null) {
-    return { ok: false, reason: "not a valid enrollment invite — refusing the ceremony", inviteSurvives: true };
+    // no survival claim: an invalid paste says nothing about any server record
+    return { ok: false, reason: "not a valid enrollment invite — refusing the ceremony" };
   }
   let serverInvite = null;
   try {
