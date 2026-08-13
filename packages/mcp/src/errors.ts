@@ -150,6 +150,21 @@ export function lockdown(tool: string, reason: string | undefined): OwnerSwitchR
 }
 
 /**
+ * The SCOPED variant: this agent is scope-killed while the rest of the fleet
+ * runs. Same code as Lockdown — the agent's correct behavior is identical
+ * (stop calling tools, tell the user) — with an honest account of the scope.
+ */
+export function scopedLockdown(tool: string, agentId: string): OwnerSwitchRefusal {
+  const why = `agent "${agentId}" is scope-killed`;
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.Lockdown,
+    `OwnerSwitch denied "${tool}": ${why}. Every tool call from this agent is denied until ` +
+      `an owner restores it — do not retry other tools; tell the user why.`,
+    { decision: "lockdown", tool, reason: why },
+  );
+}
+
+/**
  * A honeytoken surfaced in the call's arguments. Unlike every other refusal,
  * this one is not a decision an owner might revisit — it is a tripwire, and
  * by the time the agent reads this message the kill is already being

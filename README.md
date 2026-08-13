@@ -37,6 +37,17 @@ the whole guarantee — it covers calls that route through the gateway,
 nothing an agent reaches by other means (see
 [Enforcement boundary](#enforcement-boundary)).
 
+**Scoped kill — stop one agent, not the fleet.** `POST /kill` with an
+`agentId` stops that agent only: every call carrying its id is denied at
+the gateway, and the control plane refuses to open review windows for
+it, approve its pending calls, or commit its grants. Stopping an agent
+is as cheap as stopping everything; restoring one takes the same 2GO
+ceremony, scoped. A scoped kill bumps the global kill epoch on purpose —
+every in-flight approval needs a fresh owner decision afterwards — and
+if more than 64 agents pile up scope-killed, the next one escalates to
+the global kill rather than being refused: stopping never fails on a
+capacity ceiling.
+
 **Where this is headed:** once the credential broker above ships, KILL
 also means no more tokens — the shorter the TTL, the smaller the window
 between KILL and everything downstream going dark. That's the

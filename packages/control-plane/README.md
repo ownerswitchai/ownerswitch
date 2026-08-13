@@ -8,11 +8,24 @@ Stops are cheap and attributable; starts are expensive and ceremonial.
 | route | auth | direction |
 | --- | --- | --- |
 | `POST /kill` | device-signed or loopback | stop — free forever |
+| `POST /kill` `{agentId}` | device-signed or loopback | stop ONE agent (scoped kill) — same cheapness |
 | `POST /veto/:id` | owner session, or device-signed (deny-only relay) | stop |
 | `POST /veto/:id/seen` | device-signed only | delivery ack (the permissive bit; 60 s response floor) |
 | `GET /veto/pending`, `GET /veto/:id` | device-signed for pacing fields | read |
 | `POST /veto/:id` `decision:approve` | owner session + passkey assertion | start (merge grant) |
 | `POST /restore/ceremony` → `POST /restore` | owner session + passkey; 2GO cooldown | start — **the licensed act** |
+| `POST /restore/ceremony` `{agentId}` → `POST /restore` | owner session + passkey; 2GO cooldown | start ONE scope-killed agent — same ceremony, scoped |
+
+Scoped kills ride the same rails as the global switch: `GET /status`
+always serves `killedAgents` (gateways fail closed on its absence, like
+`epoch`), a scoped kill bumps the global kill epoch so pre-kill
+approvals die with it, the state file persists scope-killed agents
+across restarts, and at 64 scope-killed agents the next distinct scoped
+kill escalates to the global kill instead of failing — stopping has no
+capacity ceiling. Rollout order matters and fails in the safe
+direction: a NEW gateway polling an OLD control plane reads the missing
+`killedAgents` as an untrustworthy answer and denies everything —
+upgrade the control plane first, then its gateways.
 
 ## 2GO licensing (`src/license.ts`)
 

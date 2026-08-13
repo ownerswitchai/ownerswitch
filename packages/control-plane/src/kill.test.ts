@@ -9,7 +9,13 @@ import {
   type PersistedKillState,
   type SaveResult,
 } from "./kill-state.js";
-import { KillSwitch } from "./kill.js";
+import {
+  isValidAgentId,
+  KillSwitch,
+  MAX_KILLED_AGENTS,
+  MAX_SCOPED_KILL_REASON_CHARS,
+  sanitizeScopedKillReason,
+} from "./kill.js";
 
 const auth = { ceremonyId: "c1", ownerId: "adam", completedAt: 2000 };
 
@@ -288,5 +294,176 @@ describe("KillSwitch", () => {
     expect(k.lastKill?.reason).toBe("second");
     k.restore(auth);
     expect(k.lastKill?.reason).toBe("second"); // survives restore for the audit surface
+  });
+});
+
+describe("scoped (per-agent) kills", () => {
+  it("stops one agent without stopping the fleet, audited and attributed", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app", "looping on stripe.payout");
+    expect(k.killed).toBe(false); // the global switch is untouched
+    expect(k.agentKilled("agent-7")).toBe(true);
+    expect(k.agentKilled("agent-8")).toBe(false);
+    expect(k.killedAgents).toEqual(["agent-7"]);
+    expect(k.auditLog()).toEqual([
+      {
+        type: "agent-kill",
+        agentId: "agent-7",
+        event: { source: "app", reason: "looping on stripe.payout", at: 1000 },
+      },
+    ]);
+  });
+
+  it("bumps the GLOBAL epoch — scoped kills inherit the epoch invalidation story", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "api");
+    expect(k.epoch).toBe(1);
+    k.engageAgent("agent-7", "api"); // idempotent re-kill still opens a new epoch
+    expect(k.epoch).toBe(2);
+    expect(k.killedAgents).toEqual(["agent-7"]);
+  });
+
+  it("scoped restore needs a ceremony, is single-use, and never bumps the epoch", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app");
+    const epochAtKill = k.epoch;
+    expect(() => k.restoreAgent("agent-7", { ceremonyId: "", ownerId: "", completedAt: 0 })).toThrow(
+      /2GO/,
+    );
+    k.restoreAgent("agent-7", auth);
+    expect(k.agentKilled("agent-7")).toBe(false);
+    expect(k.epoch).toBe(epochAtKill);
+    // the spent ceremony cannot restore a second scoped kill either
+    k.engageAgent("agent-7", "app");
+    expect(() => k.restoreAgent("agent-7", auth)).toThrow(/single-use/);
+  });
+
+  it("cannot scope-restore an agent that is not scope-killed", () => {
+    expect(() => new KillSwitch().restoreAgent("agent-7", auth)).toThrow(/nothing to restore/);
+  });
+
+  it("global kill and restore leave scoped kills intact — the tiers are independent", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app");
+    k.engage("button");
+    expect(k.killed).toBe(true);
+    expect(k.agentKilled("agent-7")).toBe(true);
+    k.restore(auth);
+    expect(k.killed).toBe(false);
+    expect(k.agentKilled("agent-7")).toBe(true); // its own kill was never restored
+  });
+
+  it("persists scoped kills exactly when non-empty and reboots with them re-seated", () => {
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "incident");
+    expect(store.saved.at(-1)).toEqual({
+      version: 1,
+      killed: false,
+      epoch: 1,
+      agentKills: { "agent-7": { source: "app", reason: "incident", at: 1000 } },
+    });
+
+    const rebootStore = new FakeStore();
+    rebootStore.loadResult = { outcome: "loaded", state: store.saved.at(-1) as PersistedKillState };
+    const k2 = new KillSwitch(() => 2000, { store: rebootStore });
+    expect(k2.killed).toBe(false);
+    expect(k2.agentKilled("agent-7")).toBe(true);
+    expect(k2.epoch).toBe(1);
+    expect(k2.auditLog()).toEqual([
+      {
+        type: "agent-kill",
+        agentId: "agent-7",
+        event: { source: "app", reason: "incident", at: 1000 },
+      },
+    ]);
+
+    // scoped restore drops the field from the file again
+    k2.restoreAgent("agent-7", auth);
+    expect(rebootStore.saved.at(-1)).toEqual({ version: 1, killed: false, epoch: 1 });
+  });
+
+  it("bounds the persisted reason — scoped entries must never outgrow the state file", () => {
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "x".repeat(10_000));
+    const saved = store.saved.at(-1)?.agentKills?.["agent-7"];
+    expect(saved?.reason).toHaveLength(MAX_SCOPED_KILL_REASON_CHARS);
+  });
+
+  it("sanitizes the persisted reason: control characters become spaces, never \\u escapes", () => {
+    // A control char JSON-escapes to 6 bytes; 128 of them would triple the
+    // per-entry byte budget the state-file ceiling is sized for. Stripping
+    // at write time keeps the worst case in BYTES known, and keeps log
+    // lines and owner surfaces injection-free.
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "line1\nline2\u0000\u001b[31mred\u007f");
+    const saved = store.saved.at(-1)?.agentKills?.["agent-7"];
+    expect(saved?.reason).toBe("line1 line2  [31mred ");
+    expect(sanitizeScopedKillReason("\u0007".repeat(300))).toBe(" ".repeat(MAX_SCOPED_KILL_REASON_CHARS));
+  });
+
+  it("an id outside the contract escalates to the global kill — never recorded, never refused", () => {
+    // Defense in depth behind the HTTP/config validation: an invalid id in
+    // the map would persist a state file the strict loader rejects — a
+    // baffling fail-closed global boot later. The stop lands NOW instead,
+    // globally and attributed.
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    expect(k.engageAgent("__proto__", "app", "went rogue")).toEqual({ escalated: true });
+    expect(k.killed).toBe(true);
+    expect(k.killedAgents).toEqual([]); // nothing unloadable was recorded
+    expect(store.saved.at(-1)?.agentKills).toBeUndefined();
+    expect(k.lastKill?.reason).toContain("agentId contract");
+    expect(k.lastKill?.reason).toContain("went rogue");
+
+    // control characters in the offending id cannot smuggle into the reason
+    const k2 = new KillSwitch(() => 1000);
+    k2.engageAgent("bad\nid", "api");
+    expect(k2.killed).toBe(true);
+    expect(k2.lastKill?.reason).not.toContain("\n");
+  });
+
+  it("reports which switch flipped: scoped kills return escalated:false, the cap overflow true", () => {
+    const k = new KillSwitch(() => 1000);
+    expect(k.engageAgent("agent-0", "api")).toEqual({ escalated: false });
+    for (let i = 1; i < MAX_KILLED_AGENTS; i += 1) k.engageAgent(`agent-${i}`, "api");
+    expect(k.engageAgent("agent-0", "api")).toEqual({ escalated: false }); // re-kill: no new entry
+    expect(k.engageAgent("agent-overflow", "api")).toEqual({ escalated: true });
+    expect(k.agentKilled("agent-overflow")).toBe(false); // the GLOBAL switch answered instead
+    expect(k.killed).toBe(true);
+  });
+
+  it("at capacity a scoped kill is NEVER refused — it escalates to the global kill", () => {
+    const k = new KillSwitch(() => 1000);
+    for (let i = 0; i < MAX_KILLED_AGENTS; i += 1) k.engageAgent(`agent-${i}`, "api");
+    expect(k.killed).toBe(false);
+    // an already-killed agent re-kills fine at capacity (no new entry)
+    k.engageAgent("agent-0", "api");
+    expect(k.killed).toBe(false);
+    // one more DISTINCT agent has nowhere to go but everywhere
+    k.engageAgent("agent-overflow", "honeytoken", "decoy crossed the gateway");
+    expect(k.killed).toBe(true);
+    expect(k.lastKill?.reason).toMatch(/capacity/);
+    expect(k.lastKill?.reason).toContain("agent-overflow");
+    expect(k.lastKill?.reason).toContain("decoy crossed the gateway");
+  });
+
+  it("validates agent ids for the HTTP layer: printable ASCII, 1–128, no edge spaces", () => {
+    expect(isValidAgentId("agent-7")).toBe(true);
+    expect(isValidAgentId("a")).toBe(true);
+    expect(isValidAgentId("two words")).toBe(true);
+    expect(isValidAgentId("")).toBe(false);
+    expect(isValidAgentId(" padded ")).toBe(false);
+    expect(isValidAgentId("a".repeat(129))).toBe(false);
+    expect(isValidAgentId("newline\nagent")).toBe(false);
+    expect(isValidAgentId("ütközés")).toBe(false);
+    // prototype-footgun names are refused even though the charset fits:
+    // agent ids are object keys in JS consumers (state file, id-indexed
+    // clients), where these names pollute or shadow
+    expect(isValidAgentId("__proto__")).toBe(false);
+    expect(isValidAgentId("constructor")).toBe(false);
+    expect(isValidAgentId("prototype")).toBe(false);
   });
 });

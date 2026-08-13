@@ -28,6 +28,7 @@ import {
   ownerVetoed,
   policyDenied,
   routedCallRefused,
+  scopedLockdown,
   ticketRefused,
   vetoHeld,
   vetoPending,
@@ -289,6 +290,13 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     };
     const verdict = await evaluateRemote(call, options.policy, observing);
     if (observedKill?.killed) throw lockdown(call.tool, observedKill.reason);
+    // A SCOPED kill of this gateway's agent is a lockdown too, not a policy
+    // deny: the engine already denied the call (killedAgents outranks every
+    // rule), but the agent must hear "you are stopped, stop retrying" rather
+    // than "this tool is blocked" — the same honesty split as the global kill.
+    if (observedKill?.killedAgents?.includes(agentId) === true) {
+      throw scopedLockdown(call.tool, agentId);
+    }
 
     switch (verdict.decision) {
       case "allow":

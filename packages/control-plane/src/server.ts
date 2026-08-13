@@ -29,7 +29,7 @@ import {
 } from "./auth.js";
 import { canonicalTrustedStandingPath, DeviceStandingFileStore } from "./device-standing.js";
 import { KillStateFileStore } from "./kill-state.js";
-import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
+import { isValidAgentId, KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
 import {
   enrolledOwnerDeviceFromSpki,
@@ -839,7 +839,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // Live restore ceremonies, keyed by id. Deliberately process-local: losing
   // this map (a restart) can only make restores harder, never easier — an id
   // that is not in here restores nothing, whatever its body claims.
-  const ceremonies = new Map<string, { ceremony: RestoreCeremony; epoch: number }>();
+  // `agentId` scopes the ceremony: present, it restores that ONE scope-killed
+  // agent; absent, it restores the global kill switch — the ceremony's scope
+  // is fixed at GO 1/2 and never transferable.
+  const ceremonies = new Map<
+    string,
+    { ceremony: RestoreCeremony; epoch: number; agentId?: string }
+  >();
   // Outstanding GO 2/2 restore assertion challenges, keyed by ceremony id: the
   // server-minted challenge the owner's passkey must sign to complete a
   // restore, bound to {ceremonyId, killEpoch}. A stolen owner SESSION alone
@@ -982,7 +988,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       const window = windowId === undefined ? undefined : vetoWindows.get(windowId);
       probeFields = {
         jti,
-        grantLive: window !== undefined && window.state !== "vetoed",
+        // a scope-killed agent's grant is not vouched for, exactly like a
+        // vetoed window's — a kill IS the owner's veto, delivered louder
+        grantLive:
+          window !== undefined &&
+          window.state !== "vetoed" &&
+          !killSwitch.agentKilled(window.call.agentId),
       };
     }
     const payload = {
@@ -1062,9 +1073,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       window === undefined ||
       window.state === "vetoed" ||
       killSwitch.killed ||
+      // belt: a scoped kill bumps the epoch, so the next check already
+      // refuses — but the agent's kill state is the truth being enforced,
+      // so it is asserted here in its own right, in the same synchronous
+      // block that makes this commit atomic
+      killSwitch.agentKilled(window.call.agentId) ||
       window.approvalEpoch !== killSwitch.epoch
     ) {
-      // a veto/kill/epoch-move won, or the grant is unknown — do NOT commit
+      // a veto/kill/scoped-kill/epoch-move won, or the grant is unknown —
+      // do NOT commit
       committed = false;
     } else {
       committedGrants.add(jti); // idempotent: a retried commit stays committed
@@ -1084,8 +1101,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   function getStatus(res: ServerResponse): void {
+    // killedAgents is ALWAYS served (possibly empty): gateway clients read a
+    // missing list as an untrustworthy answer and fail the whole lookup
+    // closed, exactly like a missing epoch. Like epoch, this widens what an
+    // unauthenticated caller learns — the ids of currently scope-killed
+    // agents — and is accepted for the same reason: every gateway must be
+    // able to poll it without a session. Ids are bounded, printable ASCII by
+    // construction (kill.ts isValidAgentId).
+    const killedAgents = killSwitch.killedAgents;
     if (!killSwitch.killed) {
-      sendJson(res, 200, { killed: false, epoch: killSwitch.epoch, ...degradedFields() });
+      sendJson(res, 200, {
+        killed: false,
+        epoch: killSwitch.epoch,
+        killedAgents,
+        ...degradedFields(),
+      });
       return;
     }
     // lastKill is tracked directly — this route is polled by every gateway
@@ -1096,6 +1126,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       reason: lastKill?.reason,
       at: lastKill?.at,
       epoch: killSwitch.epoch,
+      killedAgents,
       ...degradedFields(),
     });
   }
@@ -1119,6 +1150,40 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // kills are recorded as plain "api" kills, flagged in the audit trail.
     const source = authenticated ? claimed : "api";
     const reason = typeof body.reason === "string" ? body.reason : undefined;
+    // An agentId makes this a SCOPED kill: stop that one agent, leave the
+    // fleet running. Same auth shape, same cheapness, same audit treatment.
+    // A malformed agentId is refused with 400 BEFORE anything is engaged —
+    // the caller asked to stop one agent and named it unusably; the global
+    // stop (no agentId) remains available and parameter-free.
+    const agentId = body.agentId;
+    if (agentId !== undefined) {
+      if (typeof agentId !== "string" || !isValidAgentId(agentId)) {
+        sendJson(res, 400, {
+          error: "agentId must be printable ASCII, 1-128 chars, no leading/trailing spaces",
+        });
+        return;
+      }
+      const { escalated } = killSwitch.engageAgent(agentId, source, reason, {
+        unauthenticated: !authenticated,
+      });
+      // A scoped kill bumps the global epoch (kill.ts states why), so the
+      // same belt applies as below: challenges minted into the old epoch are
+      // dead anyway — clear them so the maps hold no corpses.
+      approvalChallenges.clear();
+      loginChallenges.clear();
+      restoreChallenges.clear();
+      // At capacity the stop ESCALATED to the global kill and this agentId
+      // was NOT recorded as scope-killed — a later global restore will not
+      // leave it stopped. Say which switch actually flipped; echoing
+      // `killedAgent` for a scoped kill that did not happen would be a lie
+      // the caller acts on.
+      sendJson(res, 200, {
+        killed: killSwitch.killed,
+        ...(escalated ? { escalatedToGlobal: true as const } : { killedAgent: agentId }),
+        ...degradedFields(),
+      });
+      return;
+    }
     killSwitch.engage(source, reason, { unauthenticated: !authenticated });
     // A kill voids every outstanding approval ceremony: a challenge minted
     // before the kill must never be redeemable after a restore (its epoch
@@ -1168,41 +1233,70 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendUnauthorized(res);
       return;
     }
-    parseJsonBody(await readRawBody(req)); // drain and validate; nothing else is trusted from the body
-    if (!killSwitch.killed) {
-      sendJson(res, 409, { error: "not killed — nothing to restore" });
+    const body = parseJsonBody(await readRawBody(req)); // the ONLY trusted field is the scope selector
+    // An agentId scopes the ceremony to ONE scope-killed agent; absent, it
+    // is the global restore. The scope is fixed here at GO 1/2 — nothing
+    // later can retarget a ceremony.
+    const scopeAgentId = body.agentId;
+    if (scopeAgentId !== undefined && (typeof scopeAgentId !== "string" || !isValidAgentId(scopeAgentId))) {
+      sendJson(res, 400, {
+        error: "agentId must be printable ASCII, 1-128 chars, no leading/trailing spaces",
+      });
       return;
     }
+    if (scopeAgentId === undefined) {
+      if (!killSwitch.killed) {
+        sendJson(res, 409, { error: "not killed — nothing to restore" });
+        return;
+      }
+    } else {
+      // Restoring one agent under a GLOBAL kill would restore nothing the
+      // gateway could act on (the global switch denies everything) while
+      // spending a ceremony — refuse and point at the real restore.
+      if (killSwitch.killed) {
+        sendJson(res, 409, {
+          error: "the global kill switch is engaged — restore it first, then the agent",
+        });
+        return;
+      }
+      if (!killSwitch.agentKilled(scopeAgentId)) {
+        sendJson(res, 409, { error: "agent is not scope-killed — nothing to restore" });
+        return;
+      }
+    }
     // Dead records first, BEFORE any capacity decision: a ceremony that is
-    // past its TTL, already consumed, or bound to a superseded kill epoch is
-    // unspendable by every path in this file, so it must never hold a slot
-    // against the one ceremony that matters. (An earlier version purged only
-    // TTL expiry, which let corpses block new ceremonies for minutes — a
-    // lockout of restore, the exact operation this system exists to protect.)
+    // past its TTL, already consumed, bound to a superseded kill epoch, or
+    // scoped to an agent no longer scope-killed is unspendable by every
+    // path in this file, so it must never hold a slot against the one
+    // ceremony that matters. (An earlier version purged only TTL expiry,
+    // which let corpses block new ceremonies for minutes — a lockout of
+    // restore, the exact operation this system exists to protect.)
     for (const [staleId, record] of ceremonies) {
       const dead =
         now() >= record.ceremony.expiresAt ||
         record.ceremony.state === "completed" ||
-        record.epoch !== killSwitch.epoch;
+        record.epoch !== killSwitch.epoch ||
+        (record.agentId !== undefined && !killSwitch.agentKilled(record.agentId));
       if (dead) ceremonies.delete(staleId);
     }
-    // One live ceremony per owner per kill epoch, and GO 1/2 is IDEMPOTENT:
-    // while this owner already has a live ceremony (post-purge, so it is
-    // current-epoch, unconsumed and unexpired), return THAT ceremony with
-    // its clocks untouched. A double-click, a browser retry or a second tab
-    // must not invalidate the id the owner is holding — and a stolen
-    // same-owner session must not be able to reset the cooldown forever by
-    // hammering this route. There is deliberately no way to abandon a
-    // pending ceremony early: it ends by TTL expiry, consumption, or a new
-    // kill epoch — any owner-session cancel verb would reopen the same
-    // stolen-session lockout this idempotency closes.
+    // One live ceremony per owner PER SCOPE per kill epoch, and GO 1/2 is
+    // IDEMPOTENT: while this owner already has a live ceremony for this
+    // scope (post-purge, so it is current-epoch, unconsumed and unexpired),
+    // return THAT ceremony with its clocks untouched. A double-click, a
+    // browser retry or a second tab must not invalidate the id the owner is
+    // holding — and a stolen same-owner session must not be able to reset
+    // the cooldown forever by hammering this route. There is deliberately
+    // no way to abandon a pending ceremony early: it ends by TTL expiry,
+    // consumption, or a new kill epoch — any owner-session cancel verb
+    // would reopen the same stolen-session lockout this idempotency closes.
     for (const [existingId, record] of ceremonies) {
-      if (record.ceremony.ownerId === session.ownerId) {
+      if (record.ceremony.ownerId === session.ownerId && record.agentId === scopeAgentId) {
         sendJson(res, 200, {
           id: existingId,
           state: record.ceremony.tick(),
           cooldownRemainingMs: record.ceremony.cooldownRemainingMs(),
           expiresAt: record.ceremony.expiresAt,
+          ...(record.agentId !== undefined ? { agentId: record.agentId } : {}),
         });
         return;
       }
@@ -1249,12 +1343,17 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // (or watching them mint) must not help anyone name another.
     const id = `cer_${randomUUID()}`;
     const ceremony = new RestoreCeremony(id, session.ownerId, { now });
-    ceremonies.set(id, { ceremony, epoch: killSwitch.epoch });
+    ceremonies.set(id, {
+      ceremony,
+      epoch: killSwitch.epoch,
+      ...(scopeAgentId !== undefined ? { agentId: scopeAgentId } : {}),
+    });
     sendJson(res, 201, {
       id,
       state: ceremony.tick(),
       cooldownRemainingMs: ceremony.cooldownRemainingMs(),
       expiresAt: ceremony.expiresAt,
+      ...(scopeAgentId !== undefined ? { agentId: scopeAgentId } : {}),
     });
   }
 
@@ -1272,17 +1371,21 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     const ticked = record.ceremony.tick();
     // "completed" only ever happens via /restore, so it reads as consumed; a
-    // ceremony from a superseded kill epoch is dead and reads as expired.
+    // ceremony from a superseded kill epoch is dead and reads as expired —
+    // as does a scoped ceremony whose agent is no longer scope-killed
+    // (nothing left for it to restore).
     const state =
       ticked === "completed"
         ? "consumed"
-        : record.epoch !== killSwitch.epoch
+        : record.epoch !== killSwitch.epoch ||
+            (record.agentId !== undefined && !killSwitch.agentKilled(record.agentId))
           ? "expired"
           : ticked;
     sendJson(res, 200, {
       state,
       cooldownRemainingMs: record.ceremony.cooldownRemainingMs(),
       expiresAt: record.ceremony.expiresAt,
+      ...(record.agentId !== undefined ? { agentId: record.agentId } : {}),
     });
   }
 
@@ -1323,7 +1426,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 404, { error: `no ceremony "${id}"` });
       return;
     }
-    if (!killSwitch.killed) {
+    // Scope-aware "is there anything to restore": a global ceremony needs
+    // the global switch engaged; a scoped one needs ITS agent scope-killed
+    // (and no global kill in force — under one, restoring an agent is
+    // meaningless and the ceremony was refused at GO 1/2 anyway).
+    const restorable = () =>
+      record.agentId === undefined
+        ? killSwitch.killed
+        : !killSwitch.killed && killSwitch.agentKilled(record.agentId);
+    if (!restorable()) {
       sendJson(res, 409, { error: "not killed — nothing to restore" });
       return;
     }
@@ -1335,7 +1446,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // RE-CHECK after the await: a kill can land while the body drains, bumping
     // the epoch. A challenge minted into a moved epoch would be dead anyway
     // (redemption checks equality), but never mint it in the first place.
-    if (!killSwitch.killed || record.epoch !== killSwitch.epoch) {
+    if (!restorable() || record.epoch !== killSwitch.epoch) {
       sendJson(res, 409, { error: "the kill epoch moved while starting GO 2/2 — start a fresh ceremony" });
       return;
     }
@@ -1364,6 +1475,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       ceremonyId: id,
       killEpoch: killSwitch.epoch,
       expiresAt: now() + RESTORE_CHALLENGE_TTL_MS,
+      // scope, echoed so the owner app can SHOW what is being restored; the
+      // binding itself lives in the ceremony record the challenge is keyed to
+      ...(record.agentId !== undefined ? { agentId: record.agentId } : {}),
     });
   }
 
@@ -1392,7 +1506,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (record === undefined) return rejected();
     if (record.ceremony.ownerId !== session.ownerId) return rejected();
     if (record.epoch !== killSwitch.epoch) return rejected();
-    if (!killSwitch.killed) return rejected();
+    // Scope-aware, same shape as the challenge mint: a global ceremony
+    // restores the engaged global switch; a scoped one restores its own
+    // scope-killed agent — never the other way around.
+    if (record.agentId === undefined) {
+      if (!killSwitch.killed) return rejected();
+    } else if (killSwitch.killed || !killSwitch.agentKilled(record.agentId)) {
+      return rejected();
+    }
 
     // The owner SESSION is a REUSABLE bearer token; a stolen one must not be
     // able to restore the kill switch and reopen permissive lanes. With a
@@ -1458,11 +1579,19 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       // the cooldown, inside the TTL) and transitions to "completed" before
       // returning, so a concurrent second spend throws. Single-spend holds
       // for one process and one event loop — where all ceremony state lives.
-      killSwitch.restore(record.ceremony.confirm());
+      const authz = record.ceremony.confirm();
+      if (record.agentId === undefined) killSwitch.restore(authz);
+      else killSwitch.restoreAgent(record.agentId, authz);
     } catch {
       return rejected();
     }
-    sendJson(res, 200, { killed: false });
+    sendJson(
+      res,
+      200,
+      record.agentId === undefined
+        ? { killed: false }
+        : { killed: killSwitch.killed, restoredAgent: record.agentId },
+    );
   }
 
   async function postVeto(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
@@ -1515,6 +1644,18 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       if (killSwitch.killed) {
         sendJson(res, 409, {
           error: "cannot approve while the kill switch is engaged — restore first, then re-approve",
+        });
+        return;
+      }
+      // Same doctrine, scoped: a window whose agent is scope-killed must not
+      // be approvable into authority. The epoch alone cannot refuse this —
+      // an approval flow started entirely AFTER the scoped kill binds the
+      // current epoch and would otherwise sail through.
+      if (killSwitch.agentKilled(window.call.agentId)) {
+        sendJson(res, 409, {
+          error:
+            "cannot approve — this window's agent is scope-killed; restore the agent first, " +
+            "then re-approve",
         });
         return;
       }
@@ -2370,7 +2511,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   function toolCallFrom(value: unknown): ToolCall | null {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     const { agentId, tool, args } = value as Record<string, unknown>;
-    if (typeof agentId !== "string" || agentId === "") return null;
+    // The shared agentId contract, enforced at registration: an id this
+    // surface accepted but POST /kill {agentId} would refuse would be an
+    // agent with review windows and no scoped stop. One validator, one
+    // answer, everywhere (the gateway refuses to START with such an id).
+    if (typeof agentId !== "string" || !isValidAgentId(agentId)) return null;
     if (typeof tool !== "string" || tool === "") return null;
     if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
       return null;
@@ -2432,6 +2577,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const call = toolCallFrom(body.call);
     if (call === null) {
       sendJson(res, 400, { error: "call must be an object with string agentId and tool" });
+      return;
+    }
+    // No new owner-review windows for a scope-killed agent: the owner
+    // already answered — with a kill. Registering would re-open the very
+    // question the kill closed (and page the owner about a stopped agent).
+    if (killSwitch.agentKilled(call.agentId)) {
+      sendJson(res, 409, {
+        error: `agent "${call.agentId}" is scope-killed — no new review windows until an owner restores it`,
+      });
       return;
     }
     let purpose: VetoPurpose | undefined;

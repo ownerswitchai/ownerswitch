@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { KillStateFileStore, MAX_KILL_STATE_FILE_BYTES, type PersistedKillState } from "./kill-state.js";
+import { MAX_SCOPED_KILL_REASON_CHARS } from "./kill.js";
 
 /**
  * Arms a one-shot short write for the NEXT writeSync(fd, buffer, ...) call
@@ -152,11 +153,90 @@ describe("KillStateFileStore", () => {
       '{"version":1,"killed":true,"epoch":1,"lastKill":{"source":"button","at":"1"}}',
       '{"version":1,"killed":true,"epoch":1,"lastKill":{"source":"button","at":1,"extra":1}}',
       '{"version":1,"killed":false,"epoch":1,"extra":true}',
+      // scoped-kill shapes we would never have written ourselves
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{}}', // present means non-empty
+      '{"version":1,"killed":false,"epoch":1,"agentKills":[]}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"meteor","at":1}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"app","at":"1"}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"app","at":1,"x":1}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"":{"source":"app","at":1}}}',
+      `{"version":1,"killed":false,"epoch":1,"agentKills":{"${"a".repeat(129)}":{"source":"app","at":1}}}`,
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"nem\\nascii":{"source":"app","at":1}}}',
     ];
     for (const raw of wrongShapes) {
       writeFileSync(path, raw, "utf8");
       expect(store.load().outcome, `should reject: ${raw}`).toBe("corrupt");
     }
+  });
+
+  it("round-trips scoped-kill entries alongside the global state", () => {
+    const store = new KillStateFileStore(tempPath());
+    const state: PersistedKillState = {
+      version: 1,
+      killed: false,
+      epoch: 6,
+      agentKills: {
+        "agent-7": { source: "app", reason: "looping", at: 500 },
+        "agent-9": { source: "api", at: 900, unauthenticated: true },
+      },
+    };
+    expect(store.save(state)).toEqual({ durable: true });
+    expect(store.load()).toEqual({ outcome: "loaded", state });
+  });
+
+  it("a __proto__ agent key is refused at load — never a prototype-pollution copy", () => {
+    // JSON.parse hands back an OWN "__proto__" data property, so without the
+    // shared-contract refusal (and the loader's null-prototype copy) this
+    // file would validate while the entry silently vanished from the loaded
+    // state — a scoped kill that fails to come back after a restart.
+    const path = tempPath();
+    writeFileSync(
+      path,
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"__proto__":{"source":"app","at":1}}}',
+      "utf8",
+    );
+    expect(new KillStateFileStore(path).load().outcome).toBe("corrupt"); // boots killed, never fail-open
+  });
+
+  it("64 worst-case scoped entries still round-trip under the byte ceiling", () => {
+    // The durability invariant the reason bound exists for: any state the
+    // writer can produce, the loader must accept. Max-length ids, max-length
+    // astral-plane reasons (4 UTF-8 bytes per char, the JSON worst case once
+    // controls are stripped at write time), every flag set.
+    const store = new KillStateFileStore(tempPath());
+    const agentKills: Record<string, import("./kill.js").KillEvent> = {};
+    for (let i = 0; i < 64; i += 1) {
+      const id = `${String(i).padStart(4, "0")}-${"a".repeat(123)}`; // 128 chars, distinct
+      agentKills[id] = {
+        source: "honeytoken",
+        reason: "\u{1F6A8}".repeat(MAX_SCOPED_KILL_REASON_CHARS / 2), // astral: 2 units each
+        at: Number.MAX_SAFE_INTEGER,
+        unauthenticated: true,
+      };
+    }
+    const state: PersistedKillState = {
+      version: 1,
+      killed: true,
+      epoch: Number.MAX_SAFE_INTEGER,
+      lastKill: { source: "button", reason: "x".repeat(1024), at: 1, unauthenticated: true },
+      agentKills,
+    };
+    const bytes = Buffer.byteLength(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+    expect(bytes).toBeLessThan(MAX_KILL_STATE_FILE_BYTES);
+    expect(store.save(state)).toEqual({ durable: true });
+    expect(store.load()).toEqual({ outcome: "loaded", state });
+  });
+
+  it("rejects more scoped entries than the writer may hold — a flooded file fails closed", () => {
+    const path = tempPath();
+    const flood: Record<string, unknown> = {};
+    for (let i = 0; i < 65; i += 1) flood[`agent-${i}`] = { source: "api", at: 1 };
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 1, killed: false, epoch: 1, agentKills: flood }),
+      "utf8",
+    );
+    expect(new KillStateFileStore(path).load().outcome).toBe("corrupt");
   });
 
   it("a non-regular file (a directory where the file should be) loads as corrupt", () => {

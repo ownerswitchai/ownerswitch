@@ -167,6 +167,7 @@ function createFakeControlPlane(opts?: { grantKey?: string }) {
     killed: false as boolean,
     reason: undefined as string | undefined,
     epoch: 0,
+    killedAgents: [] as string[],
     vetoStatus: "pending" as string,
     /** when set, GET /veto/:id returns this raw body instead of JSON */
     vetoRawBody: undefined as string | undefined,
@@ -190,8 +191,8 @@ function createFakeControlPlane(opts?: { grantKey?: string }) {
       hooks.onStatus?.(statusFetches);
       return json(
         state.killed
-          ? { killed: true, reason: state.reason, epoch: state.epoch }
-          : { killed: false, epoch: state.epoch },
+          ? { killed: true, reason: state.reason, epoch: state.epoch, killedAgents: state.killedAgents }
+          : { killed: false, epoch: state.epoch, killedAgents: state.killedAgents },
       );
     }
     if (method === "POST" && url.pathname === "/veto") {

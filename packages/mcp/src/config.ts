@@ -1,6 +1,12 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { rulesMatchingTool } from "@ownerswitchai/gateway";
-import type { Decision, Policy, PolicyRule } from "@ownerswitchai/shared";
+import {
+  isValidAgentId,
+  MAX_AGENT_ID_CHARS,
+  type Decision,
+  type Policy,
+  type PolicyRule,
+} from "@ownerswitchai/shared";
 import type { DeviceIdentity } from "./veto-client.js";
 
 /**
@@ -68,6 +74,23 @@ const requireString = (v: unknown, path: string): string =>
 
 const optionalString = (v: unknown, path: string): string | undefined =>
   v === undefined ? undefined : requireString(v, path);
+
+/**
+ * The agentId must satisfy the SHARED contract at startup, not at kill
+ * time: an id this gateway runs under but `POST /kill {agentId}` would
+ * refuse is an agent with no scoped stop — the mismatch must be a config
+ * error the operator sees, never a gap the incident discovers.
+ */
+const requireAgentId = (v: unknown, path: string): string => {
+  const id = requireString(v, path);
+  return isValidAgentId(id)
+    ? id
+    : fail(
+        `${path} must satisfy the OwnerSwitch agentId contract: 1-${MAX_AGENT_ID_CHARS} ` +
+          `printable-ASCII chars, no leading/trailing spaces, not a prototype-footgun name ` +
+          `("__proto__", "constructor", "prototype") — got ${JSON.stringify(id)}`,
+      );
+};
 
 function parseRule(v: unknown, path: string): PolicyRule {
   if (!isRecord(v)) return fail(`${path} must be an object`);
@@ -219,7 +242,7 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
     },
     upstream: parseUpstream(v.upstream, "upstream"),
     policy,
-    ...(v.agentId !== undefined ? { agentId: requireString(v.agentId, "agentId") } : {}),
+    ...(v.agentId !== undefined ? { agentId: requireAgentId(v.agentId, "agentId") } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(executorRoutes !== undefined ? { executorRoutes } : {}),
   };

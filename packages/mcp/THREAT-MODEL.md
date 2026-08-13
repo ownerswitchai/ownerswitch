@@ -44,9 +44,20 @@ gateway. That qualifier is the point of this document.
 
 - **Live kill state at decision time.** Every routed call is evaluated
   with the current kill state; the order of authority is kill switch →
-  first matching policy rule → fail-closed default
+  scoped kill → first matching policy rule → fail-closed default
   (`packages/gateway/src/engine.ts`). Once KILL is engaged, everything
   routed is denied.
+- **Scoped kills carry the same weight, on the same wire.** `/status`
+  always serves `killedAgents` next to `killed` and `epoch`; a client
+  that cannot parse it fails the whole lookup closed. A scope-killed
+  agent's routed calls are denied at the gateway, and the control plane
+  itself refuses to register review windows for it, approve its windows,
+  vouch for its grants (`grantLive`), or commit them for dispatch. A
+  scoped kill bumps the global kill epoch, so every epoch-bound artifact
+  (approvals, grants, tickets, ceremonies) minted before it needs a
+  fresh owner decision after it. The same routed-path qualifier applies:
+  a scoped kill removes permission on the gatewayed path — containment
+  for a bypassing agent is §3's business, unchanged.
 - **Kill state cannot be forgotten, only asserted.** `evaluate()` takes
   kill state as a required parameter with no default — a caller that
   omits it doesn't compile. A caller with no live source must write

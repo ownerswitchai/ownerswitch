@@ -66,6 +66,17 @@ describe("loadConfig", () => {
     expect(() => load({ ...VALID, device: { id: "gw-1" } })).toThrowError(/device\.secret/);
   });
 
+  it("rejects an agentId outside the shared contract — an unstoppable agent is a config error", () => {
+    // An id this gateway runs under but POST /kill {agentId} would refuse
+    // would be an agent with no scoped stop; the mismatch must surface at
+    // startup, never during the incident.
+    for (const bad of ["ütközés", " padded ", "a".repeat(129), "__proto__", "with\nnewline"]) {
+      expect(() => load({ ...VALID, agentId: bad })).toThrowError(ConfigError);
+      expect(() => load({ ...VALID, agentId: bad })).toThrowError(/agentId contract/);
+    }
+    expect(load({ ...VALID, agentId: "claude-code" }).agentId).toBe("claude-code");
+  });
+
   it("rejects an invalid control plane URL", () => {
     expect(() => load({ ...VALID, controlPlaneUrl: "not a url" })).toThrowError(/valid URL/);
   });
