@@ -31,8 +31,7 @@
  */
 import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
 import {
-  INTERNAL_SPEND_BRAND,
-  SpendAuthorization,
+  claimSpendMinter,
   type InviteRecord,
   type InviteSpendWitness,
   type InviteStore,
@@ -42,6 +41,12 @@ import {
   verifyEnrollProofOfPossession,
 } from "./owner-device.js";
 import { storedSpkiToPem, verifyOwnerRegistration } from "./webauthn-register.js";
+
+// THE one claim of the spend minter, at module load: from here on, no other
+// module can obtain it (claimSpendMinter throws for every later caller), and
+// no plain-JS forgery passes the store's WeakSet membership check — the burn
+// is reachable only through the proof chain below.
+const mintSpendAuthorization = claimSpendMinter();
 
 export interface PerformEnrollmentOptions {
   store: InviteStore;
@@ -54,8 +59,20 @@ export type EnrollmentOutcome =
   | {
       ok: true;
       invite: InviteRecord;
-      /** the verified WebAuthn credential, in the canonical stored forms */
-      credential: { credentialId: string; publicKeySpki: string; signCount: number };
+      /**
+       * The verified WebAuthn credential, in the canonical stored forms.
+       * `signCount` is the POSSESSION ASSERTION's counter — the newest value
+       * the authenticator actually signed — not the unsigned registration
+       * field; storing the older one would let the next assertion replay a
+       * counter that should already be spent. `transports` is the pinned
+       * hint (stored, never trusted).
+       */
+      credential: {
+        credentialId: string;
+        publicKeySpki: string;
+        signCount: number;
+        transports?: string[];
+      };
       /** the cheap-lane public key, canonical SPKI DER base64url */
       cheapLaneKeySpki: string;
     }
@@ -80,16 +97,30 @@ function stringField(value: unknown, cap = 4096): string | null {
 function assertionFrom(value: unknown): WebAuthnAssertion | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record);
-  const allowed = new Set(["credentialId", "clientDataJSON", "authenticatorData", "signature"]);
-  if (keys.some((key) => !allowed.has(key))) return null;
-  const credentialId = stringField(record.credentialId);
-  const clientDataJSON = stringField(record.clientDataJSON, 64 * 1024);
-  const authenticatorData = stringField(record.authenticatorData, 8 * 1024);
-  const signature = stringField(record.signature, 4 * 1024);
+  // OWN properties only, and the required ones must BE own: with a crafted
+  // prototype, `record.credentialId` could read an INHERITED value the
+  // own-key allowlist never saw — so presence and reads both go through the
+  // own-property door.
+  const own = (key: string): unknown =>
+    Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+  const allowed = new Set([
+    "credentialId",
+    "clientDataJSON",
+    "authenticatorData",
+    "signature",
+    // pinned contract (types.ts WebAuthnAssertion): optional, ignored here
+    "userHandle",
+  ]);
+  if (Object.keys(record).some((key) => !allowed.has(key))) return null;
+  const credentialId = stringField(own("credentialId"));
+  const clientDataJSON = stringField(own("clientDataJSON"), 64 * 1024);
+  const authenticatorData = stringField(own("authenticatorData"), 8 * 1024);
+  const signature = stringField(own("signature"), 4 * 1024);
   if (credentialId === null || clientDataJSON === null || authenticatorData === null || signature === null) {
     return null;
   }
+  const userHandle = own("userHandle");
+  if (userHandle !== undefined && stringField(userHandle, 1024) === null) return null;
   return { credentialId, clientDataJSON, authenticatorData, signature };
 }
 
@@ -139,7 +170,12 @@ function performEnrollmentInner(submission: unknown, opts: PerformEnrollmentOpti
 
   /* the invite this ceremony claims — read-only until the burn */
   const invite = opts.store.peek(inviteId);
-  if (invite === null) return survive("unknown, expired, or already-spent invite");
+  if (invite === null) {
+    // there is NOTHING here for the caller to retry against — an unknown,
+    // expired, or already-spent id has no surviving capability, and saying
+    // "survives" for it would be a lie about a resource that does not exist
+    return { ok: false, reason: "unknown, expired, or already-spent invite", inviteSurvives: false };
+  }
 
   /* 2 — registration, against the invite's CREATION challenge */
   const registration = verifyOwnerRegistration(record.registration, {
@@ -180,14 +216,13 @@ function performEnrollmentInner(submission: unknown, opts: PerformEnrollmentOpti
   if (!popOk) return survive("cheap-lane proof of possession refused");
 
   /* 5 — the burn, under the authorization only this module can mint */
-  const authorization = SpendAuthorization.mintInternal(INTERNAL_SPEND_BRAND, inviteId);
+  const authorization = mintSpendAuthorization(inviteId);
   const consumed = opts.store.consume(inviteId, token, opts.witness, authorization);
   if (!consumed.ok) {
-    // the store already decided the invite's fate: a wrong secret left it
-    // alive; an authority failure (kill, epoch, generation, standing)
-    // burned it — report which, honestly
-    const survived = consumed.reason.includes("secret") || consumed.reason.includes("canonical token");
-    return { ok: false, reason: consumed.reason, inviteSurvives: survived };
+    // the store REPORTS the invite's fate as an explicit fact — never
+    // inferred from reason text: "alive" survives for the honest retry,
+    // "burned" and "absent" do not
+    return { ok: false, reason: consumed.reason, inviteSurvives: consumed.fate === "alive" };
   }
 
   return {
@@ -196,7 +231,10 @@ function performEnrollmentInner(submission: unknown, opts: PerformEnrollmentOpti
     credential: {
       credentialId: registration.credentialId,
       publicKeySpki: registration.publicKeySpki,
-      signCount: registration.signCount,
+      // the POSSESSION assertion's counter — the newest signed value; the
+      // registration's field is unsigned under fmt:"none" and may be older
+      signCount: possession.signCount,
+      ...(registration.transports !== undefined ? { transports: registration.transports } : {}),
     },
     cheapLaneKeySpki: Buffer.from(
       cheapLaneDevice.publicKey.export({ type: "spki", format: "der" }),

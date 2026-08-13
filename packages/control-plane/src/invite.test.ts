@@ -2,7 +2,7 @@ import { createHash, generateKeyPairSync, sign as ecSign } from "node:crypto";
 import { ownerEnrollPopPreimage } from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
 import {
-  INTERNAL_SPEND_BRAND,
+  claimSpendMinter,
   InviteStore,
   SpendAuthorization,
   type InviteSpendWitness,
@@ -20,10 +20,11 @@ const SECRET_2 = Buffer.from("s2".repeat(12)).toString("base64url");
 const SECRET_3 = Buffer.from("s3".repeat(12)).toString("base64url");
 const commit = (secret: string) => createHash("sha256").update(secret, "utf8").digest("base64url");
 
-// store-level tests mint the authorization directly with the in-package
-// brand; API consumers cannot (index.ts does not export the brand) — the
-// only public path to a spend is performEnrollment
-const auth = (inviteId: string) => SpendAuthorization.mintInternal(INTERNAL_SPEND_BRAND, inviteId);
+// This test file's module registry has not loaded enrollment.ts, so the
+// ONE claim is available here; in the real package graph enrollment.ts
+// claims it at import time and every later claimant throws.
+const mintAuth = claimSpendMinter();
+const auth = (inviteId: string) => mintAuth(inviteId);
 
 const record = (inviteId: string, secret: string, kind: "bootstrap" | "device" = "bootstrap") => ({
   inviteId,
@@ -162,21 +163,101 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     ).toThrow(/generation/);
   });
 
-  it("SPEND AUTHORIZATION: no proof-chain capability, no burn — and it binds to ONE invite", () => {
+  it("SPEND AUTHORIZATION is a JS boundary: plain-JS forgeries share the prototype but not the WeakSet", () => {
     const c = clock();
     const store = new InviteStore({ now: c.now });
     store.register(record("inv-1", SECRET_1));
+
+    // Object.create(prototype): passes instanceof, is NOT minted — refused
+    const protoForgery = Object.create(SpendAuthorization.prototype) as SpendAuthorization;
+    (protoForgery as { inviteId?: string }).inviteId = "inv-1";
+    expect(protoForgery instanceof SpendAuthorization).toBe(true); // the TS fiction
+    expect(store.consume("inv-1", SECRET_1, LIVE, protoForgery).ok).toBe(false);
+
+    // Reflect.construct: the "private" constructor compiles away — still refused
+    const constructed = Reflect.construct(
+      SpendAuthorization as unknown as new (inviteId: string) => SpendAuthorization,
+      ["inv-1"],
+    );
+    expect(store.consume("inv-1", SECRET_1, LIVE, constructed).ok).toBe(false);
+
+    // a plain object with the right shape — refused
+    const shaped = { inviteId: "inv-1" } as unknown as SpendAuthorization;
+    expect(store.consume("inv-1", SECRET_1, LIVE, shaped).ok).toBe(false);
+
     // an authorization minted for a DIFFERENT invite spends nothing
     const wrong = store.consume("inv-1", SECRET_1, LIVE, auth("inv-2"));
     expect(wrong.ok).toBe(false);
     if (!wrong.ok) expect(wrong.reason).toMatch(/authorization/);
-    // a forged object with the right shape is not the class — refused
-    const forged = { inviteId: "inv-1" } as unknown as SpendAuthorization;
-    expect(store.consume("inv-1", SECRET_1, LIVE, forged).ok).toBe(false);
-    // and the brand cannot be guessed: minting with a random symbol throws
-    expect(() => SpendAuthorization.mintInternal(Symbol("guess"), "inv-1")).toThrow(/verifier/);
-    // the real chain still works
+
+    // the second claim of the minter throws — there is exactly one
+    expect(() => claimSpendMinter()).toThrow(/already claimed/);
+
+    // the real chain still works, and every forgery above left the invite ALIVE
     expect(store.consume("inv-1", SECRET_1, LIVE, auth("inv-1")).ok).toBe(true);
+  });
+
+  it("FATE is an explicit fact: alive / burned / absent, never reason-text inference", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1));
+    // wrong secret -> alive
+    const wrongSecret = store.consume("inv-1", SECRET_2, LIVE, auth("inv-1"));
+    expect(!wrongSecret.ok && wrongSecret.fate).toBe("alive");
+    // superseded epoch -> burned
+    const burned = store.consume("inv-1", SECRET_1, { ...LIVE, killEpoch: 9 }, auth("inv-1"));
+    expect(!burned.ok && burned.fate).toBe("burned");
+    // and now there is nothing -> absent
+    const absent = store.consume("inv-1", SECRET_1, LIVE, auth("inv-1"));
+    expect(!absent.ok && absent.fate).toBe("absent");
+  });
+
+  it("a THROWING standing callback is a failed check (burned), never an escaping exception", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1, "device"));
+    const thrown = store.consume(
+      "inv-1",
+      SECRET_1,
+      {
+        ...LIVE,
+        deviceStanding: () => {
+          throw new Error("registry unavailable");
+        },
+      },
+      auth("inv-1"),
+    );
+    expect(thrown.ok).toBe(false);
+    if (!thrown.ok) {
+      expect(thrown.reason).toMatch(/FAILED/);
+      expect(thrown.fate).toBe("burned");
+    }
+  });
+
+  it("a MALFORMED witness proves nothing and spends nothing (fail closed, invite alive)", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    store.register(record("inv-1", SECRET_1));
+    const bad = store.consume(
+      "inv-1",
+      SECRET_1,
+      { ...LIVE, killed: "no" as unknown as boolean },
+      auth("inv-1"),
+    );
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      expect(bad.reason).toMatch(/malformed live witness/);
+      expect(bad.fate).toBe("alive");
+    }
+    // a truthy-but-not-true standing answer is NOT standing
+    store.register(record("dev-1", SECRET_2, "device"));
+    const truthy = store.consume(
+      "dev-1",
+      SECRET_2,
+      { ...LIVE, deviceStanding: (() => 1) as unknown as (d: string, g: number) => boolean },
+      auth("dev-1"),
+    );
+    expect(truthy.ok).toBe(false);
   });
 
   it("KILLED: an engaged kill switch refuses every spend, whatever the epoch says", () => {
@@ -185,7 +266,12 @@ describe("InviteStore — hash commitment, single use, TTL, live-witness spend",
     store.register(record("inv-1", SECRET_1));
     const killed = store.consume("inv-1", SECRET_1, { ...LIVE, killed: true }, auth("inv-1"));
     expect(killed.ok).toBe(false);
-    if (!killed.ok) expect(killed.reason).toMatch(/kill switch/);
+    if (!killed.ok) {
+      expect(killed.reason).toMatch(/kill switch/);
+      // refused BEFORE the reserve: the invite stays alive — harmless,
+      // because a restore bumps the epoch and burns it at any later spend
+      expect(killed.fate).toBe("alive");
+    }
   });
 
   it("BOOTSTRAP + ACTIVE DEVICE: a bootstrap invite enrolls only into an EMPTY registry", () => {

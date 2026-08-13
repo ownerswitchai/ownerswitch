@@ -181,10 +181,16 @@ export interface EnrollmentInvite {
 }
 
 /**
- * POST /devices/invite — the hash-commitment mint (DESIGN.md §2). The
- * inviting device generated the secret locally and submits only its
- * hash; the server's response carries no secret. Device-signed, plus
- * owner session and a device-invite assertion (DESIGN.md §3).
+ * POST /devices/invite — the hash-commitment mint (DESIGN.md §2), THE
+ * pinned invite model: the inviting device (or the host CLI for
+ * bootstrap) generates the ≥128-bit secret locally and submits ONLY its
+ * SHA-256; the server's response carries no secret, and the control
+ * plane's InviteStore (packages/control-plane/src/invite.ts) stores only
+ * this commitment. EnrollmentInvite above is the DEVICE-TO-DEVICE
+ * payload (QR / typed code) — its `token` is the locally generated
+ * secret in transit between phones, never a server-returned value.
+ * Device-signed, plus owner session and a device-invite assertion
+ * (DESIGN.md §3).
  */
 export interface InviteMintRequest {
   /** SHA-256 of the locally generated ≥128-bit invite secret */

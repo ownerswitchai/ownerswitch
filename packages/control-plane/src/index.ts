@@ -55,12 +55,15 @@ export type {
   VerifyRegistrationOptions,
   WebAuthnRegistrationWire,
 } from "./webauthn-register.js";
-// NOTE: INTERNAL_SPEND_BRAND and SpendAuthorization.mintInternal are
-// deliberately NOT exported here — the only package-API path to an invite
-// spend is performEnrollment, which runs the full proof chain first.
+// NOTE: claimSpendMinter and isMintedAuthorization are deliberately NOT
+// exported here — the minter is claimed exactly once (by enrollment.ts, at
+// module load) and consume() trusts WeakSet MEMBERSHIP, not the prototype
+// chain, so the only package-API path to an invite spend is
+// performEnrollment, which runs the full proof chain first.
 export { InviteStore, SpendAuthorization } from "./invite.js";
 export type {
   InviteConsume,
+  InviteFate,
   InviteOrigin,
   InviteRecord,
   InviteSpendWitness,

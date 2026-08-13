@@ -234,22 +234,56 @@ describe("performEnrollment — the ONE unbypassable spend path", () => {
     ).toBe(true);
   });
 
-  it("an AUTHORITY failure at the burn (killed) refuses and reports the invite did NOT survive", () => {
+  it("KILLED refuses before the reserve (invite alive — the restore's epoch bump kills it later); a dead EPOCH burns", () => {
     const c = clock();
     const store = new InviteStore({ now: c.now });
     const invite = mintInvite(store, SECRET);
     const p = phone();
-    const refused = performEnrollment(submissionFor(p, invite, SECRET), {
+    const killed = performEnrollment(submissionFor(p, invite, SECRET), {
       store,
       witness: { ...LIVE, killed: true },
       rpId: RP_ID,
       expectedOrigin: ORIGIN,
     });
-    expect(refused.ok).toBe(false);
-    if (!refused.ok) {
-      expect(refused.reason).toMatch(/kill switch/);
-      expect(refused.inviteSurvives).toBe(false); // burned with its authority
+    expect(killed.ok).toBe(false);
+    if (!killed.ok) {
+      expect(killed.reason).toMatch(/kill switch/);
+      expect(killed.inviteSurvives).toBe(true); // refused pre-reserve
     }
+    // a superseded EPOCH is an authority failure AT the burn — not survivable
+    const epoch = performEnrollment(submissionFor(p, invite, SECRET), {
+      store,
+      witness: { ...LIVE, killEpoch: 9 },
+      rpId: RP_ID,
+      expectedOrigin: ORIGIN,
+    });
+    expect(epoch.ok).toBe(false);
+    if (!epoch.ok) expect(epoch.inviteSurvives).toBe(false); // burned, honestly
+    // and now the invite is ABSENT — also reported as non-surviving
+    const absent = performEnrollment(submissionFor(p, invite, SECRET), {
+      store,
+      witness: LIVE,
+      rpId: RP_ID,
+      expectedOrigin: ORIGIN,
+    });
+    expect(absent.ok).toBe(false);
+    if (!absent.ok) expect(absent.inviteSurvives).toBe(false);
+  });
+
+  it("stores the POSSESSION assertion's signCount (the newest signed counter), not the unsigned registration field", () => {
+    const c = clock();
+    const store = new InviteStore({ now: c.now });
+    const invite = mintInvite(store, SECRET);
+    const p = phone();
+    // submissionFor builds registration signCount=3 and assertion signCount=4
+    const outcome = performEnrollment(submissionFor(p, invite, SECRET), {
+      store,
+      witness: LIVE,
+      rpId: RP_ID,
+      expectedOrigin: ORIGIN,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.credential.signCount).toBe(4);
   });
 
   it("NEVER THROWS on garbage submissions", () => {

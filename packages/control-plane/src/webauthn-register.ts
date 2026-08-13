@@ -85,6 +85,8 @@ export type RegistrationVerdict =
        */
       publicKeySpki: string;
       signCount: number;
+      /** the pinned optional hint, shape-checked and passed through — stored, never trusted */
+      transports?: string[];
     }
   | { ok: false; reason: string };
 
@@ -184,9 +186,13 @@ function verifyOwnerRegistrationInner(
     if (!WIRE_KEYS.has(key)) return refuse(`unexpected registration property ${JSON.stringify(key)}`);
   }
   const record = wire as Record<string, unknown>;
-  const credentialIdField = record.credentialId;
-  const clientDataField = record.clientDataJSON;
-  const attestationField = record.attestationObject;
+  // OWN properties only: with a crafted prototype, a plain property read
+  // could return an INHERITED value the own-key allowlist above never saw
+  const own = (key: string): unknown =>
+    Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+  const credentialIdField = own("credentialId");
+  const clientDataField = own("clientDataJSON");
+  const attestationField = own("attestationObject");
   if (typeof credentialIdField !== "string" || credentialIdField === "") {
     return refuse("credentialId must be a non-empty string");
   }
@@ -201,15 +207,17 @@ function verifyOwnerRegistrationInner(
   if (attestationField.length > MAX_ATTESTATION_CHARS) return refuse("attestationObject is oversized");
   // transports (optional): a bounded array of short strings, a HINT stored
   // but never trusted (types.ts) — shape-checked so junk cannot ride it
-  if ("transports" in record && record.transports !== undefined) {
-    const transports = record.transports;
+  let transports: string[] | undefined;
+  const transportsField = own("transports");
+  if (transportsField !== undefined) {
     if (
-      !Array.isArray(transports) ||
-      transports.length > 8 ||
-      transports.some((entry) => typeof entry !== "string" || entry === "" || entry.length > 32)
+      !Array.isArray(transportsField) ||
+      transportsField.length > 8 ||
+      transportsField.some((entry) => typeof entry !== "string" || entry === "" || entry.length > 32)
     ) {
       return refuse("transports must be a small array of short strings (a hint, never proof)");
     }
+    transports = [...(transportsField as string[])];
   }
   const registration: WebAuthnRegistrationWire = {
     credentialId: credentialIdField,
@@ -377,5 +385,11 @@ function verifyOwnerRegistrationInner(
     return refuse("COSE coordinates do not form a valid P-256 point");
   }
 
-  return { ok: true, credentialId: b64url(credentialIdBytes), publicKeySpki, signCount };
+  return {
+    ok: true,
+    credentialId: b64url(credentialIdBytes),
+    publicKeySpki,
+    signCount,
+    ...(transports !== undefined ? { transports } : {}),
+  };
 }

@@ -30,26 +30,56 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
 /**
- * The spend-authorization BRAND — deliberately NOT exported from the package
- * root (index.ts): the only module that may mint a SpendAuthorization is
- * enrollment.ts, whose performEnrollment() runs the full proof chain
- * (registration -> possession assertion -> cheap-lane PoP) first. That makes
- * "consume an invite without the proofs" a type error AND a runtime error
- * for every consumer of the package API — the unbypassable-core contract.
- * @internal
+ * The spend authorization — proof that the full enrolment verification chain
+ * ran for ONE invite — enforced as a REAL JavaScript boundary, not a
+ * TypeScript fiction: a TS `private constructor` compiles away, so
+ * `Reflect.construct`, `new`, and `Object.create(SpendAuthorization.prototype)`
+ * all produce objects that pass an instanceof check. What cannot be forged is
+ * MEMBERSHIP in this module-private WeakSet: only mintings that went through
+ * the claimed minter (below) are in it, and consume() checks the set, never
+ * the prototype chain. There is no exported brand to deep-import either —
+ * the minter is handed out ONCE, at module-load time, to the first claimant
+ * (enrollment.ts imports invite.js and claims in its module initializer); a
+ * later claimant throws. The residual truth, stated plainly: code running IN
+ * THIS PROCESS with import access could still race the claim or patch these
+ * modules — in-process code is the trust domain here, the same as for the
+ * kill switch's own Map. The boundary this closes is the API one: no
+ * consumer of the package, and no plain-JS object forgery, reaches the burn
+ * around the proofs.
  */
-export const INTERNAL_SPEND_BRAND: unique symbol = Symbol("ownerswitch.enrollment.spend");
+const MINTED_AUTHORIZATIONS = new WeakSet<SpendAuthorization>();
+let mintAuthorization: (inviteId: string) => SpendAuthorization;
+let minterClaimed = false;
 
-/** Proof that the full enrolment verification chain ran for ONE invite. */
 export class SpendAuthorization {
   private constructor(readonly inviteId: string) {}
-  /** @internal — enrollment.ts only; guarded by the module-private brand */
-  static mintInternal(brand: symbol, inviteId: string): SpendAuthorization {
-    if (brand !== INTERNAL_SPEND_BRAND) {
-      throw new Error("SpendAuthorization can only be minted by the enrollment verifier");
-    }
-    return new SpendAuthorization(inviteId);
+  static {
+    // the one factory, captured by claimSpendMinter below — the class itself
+    // exposes no way to mint
+    mintAuthorization = (inviteId: string) => {
+      const authorization = new SpendAuthorization(inviteId);
+      MINTED_AUTHORIZATIONS.add(authorization);
+      return authorization;
+    };
   }
+}
+
+/**
+ * Hand out the ONE spend-minter, exactly once per module instance.
+ * enrollment.ts claims it in its module initializer; any later call —
+ * including a deep import racing it — throws. @internal
+ */
+export function claimSpendMinter(): (inviteId: string) => SpendAuthorization {
+  if (minterClaimed) {
+    throw new Error("the spend minter is already claimed (enrollment.ts) — there is exactly one");
+  }
+  minterClaimed = true;
+  return mintAuthorization;
+}
+
+/** Membership check — the ONLY thing consume() trusts about an authorization. */
+export function isMintedAuthorization(value: unknown): value is SpendAuthorization {
+  return MINTED_AUTHORIZATIONS.has(value as SpendAuthorization);
 }
 
 export type InviteOrigin =
@@ -115,9 +145,19 @@ export interface InviteSpendWitness {
   deviceStanding: (deviceId: string, generation: number) => boolean;
 }
 
+/**
+ * The invite's FATE is an explicit fact of the result, never inferred from
+ * reason text: "alive" — the spend failed before the reserve and the owner
+ * can retry (wrong secret, malformed input); "burned" — the invite is gone
+ * (spent, or reserved and then refused on authority: dead epoch, dead
+ * issuer, kill engaged, callback failure); "absent" — there was nothing to
+ * spend (unknown id, expired, already spent).
+ */
+export type InviteFate = "alive" | "burned" | "absent";
+
 export type InviteConsume =
   | { ok: true; record: InviteRecord }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; fate: InviteFate };
 
 export interface InviteStoreOptions {
   now?: () => number;
@@ -188,6 +228,11 @@ export class InviteStore {
     if (record.challenge === "" || record.assertionChallenge === "") {
       throw new Error("an invite carries BOTH ceremony challenges (creation + possession assertion)");
     }
+    // the pinned contract's REQUIRED display label (types.ts InviteMintRequest
+    // deviceName) — bounded, display-only, but never silently absent
+    if (record.deviceName === "" || record.deviceName.length > 200) {
+      throw new Error("deviceName is required (non-empty, <= 200 chars)");
+    }
     if (record.ownerId === "") throw new Error("ownerId must be non-empty");
     if (!Number.isSafeInteger(record.killEpoch) || record.killEpoch < 0) {
       throw new Error("killEpoch must be a non-negative safe integer");
@@ -257,14 +302,40 @@ export class InviteStore {
     witness: InviteSpendWitness,
     authorization: SpendAuthorization,
   ): InviteConsume {
-    if (!(authorization instanceof SpendAuthorization) || authorization.inviteId !== inviteId) {
-      return { ok: false, reason: "spend refused: no enrollment-verifier authorization for this invite" };
+    // MEMBERSHIP, not instanceof: Object.create(prototype), Reflect.construct,
+    // and any other plain-JS forgery share the prototype but are not in the
+    // module-private WeakSet — only the claimed minter's output is.
+    if (!isMintedAuthorization(authorization) || authorization.inviteId !== inviteId) {
+      return {
+        ok: false,
+        reason: "spend refused: no enrollment-verifier authorization for this invite",
+        fate: "alive",
+      };
+    }
+    // The witness is VALIDATED, fail-closed, before anything is judged with
+    // it: a malformed witness proves nothing, so it spends nothing.
+    if (
+      witness.killed !== false ||
+      !Number.isSafeInteger(witness.killEpoch) ||
+      witness.killEpoch < 0 ||
+      !Number.isSafeInteger(witness.bootstrapGeneration) ||
+      !Number.isSafeInteger(witness.activeDeviceCount) ||
+      witness.activeDeviceCount < 0 ||
+      typeof witness.deviceStanding !== "function"
+    ) {
+      const reason =
+        witness.killed === true
+          ? "the kill switch is engaged — nothing enrolls while killed"
+          : "spend refused: malformed live witness (fail closed)";
+      return { ok: false, reason, fate: "alive" };
     }
     const record = this.invites.get(inviteId);
-    if (record === undefined) return { ok: false, reason: "unknown or already-spent invite" };
+    if (record === undefined) {
+      return { ok: false, reason: "unknown or already-spent invite", fate: "absent" };
+    }
     if (this.now() >= record.expiresAt) {
       this.invites.delete(inviteId);
-      return { ok: false, reason: "invite expired" };
+      return { ok: false, reason: "invite expired", fate: "absent" };
     }
     // canonical opaque token: the exact base64url alphabet, and a round-trip
     // so non-canonical final-character bits never reach the comparison
@@ -273,35 +344,61 @@ export class InviteStore {
       !/^[A-Za-z0-9_-]{22,128}$/.test(tokenSecret) ||
       decodedSecret.toString("base64url") !== tokenSecret
     ) {
-      return { ok: false, reason: "invite secret is not a canonical token (base64url, >= 22 chars)" };
+      return {
+        ok: false,
+        reason: "invite secret is not a canonical token (base64url, >= 22 chars)",
+        fate: "alive",
+      };
     }
     const submitted = createHash("sha256").update(tokenSecret, "utf8").digest();
     const committed = Buffer.from(record.tokenHash, "base64url");
     if (submitted.length !== committed.length || !timingSafeEqual(submitted, committed)) {
-      return { ok: false, reason: "invite secret does not match the commitment" };
+      return { ok: false, reason: "invite secret does not match the commitment", fate: "alive" };
     }
     // RESERVE before any callback: from here the invite is gone, whatever
     // happens next — a reentrant consume() cannot race a second success,
     // and every authority failure below stays burned.
     this.invites.delete(inviteId);
-    if (witness.killed) {
-      return { ok: false, reason: "the kill switch is engaged — nothing enrolls while killed" };
-    }
     if (record.killEpoch !== witness.killEpoch) {
-      return { ok: false, reason: "invite was minted under a superseded kill epoch" };
+      return { ok: false, reason: "invite was minted under a superseded kill epoch", fate: "burned" };
     }
     if (record.origin.kind === "bootstrap") {
       if (record.origin.bootstrapGeneration !== witness.bootstrapGeneration) {
-        return { ok: false, reason: "invite was minted under a superseded bootstrap generation" };
+        return {
+          ok: false,
+          reason: "invite was minted under a superseded bootstrap generation",
+          fate: "burned",
+        };
       }
       if (witness.activeDeviceCount !== 0) {
         return {
           ok: false,
           reason: "bootstrap invites enroll only into an EMPTY registry — an active device exists",
+          fate: "burned",
         };
       }
-    } else if (!witness.deviceStanding(record.origin.deviceId, record.origin.deviceGeneration)) {
-      return { ok: false, reason: "the inviting device is no longer in standing at its minting generation" };
+    } else {
+      // the standing callback is CALLER code running inside the spend: a
+      // throw is a failed standing check (burned — the record was reserved),
+      // never an exception that escapes with the invite's fate undecided;
+      // and only the literal `true` is standing
+      let standing: unknown;
+      try {
+        standing = witness.deviceStanding(record.origin.deviceId, record.origin.deviceGeneration);
+      } catch {
+        return {
+          ok: false,
+          reason: "issuer standing check FAILED (threw) — refusing the spend, invite burned",
+          fate: "burned",
+        };
+      }
+      if (standing !== true) {
+        return {
+          ok: false,
+          reason: "the inviting device is no longer in standing at its minting generation",
+          fate: "burned",
+        };
+      }
     }
     if (record.origin.kind === "bootstrap") {
       // FIRST PHONE WINS, atomically: no second bootstrap secret — spent
