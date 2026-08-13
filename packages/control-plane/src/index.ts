@@ -42,7 +42,35 @@ export {
   verifyOwnerSession,
 } from "./auth.js";
 
-export { enrolledOwnerDeviceFromSpki, verifyOwnerDeviceSignature } from "./owner-device.js";
+export {
+  enrolledOwnerDeviceFromSpki,
+  verifyEnrollProofOfPossession,
+  verifyOwnerDeviceSignature,
+} from "./owner-device.js";
+export { cborDecodeExact, cborDecodeFirst } from "./cbor.js";
+export type { CborDecodeResult, CborValue } from "./cbor.js";
+export { storedSpkiToPem, verifyOwnerRegistration } from "./webauthn-register.js";
+export type {
+  RegistrationVerdict,
+  VerifyRegistrationOptions,
+  WebAuthnRegistrationWire,
+} from "./webauthn-register.js";
+// NOTE: there is deliberately NO spend API on InviteStore — the burn is an
+// ECMAScript #private method whose only accessor is module-scoped inside
+// invite.ts, and performEnrollment (defined in that same module) is the one
+// function that reaches it, after the full proof chain. Nothing here — and
+// no deep import — hands out a spend capability to claim or forge.
+export { InviteStore } from "./invite.js";
+export type {
+  InviteConsume,
+  InviteFate,
+  InviteOrigin,
+  InviteRecord,
+  InviteSpendWitness,
+  InviteStoreOptions,
+} from "./invite.js";
+export { performEnrollment } from "./enrollment.js";
+export type { EnrollmentOutcome, PerformEnrollmentOptions } from "./enrollment.js";
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,

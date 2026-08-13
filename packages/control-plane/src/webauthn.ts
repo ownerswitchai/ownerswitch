@@ -44,6 +44,13 @@ export interface WebAuthnAssertion {
   authenticatorData: string;
   /** base64url, ASN.1/DER ECDSA signature */
   signature: string;
+  /**
+   * base64url echo of the credential's user.id, when the authenticator
+   * returned one — opaque metadata, never proof. The enrolment envelope
+   * (invite.ts) validates it as canonical base64url of 1–64 bytes;
+   * verification here does not read it.
+   */
+  userHandle?: string;
 }
 
 export interface VerifyAssertionOptions {
@@ -70,6 +77,17 @@ export type AssertionVerdict =
 const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
 
+/**
+ * Canonical base64url decode — the permissive decoder silently drops bad
+ * characters and repairs padding, so two different wire strings could decode
+ * to the same verified bytes; only the exact canonical encoding is accepted.
+ */
+function canonicalB64url(text: string): Buffer | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) return null;
+  const decoded = Buffer.from(text, "base64url");
+  return decoded.toString("base64url") === text ? decoded : null;
+}
+
 export function verifyOwnerAssertion(
   assertion: WebAuthnAssertion,
   opts: VerifyAssertionOptions,
@@ -89,8 +107,14 @@ export function verifyOwnerAssertion(
     crossOrigin?: unknown;
     topOrigin?: unknown;
   };
+  {
+    const decoded = canonicalB64url(assertion.clientDataJSON);
+    if (decoded === null) {
+      return { ok: false, reason: "clientDataJSON is not canonical base64url" };
+    }
+    clientDataRaw = decoded;
+  }
   try {
-    clientDataRaw = Buffer.from(assertion.clientDataJSON, "base64url");
     clientData = JSON.parse(clientDataRaw.toString("utf8")) as typeof clientData;
   } catch {
     return { ok: false, reason: "clientDataJSON does not decode" };
@@ -116,7 +140,9 @@ export function verifyOwnerAssertion(
   // crossOrigin, and any topOrigin that is not the enrolled origin. (Absent
   // fields mean a top-level ceremony from an authenticator that predates the
   // field — allowed; present-and-wrong is refused.)
-  if (clientData.crossOrigin === true) {
+  // absent or literally false, NOTHING else — a non-boolean crossOrigin is a
+  // client lying about its framing, not a value to interpret
+  if (clientData.crossOrigin !== undefined && clientData.crossOrigin !== false) {
     return { ok: false, reason: "assertion was produced in a cross-origin (embedded) context" };
   }
   if (clientData.topOrigin !== undefined && clientData.topOrigin !== opts.expectedOrigin) {
@@ -124,12 +150,11 @@ export function verifyOwnerAssertion(
   }
 
   // 3. authenticatorData: rpIdHash, UP+UV flags, signature counter
-  let authData: Buffer;
-  try {
-    authData = Buffer.from(assertion.authenticatorData, "base64url");
-  } catch {
-    return { ok: false, reason: "authenticatorData does not decode" };
+  const authDataDecoded = canonicalB64url(assertion.authenticatorData);
+  if (authDataDecoded === null) {
+    return { ok: false, reason: "authenticatorData is not canonical base64url" };
   }
+  const authData: Buffer = authDataDecoded;
   if (authData.length < 37) {
     return { ok: false, reason: "authenticatorData is too short" };
   }
@@ -158,12 +183,11 @@ export function verifyOwnerAssertion(
   }
 
   // 4. the ECDSA signature over authenticatorData || sha256(clientDataJSON)
-  let signature: Buffer;
-  try {
-    signature = Buffer.from(assertion.signature, "base64url");
-  } catch {
-    return { ok: false, reason: "signature does not decode" };
+  const signatureDecoded = canonicalB64url(assertion.signature);
+  if (signatureDecoded === null) {
+    return { ok: false, reason: "signature is not canonical base64url" };
   }
+  const signature: Buffer = signatureDecoded;
   const clientDataHash = createHash("sha256").update(clientDataRaw).digest();
   let verified: boolean;
   try {

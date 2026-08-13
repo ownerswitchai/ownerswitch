@@ -168,13 +168,29 @@ export interface EnrollmentInvite {
   };
   /** creation challenge for navigator.credentials.create() */
   challenge: Base64Url;
+  /**
+   * The ceremony's SECOND challenge: immediately after create(), the app
+   * performs a fresh `navigator.credentials.get()` with the NEW credential
+   * over this challenge and submits the assertion in the enrolment request
+   * (possessionAssertion). With attestation "none" nothing in the creation
+   * output is signed, so THIS assertion is what proves the phone holds the
+   * new private key and a human passed user verification. Minted with the
+   * invite, single-use with it.
+   */
+  assertionChallenge: Base64Url;
 }
 
 /**
- * POST /devices/invite — the hash-commitment mint (DESIGN.md §2). The
- * inviting device generated the secret locally and submits only its
- * hash; the server's response carries no secret. Device-signed, plus
- * owner session and a device-invite assertion (DESIGN.md §3).
+ * POST /devices/invite — the hash-commitment mint (DESIGN.md §2), THE
+ * pinned invite model: the inviting device (or the host CLI for
+ * bootstrap) generates the ≥128-bit secret locally and submits ONLY its
+ * SHA-256; the server's response carries no secret, and the control
+ * plane's InviteStore (packages/control-plane/src/invite.ts) stores only
+ * this commitment. EnrollmentInvite above is the DEVICE-TO-DEVICE
+ * payload (QR / typed code) — its `token` is the locally generated
+ * secret in transit between phones, never a server-returned value.
+ * Device-signed, plus owner session and a device-invite assertion
+ * (DESIGN.md §3).
  */
 export interface InviteMintRequest {
   /** SHA-256 of the locally generated ≥128-bit invite secret */
@@ -197,9 +213,23 @@ export interface EnrollmentRequest {
   inviteId: string;
   /** the invite secret — the preimage of the committed hash (DESIGN.md §2) */
   token: string;
-  /** human label shown in the device list, e.g. "Adam's phone" */
+  /**
+   * Human label shown in the device list — REQUIRED, and it must repeat
+   * the invite's mint-committed label (InviteMintRequest.deviceName)
+   * EXACTLY: the inviter chose the label; the enrolling phone repeats it
+   * as confirmation it is redeeming the invite it was actually shown. A
+   * mismatch refuses with the invite alive (DESIGN.md §2 step 5).
+   */
   deviceName: string;
   registration: WebAuthnRegistration;
+  /**
+   * The fresh webauthn.get assertion with the NEWLY created credential,
+   * over the invite's assertionChallenge — the possession-and-UV proof
+   * attestation "none" cannot give (see EnrollmentInvite.assertionChallenge).
+   * REQUIRED: the control plane's enrolment core refuses to spend an invite
+   * without it (performEnrollment, enrollment.ts).
+   */
+  possessionAssertion: WebAuthnAssertion;
   /**
    * Exportable SPKI public key of the SECOND WebCrypto keypair (ECDSA
    * P-256) whose PRIVATE key the app creates non-extractable
@@ -254,7 +284,13 @@ export interface EnrolledDevice {
   ownerId: string;
   name: string;
   credentialId: Base64Url;
-  /** COSE public key — verifies every future assertion */
+  /**
+   * THE canonical stored key representation, everywhere: base64url of the
+   * CANONICAL SPKI DER the control plane's registration verifier
+   * re-exported (never the raw COSE bytes off the wire — one format from
+   * RegistrationVerdict through the durable registry to the assertion
+   * verifier, converted to PEM only at the verify edge).
+   */
   publicKey: Base64Url;
   /**
    * Exportable SPKI public key verifying cheap-lane signatures. Always

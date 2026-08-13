@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, verify as cryptoVerify, type KeyObject } from "node:crypto";
-import { ownerDeviceSigPreimage } from "@ownerswitchai/shared";
+import { ownerDeviceSigPreimage, ownerEnrollPopPreimage } from "@ownerswitchai/shared";
 
 /**
  * Verifier for the owner app's cheap-lane device signature — the real,
@@ -157,6 +157,63 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
     generation: 1,
     revokedAt: null,
   };
+}
+
+/**
+ * Verify the enrolment PROOF OF POSSESSION: the submitted cheap-lane key's
+ * PRIVATE half signed the ceremony transcript (shared/enroll-pop.ts —
+ * label, inviteId, ownerId, RAW credentialId, RAW canonical SPKI), raw
+ * r||s like every cheap-lane signature. Runs BEFORE the invite is
+ * consumed: a key the client cannot sign with is refused and the invite
+ * survives (apps/owner/DESIGN.md §2 step 4). The SPKI bytes in the
+ * transcript are the CANONICAL DER this module's own strict parser
+ * produced — the signer exported the same canonical bytes from WebCrypto,
+ * so both sides sign/verify one encoding.
+ */
+export function verifyEnrollProofOfPossession(fields: {
+  inviteId: string;
+  ownerId: string;
+  /** base64url WebAuthn credential id (as verified by webauthn-register) */
+  credentialId: string;
+  /** the enrolled device, from enrolledOwnerDeviceFromSpki (canonical key) */
+  device: EnrolledOwnerDevice;
+  /** base64url raw r||s ECDSA signature over the transcript */
+  proof: string;
+}): boolean {
+  // CANONICAL base64url only — Buffer.from is permissive (drops bad chars,
+  // repairs padding), and a transcript built from repaired bytes is a
+  // transcript the signer never signed; a round-trip mismatch refuses.
+  const canonicalB64url = (text: string): Buffer | null => {
+    if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+    const decoded = Buffer.from(text, "base64url");
+    return decoded.toString("base64url") === text ? decoded : null;
+  };
+  const credentialIdBytes = canonicalB64url(fields.credentialId);
+  if (credentialIdBytes === null) return false;
+  let preimage: Uint8Array;
+  try {
+    preimage = ownerEnrollPopPreimage({
+      inviteId: fields.inviteId,
+      ownerId: fields.ownerId,
+      credentialId: new Uint8Array(credentialIdBytes),
+      spki: new Uint8Array(fields.device.publicKey.export({ type: "spki", format: "der" })),
+    });
+  } catch {
+    return false; // empty field — never a guess
+  }
+  const sig = canonicalB64url(fields.proof);
+  if (sig === null) return false;
+  if (sig.length !== 64) return false; // raw r||s for P-256, never DER
+  try {
+    return cryptoVerify(
+      "sha256",
+      preimage,
+      { key: fields.device.publicKey, dsaEncoding: "ieee-p1363" },
+      sig,
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

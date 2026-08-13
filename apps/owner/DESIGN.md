@@ -122,6 +122,25 @@ tightens it back up. So it is designed first.
    is cleared with `history.replaceState` on read, is served under
    `Referrer-Policy: no-referrer`, and is spent in a POST body. No
    invite token is ever written to a log on either end.
+
+   **The pinned wire contract, by name** (`src/types.ts`), so there is
+   exactly one reading of this lifecycle: the mint request is
+   `InviteMintRequest { tokenHash, deviceName }` — the hash commitment
+   plus the invited device's committed display label; the mint
+   *response* carries the ceremony contract (inviteId, both
+   challenges, RP/user entities, TTL) and **no secret**;
+   `EnrollmentInvite` is the **device-to-device payload only** (QR /
+   typed code) — its `token` field is the locally generated secret *in
+   transit between phones*, assembled on the inviting device and never
+   a server-returned value; and `EnrollmentRequest` spends it, carrying
+   the secret as preimage plus the proofs of step 5. Two further rules
+   bind mint to live state: **nothing mints while the kill switch is
+   engaged** (an invite is born and spent inside one live state — an
+   invite created during a kill would be a fresh capability inside a
+   frozen system, spendable after a restore that may not advance the
+   epoch), and the recorded authority facts (kill epoch, bootstrap
+   generation or issuer standing) must be the live ones at mint, or
+   the mint is refused.
 3. **Credential creation.** Inside the installed app, the phone calls
    `navigator.credentials.create()` against the invite's challenge and
    contract from step 2. Attestation stays `"none"` (a deliberate
@@ -160,24 +179,45 @@ tightens it back up. So it is designed first.
    not the owner's ceremony — §4, clickjacking); `rpIdHash` and the
    **UP and UV flags** live in the authenticator data *inside the
    attestation object*; the credential's algorithm must be ES256
-   (COSE `-7`) on P-256. It verifies the proof
+   (COSE `-7`) on P-256. Because attestation is `"none"`, nothing in
+   the creation output is *signed* — so the registration check is
+   structural, and the ceremony demands a second proof: a **fresh
+   `webauthn.get` assertion with the newly created credential**, over
+   the invite's second challenge (`assertionChallenge`), verified
+   against the key the registration produced. *That* assertion is what
+   proves the phone holds the new private key and a human passed user
+   verification. It then verifies the cheap-lane proof
    of possession with the submitted key, re-checks the invite's issuing
    device is still active at its recorded generation (or, for a
    bootstrap invite, that there are still **zero** active devices and
    the invite's bootstrap generation is current), and only on a fully
-   successful registration burns the invite — atomically, exactly once:
+   successful chain burns the invite — atomically, exactly once:
    two racing spends admit at most one device, a failed or malformed
    attempt (including a failed proof) consumes nothing, and a
    stranger's garbage cannot burn the capability the owner is holding
    mid-enrolment. (The flip side is accepted: an intercepted invite
    stays spendable until its TTL — one more reason the TTL is short.)
+   The request's `deviceName` must repeat the mint-committed label
+   **exactly** — the inviter chose it, the enrolling phone confirms it
+   is redeeming the invite it was shown; a mismatch refuses with the
+   invite alive. Two spend-time exceptions to "a failed attempt
+   consumes nothing", both deliberate: an attempt while the kill
+   switch is **engaged** burns the attempted invite outright (the
+   defense-in-depth twin of the mint-side refusal above), and an
+   authority failure discovered *at* the burn — dead epoch, dead
+   issuer, occupied registry — stays burned: dead authority does not
+   revive.
    On success the control plane stores **one** `EnrolledDevice` record
    holding *both* credentials — the WebAuthn credential and the
    cheap-lane public key belong to the same record, governed by the
    same revocation generation, so revocation severs one identity, not
-   half of two. The record: credential id, COSE public key, cheap-lane
-   SPKI key, signature counter, transports, device name, `ownerId`,
-   `enrolledAt`, and a **revocation generation** starting at 0.
+   half of two. The record: credential id, the WebAuthn public key
+   re-exported as **canonical SPKI DER (base64url)** — one stored key
+   format everywhere, from the registration verdict through the
+   registry to the assertion verifier — the cheap-lane SPKI key,
+   signature counter, transports, device name, `ownerId`,
+   `enrolledAt`, and a **revocation generation** starting at 1 (the
+   standing registry's convention; a revocation bumps it).
 6. **Push subscription.** After notification permission is granted, the
    app registers its Web Push subscription
    (`PUT /devices/:id/push-subscription`, device-signed). The `:id` is
@@ -232,7 +272,8 @@ design stops code resident on the device from asking the key to sign
 while it runs.
 
 **What proves it at enrolment time: possession of a live invite.**
-Nothing else. The WebAuthn ceremony proves the phone holds the new
+Nothing else. The paired WebAuthn ceremony — creation plus the fresh
+assertion over the second challenge — proves the phone holds the new
 private key (and that a human passed user verification); it does not
 prove *whose* phone it is. The invite's out-of-band channel — the
 operator's screen to the owner's camera, in person — is the actual

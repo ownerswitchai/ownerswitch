@@ -1,7 +1,17 @@
+import {
+  ENROLL_POP_LABEL as sharedEnrollLabel,
+  ownerEnrollPopPreimage,
+} from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
 import { base64urlDecode, base64urlEncode, lengthPrefixed, sha256, utf8 } from "./bytes.js";
 import { deviceSigPreimage, enrollPopTranscript } from "./device-sig.js";
-import { DEVICE_SIG_LABEL, ENROLL_POP_LABEL } from "./types.js";
+import {
+  DEVICE_SIG_LABEL,
+  ENROLL_POP_LABEL,
+  type EnrollmentInvite,
+  type EnrollmentRequest,
+  type InviteMintRequest,
+} from "./types.js";
 
 const hex = (bytes: Uint8Array): string =>
   [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -205,5 +215,40 @@ describe("enrollPopTranscript", () => {
     expect(
       hex(enrollPopTranscript({ ...base, credentialId: new Uint8Array([1, 2, 3, 4]) })),
     ).not.toBe(ref);
+  });
+
+  it("matches @ownerswitchai/shared's ownerEnrollPopPreimage byte-for-byte (drift guard)", () => {
+    // the phone signs THIS transcript; the control plane verifies SHARED's —
+    // they are one contract, held identical here the same way the device-sig
+    // preimage is pinned above
+    expect(sharedEnrollLabel).toBe(ENROLL_POP_LABEL);
+    expect(hex(ownerEnrollPopPreimage(base))).toBe(hex(enrollPopTranscript(base)));
+  });
+});
+
+describe("the pinned invite wire contract (drift guard for the control-plane core)", () => {
+  it("InviteMintRequest is the hash-commitment mint: tokenHash, never a secret", () => {
+    // a COMPILE-TIME pin: these literals type-check against the pinned
+    // contract, so renaming or removing a field breaks this file
+    const mint: InviteMintRequest = { tokenHash: "c29tZS1oYXNo", deviceName: "Adam's phone" };
+    expect(Object.keys(mint).sort()).toEqual(["deviceName", "tokenHash"]);
+  });
+
+  it("EnrollmentRequest carries BOTH proofs: the registration AND the possession assertion", () => {
+    const shape: Record<keyof EnrollmentRequest, true> = {
+      inviteId: true,
+      token: true,
+      deviceName: true,
+      registration: true,
+      possessionAssertion: true,
+      cheapLaneKey: true,
+      cheapLaneKeyProof: true,
+    };
+    expect(Object.keys(shape)).toContain("possessionAssertion");
+  });
+
+  it("EnrollmentInvite carries BOTH ceremony challenges", () => {
+    const keys: Array<keyof EnrollmentInvite> = ["challenge", "assertionChallenge", "token"];
+    expect(keys).toContain("assertionChallenge");
   });
 });
