@@ -21,12 +21,23 @@ import {
   type ActionTicket,
   type GitHubMergeClient,
 } from "@ownerswitchai/executor";
-import { createControlPlaneClient } from "@ownerswitchai/gateway";
-import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
+import {
+  createControlPlaneClient,
+  limitTripReason,
+  LimitTracker,
+  type LimitTrip,
+} from "@ownerswitchai/gateway";
+import {
+  createTripReporter,
+  createTripwire,
+  loadRegistry,
+  readRegistryFile,
+  type Tripwire,
+} from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
-import { createOwnerSwitchProxy } from "./proxy.js";
+import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
 import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
@@ -192,6 +203,39 @@ async function runGateway(argv: string[]): Promise<void> {
         })()
       : undefined;
 
+  // Cumulative limit rules, when configured: the tracker counts in-process,
+  // and a tripped kill-action rule fires a device-signed SCOPED kill of this
+  // gateway's agent through the same retrying reporter the honeytoken
+  // tripwire uses — one delivery discipline for every gateway-side tripwire.
+  const effectiveAgentId = config.agentId ?? PROXY_NAME;
+  const limitReporter =
+    config.limits !== undefined && config.limits.length > 0
+      ? createTripReporter({ controlPlaneUrl, deviceId: device.id, secret: device.secret })
+      : undefined;
+  const limits =
+    limitReporter !== undefined && config.limits !== undefined
+      ? {
+          tracker: new LimitTracker(config.limits),
+          reportKill: (trip: LimitTrip) =>
+            limitReporter.report({
+              tier: "kill",
+              canaryIds: [],
+              how: "",
+              source: "limit",
+              agentId: effectiveAgentId,
+              reason: limitTripReason(trip, effectiveAgentId),
+            }),
+          reportAlert: (trip: LimitTrip) =>
+            limitReporter.report({
+              tier: "alert",
+              canaryIds: [],
+              how: "",
+              source: "limit",
+              reason: limitTripReason(trip, effectiveAgentId),
+            }),
+        }
+      : undefined;
+
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,
     agentId: config.agentId,
@@ -199,6 +243,7 @@ async function runGateway(argv: string[]): Promise<void> {
     vetoClient: createVetoClient({ baseUrl: controlPlaneUrl, device, timeoutMs }),
     ...(tripwire !== undefined ? { honeytokens: tripwire } : {}),
     ...(executor !== undefined ? { executor } : {}),
+    ...(limits !== undefined ? { limits } : {}),
   });
 
   let shuttingDown = false;
@@ -213,6 +258,13 @@ async function runGateway(argv: string[]): Promise<void> {
         tripwire.stop();
         if (!delivered) {
           console.error(`[ownerswitch-mcp] exiting with ${pending} honeytoken report(s) UNCONFIRMED`);
+        }
+      }
+      if (limitReporter !== undefined) {
+        const { delivered, pending } = await limitReporter.flush();
+        limitReporter.stop();
+        if (!delivered) {
+          console.error(`[ownerswitch-mcp] exiting with ${pending} limit report(s) UNCONFIRMED`);
         }
       }
       process.exit(code);
@@ -268,7 +320,8 @@ async function runGateway(argv: string[]): Promise<void> {
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
       `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}; ` +
-      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}`,
+      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}; ` +
+      `limits: ${limits !== undefined ? `${config.limits?.length ?? 0} rule(s) armed for agent "${effectiveAgentId}"` : "none"}`,
   );
 }
 

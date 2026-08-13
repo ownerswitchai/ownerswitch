@@ -326,4 +326,42 @@ describe("trip reporter", () => {
     h.reporter.report({ ...ALERT_TRIP, canaryIds: ["LATE12345678"] });
     expect(h.logs.some((l) => l.includes("NOT delivered"))).toBe(true);
   });
+
+  it("override trips (source, agentId, reason) ride the same lanes with a SCOPED, attributed body", async () => {
+    const h = harness(() => okResponse());
+    const trip: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: 'limit "spend" tripped for agent "agent-7": total 1200 exceeded max 1000',
+    };
+    h.reporter.report(trip);
+    // duplicate collapses on the OVERRIDE reason, not the honeytoken phrasing
+    h.reporter.report({ ...trip });
+    await settle();
+    const kills = callsTo(h.calls, "/kill");
+    expect(kills).toHaveLength(1);
+    const body = JSON.parse(kills[0].body) as Record<string, unknown>;
+    expect(body).toEqual({
+      source: "limit",
+      agentId: "agent-7", // scoped: stops one agent, not the fleet
+      reason: 'limit "spend" tripped for agent "agent-7": total 1200 exceeded max 1000',
+    });
+    // still device-signed over the exact bytes on the wire
+    expect(
+      verifyDeviceSignature(
+        {
+          deviceId: kills[0].headers["x-device-id"],
+          timestamp: Number(kills[0].headers["x-device-timestamp"]),
+          nonce: kills[0].headers["x-device-nonce"],
+          signature: kills[0].headers["x-device-signature"],
+        },
+        kills[0].body,
+        SECRET,
+      ),
+    ).toBe(true);
+    expect(h.logs.some((l) => l.includes("[limit]"))).toBe(true);
+  });
 });

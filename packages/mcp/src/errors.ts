@@ -24,6 +24,8 @@ export const OwnerSwitchErrorCode = {
   TicketRefused: -32056,
   /** the executor's connector call failed after the single-use ticket was consumed */
   ExecutionFailed: -32057,
+  /** a cumulative limit rule (spend/error/call budget) tripped its circuit breaker */
+  LimitTripped: -32058,
 } as const;
 
 export type OwnerSwitchErrorCodeName = keyof typeof OwnerSwitchErrorCode;
@@ -146,6 +148,23 @@ export function lockdown(tool: string, reason: string | undefined): OwnerSwitchR
     `OwnerSwitch denied "${tool}": ${why}. Every tool call is denied until the owner ` +
       `restores OwnerSwitch — do not retry other tools; tell the user why.`,
     { decision: "lockdown", tool, reason: why },
+  );
+}
+
+/**
+ * A cumulative limit rule tripped its kill-action circuit breaker: the
+ * owner's declared budget (spend, errors, call rate) is exhausted and a
+ * scoped kill is firing for this agent. Refuses both the crossing call and
+ * every call after it (the tracker latches locally while the signed kill
+ * propagates to the control plane).
+ */
+export function limitTripped(tool: string, ruleId: string, reason: string): OwnerSwitchRefusal {
+  return new OwnerSwitchRefusal(
+    OwnerSwitchErrorCode.LimitTripped,
+    `OwnerSwitch stopped "${tool}": ${reason}. This agent crossed an owner-set limit ` +
+      `(rule "${ruleId}") and is being scope-killed — the call did NOT run. Do not retry any ` +
+      `tool; tell the user which limit tripped and that restoring takes the owner's 2GO ceremony.`,
+    { decision: "lockdown", tool, reason, ruleId },
   );
 }
 

@@ -58,6 +58,18 @@ export interface Trip {
   canaryIds: string[];
   /** How it tripped, for the audit trail: "read of /decoys/.env.backup (atime advanced)". */
   how: string;
+  /**
+   * The reporter is honeytoken-born but its delivery discipline (dual
+   * lanes, backoff, collapse, flush, per-attempt timeouts) is exactly what
+   * ANY gateway-side tripwire needs, so other trip kinds reuse it through
+   * these additive overrides rather than duplicating the machinery:
+   */
+  /** kill-source attribution on the wire; default "honeytoken" */
+  source?: string;
+  /** SCOPED kill: stop this one agent instead of the fleet (POST /kill {agentId}) */
+  agentId?: string;
+  /** verbatim audit reason; default tripReason(trip)'s honeytoken phrasing */
+  reason?: string;
 }
 
 export interface DeliveryConfirmation {
@@ -106,6 +118,10 @@ export function tripReason(trip: Trip): string {
 /** Back-compat alias. */
 export const killReason = tripReason;
 
+/** The reason actually sent and deduped on: the override, or the honeytoken phrasing. */
+const effectiveReason = (trip: Trip): string => trip.reason ?? tripReason(trip);
+const prefixOf = (trip: Trip): string => `[${trip.source ?? "honeytoken"}]`;
+
 interface AttemptOutcome {
   ok: boolean;
   status: number;
@@ -129,9 +145,15 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
     const url = endpoint[trip.tier];
     const timestamp = now();
     const nonce = randomBytes(16).toString("hex");
-    const body = JSON.stringify({ source: "honeytoken", reason: tripReason(trip) });
+    const source = trip.source ?? "honeytoken";
+    const body = JSON.stringify({
+      source,
+      reason: effectiveReason(trip),
+      // an agentId makes the kill SCOPED — stop this one agent, not the fleet
+      ...(trip.agentId !== undefined ? { agentId: trip.agentId } : {}),
+    });
     const signature = signDeviceRequest({ deviceId: opts.deviceId, timestamp, nonce }, body, opts.secret);
-    log(`[honeytoken] → POST ${url} (${trip.tier}, attempt ${n}, device ${opts.deviceId})`);
+    log(`[${source}] → POST ${url} (${trip.tier}, attempt ${n}, device ${opts.deviceId})`);
     // Bounds a request that never SETTLES, not just one that errors fast —
     // cancelWait (the backoff-wait canceller) has no reach into an in-flight
     // fetch, so without this a hung connection stalls the lane, and flush(),
@@ -196,13 +218,13 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
     }
 
     enqueue(trip: Trip): void {
-      const reason = tripReason(trip);
-      if (this.queue.some((q) => tripReason(q) === reason)) {
-        log(`[honeytoken] duplicate ${this.tier} trip already queued, report in flight — ${reason}`);
+      const reason = effectiveReason(trip);
+      if (this.queue.some((q) => effectiveReason(q) === reason)) {
+        log(`${prefixOf(trip)} duplicate ${this.tier} trip already queued, report in flight — ${reason}`);
         return;
       }
       this.queue.push(trip);
-      log(`[honeytoken] ⚡ TRIP (${this.tier}) — ${reason}`);
+      log(`${prefixOf(trip)} ⚡ TRIP (${this.tier}) — ${reason}`);
       this.ensureDraining();
     }
 
@@ -225,7 +247,7 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
             this.queue.shift();
             landed = true;
             const verb = trip.tier === "kill" ? "KILL CONFIRMED" : "ALERT RECORDED";
-            log(`[honeytoken] ■ ${verb} (${outcome.detail}, attempt ${n}) — ${tripReason(trip)}`);
+            log(`${prefixOf(trip)} ■ ${verb} (${outcome.detail}, attempt ${n}) — ${effectiveReason(trip)}`);
             opts.onDelivered?.(trip, {
               tier: trip.tier,
               attempts: n,
@@ -237,7 +259,7 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
           }
           if (n >= this.retryBudget) {
             log(
-              `[honeytoken] ✗ giving up after ${n} attempt(s) — ${this.tier} trip UNCONFIRMED (${outcome.detail}); ${tripReason(trip)}`,
+              `${prefixOf(trip)} ✗ giving up after ${n} attempt(s) — ${this.tier} trip UNCONFIRMED (${outcome.detail}); ${effectiveReason(trip)}`,
             );
             break;
           }

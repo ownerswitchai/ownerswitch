@@ -16,7 +16,14 @@ import {
   type ActionTicket,
   type ExecutionOutcome,
 } from "@ownerswitchai/executor";
-import { evaluateRemote, type ControlPlaneClient, type KillState } from "@ownerswitchai/gateway";
+import {
+  evaluateRemote,
+  limitTripReason,
+  type ControlPlaneClient,
+  type KillState,
+  type LimitTracker,
+  type LimitTrip,
+} from "@ownerswitchai/gateway";
 import type { Policy, ToolCall, Verdict } from "@ownerswitchai/shared";
 import { assertExecutorRoutesCoherent } from "./config.js";
 import {
@@ -24,6 +31,7 @@ import {
   controlPlaneUnavailable,
   executionFailed,
   honeytokenTripped,
+  limitTripped,
   lockdown,
   ownerVetoed,
   policyDenied,
@@ -113,6 +121,24 @@ export interface ProxyOptions {
    * forward() as the "then what" for yes on routed tools.
    */
   executor?: ExecutorWiring;
+  /**
+   * Cumulative limit rules — spend, error and call budgets counted across
+   * calls (@ownerswitchai/gateway LimitTracker; shared limit-rule.ts is the
+   * model). Counting happens only where a call would actually act: forwarded
+   * calls feed calls/amount metrics, failed executions feed errors. A
+   * kill-action trip refuses the crossing call, reports a SCOPED signed
+   * kill, and latches locally so every later call is refused while the kill
+   * propagates; an alert-action trip only flags and the call proceeds.
+   */
+  limits?: LimitEnforcement;
+}
+
+export interface LimitEnforcement {
+  tracker: LimitTracker;
+  /** fire-and-forget scoped-kill report for a tripped kill-action rule */
+  reportKill(trip: LimitTrip): void;
+  /** fire-and-forget alert report for a tripped alert-action rule */
+  reportAlert(trip: LimitTrip): void;
 }
 
 export interface OwnerSwitchProxy {
@@ -297,6 +323,17 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     if (observedKill?.killedAgents?.includes(agentId) === true) {
       throw scopedLockdown(call.tool, agentId);
     }
+    // A latched kill-action limit trip is the same lockdown, locally held:
+    // the signed scoped kill is propagating (or retrying) toward the control
+    // plane, and this gateway must not keep acting in the meantime.
+    const latched = options.limits?.tracker.killTripped;
+    if (latched !== undefined) {
+      throw limitTripped(
+        call.tool,
+        latched.id,
+        `limit "${latched.id}" already tripped for agent "${agentId}" — the scoped kill is in flight`,
+      );
+    }
 
     switch (verdict.decision) {
       case "allow":
@@ -344,17 +381,73 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
       throw honeytokenTripped(call.tool, canaryIds);
     }
+    // Limits count HERE — the only place a yes becomes an action — so a call
+    // policy refused, or a honeytoken killed, never spends a budget. A
+    // kill-action trip refuses THIS call too: the crossing call is the one
+    // the budget says must not run.
+    observeCallLimits(call);
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {
-      return runRouted(call, executor, route, verdict, mintEpoch, grant);
+      try {
+        return await runRouted(call, executor, route, verdict, mintEpoch, grant);
+      } catch (err) {
+        observeErrorLimits(call);
+        throw err;
+      }
     }
     // the client validated the result against CallToolResultSchema; the SDK's
     // return type is a union over every possible schema, so narrow it here
-    const result = await upstream.callTool(
-      { name: call.tool, arguments: call.args },
-      CallToolResultSchema,
-    );
-    return result as CallToolResult;
+    let result: CallToolResult;
+    try {
+      result = (await upstream.callTool(
+        { name: call.tool, arguments: call.args },
+        CallToolResultSchema,
+      )) as CallToolResult;
+    } catch (err) {
+      observeErrorLimits(call);
+      throw err;
+    }
+    // an upstream tool reporting its own failure counts against the error
+    // budget exactly like a transport failure — the agent's action failed
+    if (result.isError === true) observeErrorLimits(call);
+    return result;
+  }
+
+  /**
+   * Feed a forwarded call to the limit tracker. Kill trips refuse the
+   * crossing call (and report the scoped kill); alert trips only flag.
+   */
+  function observeCallLimits(call: ToolCall): void {
+    const limits = options.limits;
+    if (limits === undefined) return;
+    const trips = limits.tracker.observeCall(call);
+    let killTrip: LimitTrip | undefined;
+    for (const trip of trips) {
+      if (trip.rule.action === "kill") {
+        limits.reportKill(trip);
+        killTrip ??= trip;
+      } else {
+        limits.reportAlert(trip);
+      }
+    }
+    if (killTrip !== undefined) {
+      throw limitTripped(call.tool, killTrip.rule.id, limitTripReason(killTrip, agentId));
+    }
+  }
+
+  /**
+   * Feed a FAILED execution to the error budget. Never throws: the call
+   * already ran (and failed) — the agent must receive that outcome. A kill
+   * trip here reports the scoped kill and latches, so the NEXT call is
+   * refused at the top of the handler.
+   */
+  function observeErrorLimits(call: ToolCall): void {
+    const limits = options.limits;
+    if (limits === undefined) return;
+    for (const trip of limits.tracker.observeError(call)) {
+      if (trip.rule.action === "kill") limits.reportKill(trip);
+      else limits.reportAlert(trip);
+    }
   }
 
   /**

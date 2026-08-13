@@ -48,6 +48,31 @@ if more than 64 agents pile up scope-killed, the next one escalates to
 the global kill rather than being refused: stopping never fails on a
 capacity ceiling.
 
+**Cumulative limits — declared budgets with teeth.** The community
+`KILLSWITCH.md` convention declares agent boundaries in prose — spending
+thresholds, error budgets, call-rate ceilings — that an agent is free to
+ignore. OwnerSwitch enforces the same boundaries as configuration:
+`limits` rules in the gateway config count across calls (`calls`,
+`errors`, or an `amount` read off the call's own arguments, over a
+sliding window or the process lifetime), and a tripped `kill`-action
+rule refuses the crossing call and fires the same signed, scoped kill a
+honeytoken does — the agent that blew its budget stops, the fleet keeps
+running, and restoring it is the owner's 2GO ceremony. `alert`-action
+rules only flag. Stated honestly: counters live in the gateway process
+and reset with it; the kill they fire is durable. An unreadable amount
+on a metered call trips the rule rather than passing unmetered —
+fail-closed, like everything else here.
+
+```jsonc
+// gateway config
+"limits": [
+  { "id": "spend",  "tool": "stripe.*", "metric": "amount", "amountPath": "cents",
+    "max": 10000, "windowMs": 3600000, "action": "kill" },
+  { "id": "errors", "tool": "*", "metric": "errors", "max": 20, "action": "kill" },
+  { "id": "rate",   "tool": "*", "metric": "calls",  "max": 300, "windowMs": 60000, "action": "alert" }
+]
+```
+
 **Where this is headed:** once the credential broker above ships, KILL
 also means no more tokens — the shorter the TTL, the smaller the window
 between KILL and everything downstream going dark. That's the

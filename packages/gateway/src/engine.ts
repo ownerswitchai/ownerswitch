@@ -49,6 +49,16 @@ const globToRegex = (glob: string) =>
   new RegExp("^" + glob.split("*").map(escapeRe).join(".*") + "$");
 
 /**
+ * The engine's own tool-glob semantics, exported so every other matcher in
+ * the system (rulesMatchingTool below, the LimitTracker's rule matching)
+ * shares ONE definition instead of re-deriving glob behavior that could
+ * drift.
+ */
+export function toolGlobMatches(glob: string, tool: string): boolean {
+  return globToRegex(glob).test(tool);
+}
+
+/**
  * The rules whose tool glob matches `tool`, in policy order — the exact
  * candidate set evaluate() walks (argsPattern then decides per call which
  * candidate fires). Exported so callers that need to reason about a tool
@@ -57,7 +67,7 @@ const globToRegex = (glob: string) =>
  * glob semantics that could drift.
  */
 export function rulesMatchingTool(policy: Policy, tool: string): PolicyRule[] {
-  return policy.rules.filter((rule) => globToRegex(rule.tool).test(tool));
+  return policy.rules.filter((rule) => toolGlobMatches(rule.tool, tool));
 }
 
 /**

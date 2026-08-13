@@ -4,6 +4,7 @@ import {
   isValidAgentId,
   MAX_AGENT_ID_CHARS,
   type Decision,
+  type LimitRule,
   type Policy,
   type PolicyRule,
 } from "@ownerswitchai/shared";
@@ -50,6 +51,12 @@ export interface OwnerSwitchMcpConfig {
    * token. Tools not listed here forward exactly as before.
    */
   executorRoutes?: Record<string, ExecutorRouteConfig>;
+  /**
+   * Cumulative limit rules — spend/error/call budgets counted across calls
+   * (shared limit-rule.ts is the model). A kill-action trip fires a signed
+   * SCOPED kill of this gateway's agent; an alert-action trip only flags.
+   */
+  limits?: LimitRule[];
 }
 
 /** Configuration problems are startup errors: message only, no stack noise. */
@@ -115,6 +122,75 @@ function parseRule(v: unknown, path: string): PolicyRule {
       ? { description: requireString(v.description, `${path}.description`) }
       : {}),
   };
+}
+
+const LIMIT_METRICS = ["calls", "errors", "amount"] as const;
+const LIMIT_ACTIONS = ["kill", "alert"] as const;
+
+function parseLimitRule(v: unknown, path: string): LimitRule {
+  if (!isRecord(v)) return fail(`${path} must be an object`);
+  const metric = v.metric;
+  if (!LIMIT_METRICS.includes(metric as LimitRule["metric"])) {
+    return fail(`${path}.metric must be one of ${LIMIT_METRICS.join(" | ")}`);
+  }
+  const action = v.action;
+  if (!LIMIT_ACTIONS.includes(action as LimitRule["action"])) {
+    return fail(`${path}.action must be one of ${LIMIT_ACTIONS.join(" | ")}`);
+  }
+  const argsPattern = optionalString(v.argsPattern, `${path}.argsPattern`);
+  if (argsPattern !== undefined) {
+    try {
+      new RegExp(argsPattern);
+    } catch {
+      return fail(`${path}.argsPattern is not a valid regular expression`);
+    }
+  }
+  // amountPath and the amount metric come together or not at all: a spend
+  // limit with no path cannot meter, and a path on a non-amount metric is a
+  // config the author misread — both are startup errors, not surprises.
+  const amountPath = optionalString(v.amountPath, `${path}.amountPath`);
+  if ((metric === "amount") !== (amountPath !== undefined)) {
+    return fail(
+      metric === "amount"
+        ? `${path}.amountPath is required when metric is "amount"`
+        : `${path}.amountPath is only meaningful when metric is "amount"`,
+    );
+  }
+  const max = v.max;
+  if (typeof max !== "number" || !Number.isFinite(max) || max < 0) {
+    return fail(`${path}.max must be a finite number >= 0`);
+  }
+  const windowMs = v.windowMs;
+  if (
+    windowMs !== undefined &&
+    (typeof windowMs !== "number" || !Number.isSafeInteger(windowMs) || windowMs <= 0)
+  ) {
+    return fail(`${path}.windowMs must be a positive integer (ms)`);
+  }
+  return {
+    id: requireString(v.id, `${path}.id`),
+    tool: requireString(v.tool, `${path}.tool`),
+    metric: metric as LimitRule["metric"],
+    action: action as LimitRule["action"],
+    max,
+    ...(argsPattern !== undefined ? { argsPattern } : {}),
+    ...(amountPath !== undefined ? { amountPath } : {}),
+    ...(windowMs !== undefined ? { windowMs: windowMs as number } : {}),
+    ...(v.description !== undefined
+      ? { description: requireString(v.description, `${path}.description`) }
+      : {}),
+  };
+}
+
+function parseLimits(v: unknown, path: string): LimitRule[] {
+  if (!Array.isArray(v)) return fail(`${path} must be an array of limit rules`);
+  const rules = v.map((rule, i) => parseLimitRule(rule, `${path}[${i}]`));
+  const ids = new Set<string>();
+  for (const rule of rules) {
+    if (ids.has(rule.id)) return fail(`${path} has duplicate rule id "${rule.id}"`);
+    ids.add(rule.id);
+  }
+  return rules;
 }
 
 function parsePolicy(v: unknown, path: string): Policy {
@@ -245,6 +321,7 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
     ...(v.agentId !== undefined ? { agentId: requireAgentId(v.agentId, "agentId") } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(executorRoutes !== undefined ? { executorRoutes } : {}),
+    ...(v.limits !== undefined ? { limits: parseLimits(v.limits, "limits") } : {}),
   };
 }
 
@@ -275,6 +352,9 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
               "or set the OWNERSWITCH_* variables (OWNERSWITCH_POLICY is missing)",
           ),
     ...(env.OWNERSWITCH_AGENT_ID !== undefined ? { agentId: env.OWNERSWITCH_AGENT_ID } : {}),
+    ...(env.OWNERSWITCH_LIMITS !== undefined
+      ? { limits: parseJson(env.OWNERSWITCH_LIMITS, "OWNERSWITCH_LIMITS") }
+      : {}),
     ...(env.OWNERSWITCH_TIMEOUT_MS !== undefined
       ? { timeoutMs: Number(env.OWNERSWITCH_TIMEOUT_MS) }
       : {}),
