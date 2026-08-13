@@ -978,6 +978,19 @@ export class EnrolledDeviceRegistry {
   }
 
   /**
+   * Read an invite WITHOUT spending it — the server's non-consuming
+   * PREFLIGHT (GET /devices/enroll/contract/:id): the phone verifies the
+   * pasted payload against the control plane's own record BEFORE any
+   * platform prompt is raised, so an unauthenticated QR/paste can never
+   * steer rpId, the user entity, or a challenge into WebAuthn. A frozen
+   * copy; the spend still runs the whole proof chain later.
+   */
+  peekInvite(inviteId: string): InviteRecord | null {
+    this.#usableState();
+    return this.#invites.peek(inviteId);
+  }
+
+  /**
    * The ONE witness assembly — live kill snapshot + this registry's loaded
    * durable state, nothing else. Module-private consumers only; the
    * public paths are mintInvite and commitEnrollment.

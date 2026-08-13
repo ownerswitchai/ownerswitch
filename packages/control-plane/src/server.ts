@@ -2916,6 +2916,72 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 200, { devices });
   }
 
+  /**
+   * The COMPLETE pinned creation contract (EnrollmentInviteContract) for an
+   * invite record: everything navigator.credentials.create() needs, and no
+   * secret. ONE builder — the mint response and the non-consuming preflight
+   * serve byte-identical contracts, so the phone can pin the prompt to the
+   * control plane's record.
+   */
+  function enrollmentContractFor(record: {
+    inviteId: string;
+    expiresAt: number;
+    ownerId: string;
+    deviceName: string;
+    challenge: string;
+    assertionChallenge: string;
+  }): EnrollmentInviteContract | null {
+    if (enrolledDevices === undefined || enrollmentRp === undefined) return null;
+    const userId = enrolledDevices.ownerUserId(record.ownerId);
+    if (userId === null) return null;
+    return {
+      inviteId: record.inviteId,
+      expiresAt: record.expiresAt,
+      ownerId: record.ownerId,
+      rpId: enrollmentRp.rpId,
+      rpName: enrollmentRp.rpName,
+      user: {
+        // display-only labels for the platform UI; the opaque handle is the
+        // identity, these are never parsed
+        id: userId,
+        name: record.ownerId,
+        displayName: record.ownerId,
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        residentKey: "preferred",
+        userVerification: "required",
+      },
+      challenge: record.challenge,
+      assertionChallenge: record.assertionChallenge,
+      deviceName: record.deviceName,
+    };
+  }
+
+  /**
+   * NON-CONSUMING PREFLIGHT: the phone fetches the control plane's OWN copy
+   * of the invite contract before raising any WebAuthn prompt, and refuses
+   * the ceremony if the pasted payload disagrees — an unauthenticated paste
+   * can never steer rpId/user/challenges into the platform authenticator.
+   * The inviteId is a high-entropy capability the QR holder already has;
+   * the response carries NOTHING the mint response did not (and no secret).
+   */
+  function getEnrollContract(res: ServerResponse, inviteId: string): void {
+    if (enrolledDevices === undefined || enrollmentRp === undefined) {
+      return sendJson(res, 501, { error: "device enrollment is not configured" });
+    }
+    if (!enrolledDevices.usable) {
+      return sendJson(res, 503, { error: "enrolled-device registry is not usable" });
+    }
+    const record = enrolledDevices.peekInvite(inviteId);
+    const contract = record === null ? null : enrollmentContractFor(record);
+    if (contract === null) {
+      return sendJson(res, 404, { error: "unknown, expired, or already-spent invite" });
+    }
+    sendJson(res, 200, { invite: contract });
+  }
+
   function bootstrapMintInvite(request: BootstrapMintRequest): BootstrapMintResult {
     if (enrolledDevices === undefined || enrollmentRp === undefined) {
       return { ok: false, error: "device enrollment is not configured" };
@@ -2950,38 +3016,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         issuer: { kind: "bootstrap", ownerId },
       });
       // the owner's durable opaque user handle was established by the mint
-      const userId = enrolledDevices.ownerUserId(minted.ownerId);
-      if (userId === null) {
+      const contract = enrollmentContractFor(minted);
+      if (contract === null) {
         return { ok: false, error: "owner user handle missing after mint — refusing" };
       }
-      // the COMPLETE pinned creation contract (EnrollmentInviteContract):
-      // everything navigator.credentials.create() needs, and no secret
-      return {
-        ok: true,
-        invite: {
-          inviteId: minted.inviteId,
-          expiresAt: minted.expiresAt,
-          ownerId: minted.ownerId,
-          rpId: enrollmentRp.rpId,
-          rpName: enrollmentRp.rpName,
-          user: {
-            id: userId,
-            // display-only labels for the platform UI; the opaque handle
-            // above is the identity, these are never parsed
-            name: minted.ownerId,
-            displayName: minted.ownerId,
-          },
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-          authenticatorSelection: {
-            authenticatorAttachment: "platform",
-            residentKey: "preferred",
-            userVerification: "required",
-          },
-          challenge: minted.challenge,
-          assertionChallenge: minted.assertionChallenge,
-          deviceName: minted.deviceName,
-        },
-      };
+      return { ok: true, invite: contract };
     } catch (err) {
       // register()'s live-witness gate throws on killed/stale/occupied — the
       // CLI gets the reason, and nothing was minted
@@ -3009,6 +3048,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
     const deviceRevokeMatch = /^\/devices\/([^/]+)\/revoke$/.exec(path);
+    const enrollContractMatch = /^\/devices\/enroll\/contract\/([^/]+)$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
@@ -3021,6 +3061,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
     if (method === "POST" && path === "/devices/enroll") return postDeviceEnroll(req, res);
+    if (method === "GET" && enrollContractMatch) {
+      return getEnrollContract(res, decodeURIComponent(enrollContractMatch[1]));
+    }
     if (method === "GET" && path === "/devices") return getDevices(req, res);
     if (method === "POST" && deviceRevokeMatch) {
       return postDeviceRevoke(req, res, decodeURIComponent(deviceRevokeMatch[1]));

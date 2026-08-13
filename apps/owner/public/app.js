@@ -137,8 +137,23 @@
         })
         .then(function (outcome) {
           if (outcome.ok) {
-            setText("enroll-status", "enrolled as " + outcome.deviceId + " — this phone is now in the loop");
-            if (input) input.value = ""; // the secret leaves the DOM
+            // ADOPT the server-assigned identity DURABLY before claiming
+            // success: from here every signed request uses the registry's
+            // name for this key, not the deployment-config id
+            return loadRuntime()
+              .then(function (rt) {
+                return rt.adoptEnrolledIdentity(outcome.deviceId);
+              })
+              .then(function () {
+                setText("enroll-status", "enrolled as " + outcome.deviceId + " — signed requests now use this identity");
+                if (input) input.value = ""; // the secret leaves the DOM
+              })
+              .catch(function () {
+                setText(
+                  "enroll-status",
+                  "enrolled as " + outcome.deviceId + " on the SERVER, but this phone could not persist the identity — reload and check the device list before retrying",
+                );
+              });
           } else {
             setText(
               "enroll-status",

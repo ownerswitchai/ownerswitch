@@ -14,6 +14,8 @@ export interface SeenAckResult {
 }
 
 export function ensureDeviceKey(): Promise<CryptoKeyPair>;
+export function adoptEnrolledIdentity(deviceId: string): Promise<string>;
+export function enrolledIdentity(): Promise<string | null>;
 export function enrolledPublicKeySpki(): Promise<string>;
 export function subscribeAndEnroll(registration: ServiceWorkerRegistration): Promise<PushSubscription>;
 export function resubscribeFromWorker(registration: ServiceWorkerRegistration): Promise<PushSubscription>;

@@ -13,14 +13,24 @@
  * tests drive the SAME code against a REAL control plane with a synthetic
  * authenticator. Every WebAuthn call is wrapped: a rejection (cancel,
  * timeout, missing platform support) folds into a fixed refusal string,
- * never an escaping exception, and no partial ceremony state survives a
- * refusal.
+ * never an escaping exception. Honesty about partial state: a refusal
+ * creates NO server-side authority, ever — but a passkey created before a
+ * later refusal can remain in the platform authenticator (browsers expose
+ * no deletion API); it is inert, because the server never admitted it.
+ *
+ * TRUST DIRECTION, pinned (the review's rule): no unauthenticated pasted
+ * payload ever steers a WebAuthn prompt. Before ANY prompt, the ceremony
+ * fetches the control plane's OWN copy of the invite contract (the
+ * non-consuming GET /devices/enroll/contract/:id, over the DEPLOYMENT-
+ * CONFIGURED origin) and refuses unless the pasted payload matches it
+ * field for field. What create()/get() see is the server's record; the
+ * paste contributes only the invite id and the local secret.
  *
  * The PoP transcript encoder here is DRIFT-PINNED to
  * @ownerswitchai/shared's ownerEnrollPopPreimage by src/enroll-ceremony.test.ts
  * (byte-for-byte), the same discipline as owner-crypto.mjs.
  */
-import { beginEnrollmentCeremony } from "./enroll-invite.mjs";
+import { beginEnrollmentCeremony, parseEnrollmentInvite } from "./enroll-invite.mjs";
 
 export const ENROLL_POP_LABEL = "ownerswitch/enroll-cheap-lane/v1";
 
@@ -50,7 +60,15 @@ function base64url(bytes) {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-const asBytes = (value) => new Uint8Array(value instanceof ArrayBuffer ? value : value.buffer ?? value);
+function asBytes(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    // honor the view's window — a TypedArray/DataView over a larger buffer
+    // must not leak (or truncate to) the wrong bytes
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  throw new Error("not a BufferSource");
+}
 
 /**
  * The pinned cheap-lane PoP transcript — MUST match shared's
@@ -69,6 +87,26 @@ export function enrollPopPreimage({ inviteId, ownerId, credentialIdBytes, spkiBy
     spkiBytes,
   ]);
 }
+
+/**
+ * The control-plane base URL must be an ORIGIN, from the deployment config:
+ * https (or http on loopback, for dev), no path/query/fragment. Everything
+ * else refuses before any request or prompt exists.
+ */
+function trustedOrigin(baseUrl) {
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]" || url.hostname === "::1";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return null;
+  if ((url.pathname !== "/" && url.pathname !== "") || url.search !== "" || url.hash !== "") return null;
+  return url.origin;
+}
+
+const FETCH_GUARDS = { cache: "no-store", redirect: "error" };
 
 const REFUSED = "credential creation was refused, unavailable, or dismissed";
 const ASSERTION_REFUSED = "the possession assertion was refused, unavailable, or dismissed";
@@ -89,8 +127,58 @@ const ASSERTION_REFUSED = "the possession assertion was refused, unavailable, or
 export async function completeEnrollmentCeremony(payload, deps) {
   const { credentials, cheapLane, fetchImpl, baseUrl, now } = deps;
 
-  /* 1+2 — validate, adapt, create (enroll-invite.mjs owns the refusals) */
-  const begun = await beginEnrollmentCeremony(payload, credentials, now ?? Date.now);
+  /* 0 — the deployment-configured origin is the trust anchor */
+  const origin = trustedOrigin(baseUrl);
+  if (origin === null) {
+    return {
+      ok: false,
+      reason: "control-plane URL is not a trusted origin (https, no path) — refusing the ceremony",
+      inviteSurvives: true,
+    };
+  }
+
+  /* 1 — parse the paste (exact shape), then PREFLIGHT: fetch the control
+     plane's own contract for this inviteId and demand field-for-field
+     agreement BEFORE any platform prompt. The paste contributes the id and
+     the secret; the SERVER's record is what the prompts will see. */
+  const pasted = parseEnrollmentInvite(payload);
+  if (pasted === null) {
+    return { ok: false, reason: "not a valid enrollment invite — refusing the ceremony", inviteSurvives: true };
+  }
+  let serverInvite = null;
+  try {
+    const preflight = await fetchImpl(
+      new URL(`/devices/enroll/contract/${encodeURIComponent(pasted.inviteId)}`, origin).toString(),
+      { method: "GET", ...FETCH_GUARDS },
+    );
+    if (preflight.status === 200) {
+      const body = await preflight.json();
+      if (body !== null && typeof body === "object" && !Array.isArray(body)) {
+        serverInvite = parseEnrollmentInvite({ ...body.invite, token: pasted.token });
+      }
+    }
+  } catch {
+    serverInvite = null;
+  }
+  if (serverInvite === null) {
+    // no survival claim here, deliberately: "not vouched" covers unknown,
+    // expired, and ALREADY-SPENT alike — asserting the invite survives
+    // would be a guess about a record this refusal never saw
+    return {
+      ok: false,
+      reason: "the control plane does not vouch for this invite — refusing before any prompt",
+    };
+  }
+  if (JSON.stringify(serverInvite) !== JSON.stringify(pasted)) {
+    return {
+      ok: false,
+      reason: "the pasted invite does not match the control plane's contract — refusing before any prompt",
+      inviteSurvives: true,
+    };
+  }
+
+  /* 2 — validate, adapt, create — on the SERVER-vouched contract */
+  const begun = await beginEnrollmentCeremony(serverInvite, credentials, now ?? Date.now);
   if (!begun.ok) return begun;
 
   /* 3 — the registration wire fields, from the REAL credential object */
@@ -178,13 +266,25 @@ export async function completeEnrollmentCeremony(payload, deps) {
   });
   let response;
   try {
-    response = await fetchImpl(`${baseUrl}/devices/enroll`, {
+    response = await fetchImpl(new URL("/devices/enroll", origin).toString(), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
+      ...FETCH_GUARDS,
     });
   } catch {
-    return { ok: false, reason: "the control plane is unreachable — the invite was not spent", inviteSurvives: true };
+    // POST-DISPATCH TRANSPORT FAILURE IS UNKNOWN, honestly: the control
+    // plane may already have burned the invite, durably admitted the
+    // device, and sent a 201 this connection lost — or the request may
+    // never have arrived. Claiming either survival or spend here would be
+    // a guess; the operator checks the device list (or re-mints).
+    return {
+      ok: false,
+      outcome: "unknown",
+      reason:
+        "the connection to the control plane failed mid-enrolment — the OUTCOME IS UNKNOWN: " +
+        "check the device list before re-minting; the invite may or may not have been spent",
+    };
   }
   let parsed = null;
   try {
@@ -192,8 +292,27 @@ export async function completeEnrollmentCeremony(payload, deps) {
   } catch {
     /* structured error below */
   }
-  if (response.status === 201 && parsed !== null && typeof parsed.deviceId === "string") {
-    return { ok: true, deviceId: parsed.deviceId };
+  if (response.status === 201) {
+    // the pinned EnrollmentResponse, EXACTLY: {deviceId} with the control
+    // plane's id grammar — extra fields or a strange id refuse, because a
+    // response this load-bearing is a contract, not a suggestion
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 1 &&
+      typeof parsed.deviceId === "string" &&
+      /^dev_[A-Za-z0-9_-]{1,64}$/.test(parsed.deviceId)
+    ) {
+      return { ok: true, deviceId: parsed.deviceId };
+    }
+    return {
+      ok: false,
+      outcome: "unknown",
+      reason:
+        "the control plane's 201 did not carry the pinned {deviceId} contract — treat the outcome as " +
+        "UNKNOWN and check the device list",
+    };
   }
   return {
     ok: false,

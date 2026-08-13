@@ -10,7 +10,7 @@ export function enrollPopPreimage(fields: {
 
 export type CompleteEnrollmentResult =
   | { ok: true; deviceId: string }
-  | { ok: false; reason: string; inviteSurvives?: boolean };
+  | { ok: false; reason: string; inviteSurvives?: boolean; outcome?: "unknown" };
 
 export function completeEnrollmentCeremony(
   payload: unknown,

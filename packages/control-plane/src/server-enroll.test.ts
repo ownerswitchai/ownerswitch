@@ -149,6 +149,22 @@ describe("bootstrap enrollment over HTTP — the wire around the registry's one 
     expect(((await strangerList.json()) as { devices: unknown[] }).devices).toHaveLength(0);
   });
 
+  it("PREFLIGHT: GET /devices/enroll/contract/:id serves the mint's EXACT secret-free contract; unknown ids are 404", async () => {
+    const cp = enrolledPlane();
+    const base = await start(cp);
+    const minted = mintBootstrap(cp);
+    expect(minted.ok).toBe(true);
+    if (!minted.ok) return;
+    const preflight = await fetch(`${base}/devices/enroll/contract/${minted.invite.inviteId}`);
+    expect(preflight.status).toBe(200);
+    const body = (await preflight.json()) as { invite: unknown };
+    // byte-identical to the mint response's contract — ONE builder serves both
+    expect(body.invite).toEqual(minted.invite);
+    // and no secret anywhere, by construction
+    expect(JSON.stringify(body)).not.toContain(SECRET);
+    expect((await fetch(`${base}/devices/enroll/contract/inv_unknown`)).status).toBe(404);
+  });
+
   it("a failed proof is 400 with the invite alive; garbage is 400; oversized is 413", async () => {
     const cp = enrolledPlane();
     const base = await start(cp);

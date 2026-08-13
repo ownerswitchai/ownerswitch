@@ -19,6 +19,7 @@ import { renderContentHash, validateRenderableAlert } from "./renderable-alert.m
 const DB = "ownerswitch";
 const STORE = "keys";
 const KEY_ID = "cheap-lane";
+const IDENTITY_ID = "enrolled-identity";
 
 function cfg() {
   const c = self.OWNERSWITCH_CONFIG;
@@ -54,15 +55,120 @@ function idbPut(db, key, value) {
   });
 }
 
-/** Load the device keypair, generating and persisting it on first run. */
+function idbAdd(db, key, value) {
+  // ADD, not put: the atomic create-if-absent — a second writer gets
+  // ConstraintError instead of silently overwriting the first key
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).add(value, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = (event) => {
+      const err = tx.error ?? event?.target?.error;
+      if (err && err.name === "ConstraintError") resolve(false);
+      else reject(err);
+    };
+    tx.onabort = () => {
+      const err = tx.error;
+      if (err && err.name === "ConstraintError") resolve(false);
+      else reject(err ?? new Error("transaction aborted"));
+    };
+  });
+}
+
+// PAGE-LEVEL SINGLE-FLIGHT: the push path, the enrollment click, and any
+// other caller share ONE in-flight ensure — two concurrent calls in this
+// page can never both see "no key" and both generate.
+let keyFlight = null;
+
+/**
+ * Load the device keypair — the DESIGN §2 step-4 custody discipline, all of
+ * it, on every first run:
+ *  1. best-effort durable-storage request (navigator.storage.persist);
+ *  2. ATOMIC create-if-absent (IndexedDB add; on ConstraintError the racing
+ *     winner's key is read back and this one is discarded) — cross-context
+ *     safe, not just page-safe;
+ *  3. the database is CLOSED and REOPENED, and the pair READ BACK from
+ *     disk — the pair this function returns is always the persisted one,
+ *     never the in-memory original;
+ *  4. a PROBE SIGNATURE is produced with the read-back private key — a key
+ *     that cannot sign after its persistence round-trip never enrolls and
+ *     never acks. (The service-worker path exercises the same stored key on
+ *     every push — sw.js signs with what THIS custody persisted.)
+ */
 export async function ensureDeviceKey() {
-  const db = await idb();
+  if (!keyFlight) {
+    keyFlight = ensureDeviceKeyOnce().catch((err) => {
+      keyFlight = null; // a failed ensure must not poison every later call
+      throw err;
+    });
+  }
+  return keyFlight;
+}
+
+async function ensureDeviceKeyOnce() {
+  try {
+    await navigator.storage?.persist?.();
+  } catch {
+    /* best effort — persistence REQUEST only; the round-trip below is the test */
+  }
+  let db = await idb();
   let pair = await idbGet(db, KEY_ID);
   if (!pair || !pair.privateKey) {
-    pair = await generateOwnerDeviceKey();
-    await idbPut(db, KEY_ID, pair); // CryptoKey persists non-extractable
+    const fresh = await generateOwnerDeviceKey();
+    await idbAdd(db, KEY_ID, fresh); // loser's key is garbage-collected
   }
+  // CLOSE and REOPEN: the returned pair is what DISK holds, not what this
+  // context happened to generate
+  db.close();
+  db = await idb();
+  pair = await idbGet(db, KEY_ID);
+  if (!pair || !pair.privateKey || !pair.publicKey) {
+    throw new Error("device key did not survive its persistence round-trip — refusing to use it");
+  }
+  // PROBE: the read-back key must actually sign
+  const probe = new Uint8Array([111, 119, 110, 101, 114, 115, 119, 105, 116, 99, 104]);
+  const buf = new ArrayBuffer(probe.byteLength);
+  new Uint8Array(buf).set(probe);
+  await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, buf);
   return pair;
+}
+
+/**
+ * Adopt the server-assigned enrolled identity, DURABLY, next to the key it
+ * names: after a 201 from /devices/enroll the registry knows this key as
+ * `deviceId` — every signed request from here on must use THAT id, or the
+ * freshly enrolled phone cannot authenticate as its own registry record.
+ * Written with read-back verification; refuses malformed ids.
+ */
+export async function adoptEnrolledIdentity(deviceId) {
+  if (typeof deviceId !== "string" || !/^dev_[A-Za-z0-9_-]{1,64}$/.test(deviceId)) {
+    throw new Error("not a control-plane device id — refusing to adopt it");
+  }
+  let db = await idb();
+  await idbPut(db, IDENTITY_ID, { deviceId });
+  db.close();
+  db = await idb();
+  const stored = await idbGet(db, IDENTITY_ID);
+  if (!stored || stored.deviceId !== deviceId) {
+    throw new Error("enrolled identity did not survive its persistence round-trip");
+  }
+  return stored.deviceId;
+}
+
+/** The durably adopted enrolled deviceId, or null before enrolment. */
+export async function enrolledIdentity() {
+  const db = await idb();
+  const stored = await idbGet(db, IDENTITY_ID);
+  return stored && typeof stored.deviceId === "string" ? stored.deviceId : null;
+}
+
+/**
+ * The id every signed request uses: the ENROLLED identity once one exists
+ * (the registry record's name for this key), else the deployment-config id
+ * (the operator-provisioned keys-file model).
+ */
+async function signingDeviceId() {
+  return (await enrolledIdentity()) ?? cfg().deviceId;
 }
 
 /** The device's PUBLIC key (base64url SPKI) — hand this to the operator to enroll. */
@@ -81,9 +187,10 @@ export async function enrolledPublicKeySpki() {
  */
 async function signedFetch(baseUrl, path, method, body, guard) {
   const { privateKey } = await ensureDeviceKey();
+  const deviceId = await signingDeviceId();
   if (guard && !guard()) throw new Error("aborted: review surface no longer valid before signing");
   const headers = await signRequestHeaders(privateKey, {
-    deviceId: cfg().deviceId,
+    deviceId,
     method,
     pathAndQuery: path, // byte-exact as sent
     body: body ?? "",
