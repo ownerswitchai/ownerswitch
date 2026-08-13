@@ -19,10 +19,45 @@ import type { RestoreAuthorization } from "./twogo.js";
  *  - killed state, the epoch and the attributing event survive a process
  *    restart when a store is wired in — a restart resumes the state it went
  *    down with; it never resets it
+ *
+ * The same rules govern SCOPED (per-agent) kills — engageAgent() is as
+ * cheap as engage(), restoreAgent() is as ceremonial as restore(), and the
+ * two tiers are independent: a global restore does NOT restore scope-killed
+ * agents (their kill was never the thing restored), and a global kill does
+ * not erase them — it outranks them while it lasts.
  */
 export type KillSource = "button" | "honeytoken" | "app" | "voice" | "api";
 
 export const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voice", "api"];
+
+/**
+ * Bounds for SCOPED (per-agent) kills. They exist because scoped-kill
+ * entries persist in the kill-state file, which load() refuses over
+ * MAX_KILL_STATE_FILE_BYTES: unbounded ids, reasons or agent counts would
+ * let a kill flood write a state file tomorrow's boot rejects. The counts
+ * are sized so the worst-case file stays far under that ceiling.
+ *
+ * At the agent-count cap a scoped kill is NEVER refused — it escalates to
+ * the global kill instead (see engageAgent): out of room to stop one agent,
+ * stop them all. Fail-closed has no capacity limit.
+ */
+export const MAX_KILLED_AGENTS = 64;
+export const MAX_AGENT_ID_CHARS = 128;
+export const MAX_SCOPED_KILL_REASON_CHARS = 256;
+
+/**
+ * A valid agent id for scoped kills: 1–128 printable-ASCII chars with no
+ * leading/trailing whitespace. It appears verbatim in the state file, the
+ * unauthenticated /status body and audit surfaces, so the charset is kept
+ * boring by construction — no control characters, no Unicode confusables.
+ */
+export function isValidAgentId(value: string): boolean {
+  return (
+    value.length >= 1 &&
+    value.length <= MAX_AGENT_ID_CHARS &&
+    /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value)
+  );
+}
 
 export interface KillEvent {
   source: KillSource;
@@ -49,7 +84,9 @@ export interface AlertEvent {
 export type AuditEntry =
   | { type: "kill"; event: KillEvent }
   | { type: "restore"; auth: RestoreAuthorization; at: number }
-  | { type: "alert"; event: AlertEvent };
+  | { type: "alert"; event: AlertEvent }
+  | { type: "agent-kill"; agentId: string; event: KillEvent }
+  | { type: "agent-restore"; agentId: string; auth: RestoreAuthorization; at: number };
 
 export interface KillSwitchOptions {
   /**
@@ -71,6 +108,8 @@ export class KillSwitch {
   private lastKillEvent?: KillEvent;
   private degradedSince?: { at: number; reason: string };
   private quarantineFailedState = false;
+  /** currently scope-killed agents and the event that killed each */
+  private agentKillMap = new Map<string, KillEvent>();
 
   constructor(
     private readonly now: () => number = Date.now,
@@ -102,6 +141,14 @@ export class KillSwitch {
       this.lastKillEvent = loaded.state.lastKill;
       this.log.push({ type: "kill", event: loaded.state.lastKill });
     }
+    if (loaded.state.agentKills !== undefined) {
+      // Scoped kills survive a restart exactly like the global one: a
+      // scope-killed agent comes back scope-killed, event and all.
+      for (const [agentId, event] of Object.entries(loaded.state.agentKills)) {
+        this.agentKillMap.set(agentId, event);
+        this.log.push({ type: "agent-kill", agentId, event });
+      }
+    }
   }
 
   /** Idempotent: repeated triggers only add audit entries, never throw. */
@@ -116,6 +163,97 @@ export class KillSwitch {
     this.log.push({ type: "kill", event });
     this.lastKillEvent = event;
     this.killedState = true;
+    this.persist();
+  }
+
+  /**
+   * SCOPED kill: stop ONE agent without stopping the fleet. Same doctrine
+   * as engage() — cheap, idempotent, never throws, every trigger audited —
+   * but the global `killed` stays false and only calls carrying this
+   * agentId are denied (gateway engine + the control plane's own approval,
+   * commit and registration surfaces).
+   *
+   * A scoped kill BUMPS THE GLOBAL EPOCH. That is deliberate, not an
+   * accident of reuse: every in-flight approval, grant, action ticket and
+   * restore ceremony is epoch-bound, so bumping it makes a scoped kill
+   * inherit the whole existing invalidation story — a pre-kill approval
+   * (for ANY agent) cannot execute in the post-kill world without a fresh
+   * owner decision. The cost, stated plainly: a scoped kill voids other
+   * agents' PENDING approvals too (they re-request; the owner re-approves).
+   * It does not stop them. The alternative — a per-agent epoch woven into
+   * every signed format — would widen the surface this feature exists to
+   * keep small.
+   *
+   * The caller validates the id (isValidAgentId); this method only bounds
+   * what it stores. At MAX_KILLED_AGENTS the stop is not refused — it
+   * escalates to the global kill, because stopping must never fail on a
+   * capacity ceiling.
+   */
+  engageAgent(
+    agentId: string,
+    source: KillSource,
+    reason?: string,
+    opts: { unauthenticated?: boolean } = {},
+  ): void {
+    if (!this.agentKillMap.has(agentId) && this.agentKillMap.size >= MAX_KILLED_AGENTS) {
+      this.engage(
+        source,
+        `scoped-kill capacity (${MAX_KILLED_AGENTS} agents) exceeded at agent "${agentId}" — ` +
+          `escalated to a global kill${reason !== undefined ? `; original reason: ${reason}` : ""}`,
+        opts,
+      );
+      return;
+    }
+    this.epochCounter += 1;
+    const event: KillEvent = {
+      source,
+      // bounded because it persists per agent in the kill-state file
+      ...(reason !== undefined ? { reason: reason.slice(0, MAX_SCOPED_KILL_REASON_CHARS) } : {}),
+      at: this.now(),
+      ...(opts.unauthenticated ? { unauthenticated: true as const } : {}),
+    };
+    this.log.push({ type: "agent-kill", agentId, event });
+    this.agentKillMap.set(agentId, event);
+    this.persist();
+  }
+
+  /** True while `agentId` is scope-killed (the global switch is separate). */
+  agentKilled(agentId: string): boolean {
+    return this.agentKillMap.has(agentId);
+  }
+
+  /** The scope-killed agent ids, in kill order. Served on GET /status. */
+  get killedAgents(): readonly string[] {
+    return [...this.agentKillMap.keys()];
+  }
+
+  /** The kill event holding `agentId` down, for attribution surfaces. */
+  agentKillEvent(agentId: string): KillEvent | undefined {
+    return this.agentKillMap.get(agentId);
+  }
+
+  /**
+   * Scoped restore — the expensive direction, exactly like restore(): it
+   * demands a completed 2GO ceremony (single-use, shared consumed-id set)
+   * and un-kills ONE agent. It never touches the global switch and never
+   * bumps the epoch (restores don't). Live ceremony checks — ownership,
+   * cooldown, TTL, epoch, scope — are the HTTP layer's job.
+   */
+  restoreAgent(agentId: string, auth: RestoreAuthorization): void {
+    if (!this.agentKillMap.has(agentId)) {
+      throw new Error(`agent "${agentId}" is not scope-killed — nothing to restore`);
+    }
+    if (!auth.ceremonyId || !auth.ownerId) {
+      throw new Error("restore requires a completed 2GO ceremony");
+    }
+    if (this.consumedCeremonies.has(auth.ceremonyId)) {
+      throw new Error(
+        `ceremony "${auth.ceremonyId}" already consumed — restore authorizations are single-use`,
+      );
+    }
+    this.consumedCeremonies.add(auth.ceremonyId);
+    this.log.push({ type: "agent-restore", agentId, auth, at: this.now() });
+    this.agentKillMap.delete(agentId);
     this.persist();
   }
 
@@ -232,6 +370,11 @@ export class KillSwitch {
         epoch: this.epochCounter,
         ...(this.killedState && this.lastKillEvent !== undefined
           ? { lastKill: this.lastKillEvent }
+          : {}),
+        // present exactly when non-empty, so deployments that never use
+        // scoped kills keep writing byte-identical state files
+        ...(this.agentKillMap.size > 0
+          ? { agentKills: Object.fromEntries(this.agentKillMap) }
           : {}),
       });
     } catch (err) {

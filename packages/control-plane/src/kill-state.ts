@@ -35,7 +35,13 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { KILL_SOURCES, type KillEvent, type KillSource } from "./kill.js";
+import {
+  isValidAgentId,
+  KILL_SOURCES,
+  MAX_KILLED_AGENTS,
+  type KillEvent,
+  type KillSource,
+} from "./kill.js";
 
 export interface PersistedKillState {
   version: 1;
@@ -43,6 +49,14 @@ export interface PersistedKillState {
   epoch: number;
   /** the kill event in force; present exactly when killed */
   lastKill?: KillEvent;
+  /**
+   * Currently scope-killed agents and the event holding each one down;
+   * present exactly when non-empty. Files written before scoped kills
+   * existed simply lack the field and load unchanged; a NEW file carrying
+   * it is rejected by an OLD binary's strict shape check — which boots
+   * KILLED, the safe direction for a downgrade.
+   */
+  agentKills?: Record<string, KillEvent>;
 }
 
 export type KillStateLoad =
@@ -80,10 +94,12 @@ const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoExcept
 
 /**
  * Hard ceiling on the kill-state file's byte size — see load() below. The
- * state is a boolean, a small integer epoch, and at most one KillEvent
- * (source, an optional free-text reason, a timestamp); 64 KiB is orders of
- * magnitude more than a legitimate file needs while still bounding memory
- * against a corrupted or hostile-sized file on disk.
+ * state is a boolean, a small integer epoch, at most one KillEvent
+ * (source, an optional free-text reason, a timestamp), and at most
+ * MAX_KILLED_AGENTS scoped-kill entries whose ids and reasons are bounded
+ * at write time (kill.ts) — worst case well under half this ceiling. 64 KiB
+ * is orders of magnitude more than a legitimate file needs while still
+ * bounding memory against a corrupted or hostile-sized file on disk.
  */
 export const MAX_KILL_STATE_FILE_BYTES = 64 * 1024;
 
@@ -107,6 +123,23 @@ const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 // it, and 0600 — the kill state is nobody else's to read or replace.
 const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
 
+/** Strict KillEvent shape check; null means the surrounding state is invalid. */
+function asKillEvent(value: unknown): KillEvent | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const { source, reason, at, unauthenticated, ...eventRest } = value as Record<string, unknown>;
+  if (Object.keys(eventRest).length > 0) return null;
+  if (!KILL_SOURCES.includes(source as KillSource)) return null;
+  if (reason !== undefined && typeof reason !== "string") return null;
+  if (typeof at !== "number" || !Number.isFinite(at)) return null;
+  if (unauthenticated !== undefined && unauthenticated !== true) return null;
+  return {
+    source: source as KillSource,
+    ...(reason !== undefined ? { reason } : {}),
+    at,
+    ...(unauthenticated === true ? { unauthenticated: true as const } : {}),
+  };
+}
+
 /**
  * Strict shape check. Anything we would not have written ourselves reads as
  * invalid — and invalid loads as corrupt, which boots killed. Surprises fail
@@ -114,27 +147,39 @@ const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |
  */
 function asPersistedKillState(value: unknown): PersistedKillState | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const { version, killed, epoch, lastKill, ...rest } = value as Record<string, unknown>;
+  const { version, killed, epoch, lastKill, agentKills, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length > 0) return null;
   if (version !== 1) return null;
   if (typeof killed !== "boolean") return null;
   if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) return null;
   if (killed !== (lastKill !== undefined)) return null;
-  if (lastKill === undefined) return { version, killed, epoch };
-  if (typeof lastKill !== "object" || lastKill === null || Array.isArray(lastKill)) return null;
-  const { source, reason, at, unauthenticated, ...eventRest } = lastKill as Record<string, unknown>;
-  if (Object.keys(eventRest).length > 0) return null;
-  if (!KILL_SOURCES.includes(source as KillSource)) return null;
-  if (reason !== undefined && typeof reason !== "string") return null;
-  if (typeof at !== "number" || !Number.isFinite(at)) return null;
-  if (unauthenticated !== undefined && unauthenticated !== true) return null;
-  const event: KillEvent = {
-    source: source as KillSource,
-    ...(reason !== undefined ? { reason } : {}),
-    at,
-    ...(unauthenticated === true ? { unauthenticated: true as const } : {}),
+  let scoped: Record<string, KillEvent> | undefined;
+  if (agentKills !== undefined) {
+    // present exactly when non-empty, every id valid, every event well-formed,
+    // and never more entries than the writer is allowed to hold
+    if (typeof agentKills !== "object" || agentKills === null || Array.isArray(agentKills)) {
+      return null;
+    }
+    const entries = Object.entries(agentKills);
+    if (entries.length === 0 || entries.length > MAX_KILLED_AGENTS) return null;
+    scoped = {};
+    for (const [agentId, rawEvent] of entries) {
+      if (!isValidAgentId(agentId)) return null;
+      const event = asKillEvent(rawEvent);
+      if (event === null) return null;
+      scoped[agentId] = event;
+    }
+  }
+  const base = {
+    version: version as 1,
+    killed,
+    epoch,
+    ...(scoped !== undefined ? { agentKills: scoped } : {}),
   };
-  return { version, killed, epoch, lastKill: event };
+  if (lastKill === undefined) return base;
+  const event = asKillEvent(lastKill);
+  if (event === null) return null;
+  return { ...base, lastKill: event };
 }
 
 export class KillStateFileStore implements KillStateStore {

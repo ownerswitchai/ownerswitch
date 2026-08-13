@@ -21,6 +21,15 @@ import { evaluate, type KillState } from "./engine.js";
  * defeating the one check epoch exists to support. So there is no
  * "killed:false, epoch: unknown" state on the wire: either both fields
  * parse, or the caller gets `killed:true`.
+ *
+ * `killedAgents` — the SCOPED kill list — is required with the same
+ * strictness. `/status` always serves it (possibly empty); a body where it
+ * is missing or malformed fails the entire lookup closed rather than being
+ * read as "no agent is scope-killed", which would silently disarm every
+ * scoped kill at exactly the gateway that must enforce it. Bounds below are
+ * deliberately looser than what the control plane will ever emit (it caps
+ * both count and id length far lower) — they bound memory against a hostile
+ * or corrupted body, not define the wire contract.
  */
 export interface ControlPlaneClientOptions {
   baseUrl: string;
@@ -38,6 +47,21 @@ const failClosed = (): KillState => ({
   killed: true,
   reason: "control plane unreachable — fail closed",
 });
+
+/** Memory bounds for a hostile/corrupted body — see the class doc above. */
+const MAX_KILLED_AGENTS_ACCEPTED = 4096;
+const MAX_AGENT_ID_CHARS_ACCEPTED = 1024;
+
+/** Strict parse of the scoped-kill list; null means fail the lookup closed. */
+function parseKilledAgents(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > MAX_KILLED_AGENTS_ACCEPTED) return null;
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_AGENT_ID_CHARS_ACCEPTED) {
+      return null;
+    }
+  }
+  return value as string[];
+}
 
 export function createControlPlaneClient(
   options: ControlPlaneClientOptions,
@@ -62,10 +86,11 @@ export function createControlPlaneClient(
       if (!res.ok) return failClosed();
       const body: unknown = await res.json();
       if (typeof body !== "object" || body === null) return failClosed();
-      const { killed, reason, epoch } = body as {
+      const { killed, reason, epoch, killedAgents } = body as {
         killed?: unknown;
         reason?: unknown;
         epoch?: unknown;
+        killedAgents?: unknown;
       };
       if (typeof killed !== "boolean") return failClosed();
       // A missing or unparseable epoch must never be treated as epoch 0 —
@@ -74,8 +99,14 @@ export function createControlPlaneClient(
       if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) {
         return failClosed();
       }
-      if (!killed) return { killed: false, epoch };
-      return typeof reason === "string" ? { killed: true, reason, epoch } : { killed: true, epoch };
+      // A missing or malformed scoped-kill list must never be treated as
+      // "nobody is scope-killed" — same doctrine, same direction.
+      const scoped = parseKilledAgents(killedAgents);
+      if (scoped === null) return failClosed();
+      if (!killed) return { killed: false, epoch, killedAgents: scoped };
+      return typeof reason === "string"
+        ? { killed: true, reason, epoch, killedAgents: scoped }
+        : { killed: true, epoch, killedAgents: scoped };
     } catch {
       return failClosed();
     } finally {

@@ -171,7 +171,7 @@ describe("control-plane HTTP API", () => {
 
     let res = await fetch(`${url}/status`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: false, epoch: 0 });
+    expect(await res.json()).toEqual({ killed: false, epoch: 0, killedAgents: [] });
 
     await fetch(`${url}/kill`, {
       method: "POST",
@@ -185,6 +185,7 @@ describe("control-plane HTTP API", () => {
       reason: "red button pressed",
       at: 1_000,
       epoch: 1,
+      killedAgents: [],
     });
   });
 
@@ -349,7 +350,7 @@ describe("control-plane HTTP API", () => {
 
     // status stays not-killed — a decoy read alerts, it does not lock down
     expect(cp.killSwitch.killed).toBe(false);
-    expect((await (await fetch(`${url}/status`)).json())).toEqual({ killed: false, epoch: 0 });
+    expect((await (await fetch(`${url}/status`)).json())).toEqual({ killed: false, epoch: 0, killedAgents: [] });
 
     const [entry] = cp.killSwitch.auditLog();
     expect(entry.type).toBe("alert");
@@ -745,6 +746,7 @@ describe("control-plane HTTP API", () => {
       reason: "red button pressed",
       at: 1_000,
       epoch,
+      killedAgents: [],
     });
   });
 
@@ -785,6 +787,7 @@ describe("control-plane HTTP API", () => {
     expect(await (await fetch(`${url2}/status`)).json()).toEqual({
       killed: false,
       epoch: after.killSwitch.epoch,
+      killedAgents: [],
     });
   });
 
@@ -915,6 +918,7 @@ describe("control-plane HTTP API", () => {
         reason: "manual stop",
         at: 500,
         epoch: cp.killSwitch.epoch,
+        killedAgents: [],
         persistenceDegraded: true,
         unhealthy: expect.stringContaining("owner intervention"),
       });
@@ -3268,5 +3272,276 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     });
     expect(again.status).toBe(200);
     expect(((await again.json()) as { id: string }).id).toBe(id);
+  });
+});
+
+describe("scoped (per-agent) kills over HTTP", () => {
+  let server: Server | undefined;
+
+  const start = (cp: ControlPlane): Promise<string> => {
+    server = createServer(cp.handler);
+    return new Promise((resolve) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolve(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+  };
+
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+
+  const scopedKill = (url: string, agentId: unknown, reason?: string) =>
+    fetch(`${url}/kill`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId, ...(reason !== undefined ? { reason } : {}) }),
+    });
+
+  const startScopedCeremony = async (url: string, token: string, agentId: string): Promise<string> => {
+    const res = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(token),
+      body: JSON.stringify({ agentId }),
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { id: string; agentId?: string };
+    expect(body.agentId).toBe(agentId);
+    return body.id;
+  };
+
+  it("POST /kill with an agentId stops that agent only; /status lists it for every gateway", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const res = await scopedKill(url, "agent-7", "looping on stripe.payout");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ killed: false, killedAgent: "agent-7" });
+
+    expect(await (await fetch(`${url}/status`)).json()).toEqual({
+      killed: false,
+      epoch: 1, // a scoped kill opens a new epoch — approvals do not survive it
+      killedAgents: ["agent-7"],
+    });
+    expect(cp.killSwitch.agentKilled("agent-7")).toBe(true);
+    expect(cp.killSwitch.killed).toBe(false);
+  });
+
+  it("a malformed agentId is refused 400 with nothing engaged — the global stop stays parameter-free", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    for (const bad of ["", " padded ", "a".repeat(129), 7, { agent: 1 }, "ütközés"]) {
+      const res = await scopedKill(url, bad);
+      expect(res.status).toBe(400);
+    }
+    expect(cp.killSwitch.killed).toBe(false);
+    expect(cp.killSwitch.killedAgents).toEqual([]);
+    expect(cp.killSwitch.epoch).toBe(0);
+  });
+
+  it("scoped 2GO restore: ceremony + cooldown restores ONE agent and leaves the rest killed", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    await scopedKill(url, "agent-7");
+    await scopedKill(url, "agent-9");
+
+    const id = await startScopedCeremony(url, session.token, "agent-7");
+
+    // before the cooldown: rejected, generic
+    const early = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ ceremonyId: id }),
+    });
+    expect(early.status).toBe(409);
+    expect(cp.killSwitch.agentKilled("agent-7")).toBe(true);
+
+    c.advance(30_000);
+    const res = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ ceremonyId: id }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ killed: false, restoredAgent: "agent-7" });
+    expect(cp.killSwitch.agentKilled("agent-7")).toBe(false);
+    expect(cp.killSwitch.agentKilled("agent-9")).toBe(true); // untouched
+    expect(cp.killSwitch.killed).toBe(false); // the global switch was never involved
+  });
+
+  it("a scoped ceremony needs its agent scope-killed, and never starts under a global kill", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    // agent not scope-killed -> 409
+    const notKilled = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ agentId: "agent-7" }),
+    });
+    expect(notKilled.status).toBe(409);
+
+    // under a global kill the scoped ceremony is refused, pointing at the real restore
+    await scopedKill(url, "agent-7");
+    cp.killSwitch.engage("button");
+    const underGlobal = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ agentId: "agent-7" }),
+    });
+    expect(underGlobal.status).toBe(409);
+    expect(((await underGlobal.json()) as { error: string }).error).toMatch(/global kill/);
+  });
+
+  it("GO 1/2 is idempotent PER SCOPE: each scope-killed agent gets its own ceremony", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    await scopedKill(url, "agent-7");
+    await scopedKill(url, "agent-9");
+
+    const a = await startScopedCeremony(url, session.token, "agent-7");
+    const b = await startScopedCeremony(url, session.token, "agent-9");
+    expect(b).not.toBe(a); // different scope, different ceremony
+
+    // repeating GO 1/2 for the same scope returns the SAME ceremony, clocks untouched
+    const again = await fetch(`${url}/restore/ceremony`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ agentId: "agent-7" }),
+    });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { id: string }).id).toBe(a);
+  });
+
+  it("re-killing the agent mid-ceremony invalidates the ceremony — a kill always wins", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    await scopedKill(url, "agent-7");
+    const id = await startScopedCeremony(url, session.token, "agent-7");
+    await scopedKill(url, "agent-7"); // re-kill bumps the epoch the ceremony is bound to
+    c.advance(30_000);
+
+    const res = await fetch(`${url}/restore`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ ceremonyId: id }),
+    });
+    expect(res.status).toBe(409);
+    expect(cp.killSwitch.agentKilled("agent-7")).toBe(true);
+  });
+
+  it("a scope-killed agent gets no new review windows and no approvals", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET });
+    const url = await start(cp);
+    const session = createOwnerSession("adam", { now: c.now });
+
+    await scopedKill(url, "agent-7");
+
+    // registration: refused outright — the owner already answered, with a kill
+    const registerBody = JSON.stringify({ call: { agentId: "agent-7", tool: "stripe.payout" } });
+    const register = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    expect(register.status).toBe(409);
+    expect(((await register.json()) as { error: string }).error).toMatch(/scope-killed/);
+
+    // approval: a pre-existing window for the killed agent cannot be approved
+    // (grant-eligible window seeded directly, approval attempted after the kill)
+    const window = new VetoWindow(
+      {
+        agentId: "agent-7",
+        tool: "github.merge_pr",
+        args: {
+          owner: "ownerswitchai",
+          repo: "ownerswitch",
+          pullNumber: 7,
+          expectedHeadSha: "a".repeat(40),
+          expectedBaseRef: "main",
+        },
+      },
+      cp.killSwitch.epoch,
+      {
+        now: c.now,
+        purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" },
+      },
+    );
+    window.markDelivered();
+    cp.vetoWindows.set("v-killed-agent", window);
+    const approve = await fetch(`${url}/veto/v-killed-agent`, {
+      method: "POST",
+      headers: bearer(session.token),
+      body: JSON.stringify({ decision: "approve" }),
+    });
+    expect(approve.status).toBe(409);
+    expect(((await approve.json()) as { error: string }).error).toMatch(/scope-killed/);
+
+    // another agent's registration still goes through — the fleet is running
+    const otherBody = JSON.stringify({ call: { agentId: "agent-8", tool: "stripe.payout" } });
+    const other = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(otherBody, c.now()),
+      body: otherBody,
+    });
+    expect(other.status).toBe(201);
+  });
+
+  it("a release granted before a scoped kill reads SPENT after it — inherited epoch protection", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    // a plain (non-grant) window for a DIFFERENT agent, delivered, deadline passed
+    const window = new VetoWindow({ agentId: "agent-8", tool: "bash" }, cp.killSwitch.epoch, {
+      now: c.now,
+      windowMs: 60_000,
+    });
+    window.markDelivered();
+    cp.vetoWindows.set("v-other", window);
+    c.advance(61_000);
+
+    // a scoped kill of agent-7 bumps the epoch; agent-8's pre-kill release is spent
+    await scopedKill(url, "agent-7");
+    expect(await (await fetch(`${url}/veto/v-other`)).json()).toEqual({ status: "spent" });
+  });
+
+  it("scoped kills persist across a restart, killedAgents intact", async () => {
+    const c = clock(1_000);
+    const stateFile = tempStateFile();
+    const before = createControlPlane({ now: c.now, killStateFile: stateFile });
+    const url = await start(before);
+    await scopedKill(url, "agent-7", "incident");
+    server?.close();
+    server = undefined;
+
+    const after = createControlPlane({ now: c.now, killStateFile: stateFile });
+    expect(after.killSwitch.killed).toBe(false);
+    expect(after.killSwitch.agentKilled("agent-7")).toBe(true);
+    expect(after.killSwitch.epoch).toBe(before.killSwitch.epoch);
+    const url2 = await start(after);
+    expect(await (await fetch(`${url2}/status`)).json()).toEqual({
+      killed: false,
+      epoch: before.killSwitch.epoch,
+      killedAgents: ["agent-7"],
+    });
   });
 });

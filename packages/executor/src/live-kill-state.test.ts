@@ -17,13 +17,13 @@ const clientServing = (body: unknown, status = 200) =>
 
 describe("liveKillStateFromControlPlane", () => {
   it("reads killed and epoch off GET /status through the real gateway client", async () => {
-    const fetchLive = liveKillStateFromControlPlane(clientServing({ killed: false, epoch: 7 }));
+    const fetchLive = liveKillStateFromControlPlane(clientServing({ killed: false, epoch: 7, killedAgents: [] }));
     expect(await fetchLive()).toEqual({ killed: false, epoch: 7 });
   });
 
   it("a kill on /status reads as killed, epoch intact for the audit trail", async () => {
     const fetchLive = liveKillStateFromControlPlane(
-      clientServing({ killed: true, reason: "red button", epoch: 3 }),
+      clientServing({ killed: true, reason: "red button", epoch: 3, killedAgents: [] }),
     );
     expect(await fetchLive()).toEqual({ killed: true, epoch: 3 });
   });

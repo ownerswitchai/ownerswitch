@@ -15,6 +15,17 @@ export interface KillState {
   killed: boolean;
   reason?: string;
   /**
+   * Agents under a SCOPED kill: every call whose `agentId` appears here is
+   * denied, while the rest of the fleet keeps running under policy. The
+   * global `killed` above stays supreme — when it is true this list is
+   * irrelevant, everything is denied. Optional for the same reason `epoch`
+   * is: hand-built `KillState` values (tests, callers with no scoped-kill
+   * source) stay valid, and an absent list simply scopes nothing out.
+   * `createControlPlaneClient`'s fetched answers always populate it or fail
+   * the whole lookup closed (see client.ts).
+   */
+  killedAgents?: readonly string[];
+  /**
    * The control plane's kill epoch — a monotone count of every kill this
    * deployment has ever had; a restore never resets it. `evaluate()` itself
    * does not consult it: `killed` is enough to decide a policy call. It
@@ -48,8 +59,9 @@ export function rulesMatchingTool(policy: Policy, tool: string): PolicyRule[] {
  * The core decision function of OwnerSwitch.
  * Order of authority:
  *   1. kill switch (deny everything)
- *   2. first matching policy rule
- *   3. fail-closed default
+ *   2. scoped kill (deny everything from a killed agent)
+ *   3. first matching policy rule
+ *   4. fail-closed default
  *
  * `kill` is required and deliberately has no default. A default of
  * `{ killed: false }` would grant silent permission to any caller that
@@ -69,6 +81,16 @@ export function evaluate(
       decision: "deny",
       ruleId: null,
       reason: `kill switch engaged${kill.reason ? `: ${kill.reason}` : ""}`,
+    };
+  }
+
+  // Scoped kill: outranked only by the global switch, and outranks every
+  // policy rule — an `allow` lane must not keep a killed agent acting.
+  if (kill.killedAgents !== undefined && kill.killedAgents.includes(call.agentId)) {
+    return {
+      decision: "deny",
+      ruleId: null,
+      reason: `agent "${call.agentId}" is scope-killed — denied until an owner restores it`,
     };
   }
 

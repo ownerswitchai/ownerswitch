@@ -49,6 +49,50 @@ describe("evaluate", () => {
   });
 });
 
+describe("scoped kill", () => {
+  it("denies everything from a scope-killed agent, even allowed tools", () => {
+    const v = evaluate(
+      { agentId: "a1", tool: "search.web" },
+      policy,
+      { killed: false, killedAgents: ["a1"] },
+    );
+    expect(v.decision).toBe("deny");
+    expect(v.ruleId).toBeNull();
+    expect(v.reason).toContain('"a1"');
+    expect(v.reason).toContain("scope-killed");
+  });
+
+  it("leaves other agents running under normal policy", () => {
+    const kill = { killed: false, killedAgents: ["a1"] };
+    expect(evaluate({ agentId: "a2", tool: "search.web" }, policy, kill).decision).toBe("allow");
+    expect(evaluate({ agentId: "a2", tool: "stripe.payout" }, policy, kill).decision).toBe("approve");
+  });
+
+  it("outranks an allow rule but is outranked by the global kill", () => {
+    const v = evaluate(
+      { agentId: "a1", tool: "search.web" },
+      policy,
+      { killed: true, reason: "button pressed", killedAgents: ["a1"] },
+    );
+    // global kill wins the attribution — its reason, not the scoped one
+    expect(v.decision).toBe("deny");
+    expect(v.reason).toContain("kill switch engaged");
+  });
+
+  it("an absent list scopes nothing out (hand-built kill states stay valid)", () => {
+    expect(evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false }).decision).toBe(
+      "allow",
+    );
+  });
+
+  it("an empty list scopes nothing out", () => {
+    expect(
+      evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: false, killedAgents: [] })
+        .decision,
+    ).toBe("allow");
+  });
+});
+
 describe("kill state is required", () => {
   it("a bare { killed: true } denies even an allowed tool", () => {
     const v = evaluate({ agentId: "a1", tool: "search.web" }, policy, { killed: true });

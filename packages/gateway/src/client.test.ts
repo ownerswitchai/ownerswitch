@@ -35,8 +35,8 @@ const client = (fetchImpl: typeof fetch, timeoutMs?: number): ControlPlaneClient
 describe("createControlPlaneClient", () => {
   it("passes a healthy killed:false through, epoch intact", async () => {
     await expect(
-      client(jsonResponse({ killed: false, epoch: 0 })).fetchKillState(),
-    ).resolves.toEqual({ killed: false, epoch: 0 });
+      client(jsonResponse({ killed: false, epoch: 0, killedAgents: [] })).fetchKillState(),
+    ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [] });
   });
 
   it("requests /status with caching defeated — no-store, at the fetch layer and on the wire", async () => {
@@ -45,7 +45,7 @@ describe("createControlPlaneClient", () => {
     let captured: RequestInit | undefined;
     const capturing: typeof fetch = async (_input, init) => {
       captured = init;
-      return new Response(JSON.stringify({ killed: false, epoch: 0 }), {
+      return new Response(JSON.stringify({ killed: false, epoch: 0, killedAgents: [] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -59,9 +59,9 @@ describe("createControlPlaneClient", () => {
 
   it("passes a healthy killed:true through, reason and epoch intact", async () => {
     const state = await client(
-      jsonResponse({ killed: true, reason: "honeytoken tripped", at: 1_000, epoch: 3 }),
+      jsonResponse({ killed: true, reason: "honeytoken tripped", at: 1_000, epoch: 3, killedAgents: [] }),
     ).fetchKillState();
-    expect(state).toEqual({ killed: true, reason: "honeytoken tripped", epoch: 3 });
+    expect(state).toEqual({ killed: true, reason: "honeytoken tripped", epoch: 3, killedAgents: [] });
   });
 
   it("fails closed on network rejection instead of throwing", async () => {
@@ -85,51 +85,99 @@ describe("createControlPlaneClient", () => {
 
   it("fails closed on a 2xx body without a boolean `killed`", async () => {
     await expect(
-      client(jsonResponse({ status: "ok", epoch: 0 })).fetchKillState(),
+      client(jsonResponse({ status: "ok", epoch: 0, killedAgents: [] })).fetchKillState(),
     ).resolves.toEqual(FAIL_CLOSED);
   });
 
   describe("epoch: a missing or unparseable value must never be treated as epoch 0", () => {
     it("fails closed when epoch is absent from an otherwise-healthy killed:false body", async () => {
-      await expect(client(jsonResponse({ killed: false })).fetchKillState()).resolves.toEqual(
+      await expect(client(jsonResponse({ killed: false, killedAgents: [] })).fetchKillState()).resolves.toEqual(
         FAIL_CLOSED,
       );
     });
 
     it("fails closed when epoch is absent from an otherwise-healthy killed:true body", async () => {
       await expect(
-        client(jsonResponse({ killed: true, reason: "red button pressed" })).fetchKillState(),
+        client(jsonResponse({ killed: true, reason: "red button pressed", killedAgents: [] })).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
     });
 
     it("fails closed when epoch is a non-integer number", async () => {
       await expect(
-        client(jsonResponse({ killed: false, epoch: 1.5 })).fetchKillState(),
+        client(jsonResponse({ killed: false, epoch: 1.5, killedAgents: [] })).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
     });
 
     it("fails closed when epoch is negative", async () => {
       await expect(
-        client(jsonResponse({ killed: false, epoch: -1 })).fetchKillState(),
+        client(jsonResponse({ killed: false, epoch: -1, killedAgents: [] })).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
     });
 
     it("fails closed when epoch is a numeric string, not a number", async () => {
       await expect(
-        client(jsonResponse({ killed: false, epoch: "0" })).fetchKillState(),
+        client(jsonResponse({ killed: false, epoch: "0", killedAgents: [] })).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
     });
 
     it("fails closed when epoch is null", async () => {
       await expect(
-        client(jsonResponse({ killed: false, epoch: null })).fetchKillState(),
+        client(jsonResponse({ killed: false, epoch: null, killedAgents: [] })).fetchKillState(),
       ).resolves.toEqual(FAIL_CLOSED);
     });
 
     it("a genuine epoch of 0 (first boot, never killed) is accepted", async () => {
       await expect(
+        client(jsonResponse({ killed: false, epoch: 0, killedAgents: [] })).fetchKillState(),
+      ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [] });
+    });
+  });
+
+  describe("killedAgents: a missing or malformed list must never read as 'nobody is scope-killed'", () => {
+    it("passes a populated scoped-kill list through", async () => {
+      await expect(
+        client(jsonResponse({ killed: false, epoch: 2, killedAgents: ["agent-7"] })).fetchKillState(),
+      ).resolves.toEqual({ killed: false, epoch: 2, killedAgents: ["agent-7"] });
+    });
+
+    it("fails closed when killedAgents is absent from an otherwise-healthy body", async () => {
+      await expect(
         client(jsonResponse({ killed: false, epoch: 0 })).fetchKillState(),
-      ).resolves.toEqual({ killed: false, epoch: 0 });
+      ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("fails closed when killedAgents is not an array", async () => {
+      await expect(
+        client(jsonResponse({ killed: false, epoch: 0, killedAgents: "agent-7" })).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("fails closed when an entry is not a string", async () => {
+      await expect(
+        client(jsonResponse({ killed: false, epoch: 0, killedAgents: [7] })).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("fails closed when an entry is empty", async () => {
+      await expect(
+        client(jsonResponse({ killed: false, epoch: 0, killedAgents: [""] })).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("fails closed on a hostile-sized list rather than reading it into policy", async () => {
+      await expect(
+        client(
+          jsonResponse({ killed: false, epoch: 0, killedAgents: Array(5000).fill("a") }),
+        ).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
+    });
+
+    it("fails closed on a hostile-length agent id", async () => {
+      await expect(
+        client(
+          jsonResponse({ killed: false, epoch: 0, killedAgents: ["x".repeat(2000)] }),
+        ).fetchKillState(),
+      ).resolves.toEqual(FAIL_CLOSED);
     });
   });
 });
@@ -144,7 +192,7 @@ describe("evaluateRemote", () => {
     const v = await evaluateRemote(
       { agentId: "a1", tool: "search.web" },
       policy,
-      client(jsonResponse({ killed: false, epoch: 0 })),
+      client(jsonResponse({ killed: false, epoch: 0, killedAgents: [] })),
     );
     expect(v.decision).toBe("allow");
   });
@@ -153,7 +201,7 @@ describe("evaluateRemote", () => {
     const v = await evaluateRemote(
       { agentId: "a1", tool: "search.web" },
       policy,
-      client(jsonResponse({ killed: true, reason: "red button pressed", epoch: 1 })),
+      client(jsonResponse({ killed: true, reason: "red button pressed", epoch: 1, killedAgents: [] })),
     );
     expect(v.decision).toBe("deny");
     expect(v.reason).toContain("red button pressed");
@@ -163,7 +211,7 @@ describe("evaluateRemote", () => {
     const v = await evaluateRemote(
       { agentId: "a1", tool: "search.web" },
       policy,
-      client(jsonResponse({ killed: false })), // epoch missing
+      client(jsonResponse({ killed: false, killedAgents: [] })), // epoch missing
     );
     expect(v.decision).toBe("deny");
     expect(v.reason).toContain("control plane unreachable — fail closed");
@@ -177,5 +225,14 @@ describe("evaluateRemote", () => {
     );
     expect(v.decision).toBe("deny");
     expect(v.reason).toContain("control plane unreachable — fail closed");
+  });
+
+  it("denies a scope-killed agent's call while another agent still passes", async () => {
+    const scoped = client(jsonResponse({ killed: false, epoch: 4, killedAgents: ["a1"] }));
+    const denied = await evaluateRemote({ agentId: "a1", tool: "search.web" }, policy, scoped);
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason).toContain("scope-killed");
+    const allowed = await evaluateRemote({ agentId: "a2", tool: "search.web" }, policy, scoped);
+    expect(allowed.decision).toBe("allow");
   });
 });

@@ -93,6 +93,8 @@ function createFakeControlPlane() {
     reason: undefined as string | undefined,
     /** mirrors the real control plane's monotone kill epoch */
     epoch: 0,
+    /** mirrors the real control plane's scoped-kill list */
+    killedAgents: [] as string[],
     /** every fetch rejects, as if the process were gone */
     down: false,
     /** only veto registration fails */
@@ -117,8 +119,8 @@ function createFakeControlPlane() {
     if (method === "GET" && url.pathname === "/status") {
       return json(
         state.killed
-          ? { killed: true, reason: state.reason, epoch: state.epoch }
-          : { killed: false, epoch: state.epoch },
+          ? { killed: true, reason: state.reason, epoch: state.epoch, killedAgents: state.killedAgents }
+          : { killed: false, epoch: state.epoch, killedAgents: state.killedAgents },
       );
     }
     if (method === "POST" && url.pathname === "/veto") {
@@ -388,6 +390,29 @@ describe("kill switch", () => {
     expect(err.code).toBe(OwnerSwitchErrorCode.Lockdown);
     expect(err.message).toContain("red button pressed");
     expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+
+  it("a SCOPED kill of this gateway's agent reads as Lockdown too — never a policy deny", async () => {
+    const t = await startProxy();
+    t.controlPlane.state.killedAgents = ["test-agent"];
+    const err = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/x" } }));
+    expect(err.code).toBe(OwnerSwitchErrorCode.Lockdown);
+    expect(err.message).toContain('"test-agent"');
+    expect(err.message).toContain("scope-killed");
+    expect(t.upstream.calls).toEqual([]);
+    await t.close();
+  });
+
+  it("another agent's scoped kill leaves this gateway forwarding normally", async () => {
+    const t = await startProxy();
+    t.controlPlane.state.killedAgents = ["some-other-agent"];
+    const result = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/x" },
+    })) as { content: unknown };
+    expect(result.content).toBeDefined();
+    expect(t.upstream.calls).toHaveLength(1);
     await t.close();
   });
 });

@@ -1,7 +1,14 @@
 /**
  * @ownerswitchai/control-plane — kill state, veto windows, 2GO restore.
  */
-export { KillSwitch, KILL_SOURCES } from "./kill.js";
+export {
+  isValidAgentId,
+  KILL_SOURCES,
+  KillSwitch,
+  MAX_AGENT_ID_CHARS,
+  MAX_KILLED_AGENTS,
+  MAX_SCOPED_KILL_REASON_CHARS,
+} from "./kill.js";
 export type { KillSource, KillEvent, AlertEvent, AuditEntry, KillSwitchOptions } from "./kill.js";
 
 export { KillStateFileStore } from "./kill-state.js";

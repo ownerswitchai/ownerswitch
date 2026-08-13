@@ -152,11 +152,47 @@ describe("KillStateFileStore", () => {
       '{"version":1,"killed":true,"epoch":1,"lastKill":{"source":"button","at":"1"}}',
       '{"version":1,"killed":true,"epoch":1,"lastKill":{"source":"button","at":1,"extra":1}}',
       '{"version":1,"killed":false,"epoch":1,"extra":true}',
+      // scoped-kill shapes we would never have written ourselves
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{}}', // present means non-empty
+      '{"version":1,"killed":false,"epoch":1,"agentKills":[]}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"meteor","at":1}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"app","at":"1"}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"a":{"source":"app","at":1,"x":1}}}',
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"":{"source":"app","at":1}}}',
+      `{"version":1,"killed":false,"epoch":1,"agentKills":{"${"a".repeat(129)}":{"source":"app","at":1}}}`,
+      '{"version":1,"killed":false,"epoch":1,"agentKills":{"nem\\nascii":{"source":"app","at":1}}}',
     ];
     for (const raw of wrongShapes) {
       writeFileSync(path, raw, "utf8");
       expect(store.load().outcome, `should reject: ${raw}`).toBe("corrupt");
     }
+  });
+
+  it("round-trips scoped-kill entries alongside the global state", () => {
+    const store = new KillStateFileStore(tempPath());
+    const state: PersistedKillState = {
+      version: 1,
+      killed: false,
+      epoch: 6,
+      agentKills: {
+        "agent-7": { source: "app", reason: "looping", at: 500 },
+        "agent-9": { source: "api", at: 900, unauthenticated: true },
+      },
+    };
+    expect(store.save(state)).toEqual({ durable: true });
+    expect(store.load()).toEqual({ outcome: "loaded", state });
+  });
+
+  it("rejects more scoped entries than the writer may hold — a flooded file fails closed", () => {
+    const path = tempPath();
+    const flood: Record<string, unknown> = {};
+    for (let i = 0; i < 65; i += 1) flood[`agent-${i}`] = { source: "api", at: 1 };
+    writeFileSync(
+      path,
+      JSON.stringify({ version: 1, killed: false, epoch: 1, agentKills: flood }),
+      "utf8",
+    );
+    expect(new KillStateFileStore(path).load().outcome).toBe("corrupt");
   });
 
   it("a non-regular file (a directory where the file should be) loads as corrupt", () => {

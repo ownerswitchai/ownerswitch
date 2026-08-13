@@ -9,7 +9,12 @@ import {
   type PersistedKillState,
   type SaveResult,
 } from "./kill-state.js";
-import { KillSwitch } from "./kill.js";
+import {
+  isValidAgentId,
+  KillSwitch,
+  MAX_KILLED_AGENTS,
+  MAX_SCOPED_KILL_REASON_CHARS,
+} from "./kill.js";
 
 const auth = { ceremonyId: "c1", ownerId: "adam", completedAt: 2000 };
 
@@ -288,5 +293,126 @@ describe("KillSwitch", () => {
     expect(k.lastKill?.reason).toBe("second");
     k.restore(auth);
     expect(k.lastKill?.reason).toBe("second"); // survives restore for the audit surface
+  });
+});
+
+describe("scoped (per-agent) kills", () => {
+  it("stops one agent without stopping the fleet, audited and attributed", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app", "looping on stripe.payout");
+    expect(k.killed).toBe(false); // the global switch is untouched
+    expect(k.agentKilled("agent-7")).toBe(true);
+    expect(k.agentKilled("agent-8")).toBe(false);
+    expect(k.killedAgents).toEqual(["agent-7"]);
+    expect(k.auditLog()).toEqual([
+      {
+        type: "agent-kill",
+        agentId: "agent-7",
+        event: { source: "app", reason: "looping on stripe.payout", at: 1000 },
+      },
+    ]);
+  });
+
+  it("bumps the GLOBAL epoch — scoped kills inherit the epoch invalidation story", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "api");
+    expect(k.epoch).toBe(1);
+    k.engageAgent("agent-7", "api"); // idempotent re-kill still opens a new epoch
+    expect(k.epoch).toBe(2);
+    expect(k.killedAgents).toEqual(["agent-7"]);
+  });
+
+  it("scoped restore needs a ceremony, is single-use, and never bumps the epoch", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app");
+    const epochAtKill = k.epoch;
+    expect(() => k.restoreAgent("agent-7", { ceremonyId: "", ownerId: "", completedAt: 0 })).toThrow(
+      /2GO/,
+    );
+    k.restoreAgent("agent-7", auth);
+    expect(k.agentKilled("agent-7")).toBe(false);
+    expect(k.epoch).toBe(epochAtKill);
+    // the spent ceremony cannot restore a second scoped kill either
+    k.engageAgent("agent-7", "app");
+    expect(() => k.restoreAgent("agent-7", auth)).toThrow(/single-use/);
+  });
+
+  it("cannot scope-restore an agent that is not scope-killed", () => {
+    expect(() => new KillSwitch().restoreAgent("agent-7", auth)).toThrow(/nothing to restore/);
+  });
+
+  it("global kill and restore leave scoped kills intact — the tiers are independent", () => {
+    const k = new KillSwitch(() => 1000);
+    k.engageAgent("agent-7", "app");
+    k.engage("button");
+    expect(k.killed).toBe(true);
+    expect(k.agentKilled("agent-7")).toBe(true);
+    k.restore(auth);
+    expect(k.killed).toBe(false);
+    expect(k.agentKilled("agent-7")).toBe(true); // its own kill was never restored
+  });
+
+  it("persists scoped kills exactly when non-empty and reboots with them re-seated", () => {
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "incident");
+    expect(store.saved.at(-1)).toEqual({
+      version: 1,
+      killed: false,
+      epoch: 1,
+      agentKills: { "agent-7": { source: "app", reason: "incident", at: 1000 } },
+    });
+
+    const rebootStore = new FakeStore();
+    rebootStore.loadResult = { outcome: "loaded", state: store.saved.at(-1) as PersistedKillState };
+    const k2 = new KillSwitch(() => 2000, { store: rebootStore });
+    expect(k2.killed).toBe(false);
+    expect(k2.agentKilled("agent-7")).toBe(true);
+    expect(k2.epoch).toBe(1);
+    expect(k2.auditLog()).toEqual([
+      {
+        type: "agent-kill",
+        agentId: "agent-7",
+        event: { source: "app", reason: "incident", at: 1000 },
+      },
+    ]);
+
+    // scoped restore drops the field from the file again
+    k2.restoreAgent("agent-7", auth);
+    expect(rebootStore.saved.at(-1)).toEqual({ version: 1, killed: false, epoch: 1 });
+  });
+
+  it("bounds the persisted reason — scoped entries must never outgrow the state file", () => {
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    k.engageAgent("agent-7", "app", "x".repeat(10_000));
+    const saved = store.saved.at(-1)?.agentKills?.["agent-7"];
+    expect(saved?.reason).toHaveLength(MAX_SCOPED_KILL_REASON_CHARS);
+  });
+
+  it("at capacity a scoped kill is NEVER refused — it escalates to the global kill", () => {
+    const k = new KillSwitch(() => 1000);
+    for (let i = 0; i < MAX_KILLED_AGENTS; i += 1) k.engageAgent(`agent-${i}`, "api");
+    expect(k.killed).toBe(false);
+    // an already-killed agent re-kills fine at capacity (no new entry)
+    k.engageAgent("agent-0", "api");
+    expect(k.killed).toBe(false);
+    // one more DISTINCT agent has nowhere to go but everywhere
+    k.engageAgent("agent-overflow", "honeytoken", "decoy crossed the gateway");
+    expect(k.killed).toBe(true);
+    expect(k.lastKill?.reason).toMatch(/capacity/);
+    expect(k.lastKill?.reason).toContain("agent-overflow");
+    expect(k.lastKill?.reason).toContain("decoy crossed the gateway");
+  });
+
+  it("validates agent ids for the HTTP layer: printable ASCII, 1–128, no edge spaces", () => {
+    expect(isValidAgentId("agent-7")).toBe(true);
+    expect(isValidAgentId("a")).toBe(true);
+    expect(isValidAgentId("two words")).toBe(true);
+    expect(isValidAgentId("")).toBe(false);
+    expect(isValidAgentId(" padded ")).toBe(false);
+    expect(isValidAgentId("a".repeat(129))).toBe(false);
+    expect(isValidAgentId("newline\nagent")).toBe(false);
+    expect(isValidAgentId("ütközés")).toBe(false);
   });
 });
