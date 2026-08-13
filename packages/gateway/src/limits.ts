@@ -20,14 +20,17 @@
  *    the signed kill SYNCHRONOUSLY on the crossing refusal; the in-memory
  *    latch only bridges an unreachable control plane — a state in which
  *    the fail-closed /status client is already denying every call anyway.
- *    The latch becomes CONFIRMED when the control plane is seen listing
- *    the agent scope-killed (`observeKillState`) or when the kill report's
- *    delivery confirms (`confirmKillDelivered`). Only a CONFIRMED latch
- *    releases when the agent later leaves `killedAgents` — that absence is
- *    the owner's 2GO restore, and it re-arms every budget fresh (reset).
- *    An UNCONFIRMED latch never releases on absence: before the kill
- *    lands the agent is absent from the list too, and reading that as
- *    "restored" would be fail-open.
+ *    The latch becomes CONFIRMED by exactly one thing: the control plane's
+ *    validated answer to OUR OWN kill request, carrying the commit epoch
+ *    (`confirmKillDelivered`). `/status` can never confirm — an agent
+ *    listed in `killedAgents` was killed by SOMETHING, which may be a
+ *    manual stop, a honeytoken or a previous limit cycle, and binding this
+ *    trip to a foreign kill would let that kill's restore release us.
+ *    Only a CONFIRMED latch releases, and only when the agent leaves
+ *    `killedAgents` in an answer at or after our commit epoch — that
+ *    absence is the owner's 2GO restore for OUR kill, and it re-arms every
+ *    budget fresh. An UNCONFIRMED latch ignores `/status` in both
+ *    directions and simply holds.
  *  - counters are process-local and honest about it: a gateway restart
  *    resets them (documented in limit-rule.ts). The accepted residual,
  *    stated plainly: a crash while the control plane was UNREACHABLE at
@@ -55,10 +58,9 @@ export interface LimitTrip {
 
 /**
  * The latched record of a kill-action trip: what the refusals cite and what
- * the kill report carries. `confirmed` flips when the control plane is seen
- * holding the kill (listed on /status.killedAgents, or the report's
- * delivery confirmed) — only then may a later absence from the list read as
- * the owner's restore.
+ * the kill report carries. `confirmed` flips ONLY when our own kill request
+ * comes back validated from the control plane — never from `/status` (see
+ * the class doc). Until then the latch holds and nothing releases it.
  */
 export interface LatchedLimitTrip {
   ruleId: string;
@@ -74,14 +76,12 @@ export interface LatchedLimitTrip {
    * us, and reading it as the owner's restore would be fail-open.
    *
    * It starts as a PROVISIONAL lower bound (this call's own pre-dispatch
-   * epoch + 1: our kill must bump past what we saw) and is RAISED, never
-   * lowered, as better evidence arrives:
-   *  - the control plane's own commit epoch from the kill response — the
-   *    authoritative anchor, because the epoch line is SHARED and some
-   *    other agent's kill may have taken the epoch we guessed;
-   *  - the epoch of any answer that actually LISTS us killed.
-   * Undefined only when the trip had no epoch to start from; then the
-   * floor is learned from the first admissible evidence above.
+   * epoch + 1: our kill must bump past what we saw), becomes EXACT when
+   * our kill response arrives (the commit epoch — the authoritative
+   * anchor, because the epoch line is SHARED and another agent's kill may
+   * have taken the number we guessed), and is only ever RAISED afterwards
+   * by answers that still list us killed. Undefined only while the trip
+   * had no epoch to start from.
    */
   epochFloor?: number;
 }
@@ -222,25 +222,26 @@ export class LimitTracker {
     const { epoch, durable = true } = opts;
     this.rememberEpoch(epoch);
     if (!durable) return; // says nothing trustworthy in either direction
-    if (this.latch.phase === "armed") return;
+    // An UNCONFIRMED latch ignores `/status` ENTIRELY. A listing is not
+    // evidence about THIS trip (any kill of this agent produces one), and
+    // an absence is not evidence either (our kill has not landed yet).
+    // Confirmation comes from our own kill response — see
+    // confirmKillDelivered — and until then the latch simply holds.
+    if (this.latch.phase !== "confirmed") return;
 
     const floor = this.latch.record.epochFloor;
     const listed = killedAgents.includes(this.latch.record.agentId);
-    // An answer BELOW the floor predates our kill — whether it lists us
-    // (a previous, since-restored kill of the same agent) or not (a
-    // neighbouring kill's epoch). Either way it cannot speak about this
-    // trip, in either direction.
+    // An answer BELOW the floor describes a world older than our confirmed
+    // commit: it cannot speak about this trip in either direction.
     const admissible = floor === undefined || (epoch !== undefined && epoch >= floor);
     if (!admissible) return;
 
     if (listed) {
-      // Seen killed at this epoch: confirm if we were waiting, and narrow
-      // the floor to here — nothing older can be about this kill anymore.
+      // Still killed at this epoch: narrow the floor — nothing older can be
+      // about this kill anymore.
       this.raiseFloor(epoch);
-      if (this.latch.phase === "unconfirmed") this.confirmKillDelivered(epoch);
       return;
     }
-    if (this.latch.phase !== "confirmed") return;
 
     // Without a floor we cannot tell a stale pre-kill answer from a
     // restore, and cannot prove our kill was ever visible — hold.
@@ -255,18 +256,33 @@ export class LimitTracker {
   }
 
   /**
-   * The kill report's delivery confirmed by the control plane itself.
-   * `epoch` is the COMMIT epoch from that response — the authoritative
-   * anchor for this specific kill, and the only thing that can tell our
-   * kill's epoch from a neighbouring kill's. Passing it raises the floor;
-   * omitting it (a caller with no epoch in hand) leaves the provisional
-   * bound in place, which is weaker but never lower.
+   * THE ONLY WAY A LATCH BECOMES CONFIRMED: the control plane answered our
+   * own kill request, and `epoch` is the COMMIT epoch from that validated
+   * response.
+   *
+   * `/status` deliberately cannot do this. Seeing the agent in
+   * `killedAgents` proves only that SOMETHING killed it — a manual stop, a
+   * honeytoken, a previous limit cycle — never that OUR kill landed. Taking
+   * that as confirmation would bind the latch to a foreign kill's epoch and
+   * let that kill's restore release OUR trip with no owner decision for it.
+   * So confirmation is the response, and only the response.
+   *
+   * Refused (leaving the latch UNCONFIRMED, which keeps refusing calls):
+   * an epoch that is not a positive safe integer — a successful kill always
+   * bumps the counter, so 0 is never a commit epoch — or one BELOW this
+   * trip's floor, which would describe a world older than the one we
+   * already observed. The reporter retries; a kill is idempotent, so a
+   * later attempt confirms with a real anchor.
    */
-  confirmKillDelivered(epoch?: number): void {
+  confirmKillDelivered(epoch: number): void {
     if (this.latch.phase !== "unconfirmed") return;
-    const record = { ...this.latch.record, confirmed: true };
-    this.latch = { phase: "confirmed", record };
-    this.raiseFloor(epoch);
+    if (!Number.isSafeInteger(epoch) || epoch < 1) return;
+    const floor = this.latch.record.epochFloor;
+    if (floor !== undefined && epoch < floor) return;
+    this.latch = {
+      phase: "confirmed",
+      record: { ...this.latch.record, confirmed: true, epochFloor: epoch },
+    };
     this.rememberEpoch(epoch);
   }
 

@@ -625,16 +625,31 @@ describe("honeytoken tripwire", () => {
 });
 
 describe("cumulative limits", () => {
-  const recordingLimits = (rules: LimitRule[]) => {
+  /**
+   * Mirrors the CLI's wiring: reportKill delivers and then confirms the
+   * latch with the CONTROL PLANE'S OWN commit epoch (`commitEpoch`), which
+   * is the only thing that can. `/status` never confirms — see
+   * gateway/limits.ts — so a helper that skipped this would leave every
+   * latch unconfirmed and never release.
+   */
+  const recordingLimits = (
+    rules: LimitRule[],
+    opts: { commitEpoch?: number; autoConfirm?: boolean } = {},
+  ) => {
+    const { commitEpoch = 1, autoConfirm = true } = opts;
     const kills: LimitTrip[] = [];
     const alerts: LimitTrip[] = [];
+    const tracker = new LimitTracker(rules);
     return {
       kills,
       alerts,
+      /** the CLI's step: the control plane's own commit epoch confirms */
+      confirm: () => tracker.confirmKillDelivered(commitEpoch),
       limits: {
-        tracker: new LimitTracker(rules),
+        tracker,
         reportKill: (trip: LimitTrip): void => {
           kills.push(trip);
+          if (autoConfirm) tracker.confirmKillDelivered(commitEpoch);
         },
         reportAlert: (trip: LimitTrip): void => {
           alerts.push(trip);
@@ -662,7 +677,7 @@ describe("cumulative limits", () => {
     // even one the budget does not count
     const later = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));
     expect(later.code).toBe(OwnerSwitchErrorCode.LimitTripped);
-    expect(later.message).toContain("in flight");
+    expect(later.message).toContain("2GO restore"); // delivered → confirmed wording
     expect(t.upstream.calls).toHaveLength(2);
     await t.close();
   });
@@ -750,10 +765,13 @@ describe("cumulative limits", () => {
   });
 
   it("the full trip lifecycle: refused in flight → scope-killed → owner restore re-arms the budget", async () => {
-    const r = recordingLimits([
-      { id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" },
-    ]);
     const cp = createFakeControlPlane();
+    // autoConfirm off: the kill is "in flight" until the control plane's
+    // response comes back — exactly the window the wording describes
+    const r = recordingLimits(
+      [{ id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" }],
+      { commitEpoch: cp.state.epoch + 1, autoConfirm: false },
+    );
     const t = await startProxy(cp, undefined, r.limits);
 
     await t.client.callTool({ name: "read_file", arguments: { path: "/a" } });
@@ -766,12 +784,13 @@ describe("cumulative limits", () => {
     const inFlight = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/c" } }));
     expect(inFlight.message).toContain("in flight");
 
-    // the control plane applies the scoped kill (epoch bumps, agent listed):
-    // the refusal becomes the authoritative scoped lockdown. The epoch bump
-    // is what later lets the tracker tell the owner's restore from a stale
-    // pre-kill answer.
+    // the control plane applies the scoped kill and answers our request: the
+    // commit epoch confirms the latch (only this can — a /status listing
+    // never does, since any kill of this agent produces one), and the
+    // refusal becomes the authoritative scoped lockdown
     cp.state.epoch += 1;
     cp.state.killedAgents = ["test-agent"];
+    r.confirm();
     const killed = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));
     expect(killed.code).toBe(OwnerSwitchErrorCode.Lockdown);
     expect(killed.message).toContain("scope-killed");

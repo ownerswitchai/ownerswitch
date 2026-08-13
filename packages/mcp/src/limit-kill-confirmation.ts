@@ -23,8 +23,12 @@
  *  - `persistenceDegraded` / `unhealthy` present → the kill is in force in
  *    memory but may not survive a restart; a restart would then erase it,
  *    and the next answer's absence would look exactly like a restore;
- *  - no `epoch`, or one that is not a non-negative safe integer → the proof
- *    cannot be anchored, so it is not proof;
+ *  - no `epoch`, or one that is not a POSITIVE safe integer → the proof
+ *    cannot be anchored, so it is not proof (a kill always bumps the
+ *    counter, so a commit epoch is never 0);
+ *  - any key beyond the exact two shapes → not an answer this control
+ *    plane produces, and the extra key may be the very disclaimer that
+ *    matters;
  *  - `killedAgent` naming a DIFFERENT agent → some other scope was killed;
  *  - `escalatedToGlobal` without `killed: true` → an escalation that did
  *    not actually engage the global switch is not an escalation;
@@ -46,13 +50,22 @@ export function parseLimitKillConfirmation(
 ): LimitKillConfirmation | null {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
   const b = body as Record<string, unknown>;
+  // EXACT own-key schema. This is a proof boundary, so "the fields I need
+  // are present" is not enough: an answer carrying anything else is not one
+  // of the two shapes the control plane produces, and an unrecognised field
+  // may be exactly the disclaimer that matters (degraded persistence is
+  // signalled by an EXTRA key). Deployment consequence, same as elsewhere:
+  // upgrade the control plane first — an older gateway reading a newer
+  // response simply never confirms, which holds the latch rather than
+  // releasing it.
+  const keys = Object.keys(b).sort().join(",");
+  const scoped = keys === "epoch,killed,killedAgent";
+  const escalated = keys === "epoch,escalatedToGlobal,killed";
+  if (!scoped && !escalated) return null;
   if (typeof b.killed !== "boolean") return null;
-  if (b.persistenceDegraded !== undefined || b.unhealthy !== undefined) return null;
-  if (typeof b.epoch !== "number" || !Number.isSafeInteger(b.epoch) || b.epoch < 0) return null;
-
-  const scoped = b.killedAgent !== undefined;
-  const escalated = b.escalatedToGlobal !== undefined;
-  if (scoped === escalated) return null; // exactly one, never both, never neither
+  // A successful kill always BUMPS the counter, so 0 is never a commit
+  // epoch — accepting it would anchor the latch before any kill existed.
+  if (typeof b.epoch !== "number" || !Number.isSafeInteger(b.epoch) || b.epoch < 1) return null;
   if (scoped && b.killedAgent !== agentId) return null;
   if (escalated && !(b.escalatedToGlobal === true && b.killed === true)) return null;
   return { epoch: b.epoch };

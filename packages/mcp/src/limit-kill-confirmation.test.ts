@@ -21,11 +21,10 @@ describe("parseLimitKillConfirmation — the full response matrix", () => {
     expect(
       parseLimitKillConfirmation({ killed: true, epoch: 12, escalatedToGlobal: true }, AGENT),
     ).toEqual({ epoch: 12 });
-    // epoch 0 is a genuine value (a deployment's very first kill answers 1,
-    // but the parser must not treat 0 as falsy-missing)
+    // the first kill of a deployment answers epoch 1 — never 0
     expect(
-      parseLimitKillConfirmation({ killed: false, epoch: 0, killedAgent: AGENT }, AGENT),
-    ).toEqual({ epoch: 0 });
+      parseLimitKillConfirmation({ killed: false, epoch: 1, killedAgent: AGENT }, AGENT),
+    ).toEqual({ epoch: 1 });
   });
 
   it("rejects anything that does not ANCHOR a durable record for this agent", () => {
@@ -43,6 +42,10 @@ describe("parseLimitKillConfirmation — the full response matrix", () => {
       // the anchor itself must be real: without it, a neighbouring kill's
       // epoch could later pass for this kill's world
       ["no epoch at all", { killed: false, killedAgent: AGENT }],
+      ["epoch 0 — a kill always bumps the counter", { killed: false, epoch: 0, killedAgent: AGENT }],
+      // exact schema: unknown keys are not this control plane's answer
+      ["an extra key", { killed: false, epoch: 1, killedAgent: AGENT, note: "fyi" }],
+      ["a missing key", { epoch: 1, killedAgent: AGENT }],
       ["epoch not a number", { killed: false, epoch: "3", killedAgent: AGENT }],
       ["epoch fractional", { killed: false, epoch: 3.5, killedAgent: AGENT }],
       ["epoch negative", { killed: false, epoch: -1, killedAgent: AGENT }],

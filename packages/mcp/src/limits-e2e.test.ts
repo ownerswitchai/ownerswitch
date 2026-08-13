@@ -16,7 +16,10 @@ import { createControlPlane, createOwnerSession } from "@ownerswitchai/control-p
 import { LimitTracker, limitTripReason, type LimitTrip } from "@ownerswitchai/gateway";
 import { createTripReporter } from "@ownerswitchai/honeytoken";
 import type { LimitRule } from "@ownerswitchai/shared";
-import { isLimitKillConfirmation } from "./limit-kill-confirmation.js";
+import {
+  isLimitKillConfirmation,
+  parseLimitKillConfirmation,
+} from "./limit-kill-confirmation.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const DEVICE_SECRET = "limits-e2e-device-secret";
@@ -68,8 +71,13 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       // skew window, so the reporter runs on the same injected clock
       now: c.now,
       log: () => {},
-      onDelivered: (trip) => {
-        if (trip.tier === "kill" && trip.source === "limit") tracker.confirmKillDelivered();
+      // the REAL chain the CLI runs: response → parser → exact commit epoch
+      // → tracker. Nothing here stands in for production code.
+      onDelivered: (trip, confirmation) => {
+        if (trip.tier !== "kill" || trip.source !== "limit") return;
+        const parsed = parseLimitKillConfirmation(confirmation.body, AGENT_ID);
+        expect(parsed).not.toBeNull();
+        if (parsed !== null) tracker.confirmKillDelivered(parsed.epoch);
       },
     });
 
@@ -146,6 +154,9 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     // a STALE pre-kill answer arriving late must not read as the restore
     tracker.observeKillState([], { epoch: status.epoch - 1 });
     expect(tracker.killTripped?.ruleId).toBe("e2e-budget");
+    // ...and the latch is anchored to OUR kill's commit epoch, which is
+    // exactly the epoch /status now reports
+    expect(tracker.killTripped?.confirmed).toBe(true);
 
     // 4. the owner's scoped 2GO restore over the real HTTP surface
     const session = createOwnerSession("adam", { now: c.now });

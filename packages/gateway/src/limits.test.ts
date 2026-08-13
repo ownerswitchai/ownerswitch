@@ -233,12 +233,12 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still latched — fail closed
   });
 
-  it("seen listed → CONFIRMED; later absence → released and budgets re-armed", () => {
+  it("confirmed → later absence → released and budgets re-armed", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 4 }); // the world before the trip
     tracker.observeCall(call("x"));
 
-    tracker.observeKillState(["a1"], { epoch: 5 }); // the scoped kill landed on /status
+    tracker.confirmKillDelivered(5); // our kill's own commit epoch
     expect(tracker.killTripped?.confirmed).toBe(true);
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still refusing, honestly
 
@@ -259,7 +259,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 7 }); // the world before the trip
     tracker.observeCall(call("x")); // trips; the kill will make epoch 8
-    tracker.observeKillState(["a1"], { epoch: 8 }); // the kill landed → confirmed
+    tracker.confirmKillDelivered(8); // our kill's own response → confirmed
     expect(tracker.killTripped?.confirmed).toBe(true);
 
     tracker.observeKillState([], { epoch: 7 }); // the stale answer, arriving late
@@ -301,8 +301,8 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     tracker.observeKillState([], { epoch: 5 });
     expect(tracker.killTripped?.ruleId).toBe("hard");
 
-    // our own kill lands and confirms properly
-    tracker.observeKillState(["a1"], { epoch: 6 });
+    // our own kill response is what confirms
+    tracker.confirmKillDelivered(6);
     expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([], { epoch: 6 });
     expect(tracker.killTripped).toBeUndefined();
@@ -311,7 +311,8 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
   it("floors only ever rise: an out-of-order answer cannot widen the release window", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"), { epoch: 3 }); // floor 4
-    tracker.observeKillState(["a1"], { epoch: 9 }); // seen killed far later → floor 9
+    tracker.confirmKillDelivered(4); // our commit epoch anchors at 4
+    tracker.observeKillState(["a1"], { epoch: 9 }); // still killed at 9 → floor 9
     expect(tracker.killTripped?.confirmed).toBe(true);
     for (const stale of [4, 5, 8]) {
       tracker.observeKillState([], { epoch: stale });
@@ -332,15 +333,13 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     expect(tracker.killTripped).toBeUndefined();
   });
 
-  it("an epoch-less or floor-less answer holds the latch rather than guessing", () => {
+  it("an epoch-less answer holds a confirmed latch rather than guessing", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x")); // no epoch ever observed → no floor
-    tracker.confirmKillDelivered(); // POST-confirmed, but we never saw it listed
-    tracker.observeKillState([]); // no epoch, no floor: cannot prove a restore
+    tracker.confirmKillDelivered(4); // our commit epoch anchors it exactly
+    tracker.observeKillState([]); // no epoch on the answer: cannot order it
     expect(tracker.killTripped?.ruleId).toBe("hard");
-    // learning the floor from a listing answer makes release possible again
-    tracker.observeKillState(["a1"], { epoch: 4 });
-    tracker.observeKillState([], { epoch: 4 });
+    tracker.observeKillState([], { epoch: 4 }); // our world: the real restore
     expect(tracker.killTripped).toBeUndefined();
   });
 
@@ -348,31 +347,71 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 1 });
     tracker.observeCall(call("x"));
-    // listed, but the control plane admits its persistence is degraded:
-    // confirming here would let a CP restart erase the kill and the next
-    // absence re-arm the budget with no owner ceremony
-    tracker.observeKillState(["a1"], { epoch: 2, durable: false });
-    expect(tracker.killTripped?.confirmed).toBe(false);
-    // a healthy answer confirms properly...
-    tracker.observeKillState(["a1"], { epoch: 2 });
+    // our kill's own response confirms (the only path that can)
+    tracker.confirmKillDelivered(2);
     expect(tracker.killTripped?.confirmed).toBe(true);
-    // ...and a degraded absence cannot release it either
+    // a DEGRADED absence cannot release: the kill it describes may not
+    // survive a restart, so it proves nothing durable in either direction
     tracker.observeKillState([], { epoch: 2, durable: false });
     expect(tracker.killTripped?.ruleId).toBe("hard");
-    tracker.observeKillState([], { epoch: 2 });
+    tracker.observeKillState([], { epoch: 2 }); // healthy: the real restore
     expect(tracker.killTripped).toBeUndefined();
   });
 
-  it("confirmKillDelivered() is the same transition as being seen listed", () => {
+  it("our own kill response is the ONLY confirmation, and its epoch is the anchor", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 2 });
     tracker.observeCall(call("x")); // floor = 3 (the kill will bump 2 → 3)
-    tracker.confirmKillDelivered(); // POST /kill confirmed by the reporter
+    tracker.confirmKillDelivered(3); // POST /kill confirmed, commit epoch 3
     expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([], { epoch: 2 }); // a stale pre-kill answer: holds
     expect(tracker.killTripped?.ruleId).toBe("hard");
     tracker.observeKillState([], { epoch: 3 }); // the post-kill world: restore
     expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("a foreign kill's listing cannot confirm us, and its restore cannot release us", () => {
+    // The v7 finding: /status only proves the agent was killed by
+    // SOMETHING — a manual stop, a honeytoken, a previous limit cycle.
+    // Binding this trip to that kill would let ITS restore release US.
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 10 }); // our trip; provisional floor 11
+    tracker.observeKillState(["a1"], { epoch: 11 }); // some OTHER kill of this agent
+    expect(tracker.killTripped?.confirmed).toBe(false); // not our evidence
+    tracker.observeKillState([], { epoch: 11 }); // that kill's restore
+    expect(tracker.killTripped?.ruleId).toBe("hard"); // we are STILL latched
+
+    tracker.confirmKillDelivered(12); // now OUR kill's response arrives
+    expect(tracker.killTripped?.confirmed).toBe(true);
+    tracker.observeKillState([], { epoch: 11 }); // the older world: inadmissible
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+    tracker.observeKillState([], { epoch: 12 }); // our own restore
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("a foreign listing+absence BEFORE our response leaves the latch untouched", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 4 });
+    tracker.observeKillState(["a1"], { epoch: 5 }); // foreign kill
+    tracker.observeKillState([], { epoch: 6 }); // its restore
+    expect(tracker.killTripped?.ruleId).toBe("hard"); // never confirmed, never released
+    expect(tracker.killTripped?.confirmed).toBe(false);
+  });
+
+  it("refuses a confirmation that cannot be a real commit anchor", () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
+      const tracker = new LimitTracker([KILL_RULE]);
+      tracker.observeCall(call("x"), { epoch: 2 });
+      tracker.confirmKillDelivered(bad);
+      expect(tracker.killTripped?.confirmed, `epoch ${bad}`).toBe(false);
+    }
+    // below the trip's own floor: an older world than we already saw
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 9 }); // floor 10
+    tracker.confirmKillDelivered(9);
+    expect(tracker.killTripped?.confirmed).toBe(false);
+    tracker.confirmKillDelivered(10); // the real one
+    expect(tracker.killTripped?.confirmed).toBe(true);
   });
 });
 
