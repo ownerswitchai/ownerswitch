@@ -1,3 +1,7 @@
+import {
+  ENROLL_POP_LABEL as sharedEnrollLabel,
+  ownerEnrollPopPreimage,
+} from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
 import { base64urlDecode, base64urlEncode, lengthPrefixed, sha256, utf8 } from "./bytes.js";
 import { deviceSigPreimage, enrollPopTranscript } from "./device-sig.js";
@@ -205,5 +209,13 @@ describe("enrollPopTranscript", () => {
     expect(
       hex(enrollPopTranscript({ ...base, credentialId: new Uint8Array([1, 2, 3, 4]) })),
     ).not.toBe(ref);
+  });
+
+  it("matches @ownerswitchai/shared's ownerEnrollPopPreimage byte-for-byte (drift guard)", () => {
+    // the phone signs THIS transcript; the control plane verifies SHARED's —
+    // they are one contract, held identical here the same way the device-sig
+    // preimage is pinned above
+    expect(sharedEnrollLabel).toBe(ENROLL_POP_LABEL);
+    expect(hex(ownerEnrollPopPreimage(base))).toBe(hex(enrollPopTranscript(base)));
   });
 });

@@ -42,7 +42,21 @@ export {
   verifyOwnerSession,
 } from "./auth.js";
 
-export { enrolledOwnerDeviceFromSpki, verifyOwnerDeviceSignature } from "./owner-device.js";
+export {
+  enrolledOwnerDeviceFromSpki,
+  verifyEnrollProofOfPossession,
+  verifyOwnerDeviceSignature,
+} from "./owner-device.js";
+export { cborDecodeExact, cborDecodeFirst } from "./cbor.js";
+export type { CborDecodeResult, CborValue } from "./cbor.js";
+export { verifyOwnerRegistration } from "./webauthn-register.js";
+export type {
+  RegistrationVerdict,
+  VerifyRegistrationOptions,
+  WebAuthnRegistrationWire,
+} from "./webauthn-register.js";
+export { InviteStore } from "./invite.js";
+export type { InviteConsume, InviteOrigin, InviteRecord, InviteStoreOptions } from "./invite.js";
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,

@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, verify as cryptoVerify, type KeyObject } from "node:crypto";
-import { ownerDeviceSigPreimage } from "@ownerswitchai/shared";
+import { ownerDeviceSigPreimage, ownerEnrollPopPreimage } from "@ownerswitchai/shared";
 
 /**
  * Verifier for the owner app's cheap-lane device signature — the real,
@@ -157,6 +157,57 @@ export function enrolledOwnerDeviceFromSpki(deviceId: string, spki: string): Enr
     generation: 1,
     revokedAt: null,
   };
+}
+
+/**
+ * Verify the enrolment PROOF OF POSSESSION: the submitted cheap-lane key's
+ * PRIVATE half signed the ceremony transcript (shared/enroll-pop.ts —
+ * label, inviteId, ownerId, RAW credentialId, RAW canonical SPKI), raw
+ * r||s like every cheap-lane signature. Runs BEFORE the invite is
+ * consumed: a key the client cannot sign with is refused and the invite
+ * survives (apps/owner/DESIGN.md §2 step 4). The SPKI bytes in the
+ * transcript are the CANONICAL DER this module's own strict parser
+ * produced — the signer exported the same canonical bytes from WebCrypto,
+ * so both sides sign/verify one encoding.
+ */
+export function verifyEnrollProofOfPossession(fields: {
+  inviteId: string;
+  ownerId: string;
+  /** base64url WebAuthn credential id (as verified by webauthn-register) */
+  credentialId: string;
+  /** the enrolled device, from enrolledOwnerDeviceFromSpki (canonical key) */
+  device: EnrolledOwnerDevice;
+  /** base64url raw r||s ECDSA signature over the transcript */
+  proof: string;
+}): boolean {
+  let preimage: Uint8Array;
+  try {
+    preimage = ownerEnrollPopPreimage({
+      inviteId: fields.inviteId,
+      ownerId: fields.ownerId,
+      credentialId: new Uint8Array(Buffer.from(fields.credentialId, "base64url")),
+      spki: new Uint8Array(fields.device.publicKey.export({ type: "spki", format: "der" })),
+    });
+  } catch {
+    return false; // empty field — never a guess
+  }
+  let sig: Buffer;
+  try {
+    sig = Buffer.from(fields.proof, "base64url");
+  } catch {
+    return false;
+  }
+  if (sig.length !== 64) return false; // raw r||s for P-256, never DER
+  try {
+    return cryptoVerify(
+      "sha256",
+      preimage,
+      { key: fields.device.publicKey, dsaEncoding: "ieee-p1363" },
+      sig,
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
