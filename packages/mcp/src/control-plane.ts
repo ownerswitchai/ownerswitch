@@ -57,6 +57,7 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *                                            or not at all — absent, the
  *                                            enrollment lane is 501 (launch default)
  *   OWNERSWITCH_ENROLLMENT_RP_ID             WebAuthn rpId of the owner app
+ *   OWNERSWITCH_ENROLLMENT_RP_NAME           human-readable RP name for create()
  *   OWNERSWITCH_ENROLLMENT_ORIGIN            exact https:// owner-app origin
  *   OWNERSWITCH_BOOTSTRAP_SOCKET             Unix-socket path for the host-local
  *                                            bootstrap invite mint (requires the
@@ -156,14 +157,16 @@ function main(): void {
   // lane is 501 and no registry file is touched.
   const enrolledDevicesFile = process.env.OWNERSWITCH_ENROLLED_DEVICES_FILE?.trim();
   const enrollmentRpId = process.env.OWNERSWITCH_ENROLLMENT_RP_ID?.trim();
+  const enrollmentRpName = process.env.OWNERSWITCH_ENROLLMENT_RP_NAME?.trim();
   const enrollmentOrigin = process.env.OWNERSWITCH_ENROLLMENT_ORIGIN?.trim();
-  const enrollmentEnvs = [enrolledDevicesFile, enrollmentRpId, enrollmentOrigin];
+  const enrollmentEnvs = [enrolledDevicesFile, enrollmentRpId, enrollmentRpName, enrollmentOrigin];
   const enrollmentSet = enrollmentEnvs.filter((value) => value !== undefined && value !== "");
   if (enrollmentSet.length !== 0 && enrollmentSet.length !== enrollmentEnvs.length) {
     throw new Error(
-      "device enrollment needs OWNERSWITCH_ENROLLED_DEVICES_FILE, OWNERSWITCH_ENROLLMENT_RP_ID and " +
-        "OWNERSWITCH_ENROLLMENT_ORIGIN together (or none of them) — a partial trio would verify the " +
-        "ceremony against the wrong RP or persist devices nowhere",
+      "device enrollment needs OWNERSWITCH_ENROLLED_DEVICES_FILE, OWNERSWITCH_ENROLLMENT_RP_ID, " +
+        "OWNERSWITCH_ENROLLMENT_RP_NAME and OWNERSWITCH_ENROLLMENT_ORIGIN together (or none of " +
+        "them) — a partial set would hand the phone an incomplete WebAuthn contract or persist " +
+        "devices nowhere",
     );
   }
   const enrollment =
@@ -171,6 +174,7 @@ function main(): void {
       ? {
           devicesFile: enrolledDevicesFile as string,
           rpId: enrollmentRpId as string,
+          rpName: enrollmentRpName as string,
           origin: enrollmentOrigin as string,
         }
       : undefined;
@@ -251,11 +255,23 @@ function main(): void {
   // deliberately NEVER an HTTP route (DESIGN.md §2): filesystem permission
   // to the socket IS the authorization to mint the root of trust.
   if (bootstrapSocketPath !== undefined && bootstrapSocketPath !== "") {
+    // resolves only once the socket is LIVE at its final path, 0600, behind
+    // an exactly-0700 parent — a namespace surprise refuses the whole boot
     createBootstrapInviteSocket({
       socketPath: bootstrapSocketPath,
       mint: controlPlane.bootstrapMintInvite,
-    });
-    console.error(`[ownerswitch] bootstrap invite socket at ${bootstrapSocketPath} (mode 0600)`);
+    }).then(
+      () =>
+        console.error(
+          `[ownerswitch] bootstrap invite socket at ${bootstrapSocketPath} (0600, private parent)`,
+        ),
+      (err: unknown) => {
+        console.error(
+          `[ownerswitch] refusing to start: bootstrap socket failed — ${err instanceof Error ? err.message : "unknown"}`,
+        );
+        process.exit(1);
+      },
+    );
   }
 
   createServer(controlPlane.handler).listen(port, host, () => {

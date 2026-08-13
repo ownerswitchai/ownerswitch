@@ -119,6 +119,14 @@ export interface PersistedEnrolledDevices {
    */
   bootstrapGeneration: number;
   devices: Record<string, PersistedEnrolledDevice>;
+  /**
+   * Per-owner WebAuthn user handles: `userId` is an OPAQUE CSPRNG value
+   * (never the ownerId re-encoded, never PII — the pinned EnrollmentInvite
+   * user entity), STABLE per owner because it is minted once, durably,
+   * with the owner's first invite. 16–64 decoded bytes, canonical
+   * base64url, unique across owners.
+   */
+  owners: Record<string, { userId: string }>;
 }
 
 export type EnrolledDevicesLoad =
@@ -178,7 +186,7 @@ function cloneDevice(device: PersistedEnrolledDevice): PersistedEnrolledDevice {
 /** Strict shape check — anything we would not have written reads as corrupt. */
 function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const { version, bootstrapGeneration, devices, ...rest } = value as Record<string, unknown>;
+  const { version, bootstrapGeneration, devices, owners, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length > 0) return null;
   if (version !== 1) return null;
   if (
@@ -271,7 +279,25 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     if (device.revokedAt === null) active += 1;
   }
   if (active > MAX_ACTIVE_DEVICES) return null;
-  return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries) };
+  // per-owner user handles: same prototype-safety and canonicality rules as
+  // the device table, plus cross-owner uniqueness — a handle is an identity
+  if (typeof owners !== "object" || owners === null || Array.isArray(owners)) return null;
+  const ownerEntries: Array<readonly [string, { userId: string }]> = [];
+  const seenUserIds = new Set<string>();
+  for (const [ownerId, handle] of Object.entries(owners)) {
+    if (ownerId === "" || ownerId.length > 256) return null;
+    if (FORBIDDEN_DEVICE_IDS.has(ownerId)) return null;
+    if (typeof handle !== "object" || handle === null || Array.isArray(handle)) return null;
+    const { userId, ...handleRest } = handle as Record<string, unknown>;
+    if (Object.keys(handleRest).length > 0) return null;
+    if (typeof userId !== "string" || !isCanonicalB64url(userId, 16, 64)) return null;
+    if (seenUserIds.has(userId)) return null;
+    seenUserIds.add(userId);
+    ownerEntries.push([ownerId, { userId }] as const);
+  }
+  const ownersOut: Record<string, { userId: string }> = Object.create(null);
+  for (const [ownerId, handle] of ownerEntries) ownersOut[ownerId] = handle;
+  return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries), owners: ownersOut };
 }
 
 export interface EnrolledDeviceStoreOptions {
@@ -735,6 +761,7 @@ export class EnrolledDeviceRegistry {
       version: 1,
       bootstrapGeneration: 1,
       devices: nullProtoDevices([]),
+      owners: Object.create(null) as Record<string, { userId: string }>,
     };
     let saved: SaveResult;
     try {
@@ -833,11 +860,54 @@ export class EnrolledDeviceRegistry {
     };
   }
 
+  /** The owner's stable opaque WebAuthn user handle, or null before their first mint. */
+  ownerUserId(ownerId: string): string | null {
+    const owners = this.#usableState().owners;
+    return Object.hasOwn(owners, ownerId) ? owners[ownerId].userId : null;
+  }
+
+  /**
+   * Ensure the owner has a DURABLE opaque user handle before an invite for
+   * them exists: generated from the CSPRNG (never derived from the
+   * ownerId), published atomically with the same durable-or-refuse /
+   * quarantine-on-unproven rules as the admit path, and only then adopted
+   * in memory. Idempotent for owners that already have one.
+   */
+  #ensureOwnerUserId(ownerId: string): string {
+    const state = this.#usableState();
+    if (Object.hasOwn(state.owners, ownerId)) return state.owners[ownerId].userId;
+    let userId = randomBytes(32).toString("base64url");
+    const taken = new Set(Object.values(state.owners).map((handle) => handle.userId));
+    while (taken.has(userId)) userId = randomBytes(32).toString("base64url");
+    const ownersOut: Record<string, { userId: string }> = Object.create(null);
+    for (const [id, handle] of Object.entries(state.owners)) ownersOut[id] = handle;
+    ownersOut[ownerId] = { userId };
+    const next: PersistedEnrolledDevices = { ...state, owners: ownersOut };
+    let saved: SaveResult;
+    try {
+      saved = this.#store.save(next);
+    } catch (err) {
+      throw new Error(`owner user-handle persist FAILED (${message(err)}) — nothing mints`);
+    }
+    if (!saved.durable) {
+      this.#quarantine(`owner user-handle publish durability UNPROVEN: ${saved.detail}`);
+      throw new Error(
+        `owner user-handle publish durability UNPROVEN (${saved.detail}) — registry quarantined until recovery`,
+      );
+    }
+    this.#state = next;
+    return userId;
+  }
+
   /**
    * Mint an invite with the authority fields AND the owner filled from
    * LIVE state (see MintInviteRequest). register()'s own live-witness
    * gate then re-checks everything it is handed — a killed system, a
    * stale fact, or an out-of-standing issuer throws, and nothing minted.
+   * The owner's durable user handle is established here too, BEFORE the
+   * invite exists — the mint response must carry the complete WebAuthn
+   * creation contract, and the handle in it must be the one every later
+   * ceremony for this owner will see.
    */
   mintInvite(kill: LiveKillState, request: MintInviteRequest): InviteRecord {
     const state = this.#usableState();
@@ -863,6 +933,7 @@ export class EnrolledDeviceRegistry {
       // to claim otherwise; this line is where the fact comes from)
       ownerId = issuer.ownerId;
     }
+    this.#ensureOwnerUserId(ownerId);
     return this.#invites.register(
       {
         inviteId: request.inviteId,
@@ -978,6 +1049,7 @@ export class EnrolledDeviceRegistry {
           ? state.bootstrapGeneration + 1
           : state.bootstrapGeneration,
       devices: nullProtoDevices([...Object.entries(state.devices), [deviceId, device] as const]),
+      owners: state.owners,
     };
     let saved: SaveResult;
     try {

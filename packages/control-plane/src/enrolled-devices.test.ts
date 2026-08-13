@@ -292,6 +292,7 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     const hostile = {
       version: 1,
       bootstrapGeneration: 1,
+      owners: {},
       devices: {
         ["__proto__"]: {
           deviceId: "__proto__",

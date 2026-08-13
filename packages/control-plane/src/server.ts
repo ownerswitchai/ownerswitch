@@ -18,6 +18,7 @@ import {
   type RenderableAlertV1,
   type SignedMergeGrant,
   type ToolCall,
+  type EnrollmentInviteContract,
 } from "@ownerswitchai/shared";
 import {
   createOwnerSession,
@@ -263,6 +264,8 @@ export interface ControlPlaneOptions {
   enrollment?: {
     devicesFile: string;
     rpId: string;
+    /** human-readable RP name for the platform's create() UI (EnrollmentInvite.rpName) */
+    rpName: string;
     origin: string;
   };
   ownerPasskey?: {
@@ -440,17 +443,14 @@ export interface BootstrapMintRequest {
 export type BootstrapMintResult =
   | {
       ok: true;
-      /** the ceremony contract — no secret anywhere in it */
-      invite: {
-        inviteId: string;
-        ownerId: string;
-        deviceName: string;
-        challenge: string;
-        assertionChallenge: string;
-        expiresAt: number;
-        rpId: string;
-        origin: string;
-      };
+      /**
+       * The COMPLETE, runnable WebAuthn creation contract — the shared
+       * secret-free type (EnrollmentInviteContract = the pinned
+       * EnrollmentInvite minus its token): the CLI appends the locally
+       * generated token and validates the result with the same runtime
+       * validator the phone app uses before it prints anything.
+       */
+      invite: EnrollmentInviteContract;
     }
   | { ok: false; error: string };
 
@@ -726,11 +726,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // REAL KillSwitch at call time, and nothing else — no witness, no owner,
   // no authority field ever crosses from a request body into a spend.
   let enrolledDevices: EnrolledDeviceRegistry | undefined;
-  let enrollmentRp: { rpId: string; origin: string } | undefined;
+  let enrollmentRp: { rpId: string; rpName: string; origin: string } | undefined;
   if (opts.enrollment !== undefined) {
-    const { devicesFile, rpId, origin } = opts.enrollment;
-    if (rpId === "" || origin === "") {
-      throw new Error("enrollment.rpId and enrollment.origin are required together with devicesFile");
+    const { devicesFile, rpId, rpName, origin } = opts.enrollment;
+    if (rpId === "" || rpName === "" || origin === "") {
+      throw new Error(
+        "enrollment.rpId, enrollment.rpName and enrollment.origin are required together with devicesFile",
+      );
     }
     if (opts.dev !== true && !origin.startsWith("https://")) {
       throw new Error(
@@ -754,7 +756,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         `[ownerswitch] enrolled-device registry UNUSABLE — enrollment refuses until recovery: ${initialized.detail}`,
       );
     }
-    enrollmentRp = { rpId, origin };
+    enrollmentRp = { rpId, rpName, origin };
   }
   // The pinned witness rule, restated where it executes: this snapshot is
   // the ONLY kill fact the registry ever receives, and it is read from the
@@ -2858,14 +2860,18 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         error: "enrolled-device registry is not usable — enrollment refuses until recovery",
       });
     }
-    let raw = "";
+    // BYTE-accurate cap: chunks are counted as wire bytes BEFORE decoding,
+    // so multibyte UTF-8 cannot slip past a character-counted limit
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
     for await (const chunk of req) {
-      raw += (chunk as Buffer).toString("utf8");
-      if (raw.length > MAX_ENROLL_BODY_BYTES) {
+      receivedBytes += (chunk as Buffer).length;
+      if (receivedBytes > MAX_ENROLL_BODY_BYTES) {
         return sendJson(res, 413, { error: "enrollment request too large" });
       }
+      chunks.push(chunk as Buffer);
     }
-    const body = parseJsonBody(raw);
+    const body = parseJsonBody(Buffer.concat(chunks).toString("utf8"));
     const outcome = enrolledDevices.commitEnrollment(body, {
       kill: liveKillSnapshot(),
       rpId: enrollmentRp.rpId,
@@ -2914,37 +2920,66 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (enrolledDevices === undefined || enrollmentRp === undefined) {
       return { ok: false, error: "device enrollment is not configured" };
     }
-    if (
-      typeof request !== "object" ||
-      request === null ||
-      typeof request.tokenHash !== "string" ||
-      typeof request.ownerId !== "string" ||
-      request.ownerId === "" ||
-      request.ownerId.length > 256 ||
-      typeof request.deviceName !== "string"
-    ) {
-      return { ok: false, error: "tokenHash, ownerId and deviceName are required" };
+    // EXACT own-key schema — this is the root-of-trust mint request, so an
+    // extra key, an inherited "field", or a non-string refuses outright
+    if (typeof request !== "object" || request === null || Array.isArray(request)) {
+      return { ok: false, error: "request must be a JSON object" };
+    }
+    const record = request as unknown as Record<string, unknown>;
+    const requestKeys = Object.keys(record);
+    const REQUIRED = ["tokenHash", "ownerId", "deviceName"];
+    const ownOk =
+      requestKeys.length === REQUIRED.length &&
+      REQUIRED.every(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(record, key) && typeof record[key] === "string",
+      );
+    const tokenHash = record["tokenHash"] as string;
+    const ownerId = record["ownerId"] as string;
+    const deviceName = record["deviceName"] as string;
+    if (!ownOk || ownerId === "" || ownerId.length > 256 || tokenHash === "" || deviceName === "") {
+      return { ok: false, error: "exactly {tokenHash, ownerId, deviceName} (strings) is required" };
     }
     try {
-      const record = enrolledDevices.mintInvite(liveKillSnapshot(), {
+      const minted = enrolledDevices.mintInvite(liveKillSnapshot(), {
         inviteId: `inv_${randomBytes(9).toString("base64url")}`,
-        tokenHash: request.tokenHash,
-        deviceName: request.deviceName,
+        tokenHash,
+        deviceName,
         challenge: randomBytes(32).toString("base64url"),
         assertionChallenge: randomBytes(32).toString("base64url"),
-        issuer: { kind: "bootstrap", ownerId: request.ownerId },
+        issuer: { kind: "bootstrap", ownerId },
       });
+      // the owner's durable opaque user handle was established by the mint
+      const userId = enrolledDevices.ownerUserId(minted.ownerId);
+      if (userId === null) {
+        return { ok: false, error: "owner user handle missing after mint — refusing" };
+      }
+      // the COMPLETE pinned creation contract (EnrollmentInviteContract):
+      // everything navigator.credentials.create() needs, and no secret
       return {
         ok: true,
         invite: {
-          inviteId: record.inviteId,
-          ownerId: record.ownerId,
-          deviceName: record.deviceName,
-          challenge: record.challenge,
-          assertionChallenge: record.assertionChallenge,
-          expiresAt: record.expiresAt,
+          inviteId: minted.inviteId,
+          expiresAt: minted.expiresAt,
+          ownerId: minted.ownerId,
           rpId: enrollmentRp.rpId,
-          origin: enrollmentRp.origin,
+          rpName: enrollmentRp.rpName,
+          user: {
+            id: userId,
+            // display-only labels for the platform UI; the opaque handle
+            // above is the identity, these are never parsed
+            name: minted.ownerId,
+            displayName: minted.ownerId,
+          },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            residentKey: "preferred",
+            userVerification: "required",
+          },
+          challenge: minted.challenge,
+          assertionChallenge: minted.assertionChallenge,
+          deviceName: minted.deviceName,
         },
       };
     } catch (err) {
