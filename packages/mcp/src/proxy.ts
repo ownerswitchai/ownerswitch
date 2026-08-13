@@ -137,9 +137,16 @@ export interface ProxyOptions {
 
 export interface LimitEnforcement {
   tracker: LimitTracker;
-  /** fire-and-forget scoped-kill report for a tripped kill-action rule */
-  reportKill(trip: LimitTrip): void;
-  /** fire-and-forget alert report for a tripped alert-action rule */
+  /**
+   * Deliver the scoped-kill report for a tripped kill-action rule. AWAITED
+   * by the proxy: the crossing refusal returns only after this settles, so
+   * an implementation that delivers synchronously makes the kill durable on
+   * the control plane — the separate-uid latch authority — before the agent
+   * even hears "no". On failure the tracker stays latched (unconfirmed) and
+   * the implementation keeps retrying in the background.
+   */
+  reportKill(trip: LimitTrip): void | Promise<void>;
+  /** fire-and-forget alert report for a tripped alert-action rule — best effort */
   reportAlert(trip: LimitTrip): void;
 }
 
@@ -399,7 +406,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     // policy refused, or a honeytoken killed, never spends a budget. A
     // kill-action trip refuses THIS call too: the crossing call is the one
     // the budget says must not run.
-    observeCallLimits(call);
+    await observeCallLimits(call);
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {
       try {
@@ -414,7 +421,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
           !(err instanceof OwnerSwitchRefusal) ||
           err.code === OwnerSwitchErrorCode.ExecutionFailed
         ) {
-          observeErrorLimits(call);
+          await observeErrorLimits(call);
         }
         throw err;
       }
@@ -428,30 +435,49 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         CallToolResultSchema,
       )) as CallToolResult;
     } catch (err) {
-      observeErrorLimits(call);
+      await observeErrorLimits(call);
       throw err;
     }
     // an upstream tool reporting its own failure counts against the error
     // budget exactly like a transport failure — the agent's action failed
-    if (result.isError === true) observeErrorLimits(call);
+    if (result.isError === true) await observeErrorLimits(call);
     return result;
   }
 
   /**
    * Feed a forwarded call to the limit tracker. Kill trips refuse the
-   * crossing call (and report the scoped kill); alert trips only flag.
+   * crossing call — AFTER the scoped-kill report settles, so in the healthy
+   * case the kill is already durable on the control plane when the refusal
+   * returns. Alert trips only flag, and alert DELIVERY is best effort: a
+   * broken reporter must not block a call an alert rule never blocks.
    */
-  function observeCallLimits(call: ToolCall): void {
+  async function observeCallLimits(call: ToolCall): Promise<void> {
     const limits = options.limits;
     if (limits === undefined) return;
     const trips = limits.tracker.observeCall(call);
     let killTrip: LimitTrip | undefined;
     for (const trip of trips) {
       if (trip.rule.action === "kill") {
-        limits.reportKill(trip);
+        try {
+          await limits.reportKill(trip);
+        } catch (err) {
+          // the tracker latched at observe time; delivery keeps retrying in
+          // the implementation — the refusal below stands either way
+          console.error(
+            `[ownerswitch-mcp] limit kill report failed (rule "${trip.rule.id}"): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         killTrip ??= trip;
       } else {
-        limits.reportAlert(trip);
+        try {
+          limits.reportAlert(trip);
+        } catch (err) {
+          console.error(
+            `[ownerswitch-mcp] limit alert report failed (rule "${trip.rule.id}"): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
     }
     if (killTrip !== undefined) {
@@ -467,12 +493,12 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
    * reports the scoped kill and latches, so the NEXT call is refused at the
    * top of the handler.
    */
-  function observeErrorLimits(call: ToolCall): void {
+  async function observeErrorLimits(call: ToolCall): Promise<void> {
     const limits = options.limits;
     if (limits === undefined) return;
     try {
       for (const trip of limits.tracker.observeError(call)) {
-        if (trip.rule.action === "kill") limits.reportKill(trip);
+        if (trip.rule.action === "kill") await limits.reportKill(trip);
         else limits.reportAlert(trip);
       }
     } catch (err) {

@@ -36,7 +36,6 @@ import {
   type Tripwire,
 } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
-import { createFileLimitTripStore } from "./limit-trip-store.js";
 import { doctorMain } from "./doctor.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
@@ -207,29 +206,17 @@ async function runGateway(argv: string[]): Promise<void> {
 
   // Cumulative limit rules, when configured: the tracker counts in-process,
   // and a tripped kill-action rule fires a device-signed SCOPED kill of this
-  // gateway's agent through the same retrying reporter the honeytoken
-  // tripwire uses — one delivery discipline for every gateway-side tripwire.
-  // The trip itself follows a durable lifecycle (gateway/limits.ts): with a
-  // limitStateFile it survives crashes and is RE-FIRED at startup; delivery
-  // confirmation and the owner's restore drive the latch, never a restart.
+  // gateway's agent. The DURABLE latch authority is the control plane's
+  // persisted scoped kill (separate uid, fsync'd, deletion-protected) — a
+  // gateway-side file could never be one within the agent's uid — so
+  // reportKill delivers SYNCHRONOUSLY: the crossing refusal returns only
+  // after the kill landed (or after bounded retries against an unreachable
+  // control plane — a state in which the fail-closed /status client is
+  // already denying every call). An undelivered kill keeps pumping in the
+  // background; delivery confirmation advances the tracker's lifecycle.
   const effectiveAgentId = config.agentId ?? PROXY_NAME;
   const armLimits = config.limits !== undefined && config.limits.length > 0;
-  const tripStore =
-    armLimits && config.limitStateFile !== undefined
-      ? createFileLimitTripStore(config.limitStateFile)
-      : undefined;
-  if (armLimits && tripStore === undefined && config.limits?.some((r) => r.action === "kill")) {
-    console.error(
-      "[ownerswitch-mcp] WARNING: kill-action limits are armed WITHOUT limitStateFile — " +
-        "a crash between a trip and its kill's delivery re-opens the budget on the next " +
-        "boot. Set limitStateFile (or OWNERSWITCH_LIMIT_STATE_FILE) for a durable latch.",
-    );
-  }
-  const limitTracker = armLimits
-    ? new LimitTracker(config.limits as LimitRule[], {
-        ...(tripStore !== undefined ? { tripStore } : {}),
-      })
-    : undefined;
+  const limitTracker = armLimits ? new LimitTracker(config.limits as LimitRule[]) : undefined;
   const limitReporter = armLimits
     ? createTripReporter({
         controlPlaneUrl,
@@ -247,7 +234,7 @@ async function runGateway(argv: string[]): Promise<void> {
     limitTracker !== undefined && limitReporter !== undefined
       ? {
           tracker: limitTracker,
-          reportKill: (trip: LimitTrip) =>
+          reportKill: async (trip: LimitTrip): Promise<void> => {
             limitReporter.report({
               tier: "kill",
               canaryIds: [],
@@ -255,7 +242,19 @@ async function runGateway(argv: string[]): Promise<void> {
               source: "limit",
               agentId: effectiveAgentId,
               reason: limitTripReason(trip, effectiveAgentId),
-            }),
+            });
+            // Synchronous delivery: a bounded flush (backoff 200/400/800 ms)
+            // so the crossing refusal returns with the kill already durable
+            // on the control plane in the healthy case.
+            const { delivered } = await limitReporter.flush({ maxAttempts: 4 });
+            if (!delivered) {
+              // Control plane unreachable: stay latched (the tracker already
+              // is) and keep pumping in the background until it lands —
+              // onDelivered will confirm. Every call is meanwhile denied by
+              // the fail-closed /status lookup anyway.
+              void limitReporter.flush({ maxAttempts: Number.MAX_SAFE_INTEGER }).catch(() => {});
+            }
+          },
           reportAlert: (trip: LimitTrip) =>
             limitReporter.report({
               tier: "alert",
@@ -268,24 +267,6 @@ async function runGateway(argv: string[]): Promise<void> {
             }),
         }
       : undefined;
-  // A trip persisted by a previous life whose kill was never confirmed:
-  // re-fire it NOW, before any call is served — the latch is already armed
-  // (the tracker loaded it), and the kill must not stay unsent.
-  const pendingTrip = limitTracker?.pendingKillReport;
-  if (pendingTrip !== undefined && limitReporter !== undefined) {
-    console.error(
-      `[ownerswitch-mcp] re-firing an UNCONFIRMED limit kill from a previous run ` +
-        `(rule "${pendingTrip.ruleId}", agent "${pendingTrip.agentId}")`,
-    );
-    limitReporter.report({
-      tier: "kill",
-      canaryIds: [],
-      how: "",
-      source: "limit",
-      agentId: pendingTrip.agentId,
-      reason: pendingTrip.reason,
-    });
-  }
 
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,

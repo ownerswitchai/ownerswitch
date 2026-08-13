@@ -1,30 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LimitRule, ToolCall } from "@ownerswitchai/shared";
-import {
-  LimitTracker,
-  limitTripReason,
-  MAX_WINDOW_EVENTS,
-  type LimitTripStore,
-  type PersistedLimitTrip,
-} from "./limits.js";
-
-/** In-memory store: records saves/clears, serves a scripted load. */
-class FakeTripStore implements LimitTripStore {
-  stored: PersistedLimitTrip | null = null;
-  saves: PersistedLimitTrip[] = [];
-  clears = 0;
-  load(): PersistedLimitTrip | null {
-    return this.stored;
-  }
-  save(record: PersistedLimitTrip): void {
-    this.saves.push(record);
-    this.stored = record;
-  }
-  clear(): void {
-    this.clears += 1;
-    this.stored = null;
-  }
-}
+import { LimitTracker, limitTripReason, MAX_WINDOW_EVENTS } from "./limits.js";
 
 const call = (tool: string, args?: Record<string, unknown>): ToolCall => ({
   agentId: "a1",
@@ -237,53 +213,36 @@ describe("LimitTracker", () => {
 describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → released", () => {
   const KILL_RULE: LimitRule = { id: "hard", tool: "*", metric: "calls", max: 0, action: "kill" };
 
-  it("a fresh trip persists UNCONFIRMED and is offered for (re-)reporting", () => {
-    const store = new FakeTripStore();
-    const tracker = new LimitTracker([KILL_RULE], { now: () => 5, tripStore: store });
+  it("a fresh trip latches UNCONFIRMED with the record the kill report carries", () => {
+    const tracker = new LimitTracker([KILL_RULE], { now: () => 5 });
     tracker.observeCall(call("x"));
-    expect(tracker.killTripped?.ruleId).toBe("hard");
-    expect(tracker.pendingKillReport).toMatchObject({
+    expect(tracker.killTripped).toMatchObject({
       ruleId: "hard",
       agentId: "a1",
       confirmed: false,
       at: 5,
     });
-    expect(store.stored?.confirmed).toBe(false);
-  });
-
-  it("a restart re-latches from the store and re-offers the unconfirmed kill report", () => {
-    // the crash-before-delivery case: the trip must survive the process
-    const store = new FakeTripStore();
-    new LimitTracker([KILL_RULE], { now: () => 5, tripStore: store }).observeCall(call("x"));
-
-    const rebooted = new LimitTracker([KILL_RULE], { now: () => 9, tripStore: store });
-    expect(rebooted.killTripped?.ruleId).toBe("hard"); // latched before any call
-    expect(rebooted.pendingKillReport?.reason).toContain('"hard"'); // re-fire with the stored reason
+    expect(tracker.killTripped?.reason).toContain('"hard"');
   });
 
   it("an UNCONFIRMED latch never releases on absence — before the kill lands the agent is absent too", () => {
-    const store = new FakeTripStore();
-    const tracker = new LimitTracker([KILL_RULE], { tripStore: store });
+    const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"));
     tracker.observeKillState([]); // control plane does not (yet) list the agent
     tracker.observeKillState([]);
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still latched — fail closed
-    expect(store.stored).not.toBeNull();
   });
 
-  it("seen listed → CONFIRMED (persisted); later absence → released, store cleared, budgets re-armed", () => {
-    const store = new FakeTripStore();
-    const tracker = new LimitTracker([KILL_RULE], { tripStore: store });
+  it("seen listed → CONFIRMED; later absence → released and budgets re-armed", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"));
 
     tracker.observeKillState(["a1"]); // the scoped kill landed on /status
-    expect(store.stored?.confirmed).toBe(true);
-    expect(tracker.pendingKillReport).toBeUndefined(); // nothing left to re-fire
+    expect(tracker.killTripped?.confirmed).toBe(true);
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still refusing, honestly
 
     tracker.observeKillState([]); // the owner's 2GO restore
     expect(tracker.killTripped).toBeUndefined();
-    expect(store.clears).toBe(1);
     // budgets re-armed FRESH: the very next call is a new crossing, not a
     // stale continuation of the pre-restore totals
     const trips = tracker.observeCall(call("x"));
@@ -292,23 +251,11 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
   });
 
   it("confirmKillDelivered() is the same transition as being seen listed", () => {
-    const store = new FakeTripStore();
-    const tracker = new LimitTracker([KILL_RULE], { tripStore: store });
+    const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"));
     tracker.confirmKillDelivered(); // POST /kill confirmed by the reporter
-    expect(store.stored?.confirmed).toBe(true);
+    expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([]); // absence after confirmation = restore
-    expect(tracker.killTripped).toBeUndefined();
-  });
-
-  it("a confirmed record loaded at boot releases only on observed absence", () => {
-    const store = new FakeTripStore();
-    store.stored = { ruleId: "hard", agentId: "a1", reason: "r", at: 1, confirmed: true };
-    const tracker = new LimitTracker([KILL_RULE], { tripStore: store });
-    expect(tracker.killTripped?.ruleId).toBe("hard");
-    tracker.observeKillState(["a1"]); // still killed: stays latched
-    expect(tracker.killTripped?.ruleId).toBe("hard");
-    tracker.observeKillState([]); // restored
     expect(tracker.killTripped).toBeUndefined();
   });
 });

@@ -12,21 +12,30 @@
  *  - a KILL trip follows an explicit LIFECYCLE, not a process-lifetime
  *    boolean:
  *      armed → tripped-UNCONFIRMED → tripped-CONFIRMED → released
- *    A fresh trip latches locally and (with a store wired in) persists, so
- *    a crash before the signed kill lands does not un-trip the budget: the
- *    next boot latches again and the caller re-fires the report
- *    (`pendingKillReport`). The latch becomes CONFIRMED when the control
- *    plane is seen listing the agent scope-killed (`observeKillState`) or
- *    when the kill report's delivery confirms (`confirmKillDelivered`).
- *    Only a CONFIRMED latch releases when the agent later leaves
- *    `killedAgents` — that absence is the owner's 2GO restore, and it
- *    re-arms every budget fresh (reset). An UNCONFIRMED latch never
- *    releases on absence: before the kill lands the agent is absent from
- *    the list too, and reading that as "restored" would be fail-open.
+ *    The DURABLE latch authority is the CONTROL PLANE's persisted scoped
+ *    kill — a separate-uid, fsync'd, deletion-protected record the agent
+ *    cannot reach — not any gateway-side file (within one uid a gateway
+ *    file is the agent's file, so it can never be a boundary; an earlier
+ *    design tried and was rightly rejected in review). The caller delivers
+ *    the signed kill SYNCHRONOUSLY on the crossing refusal; the in-memory
+ *    latch only bridges an unreachable control plane — a state in which
+ *    the fail-closed /status client is already denying every call anyway.
+ *    The latch becomes CONFIRMED when the control plane is seen listing
+ *    the agent scope-killed (`observeKillState`) or when the kill report's
+ *    delivery confirms (`confirmKillDelivered`). Only a CONFIRMED latch
+ *    releases when the agent later leaves `killedAgents` — that absence is
+ *    the owner's 2GO restore, and it re-arms every budget fresh (reset).
+ *    An UNCONFIRMED latch never releases on absence: before the kill
+ *    lands the agent is absent from the list too, and reading that as
+ *    "restored" would be fail-open.
  *  - counters are process-local and honest about it: a gateway restart
- *    resets them (documented in limit-rule.ts). The latch is the one thing
- *    the store carries across restarts, because the latch is enforcement;
- *    the counters that led to it are bookkeeping.
+ *    resets them (documented in limit-rule.ts). The accepted residual,
+ *    stated plainly: a crash while the control plane was UNREACHABLE at
+ *    the exact moment of a trip loses that trip — no executed overspend
+ *    (the crossing call was refused, and every call during the outage was
+ *    denied fail-closed), only the counter history and the undelivered
+ *    kill. A durable commit to an unreachable authority does not exist,
+ *    and a same-uid local file is not one either.
  *
  * Trip semantics: a rule fires when one observation moves its total from
  * ≤ max to > max — the crossing is computed fresh per observation, from the
@@ -45,32 +54,19 @@ export interface LimitTrip {
 }
 
 /**
- * The durable record of a kill-action trip: everything a fresh process
- * needs to keep refusing and to RE-FIRE the signed scoped kill. `confirmed`
- * flips when the control plane is seen holding the kill (listed on
- * /status.killedAgents, or the report's delivery confirmed) — only then may
- * a later absence from the list read as the owner's restore.
+ * The latched record of a kill-action trip: what the refusals cite and what
+ * the kill report carries. `confirmed` flips when the control plane is seen
+ * holding the kill (listed on /status.killedAgents, or the report's
+ * delivery confirmed) — only then may a later absence from the list read as
+ * the owner's restore.
  */
-export interface PersistedLimitTrip {
+export interface LatchedLimitTrip {
   ruleId: string;
   agentId: string;
-  /** the audit reason the kill report carries — re-fired verbatim after a restart */
+  /** the audit reason the kill report carries */
   reason: string;
   at: number;
   confirmed: boolean;
-}
-
-/**
- * Where a kill-action trip survives a process restart. Load runs once at
- * construction; save/clear on latch transitions. An implementation that
- * cannot durably persist should THROW from save — a trip the caller
- * believes persisted but was not is the one lie this interface must not
- * tell (the tracker latches in memory regardless; see observe()).
- */
-export interface LimitTripStore {
-  load(): PersistedLimitTrip | null;
-  save(record: PersistedLimitTrip): void;
-  clear(): void;
 }
 
 /**
@@ -102,8 +98,8 @@ interface RuleState {
 
 type LatchState =
   | { phase: "armed" }
-  | { phase: "unconfirmed"; record: PersistedLimitTrip }
-  | { phase: "confirmed"; record: PersistedLimitTrip };
+  | { phase: "unconfirmed"; record: LatchedLimitTrip }
+  | { phase: "confirmed"; record: LatchedLimitTrip };
 
 /**
  * Read a dot-path (e.g. "payment.total") off the call args. Amounts count
@@ -115,6 +111,9 @@ function amountAt(args: Record<string, unknown> | undefined, path: string): numb
   let node: unknown = args;
   for (const key of path.split(".")) {
     if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
+    // own properties only: the wire hands us plain JSON, and an inherited
+    // property standing in for an amount would be a boundary leak
+    if (!Object.hasOwn(node, key)) return null;
     node = (node as Record<string, unknown>)[key];
   }
   return typeof node === "number" && Number.isSafeInteger(node) && node >= 0 ? node : null;
@@ -130,23 +129,18 @@ export class LimitTracker {
   private readonly states: RuleState[];
   private readonly now: () => number;
   private readonly maxWindowEvents: number;
-  private readonly store?: LimitTripStore;
   private latch: LatchState = { phase: "armed" };
 
   constructor(
     rules: readonly LimitRule[],
-    opts: { now?: () => number; tripStore?: LimitTripStore; maxWindowEvents?: number } = {},
+    opts: { now?: () => number; maxWindowEvents?: number } = {},
   ) {
-    this.now = opts.now ?? Date.now;
+    // Monotonic by default: sliding windows are process-local, and a
+    // wall-clock jump (NTP step, manual set) must not silently expire or
+    // extend a window. Injectable for tests.
+    this.now = opts.now ?? (() => performance.now());
     this.maxWindowEvents = opts.maxWindowEvents ?? MAX_WINDOW_EVENTS;
-    this.store = opts.tripStore;
     this.states = rules.map((rule) => ({ rule, lifetimeTotal: 0, events: [] }));
-    // A persisted trip re-latches BEFORE any call can be observed: a crash
-    // between the trip and the kill's delivery must not reopen the budget.
-    const persisted = this.store?.load() ?? null;
-    if (persisted !== null) {
-      this.latch = { phase: persisted.confirmed ? "confirmed" : "unconfirmed", record: persisted };
-    }
   }
 
   /**
@@ -168,16 +162,8 @@ export class LimitTracker {
    * signed scoped kill propagates (or awaits the owner's restore). The
    * caller should refuse every call while this is set.
    */
-  get killTripped(): PersistedLimitTrip | undefined {
+  get killTripped(): LatchedLimitTrip | undefined {
     return this.latch.phase === "armed" ? undefined : this.latch.record;
-  }
-
-  /**
-   * The trip whose kill report has NOT been confirmed delivered — a fresh
-   * process re-fires this at startup so a crash cannot swallow the kill.
-   */
-  get pendingKillReport(): PersistedLimitTrip | undefined {
-    return this.latch.phase === "unconfirmed" ? this.latch.record : undefined;
   }
 
   /**
@@ -201,16 +187,13 @@ export class LimitTracker {
         state.events.length = 0;
         state.saturatedUntil = undefined;
       }
-      this.store?.clear();
     }
   }
 
   /** The kill report's delivery confirmed — same transition as being seen listed. */
   confirmKillDelivered(): void {
     if (this.latch.phase !== "unconfirmed") return;
-    const record: PersistedLimitTrip = { ...this.latch.record, confirmed: true };
-    this.latch = { phase: "confirmed", record };
-    this.persist(record);
+    this.latch = { phase: "confirmed", record: { ...this.latch.record, confirmed: true } };
   }
 
   private observe(call: ToolCall, metrics: readonly string[]): LimitTrip[] {
@@ -291,32 +274,14 @@ export class LimitTracker {
   private trip(trips: LimitTrip[], trip: LimitTrip, call: ToolCall): void {
     trips.push(trip);
     if (trip.rule.action !== "kill" || this.latch.phase !== "armed") return;
-    const record: PersistedLimitTrip = {
+    const record: LatchedLimitTrip = {
       ruleId: trip.rule.id,
       agentId: call.agentId,
       reason: limitTripReason(trip, call.agentId),
       at: this.now(),
       confirmed: false,
     };
-    // Latch in memory FIRST: a store that throws must never leave the
-    // budget open. The caller decides whether an unpersistable trip is a
-    // startup-blocking condition (the file store refuses to construct on a
-    // bad path, so a throw here is disk trouble mid-flight — the in-memory
-    // latch still refuses everything until the process ends).
     this.latch = { phase: "unconfirmed", record };
-    this.persist(record);
-  }
-
-  private persist(record: PersistedLimitTrip): void {
-    try {
-      this.store?.save(record);
-    } catch (err) {
-      console.error(
-        `[ownerswitch] FAILED to persist limit trip (rule "${record.ruleId}"): ` +
-          `${err instanceof Error ? err.message : String(err)} — the in-memory latch stands, ` +
-          `but a crash before the kill lands could lose it`,
-      );
-    }
   }
 
   private saturate(state: RuleState, at: number): void {

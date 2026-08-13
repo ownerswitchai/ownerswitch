@@ -58,14 +58,20 @@ sliding window or the process lifetime), and a tripped `kill`-action
 rule refuses the crossing call and fires the same signed, scoped kill a
 honeytoken does — the agent that blew its budget stops, the fleet keeps
 running, and restoring it is the owner's 2GO ceremony. `alert`-action
-rules only flag — they never block, whatever tripped them. Stated
+rules only flag — they never block, whatever tripped them. The durable
+record of a tripped kill is the control plane's persisted scoped kill —
+delivered synchronously on the crossing refusal, to the one store the
+agent cannot reach (a gateway-side file would be the agent's own file
+under the stdio deployment's shared uid, so none is kept). Stated
 honestly: counters live in the gateway process and reset with it (one
 budget per gateway — two gateways under one agentId count separately);
-the tripped-kill latch survives restarts via `limitStateFile` and the
-kill it fires is durable. On a `kill`-action rule an unreadable amount
-trips rather than passing unmetered, amounts count in integer atomic
-units (a rounding budget is no budget), and the latch releases only
-when the owner's 2GO restore is observed — never by a restart.
+while the control plane is unreachable every call is already denied
+fail-closed, and a crash during exactly such an outage loses the
+undelivered kill and the counter history — never an executed overspend.
+On a `kill`-action rule an unreadable amount trips rather than passing
+unmetered, amounts count in integer atomic units (a rounding budget is
+no budget), and the latch releases only when the owner's 2GO restore is
+observed on `/status` — never by a restart.
 
 ```jsonc
 // gateway config
@@ -74,8 +80,7 @@ when the owner's 2GO restore is observed — never by a restart.
     "max": 10000, "windowMs": 3600000, "action": "kill" },
   { "id": "errors", "tool": "*", "metric": "errors", "max": 20, "action": "kill" },
   { "id": "rate",   "tool": "*", "metric": "calls",  "max": 300, "windowMs": 60000, "action": "alert" }
-],
-"limitStateFile": "/var/lib/ownerswitch/limit-trip.json"
+]
 ```
 
 **Where this is headed:** once the credential broker above ships, KILL

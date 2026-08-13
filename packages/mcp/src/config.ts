@@ -57,13 +57,6 @@ export interface OwnerSwitchMcpConfig {
    * SCOPED kill of this gateway's agent; an alert-action trip only flags.
    */
   limits?: LimitRule[];
-  /**
-   * Where a kill-action limit trip survives a gateway restart (the durable
-   * latch of gateway/limits.ts's trip lifecycle). Strongly recommended with
-   * kill-action limits: without it a crash between the trip and the kill's
-   * delivery re-opens the budget on the next boot, and the CLI warns loudly.
-   */
-  limitStateFile?: string;
 }
 
 /** Configuration problems are startup errors: message only, no stack noise. */
@@ -332,9 +325,6 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(executorRoutes !== undefined ? { executorRoutes } : {}),
     ...(v.limits !== undefined ? { limits: parseLimits(v.limits, "limits") } : {}),
-    ...(v.limitStateFile !== undefined
-      ? { limitStateFile: requireString(v.limitStateFile, "limitStateFile") }
-      : {}),
   };
 }
 
@@ -367,9 +357,6 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
     ...(env.OWNERSWITCH_AGENT_ID !== undefined ? { agentId: env.OWNERSWITCH_AGENT_ID } : {}),
     ...(env.OWNERSWITCH_LIMITS !== undefined
       ? { limits: parseJson(env.OWNERSWITCH_LIMITS, "OWNERSWITCH_LIMITS") }
-      : {}),
-    ...(env.OWNERSWITCH_LIMIT_STATE_FILE !== undefined
-      ? { limitStateFile: env.OWNERSWITCH_LIMIT_STATE_FILE }
       : {}),
     ...(env.OWNERSWITCH_TIMEOUT_MS !== undefined
       ? { timeoutMs: Number(env.OWNERSWITCH_TIMEOUT_MS) }

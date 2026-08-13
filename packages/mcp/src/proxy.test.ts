@@ -633,8 +633,12 @@ describe("cumulative limits", () => {
       alerts,
       limits: {
         tracker: new LimitTracker(rules),
-        reportKill: (trip: LimitTrip) => kills.push(trip),
-        reportAlert: (trip: LimitTrip) => alerts.push(trip),
+        reportKill: (trip: LimitTrip): void => {
+          kills.push(trip);
+        },
+        reportAlert: (trip: LimitTrip): void => {
+          alerts.push(trip);
+        },
       },
     };
   };
