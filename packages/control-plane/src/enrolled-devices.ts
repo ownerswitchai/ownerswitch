@@ -2,62 +2,78 @@
  * The DURABLE enrolled-device registry — the persistence half of the
  * enrollment ceremony (apps/owner/DESIGN.md §2 step 5: "stores ONE
  * EnrolledDevice record holding both credentials"), and the ONLY place a
- * mint/spend witness is assembled. Three jobs, each a review-pinned
+ * mint/spend can happen at all. Four jobs, each a review-pinned
  * requirement:
  *
- *  1. WITNESS FROM LIVE STATE ONLY. The InviteSpendWitness handed to the
- *     invite store is built HERE, synchronously, from the loaded durable
- *     registry plus the caller's live kill snapshot — there is no API that
- *     accepts a witness from outside, so an HTTP handler cannot relay a
- *     wire-supplied one (the exact hole the review named).
+ *  1. THE SPEND PATH IS REGISTRY-PRIVATE. The registry OWNS its
+ *     InviteStore — the package exports neither the store, nor the
+ *     low-level spend function, nor a way to hand in a witness: the only
+ *     public mint is mintInvite() and the only public spend is
+ *     commitEnrollment(), so an HTTP handler cannot fabricate live state
+ *     or route around the kill/bootstrap/issuer-standing boundary.
  *
- *  2. CRASH-ATOMIC COMMIT. A successful ceremony admits a device by ONE
- *     atomic file publish that carries the new device AND the bootstrap
- *     generation bump together (temp + fsync + rename + dir-fsync — the
- *     kill-state discipline). In-memory state changes only AFTER the
- *     publish reports durable. The crash window is honest and fails in the
- *     safe direction: the invite burns in memory BEFORE the write, so a
- *     crash (or a failed persist) between burn and publish loses the
- *     INVITE, never admits an unpersisted device — the owner re-mints; a
- *     crash after publish before the response leaves a durably enrolled
- *     device the client discovers on the device list.
+ *  2. WITNESS AND OWNER FROM LIVE STATE ONLY. Witnesses are assembled
+ *     here, synchronously, from the loaded durable registry plus a
+ *     shape-validated kill snapshot the server reads off the real
+ *     KillSwitch. The invite's ownerId comes from the ISSUER: a
+ *     device-minted invite inherits the issuing device's persisted
+ *     ownerId (the caller cannot name one), and only the bootstrap
+ *     variant — the operator's own trusted channel — states it.
  *
- *  3. FAIL-CLOSED REGISTRY. A corrupt, missing-after-initialized, or
- *     boundary-violating registry file makes the registry UNUSABLE: no
- *     witness, no mint, no enrollment — refused before any proof chain
- *     runs, with the invite left alone. Same load discipline as the
- *     standing store: O_NOFOLLOW, bounded read, strict shape (canonical
- *     base64url re-checked field by field), owner + mode 0600 exactly.
+ *  3. CRASH-ATOMIC ADMIT. A successful ceremony admits a device by ONE
+ *     atomic file publish carrying the new device AND the bootstrap
+ *     generation bump (temp + fsync + rename + dir-fsync). Memory changes
+ *     only AFTER the publish proves durable. A failed publish refuses
+ *     with the invite already burned (the safe direction — re-mint,
+ *     never an unpersisted device); an UNPROVEN publish (visible but the
+ *     directory entry's durability unverifiable) QUARANTINES the whole
+ *     registry — no standing, no witness, no mint, no enrollment — until
+ *     a fresh initialize() establishes what actually survived on disk.
  *
- * Scope, stated plainly: this registry is the durable source of truth for
- * CEREMONY-enrolled devices. Wiring it into the request-auth path, remote
- * revocation, and the reconciliation with the operator-provisioned keys
- * file (owner-device-file.ts) belong to the HTTP slice — nothing reads
- * this registry for authentication yet, so its records grant nothing until
- * that slice lands behind the same review gate.
+ *  4. FAIL-CLOSED REGISTRY, WHOLE-NAMESPACE. The file store demands an
+ *     absolute path, canonicalises it, walks the REAL ancestor chain
+ *     (root/this-process/named-uid owners, никогда group- or
+ *     world-writable — the same boundary as the standing store), PINS the
+ *     directory identity (dev+ino) and re-verifies it on every load and
+ *     save; the leaf and the `.initialized` marker are both opened
+ *     O_NOFOLLOW and validated (regular file, trusted owner, mode
+ *     EXACTLY 0600, bounded size). A parse that meets `__proto__`,
+ *     `constructor`, or `prototype` as a device id is corrupt, and the
+ *     in-memory device table is null-prototype with own-property lookups
+ *     only. A marker that is missing next to an existing registry and
+ *     cannot be re-established durably is corruption, not best effort.
+ *
+ * SINGLE WRITER, stated plainly: exactly one control-plane process owns
+ * this file — there is no cross-process lock or CAS. Running two
+ * concurrent writers is an unsupported deployment, the same invariant as
+ * the kill-state and standing stores.
+ *
+ * Scope: nothing reads this registry for request authentication yet —
+ * auth wiring, remote revocation, and reconciliation with the operator
+ * keys file are the HTTP slice, behind the same review gate.
  */
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
-  existsSync,
   fchmodSync,
   fstatSync,
   fsyncSync,
-  mkdirSync,
   openSync,
   readSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
 import type { SaveResult } from "./kill-state.js";
+import { canonicalTrustedStandingPath } from "./device-standing.js";
 import {
   performEnrollment,
+  InviteStore,
   type InviteRecord,
   type InviteSpendWitness,
-  type InviteStore,
 } from "./invite.js";
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -110,9 +126,19 @@ export type EnrolledDevicesLoad =
 export const MAX_ENROLLED_DEVICES_FILE_BYTES = 512 * 1024;
 /** Active-device ceiling (flood backstop) — households, not fleets. */
 export const MAX_ACTIVE_DEVICES = 64;
+/** The marker is a short fixed note; anything bigger was not written by us. */
+const MAX_MARKER_BYTES = 4096;
 
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
+
+/**
+ * Property names that collide with Object.prototype machinery: a registry
+ * file using one as a device id is hostile by definition — `out[deviceId]`
+ * on a normal object would hit the prototype SETTER and vanish from every
+ * own-property enumeration while still answering inherited lookups.
+ */
+const FORBIDDEN_DEVICE_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 /** canonical unpadded base64url, by ROUND-TRIP — the same rule as the wire */
 function isCanonicalB64url(value: string, minBytes: number, maxBytes: number): boolean {
@@ -123,6 +149,22 @@ function isCanonicalB64url(value: string, minBytes: number, maxBytes: number): b
     decoded.length <= maxBytes &&
     decoded.toString("base64url") === value
   );
+}
+
+/** null-prototype copy — the ONLY shape the in-memory device table takes */
+function nullProtoDevices(
+  entries: Iterable<readonly [string, PersistedEnrolledDevice]>,
+): Record<string, PersistedEnrolledDevice> {
+  const out: Record<string, PersistedEnrolledDevice> = Object.create(null);
+  for (const [deviceId, device] of entries) out[deviceId] = device;
+  return out;
+}
+
+function cloneDevice(device: PersistedEnrolledDevice): PersistedEnrolledDevice {
+  return {
+    ...device,
+    ...(device.transports !== undefined ? { transports: [...device.transports] } : {}),
+  };
 }
 
 /** Strict shape check — anything we would not have written reads as corrupt. */
@@ -139,10 +181,16 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     return null;
   }
   if (typeof devices !== "object" || devices === null || Array.isArray(devices)) return null;
-  const out: Record<string, PersistedEnrolledDevice> = {};
+  const entries: Array<readonly [string, PersistedEnrolledDevice]> = [];
   const seenCredentials = new Set<string>();
+  const seenCheapLaneKeys = new Set<string>();
+  // Object.keys/entries see OWN properties only (JSON.parse defines own
+  // properties, never setters) — the danger is what WE would do with a
+  // hostile key, so those keys are refused outright, before any table is
+  // built at all.
   for (const [deviceId, record] of Object.entries(devices)) {
     if (deviceId === "" || deviceId.length > 128) return null;
+    if (FORBIDDEN_DEVICE_IDS.has(deviceId)) return null;
     if (typeof record !== "object" || record === null || Array.isArray(record)) return null;
     const {
       deviceId: innerId,
@@ -181,51 +229,80 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1) return null;
     if (revokedAt !== null && (typeof revokedAt !== "number" || !Number.isFinite(revokedAt))) return null;
     if (typeof enrolledAt !== "number" || !Number.isFinite(enrolledAt)) return null;
-    // one credential, one device: a registry claiming otherwise is corrupt
+    // ONE credential / cheap-lane key, ONE device — across the WHOLE
+    // history, revoked records included: a registry claiming otherwise is
+    // corrupt (the same historical-ban rule the admit path enforces)
     if (seenCredentials.has(credentialId)) return null;
+    if (seenCheapLaneKeys.has(cheapLaneKeySpki)) return null;
     seenCredentials.add(credentialId);
-    out[deviceId] = {
+    seenCheapLaneKeys.add(cheapLaneKeySpki);
+    entries.push([
       deviceId,
-      ownerId,
-      deviceName,
-      credentialId,
-      publicKeySpki,
-      cheapLaneKeySpki,
-      signCount,
-      ...(transports !== undefined ? { transports: [...(transports as string[])] } : {}),
-      ...(userHandle !== undefined ? { userHandle: userHandle as string } : {}),
-      generation,
-      revokedAt: revokedAt as number | null,
-      enrolledAt,
-    };
+      {
+        deviceId,
+        ownerId,
+        deviceName,
+        credentialId,
+        publicKeySpki,
+        cheapLaneKeySpki,
+        signCount,
+        ...(transports !== undefined ? { transports: [...(transports as string[])] } : {}),
+        ...(userHandle !== undefined ? { userHandle: userHandle as string } : {}),
+        generation,
+        revokedAt: revokedAt as number | null,
+        enrolledAt,
+      },
+    ] as const);
   }
-  return { version: 1, bootstrapGeneration, devices: out };
+  return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries) };
 }
 
 export interface EnrolledDeviceStoreOptions {
   /**
-   * The uids allowed to OWN the registry file (checked at LOAD, fstat on
-   * the open fd). Default: root and this process. The registry is positive
-   * authorization state-to-be — mode is pinned to EXACTLY 0600, no group
-   * model: nothing else reads it (the escalation service consumes standing
-   * through the standing store, not this file).
+   * The uids allowed to OWN the registry file and marker (checked at LOAD,
+   * fstat on the open fd). Default: root and this process. Mode is pinned
+   * to EXACTLY 0600, no group model: nothing else reads this file (the
+   * escalation service consumes standing through the standing store).
    */
   trustedOwnerUids?: number[];
+  /** extra uids trusted to own ancestors (the distinct-UID model's operator-named uid) */
+  alsoTrustAncestorUids?: number[];
+  /** test-only: skip the trusted-ancestry walk (public tmp roots fail it by design) */
+  unsafeAllowUntrustedAncestryForTests?: boolean;
 }
 
 /**
- * The registry FILE — kill-state.ts's persistence discipline, verbatim in
- * miniature (atomic publish, `.initialized` marker so deletion reads as
- * corruption, O_NOFOLLOW + fstat + bounded read on load, strict shape).
+ * The registry FILE — kill-state.ts's persistence discipline plus the
+ * whole-namespace boundary: canonical absolute path, trusted non-writable
+ * ancestors, pinned directory identity re-verified on every touch, and a
+ * marker that is validated as strictly as the state itself.
  */
 export class EnrolledDeviceFileStore {
   private warnedDirFsync = false;
   private readonly trustedOwnerUids: ReadonlySet<number>;
+  /** canonical path — every open goes through the resolved chain */
+  readonly filePath: string;
+  private readonly dirPath: string;
+  /** the directory's pinned identity: a swapped directory is a broken boundary */
+  private readonly dirDev: number;
+  private readonly dirIno: number;
 
-  constructor(
-    readonly filePath: string,
-    opts: EnrolledDeviceStoreOptions = {},
-  ) {
+  constructor(filePath: string, opts: EnrolledDeviceStoreOptions = {}) {
+    this.filePath = canonicalTrustedStandingPath(
+      filePath,
+      {
+        alsoTrustUids: opts.alsoTrustAncestorUids,
+        unsafeAllowUntrustedAncestryForTests: opts.unsafeAllowUntrustedAncestryForTests,
+      },
+      "enrolled-device registry",
+    );
+    this.dirPath = dirname(this.filePath);
+    const dirStat = statSync(this.dirPath);
+    if (!dirStat.isDirectory()) {
+      throw new Error(`enrolled-device registry parent "${this.dirPath}" is not a directory`);
+    }
+    this.dirDev = dirStat.dev;
+    this.dirIno = dirStat.ino;
     const ourUid = typeof process.getuid === "function" ? process.getuid() : 0;
     this.trustedOwnerUids = new Set(opts.trustedOwnerUids ?? [0, ourUid]);
   }
@@ -234,14 +311,77 @@ export class EnrolledDeviceFileStore {
     return `${this.filePath}.initialized`;
   }
 
+  /** the pinned directory must still BE the pinned directory */
+  private dirIdentityViolation(): string | null {
+    let stat;
+    try {
+      stat = statSync(this.dirPath);
+    } catch (err) {
+      return `registry directory "${this.dirPath}" is gone: ${message(err)}`;
+    }
+    if (!stat.isDirectory() || stat.dev !== this.dirDev || stat.ino !== this.dirIno) {
+      return `registry directory "${this.dirPath}" is not the directory this store was opened with — the namespace was swapped`;
+    }
+    return null;
+  }
+
+  private leafViolation(stat: {
+    uid: number;
+    mode: number;
+    isFile: () => boolean;
+  }, what: string): string | null {
+    if (!stat.isFile()) return `${what} is not a regular file`;
+    if (!this.trustedOwnerUids.has(stat.uid)) {
+      return `${what} is owned by uid ${stat.uid} — not root, this process, or a configured trusted uid`;
+    }
+    if ((stat.mode & 0o7777) !== 0o600) {
+      return `${what} has mode ${(stat.mode & 0o7777).toString(8)} — this registry is private to the control plane, EXACTLY 0600`;
+    }
+    return null;
+  }
+
+  /**
+   * The marker, validated as strictly as the state: O_NOFOLLOW, regular
+   * file, trusted owner, mode exactly 0600, bounded size. "absent" is a
+   * fact only when the open says ENOENT — every other surprise is corrupt.
+   */
+  private markerState(): "absent" | "valid" | { corrupt: string } {
+    let fd: number;
+    try {
+      fd = openSync(this.markerPath, constants.O_RDONLY | O_NOFOLLOW);
+    } catch (err) {
+      const code = errCode(err);
+      if (code === "ENOENT") return "absent";
+      if (code === "ELOOP") return { corrupt: `${this.markerPath} is a symlink — refusing to follow it` };
+      return { corrupt: `cannot open ${this.markerPath}: ${message(err)}` };
+    }
+    try {
+      const stat = fstatSync(fd);
+      const violation = this.leafViolation(stat, this.markerPath);
+      if (violation !== null) return { corrupt: violation };
+      if (stat.size > MAX_MARKER_BYTES) {
+        return { corrupt: `${this.markerPath} is ${stat.size} bytes — not the marker this store writes` };
+      }
+      return "valid";
+    } catch (err) {
+      return { corrupt: `cannot stat ${this.markerPath}: ${message(err)}` };
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   load(): EnrolledDevicesLoad {
+    const dirViolation = this.dirIdentityViolation();
+    if (dirViolation !== null) return { outcome: "corrupt", detail: dirViolation };
+    const marker = this.markerState();
+    if (typeof marker === "object") return { outcome: "corrupt", detail: marker.corrupt };
     let fd: number;
     try {
       fd = openSync(this.filePath, constants.O_RDONLY | O_NOFOLLOW);
     } catch (err) {
       const code = errCode(err);
       if (code === "ENOENT") {
-        if (existsSync(this.markerPath)) {
+        if (marker === "valid") {
           return {
             outcome: "corrupt",
             detail:
@@ -259,23 +399,8 @@ export class EnrolledDeviceFileStore {
     let raw: string;
     try {
       const stat = fstatSync(fd);
-      if (!stat.isFile()) {
-        return { outcome: "corrupt", detail: `${this.filePath} is not a regular file` };
-      }
-      if (!this.trustedOwnerUids.has(stat.uid)) {
-        return {
-          outcome: "corrupt",
-          detail: `${this.filePath} is owned by uid ${stat.uid} — not root, this process, or a configured trusted uid`,
-        };
-      }
-      if ((stat.mode & 0o7777) !== 0o600) {
-        return {
-          outcome: "corrupt",
-          detail:
-            `${this.filePath} has mode ${(stat.mode & 0o7777).toString(8)} — the enrolled-device ` +
-            "registry is private to the control plane, EXACTLY 0600",
-        };
-      }
+      const violation = this.leafViolation(stat, this.filePath);
+      if (violation !== null) return { outcome: "corrupt", detail: violation };
       const limit = MAX_ENROLLED_DEVICES_FILE_BYTES;
       const buffer = Buffer.alloc(limit + 1);
       let total = 0;
@@ -306,22 +431,48 @@ export class EnrolledDeviceFileStore {
     if (state === null) {
       return { outcome: "corrupt", detail: `unexpected shape in ${this.filePath}` };
     }
-    try {
-      this.ensureMarker();
-    } catch {
-      /* best effort — the state file still governs */
+    if (marker === "absent") {
+      // a registry with state but no marker: the marker must be
+      // RE-ESTABLISHED durably before this state is trusted — otherwise a
+      // later deletion of the state file reads as a fresh boot, which
+      // forgets devices and REOPENS the bootstrap lane. Not best effort.
+      let markerDurable: boolean;
+      try {
+        markerDurable = this.ensureMarker();
+      } catch (err) {
+        return {
+          outcome: "corrupt",
+          detail: `registry state exists but its marker cannot be established: ${message(err)}`,
+        };
+      }
+      if (!markerDurable) {
+        return {
+          outcome: "corrupt",
+          detail: "registry state exists but its marker could not be established DURABLY (fsync failed)",
+        };
+      }
     }
     return { outcome: "loaded", state };
   }
 
   save(state: PersistedEnrolledDevices): SaveResult {
-    mkdirSync(dirname(this.filePath), { recursive: true });
+    const dirViolation = this.dirIdentityViolation();
+    if (dirViolation !== null) {
+      throw new Error(`refusing to publish: ${dirViolation}`);
+    }
+    const data = Buffer.from(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+    // what we write must be what load() will accept — a registry that grew
+    // past its own read limit would publish fine and then load corrupt
+    if (data.length > MAX_ENROLLED_DEVICES_FILE_BYTES) {
+      throw new Error(
+        `refusing to publish: serialized registry is ${data.length} bytes, over the ${MAX_ENROLLED_DEVICES_FILE_BYTES}-byte load limit`,
+      );
+    }
     // Marker before state: a save that dies half-way errs toward
     // "initialised but missing" — which loads corrupt and refuses all
     // enrollment, never toward a fresh boot that forgets devices.
     const markerDurable = this.ensureMarker();
     const tmp = `${this.filePath}.${randomBytes(8).toString("hex")}.tmp`;
-    const data = Buffer.from(`${JSON.stringify(state, null, 2)}\n`, "utf8");
     let fd: number | undefined;
     try {
       fd = openSync(tmp, CREATE_FLAGS, 0o600);
@@ -361,7 +512,11 @@ export class EnrolledDeviceFileStore {
   }
 
   private ensureMarker(): boolean {
-    if (existsSync(this.markerPath)) return true;
+    const existing = this.markerState();
+    if (existing === "valid") return true;
+    if (typeof existing === "object") {
+      throw new Error(`marker unusable: ${existing.corrupt}`);
+    }
     let fd: number | undefined;
     try {
       fd = openSync(this.markerPath, CREATE_FLAGS, 0o600);
@@ -377,7 +532,15 @@ export class EnrolledDeviceFileStore {
       }
       fsyncSync(fd);
     } catch (err) {
-      if (errCode(err) === "EEXIST") return true;
+      if (errCode(err) === "EEXIST") {
+        // a marker appeared between the check and the create — accept it
+        // only if it VALIDATES; anything else is the corrupt path
+        const raced = this.markerState();
+        if (raced === "valid") return true;
+        throw new Error(
+          `marker unusable: ${typeof raced === "object" ? raced.corrupt : "vanished during creation"}`,
+        );
+      }
       throw err;
     } finally {
       if (fd !== undefined) closeSync(fd);
@@ -388,14 +551,14 @@ export class EnrolledDeviceFileStore {
   private fsyncDir(): boolean {
     let fd: number | undefined;
     try {
-      fd = openSync(dirname(this.filePath), constants.O_RDONLY);
+      fd = openSync(this.dirPath, constants.O_RDONLY);
       fsyncSync(fd);
       return true;
     } catch {
       if (!this.warnedDirFsync) {
         this.warnedDirFsync = true;
         console.error(
-          `[ownerswitch] cannot fsync ${dirname(this.filePath)} — enrolled-device durability is degraded`,
+          `[ownerswitch] cannot fsync ${this.dirPath} — enrolled-device durability is degraded`,
         );
       }
       return false;
@@ -424,22 +587,26 @@ function killStateIsMalformed(kill: LiveKillState): boolean {
   );
 }
 
-/** What the server hands the registry to mint an invite — NO authority fields. */
+/**
+ * What the server hands the registry to mint an invite — the ceremony
+ * contract and WHO mints, nothing more. The authority facts (kill epoch,
+ * bootstrap generation, the issuer's CURRENT revocation generation) are
+ * filled in from live state, and the OWNER comes from the issuer: an
+ * enrolled device can only ever invite into its own ownerId (read from its
+ * persisted record — there is no field to claim another), while the
+ * bootstrap variant states it because the operator's host channel IS the
+ * root of trust being established.
+ */
 export interface MintInviteRequest {
   inviteId: string;
   /** SHA-256 of the locally generated secret, canonical base64url (the commitment) */
   tokenHash: string;
-  ownerId: string;
   deviceName: string;
   challenge: string;
   assertionChallenge: string;
-  /**
-   * Who is minting: the host (bootstrap) or an enrolled device. The
-   * authority facts — kill epoch, bootstrap generation, the issuer's
-   * CURRENT revocation generation — are filled in HERE from live state,
-   * never accepted from the caller.
-   */
-  issuer: { kind: "bootstrap" } | { kind: "device"; deviceId: string };
+  issuer:
+    | { kind: "bootstrap"; ownerId: string }
+    | { kind: "device"; deviceId: string };
 }
 
 export type CommitEnrollmentOutcome =
@@ -452,7 +619,6 @@ export type CommitEnrollmentOutcome =
   | { ok: false; reason: string; inviteSurvives: boolean };
 
 export interface CommitEnrollmentOptions {
-  invites: InviteStore;
   /** the live kill snapshot, read from the real KillSwitch by the caller */
   kill: LiveKillState;
   rpId: string;
@@ -461,18 +627,24 @@ export interface CommitEnrollmentOptions {
 
 export interface EnrolledDeviceRegistryOptions {
   now?: () => number;
+  /** invite lifetime; default 10 minutes (the invite store's own default) */
+  inviteTtlMs?: number;
+  /** live-invite ceiling; default 32 */
+  maxInvites?: number;
   /** test-only deterministic device ids */
   deviceIdFactory?: () => string;
 }
 
 /**
  * The registry RUNTIME: loads the durable state once, answers standing
- * queries from memory, assembles every witness, and owns the crash-atomic
- * enrollment commit. Every mutating path publishes durably BEFORE memory
- * changes; every refusal names whether the invite survived.
+ * queries from memory, owns the invite store, assembles every witness, and
+ * owns the crash-atomic enrollment commit. Every mutating path publishes
+ * durably BEFORE memory changes; every refusal names whether the invite
+ * survived; every durability surprise quarantines rather than guesses.
  */
 export class EnrolledDeviceRegistry {
   readonly #store: EnrolledDeviceFileStore;
+  readonly #invites: InviteStore;
   readonly #now: () => number;
   readonly #deviceIdFactory: () => string;
   #state: PersistedEnrolledDevices | null = null;
@@ -481,19 +653,25 @@ export class EnrolledDeviceRegistry {
   constructor(store: EnrolledDeviceFileStore, opts: EnrolledDeviceRegistryOptions = {}) {
     this.#store = store;
     this.#now = opts.now ?? Date.now;
+    this.#invites = new InviteStore({
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+      ...(opts.inviteTtlMs !== undefined ? { ttlMs: opts.inviteTtlMs } : {}),
+      ...(opts.maxInvites !== undefined ? { maxInvites: opts.maxInvites } : {}),
+    });
     this.#deviceIdFactory = opts.deviceIdFactory ?? (() => `dev_${randomBytes(12).toString("base64url")}`);
   }
 
   /**
    * Load the durable state (or persist the first-boot state so the marker
    * exists from the first instant). An unusable registry stays unusable —
-   * there is no in-memory fallback to enroll into.
+   * there is no in-memory fallback to enroll into. This is ALSO the
+   * recovery step after a quarantine: it establishes what actually
+   * survived on disk and resumes from exactly that.
    */
   initialize(): { ok: true } | { ok: false; detail: string } {
     const loaded = this.#store.load();
     if (loaded.outcome === "corrupt") {
-      this.#state = null;
-      this.#corruptDetail = loaded.detail;
+      this.#quarantine(loaded.detail);
       return { ok: false, detail: loaded.detail };
     }
     if (loaded.outcome === "loaded") {
@@ -503,23 +681,32 @@ export class EnrolledDeviceRegistry {
     }
     // genuine first boot: bootstrap generation starts at 1, persisted NOW —
     // from here on a missing file is corruption, not a fresh start
-    const initial: PersistedEnrolledDevices = { version: 1, bootstrapGeneration: 1, devices: {} };
+    const initial: PersistedEnrolledDevices = {
+      version: 1,
+      bootstrapGeneration: 1,
+      devices: nullProtoDevices([]),
+    };
     let saved: SaveResult;
     try {
       saved = this.#store.save(initial);
     } catch (err) {
-      this.#state = null;
-      this.#corruptDetail = `first-boot registry persist failed: ${message(err)}`;
-      return { ok: false, detail: this.#corruptDetail };
+      const detail = `first-boot registry persist failed: ${message(err)}`;
+      this.#quarantine(detail);
+      return { ok: false, detail };
     }
     if (!saved.durable) {
-      this.#state = null;
-      this.#corruptDetail = `first-boot registry persist not durable: ${saved.detail}`;
-      return { ok: false, detail: this.#corruptDetail };
+      const detail = `first-boot registry persist not durable: ${saved.detail}`;
+      this.#quarantine(detail);
+      return { ok: false, detail };
     }
     this.#state = initial;
     this.#corruptDetail = null;
     return { ok: true };
+  }
+
+  #quarantine(detail: string): void {
+    this.#state = null;
+    this.#corruptDetail = detail;
   }
 
   get usable(): boolean {
@@ -553,25 +740,32 @@ export class EnrolledDeviceRegistry {
 
   /** Enrolled, unrevoked, at EXACTLY this generation — the standing answer. */
   standing(deviceId: string, generation: number): boolean {
-    const device = this.#usableState().devices[deviceId];
-    return device !== undefined && device.revokedAt === null && device.generation === generation;
+    const devices = this.#usableState().devices;
+    if (!Object.hasOwn(devices, deviceId)) return false;
+    const device = devices[deviceId];
+    return device.revokedAt === null && device.generation === generation;
   }
 
   get(deviceId: string): PersistedEnrolledDevice | null {
-    const device = this.#usableState().devices[deviceId];
-    return device === undefined ? null : { ...device };
+    const devices = this.#usableState().devices;
+    return Object.hasOwn(devices, deviceId) ? cloneDevice(devices[deviceId]) : null;
   }
 
   list(): PersistedEnrolledDevice[] {
-    return Object.values(this.#usableState().devices).map((device) => ({ ...device }));
+    return Object.values(this.#usableState().devices).map(cloneDevice);
+  }
+
+  /** KILL HOOK: sweep invites minted under any other epoch (see InviteStore). */
+  invalidateSupersededEpoch(currentEpoch: number): number {
+    return this.#invites.invalidateSupersededEpoch(currentEpoch);
   }
 
   /**
    * The ONE witness assembly — live kill snapshot + this registry's loaded
-   * durable state, nothing else. Throws on an unusable registry or a
-   * malformed kill snapshot (fail closed): no witness, no spend.
+   * durable state, nothing else. Module-private consumers only; the
+   * public paths are mintInvite and commitEnrollment.
    */
-  liveWitness(kill: LiveKillState): InviteSpendWitness {
+  #liveWitness(kill: LiveKillState): InviteSpendWitness {
     const state = this.#usableState();
     if (killStateIsMalformed(kill)) {
       throw new Error("malformed live kill state — no witness (fail closed)");
@@ -590,40 +784,47 @@ export class EnrolledDeviceRegistry {
   }
 
   /**
-   * Mint an invite with the authority fields filled from LIVE state: the
-   * caller names WHO mints (bootstrap host / an enrolled device) and the
-   * ceremony contract; the kill epoch, bootstrap generation, and the
-   * issuer's current revocation generation come from here. register()'s
-   * own live-witness gate then re-checks everything it is handed — a
-   * killed system, a stale fact, or an out-of-standing issuer throws.
+   * Mint an invite with the authority fields AND the owner filled from
+   * LIVE state (see MintInviteRequest). register()'s own live-witness
+   * gate then re-checks everything it is handed — a killed system, a
+   * stale fact, or an out-of-standing issuer throws, and nothing minted.
    */
-  mintInvite(invites: InviteStore, kill: LiveKillState, request: MintInviteRequest): InviteRecord {
+  mintInvite(kill: LiveKillState, request: MintInviteRequest): InviteRecord {
     const state = this.#usableState();
     if (killStateIsMalformed(kill)) {
       throw new Error("malformed live kill state — nothing mints unproven (fail closed)");
     }
     let origin: InviteRecord["origin"];
+    let ownerId: string;
     if (request.issuer.kind === "bootstrap") {
       origin = { kind: "bootstrap", bootstrapGeneration: state.bootstrapGeneration };
+      ownerId = request.issuer.ownerId;
     } else {
-      const issuer = state.devices[request.issuer.deviceId];
+      const devices = state.devices;
+      const issuer = Object.hasOwn(devices, request.issuer.deviceId)
+        ? devices[request.issuer.deviceId]
+        : undefined;
       if (issuer === undefined || issuer.revokedAt !== null) {
         throw new Error("the inviting device is not enrolled and in standing — nothing mints");
       }
       origin = { kind: "device", deviceId: issuer.deviceId, deviceGeneration: issuer.generation };
+      // the OWNER is the issuer's persisted owner — a device invites into
+      // its own household, never someone else's (there is no request field
+      // to claim otherwise; this line is where the fact comes from)
+      ownerId = issuer.ownerId;
     }
-    return invites.register(
+    return this.#invites.register(
       {
         inviteId: request.inviteId,
         tokenHash: request.tokenHash,
-        ownerId: request.ownerId,
+        ownerId,
         deviceName: request.deviceName,
         challenge: request.challenge,
         assertionChallenge: request.assertionChallenge,
         killEpoch: kill.epoch,
         origin,
       },
-      this.liveWitness(kill),
+      this.#liveWitness(kill),
     );
   }
 
@@ -635,10 +836,13 @@ export class EnrolledDeviceRegistry {
    *
    *   proof chain + burn  →  duplicate checks  →  atomic publish  →  memory
    *
-   * A failed or non-durable publish refuses the enrollment with the invite
-   * already burned (inviteSurvives: false — the safe direction: re-mint,
-   * never an unpersisted device that evaporates on restart). An unusable
-   * registry refuses BEFORE the chain runs, invite untouched.
+   * A failed publish refuses with the invite already burned
+   * (inviteSurvives: false — the safe direction: re-mint, never an
+   * unpersisted device). An UNPROVEN publish (visible, but the directory
+   * entry could not be fsynced — a power cut may resurface the old state)
+   * QUARANTINES the registry: memory serves NOTHING until a fresh
+   * initialize() establishes what actually survived. An unusable registry
+   * refuses BEFORE the chain runs, invite untouched.
    */
   commitEnrollment(submission: unknown, opts: CommitEnrollmentOptions): CommitEnrollmentOutcome {
     if (this.#state === null) {
@@ -664,37 +868,39 @@ export class EnrolledDeviceRegistry {
       };
     }
     const outcome = performEnrollment(submission, {
-      store: opts.invites,
-      witness: this.liveWitness(opts.kill),
+      store: this.#invites,
+      witness: this.#liveWitness(opts.kill),
       rpId: opts.rpId,
       expectedOrigin: opts.expectedOrigin,
     });
     if (!outcome.ok) {
       return { ok: false, reason: outcome.reason, inviteSurvives: outcome.inviteSurvives };
     }
-    // ONE CREDENTIAL, ONE DEVICE: a ceremony that verified against a
-    // credential (or cheap-lane key) already enrolled on an ACTIVE device
-    // is refused — the invite is already burned at this point, honestly
-    // reported: a re-played credential costs the invite, by design.
+    // ONE CREDENTIAL / CHEAP-LANE KEY, ONE DEVICE — across the WHOLE
+    // history, revoked records included: re-enrolling a phone means fresh
+    // keys, so a credential that ever lived here refuses. The invite is
+    // already burned at this point, honestly reported: a re-played
+    // credential costs the invite, by design.
     for (const existing of Object.values(state.devices)) {
-      if (existing.revokedAt !== null) continue;
       if (existing.credentialId === outcome.credential.credentialId) {
         return {
           ok: false,
-          reason: "this WebAuthn credential is already enrolled on an active device",
+          reason: "this WebAuthn credential was already enrolled here — re-enrolment requires fresh keys",
           inviteSurvives: false,
         };
       }
       if (existing.cheapLaneKeySpki === outcome.cheapLaneKeySpki) {
         return {
           ok: false,
-          reason: "this cheap-lane key is already enrolled on an active device",
+          reason: "this cheap-lane key was already enrolled here — re-enrolment requires fresh keys",
           inviteSurvives: false,
         };
       }
     }
     let deviceId = this.#deviceIdFactory();
-    while (state.devices[deviceId] !== undefined) deviceId = this.#deviceIdFactory();
+    while (Object.hasOwn(state.devices, deviceId) || FORBIDDEN_DEVICE_IDS.has(deviceId)) {
+      deviceId = this.#deviceIdFactory();
+    }
     const device: PersistedEnrolledDevice = {
       deviceId,
       ownerId: outcome.invite.ownerId,
@@ -721,7 +927,7 @@ export class EnrolledDeviceRegistry {
         outcome.invite.origin.kind === "bootstrap"
           ? state.bootstrapGeneration + 1
           : state.bootstrapGeneration,
-      devices: { ...state.devices, [deviceId]: device },
+      devices: nullProtoDevices([...Object.entries(state.devices), [deviceId, device] as const]),
     };
     let saved: SaveResult;
     try {
@@ -736,20 +942,20 @@ export class EnrolledDeviceRegistry {
       };
     }
     if (!saved.durable) {
-      // The publish is VISIBLE but its durability could not be proven
-      // (dir-fsync failed). Admitting from memory while the file might
-      // resurface the old state after a power cut would be a lie in the
-      // permissive direction — refuse, and RELOAD the store's view so
-      // memory keeps matching whatever the file now says.
-      const reload = this.#store.load();
-      if (reload.outcome === "loaded") this.#state = reload.state;
+      // The publish is VISIBLE but its durability is UNPROVEN (dir-fsync
+      // failed): after a power cut either state may be on disk. Guessing
+      // in memory — old OR new — could disagree with what survives, so
+      // the registry QUARANTINES: no standing, no witness, no mint, no
+      // enrollment, until a fresh initialize() reads what disk actually
+      // holds. The client's refusal is honest: the invite is spent.
+      this.#quarantine(`enrollment publish durability UNPROVEN: ${saved.detail}`);
       return {
         ok: false,
-        reason: `enrollment not admitted: durable registry publish UNPROVEN (${saved.detail}) — the invite is spent, mint a new one`,
+        reason: `enrollment not admitted: durable registry publish UNPROVEN (${saved.detail}) — registry quarantined until recovery, the invite is spent`,
         inviteSurvives: false,
       };
     }
     this.#state = next;
-    return { ok: true, device: { ...device }, durable: true };
+    return { ok: true, device: cloneDevice(device), durable: true };
   }
 }
