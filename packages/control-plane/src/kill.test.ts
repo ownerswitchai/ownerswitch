@@ -404,6 +404,27 @@ describe("scoped (per-agent) kills", () => {
     expect(sanitizeScopedKillReason("\u0007".repeat(300))).toBe(" ".repeat(MAX_SCOPED_KILL_REASON_CHARS));
   });
 
+  it("an id outside the contract escalates to the global kill — never recorded, never refused", () => {
+    // Defense in depth behind the HTTP/config validation: an invalid id in
+    // the map would persist a state file the strict loader rejects — a
+    // baffling fail-closed global boot later. The stop lands NOW instead,
+    // globally and attributed.
+    const store = new FakeStore();
+    const k = new KillSwitch(() => 1000, { store });
+    expect(k.engageAgent("__proto__", "app", "went rogue")).toEqual({ escalated: true });
+    expect(k.killed).toBe(true);
+    expect(k.killedAgents).toEqual([]); // nothing unloadable was recorded
+    expect(store.saved.at(-1)?.agentKills).toBeUndefined();
+    expect(k.lastKill?.reason).toContain("agentId contract");
+    expect(k.lastKill?.reason).toContain("went rogue");
+
+    // control characters in the offending id cannot smuggle into the reason
+    const k2 = new KillSwitch(() => 1000);
+    k2.engageAgent("bad\nid", "api");
+    expect(k2.killed).toBe(true);
+    expect(k2.lastKill?.reason).not.toContain("\n");
+  });
+
   it("reports which switch flipped: scoped kills return escalated:false, the cap overflow true", () => {
     const k = new KillSwitch(() => 1000);
     expect(k.engageAgent("agent-0", "api")).toEqual({ escalated: false });

@@ -56,12 +56,16 @@ const failClosed = (): KillState => ({
 });
 
 /**
- * Hard cap on the /status body read into memory. A legitimate body is a few
- * hundred bytes; 256 KiB is orders of magnitude of headroom while making a
- * hostile or misrouted endpoint's response a fail-closed answer, not an
- * allocation. Enforced BEFORE JSON.parse, so parse cost is bounded too.
+ * Ceiling on the /status body accepted for parsing, in UTF-16 code units (a
+ * lower bound on wire bytes — the safe direction for a ceiling). Honest
+ * scope: the body is still read fully into memory by res.text() before this
+ * check runs, so this bounds JSON.parse cost and rejects absurd responses —
+ * it is NOT a streaming network-memory cap. The read itself is bounded in
+ * practice by the request timeout and the loopback deployment; a streaming
+ * byte-counter would buy little here at real complexity cost. A legitimate
+ * body is a few hundred bytes; 256 KiB is orders of magnitude of headroom.
  */
-const MAX_STATUS_BODY_BYTES = 256 * 1024;
+const MAX_STATUS_BODY_UNITS = 256 * 1024;
 
 /**
  * Strict parse of the scoped-kill list against the shared agentId contract;
@@ -96,12 +100,12 @@ export function createControlPlaneClient(
         headers: { "cache-control": "no-store, no-cache", pragma: "no-cache" },
       });
       if (!res.ok) return failClosed();
-      // Read as text and bound it BEFORE parsing: a response no real control
-      // plane could have produced must become a fail-closed answer, not an
-      // unbounded parse. (`text.length` counts UTF-16 units — a lower bound
-      // on bytes, which is the safe direction for a ceiling check.)
+      // Bound the body BEFORE parsing: a response no real control plane
+      // could have produced must become a fail-closed answer, not an
+      // unbounded parse (see MAX_STATUS_BODY_UNITS for the honest scope of
+      // this cap).
       const text = await res.text();
-      if (text.length > MAX_STATUS_BODY_BYTES) return failClosed();
+      if (text.length > MAX_STATUS_BODY_UNITS) return failClosed();
       let body: unknown;
       try {
         body = JSON.parse(text);

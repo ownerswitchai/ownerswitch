@@ -38,7 +38,7 @@ export const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app
  * import site.
  */
 export { isValidAgentId, MAX_AGENT_ID_CHARS, MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
-import { MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
+import { isValidAgentId, MAX_KILLED_AGENTS } from "@ownerswitchai/shared";
 
 /**
  * Ceiling on a SCOPED kill's persisted reason, in UTF-16 code units, after
@@ -207,6 +207,22 @@ export class KillSwitch {
     opts: { unauthenticated?: boolean } = {},
   ): { escalated: boolean } {
     const sanitized = reason === undefined ? undefined : sanitizeScopedKillReason(reason);
+    // Defense in depth behind the HTTP/config validation: an id outside the
+    // shared contract must never be recorded — the strict loader would
+    // refuse the resulting state file, turning this scoped kill into a
+    // fail-closed-but-baffling global boot later. And a stop is never
+    // REFUSED for a bad name either: it escalates to the global kill now,
+    // loudly attributed, instead of failing later, silently.
+    if (!isValidAgentId(agentId)) {
+      this.engage(
+        source,
+        `scoped kill requested for an id outside the agentId contract ` +
+          `(${sanitizeScopedKillReason(agentId)}) — escalated to a global kill` +
+          `${sanitized !== undefined ? `; original reason: ${sanitized}` : ""}`,
+        opts,
+      );
+      return { escalated: true };
+    }
     if (!this.agentKillMap.has(agentId) && this.agentKillMap.size >= MAX_KILLED_AGENTS) {
       this.engage(
         source,

@@ -22,7 +22,10 @@ always serves `killedAgents` (gateways fail closed on its absence, like
 approvals die with it, the state file persists scope-killed agents
 across restarts, and at 64 scope-killed agents the next distinct scoped
 kill escalates to the global kill instead of failing — stopping has no
-capacity ceiling.
+capacity ceiling. Rollout order matters and fails in the safe
+direction: a NEW gateway polling an OLD control plane reads the missing
+`killedAgents` as an untrustworthy answer and denies everything —
+upgrade the control plane first, then its gateways.
 
 ## 2GO licensing (`src/license.ts`)
 
