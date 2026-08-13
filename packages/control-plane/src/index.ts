@@ -62,22 +62,33 @@ export type {
   VerifyRegistrationOptions,
   WebAuthnRegistrationWire,
 } from "./webauthn-register.js";
-// NOTE: there is deliberately NO spend API on InviteStore — the burn is an
-// ECMAScript #private method whose only accessor is module-scoped inside
-// invite.ts, and performEnrollment (defined in that same module) is the one
-// function that reaches it, after the full proof chain. Nothing here — and
-// no deep import — hands out a spend capability to claim or forge.
-export { InviteStore } from "./invite.js";
+// NOTE: the package exports NO invite store, NO witness type, and NO
+// low-level spend function — deliberately. The burn is an ECMAScript
+// #private method inside invite.ts, reachable only by performEnrollment in
+// that same module, and performEnrollment itself is reachable only through
+// EnrolledDeviceRegistry.commitEnrollment, which OWNS its invite store and
+// assembles every witness from the loaded durable registry plus the live
+// kill snapshot. A handler holding this package can mint through
+// mintInvite() and enroll through commitEnrollment() — and can neither
+// fabricate live state nor reach a burn around the proof chain.
+export type { InviteOrigin, InviteRecord } from "./invite.js";
+export {
+  EnrolledDeviceFileStore,
+  EnrolledDeviceRegistry,
+  MAX_ACTIVE_DEVICES,
+  MAX_ENROLLED_DEVICES_FILE_BYTES,
+} from "./enrolled-devices.js";
 export type {
-  InviteConsume,
-  InviteFate,
-  InviteOrigin,
-  InviteRecord,
-  InviteSpendWitness,
-  InviteStoreOptions,
-} from "./invite.js";
-export { performEnrollment } from "./enrollment.js";
-export type { EnrollmentOutcome, PerformEnrollmentOptions } from "./enrollment.js";
+  CommitEnrollmentOptions,
+  CommitEnrollmentOutcome,
+  EnrolledDeviceRegistryOptions,
+  EnrolledDevicesLoad,
+  EnrolledDeviceStoreOptions,
+  LiveKillState,
+  MintInviteRequest,
+  PersistedEnrolledDevice,
+  PersistedEnrolledDevices,
+} from "./enrolled-devices.js";
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,

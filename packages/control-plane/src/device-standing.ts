@@ -123,16 +123,18 @@ export interface TrustedStandingPathOptions {
 export function canonicalTrustedStandingPath(
   path: string,
   options: TrustedStandingPathOptions = {},
+  /** which store's boundary this is — used only in error messages */
+  label = "device-standing",
 ): string {
   if (!isAbsolute(path)) {
-    throw new Error(`device-standing path must be absolute, got "${path}"`);
+    throw new Error(`${label} path must be absolute, got "${path}"`);
   }
   let realParent: string;
   try {
     realParent = realpathSync(dirname(path));
   } catch (err) {
     throw new Error(
-      `device-standing directory "${dirname(path)}" cannot be resolved: ${err instanceof Error ? err.message : "failed"}`,
+      `${label} directory "${dirname(path)}" cannot be resolved: ${err instanceof Error ? err.message : "failed"}`,
     );
   }
   if (options.unsafeAllowUntrustedAncestryForTests !== true) {
@@ -145,17 +147,17 @@ export function canonicalTrustedStandingPath(
       try {
         stat = statSync(current);
       } catch {
-        throw new Error(`device-standing ancestor "${current}" is unreadable`);
+        throw new Error(`${label} ancestor "${current}" is unreadable`);
       }
       if (!trusted.has(stat.uid)) {
         throw new Error(
-          `device-standing ancestor "${current}" is owned by uid ${stat.uid} — not root, this process, ` +
+          `${label} ancestor "${current}" is owned by uid ${stat.uid} — not root, this process, ` +
             "or an explicitly trusted uid; an untrusted owner could swap the registry path",
         );
       }
       if ((stat.mode & 0o022) !== 0) {
         throw new Error(
-          `device-standing ancestor "${current}" is group- or world-writable (mode ` +
+          `${label} ancestor "${current}" is group- or world-writable (mode ` +
             `${(stat.mode & 0o777).toString(8)}) — a writable ancestor lets the registry be replaced wholesale`,
         );
       }
