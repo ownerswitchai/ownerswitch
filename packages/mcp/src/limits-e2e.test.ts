@@ -9,6 +9,9 @@
  * gateway-side state.
  */
 import { createServer, type Server } from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createControlPlane, createOwnerSession } from "@ownerswitchai/control-plane";
 import { LimitTracker, limitTripReason, type LimitTrip } from "@ownerswitchai/gateway";
 import { createTripReporter } from "@ownerswitchai/honeytoken";
@@ -33,11 +36,14 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
 
   it("runs the whole pipeline against a real control plane", async () => {
     const c = clock(1_000);
+    // A REAL kill-state file: the scoped kill this pipeline lands must be
+    // provably durable — the control-plane-restart leg below depends on it.
+    const killStateFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-limits-e2e-")), "kill.json");
     const silenceDevWarning = vi.spyOn(console, "error").mockImplementation(() => {});
     const cp = createControlPlane({
       now: c.now,
       dev: true,
-      killStateFile: null,
+      killStateFile,
       deviceSecret: DEVICE_SECRET,
       acceptSessionOnlyApprovalRisk: true,
     });
@@ -100,9 +106,39 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     tracker.observeKillState(status.killedAgents);
     expect(tracker.killTripped?.ruleId).toBe("e2e-budget");
 
+    // 3b. THE DURABILITY LEG: restart the control plane onto the same state
+    // file — the scoped kill must come back, because THIS record is the
+    // durable latch the whole design leans on. (A gateway crash-restart is
+    // covered by the same fact: a fresh gateway polls /status and sees the
+    // agent listed.)
+    server.close();
+    server = undefined;
+    const silenceReboot = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cp2 = createControlPlane({
+      now: c.now,
+      dev: true,
+      killStateFile,
+      deviceSecret: DEVICE_SECRET,
+      acceptSessionOnlyApprovalRisk: true,
+    });
+    silenceReboot.mockRestore();
+    expect(cp2.killSwitch.agentKilled(AGENT_ID)).toBe(true); // survived the restart
+    server = createServer(cp2.handler);
+    const url2 = await new Promise<string>((resolveUrl) => {
+      server!.listen(0, "127.0.0.1", () => {
+        const addr = server!.address();
+        if (addr === null || typeof addr === "string") throw new Error("no address");
+        resolveUrl(`http://127.0.0.1:${addr.port}`);
+      });
+    });
+    const statusAfterReboot = (await (await fetch(`${url2}/status`)).json()) as {
+      killedAgents: string[];
+    };
+    expect(statusAfterReboot.killedAgents).toEqual([AGENT_ID]);
+
     // 4. the owner's scoped 2GO restore over the real HTTP surface
     const session = createOwnerSession("adam", { now: c.now });
-    const ceremony = await fetch(`${url}/restore/ceremony`, {
+    const ceremony = await fetch(`${url2}/restore/ceremony`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${session.token}` },
       body: JSON.stringify({ agentId: AGENT_ID }),
@@ -110,7 +146,7 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     expect(ceremony.status).toBe(201);
     const { id } = (await ceremony.json()) as { id: string };
     c.advance(30_000); // the mandatory 2GO cooldown
-    const restore = await fetch(`${url}/restore`, {
+    const restore = await fetch(`${url2}/restore`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${session.token}` },
       body: JSON.stringify({ ceremonyId: id }),
@@ -119,7 +155,7 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     expect(await restore.json()).toEqual({ killed: false, restoredAgent: AGENT_ID });
 
     // 5. the tracker sees the restore on /status and releases — budgets re-armed
-    const after = (await (await fetch(`${url}/status`)).json()) as { killedAgents: string[] };
+    const after = (await (await fetch(`${url2}/status`)).json()) as { killedAgents: string[] };
     expect(after.killedAgents).toEqual([]);
     tracker.observeKillState(after.killedAgents);
     expect(tracker.killTripped).toBeUndefined();

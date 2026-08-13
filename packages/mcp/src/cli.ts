@@ -35,7 +35,7 @@ import {
   readRegistryFile,
   type Tripwire,
 } from "@ownerswitchai/honeytoken";
-import { ConfigError, loadConfig } from "./config.js";
+import { assertKillLimitRiskAccepted, ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
@@ -216,6 +216,9 @@ async function runGateway(argv: string[]): Promise<void> {
   // background; delivery confirmation advances the tracker's lifecycle.
   const effectiveAgentId = config.agentId ?? PROXY_NAME;
   const armLimits = config.limits !== undefined && config.limits.length > 0;
+  // Kill-action budgets demand the explicit process-local-risk flag —
+  // rationale and contract in config.ts assertKillLimitRiskAccepted.
+  assertKillLimitRiskAccepted(config.limits, process.env);
   const limitTracker = armLimits ? new LimitTracker(config.limits as LimitRule[]) : undefined;
   const limitReporter = armLimits
     ? createTripReporter({
@@ -242,6 +245,22 @@ async function runGateway(argv: string[]): Promise<void> {
               source: "limit",
               agentId: effectiveAgentId,
               reason: limitTripReason(trip, effectiveAgentId),
+              // A 2xx alone must not confirm the latch: the body has to be
+              // the control plane's real answer for THIS scoped kill — the
+              // agent echoed back (or an explicit, validated escalation to
+              // the global kill) and NO degraded/unhealthy persistence. A
+              // degraded 200 keeps retrying: each retry re-kills
+              // (idempotent) and re-persists, so a recovered disk confirms
+              // a later attempt; a broken one keeps the latch fail-closed.
+              confirmDelivery: (body: unknown): boolean => {
+                if (typeof body !== "object" || body === null) return false;
+                const b = body as Record<string, unknown>;
+                if (b.persistenceDegraded !== undefined || b.unhealthy !== undefined) return false;
+                // killedAgent echoes OUR agent → the scoped record was made
+                // (a concurrently-engaged global kill does not invalidate
+                // it); escalatedToGlobal is the explicit capacity fallback.
+                return b.killedAgent === effectiveAgentId || b.escalatedToGlobal === true;
+              },
             });
             // Synchronous delivery: a bounded flush (backoff 200/400/800 ms)
             // so the crossing refusal returns with the kill already durable

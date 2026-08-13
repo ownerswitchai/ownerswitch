@@ -364,4 +364,73 @@ describe("trip reporter", () => {
     ).toBe(true);
     expect(h.logs.some((l) => l.includes("[limit]"))).toBe(true);
   });
+
+  it("confirmDelivery gates a 2xx: a non-conforming body is a FAILED attempt that retries", async () => {
+    // first answer: 200 with a body no real scoped-kill confirmation has;
+    // second answer: the genuine echo — only that one confirms
+    const h = harness((n) =>
+      n === 1
+        ? okResponse({ killed: false }) // 200, but no killedAgent echo
+        : okResponse({ killed: false, killedAgent: "agent-7" }),
+    );
+    const trip: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: "limit tripped",
+      confirmDelivery: (body) =>
+        typeof body === "object" && body !== null &&
+        (body as Record<string, unknown>).killedAgent === "agent-7",
+    };
+    h.reporter.report(trip);
+    await settle();
+    expect(h.delivered).toHaveLength(0); // the lying 200 did not confirm
+    await vi.advanceTimersByTimeAsync(250); // first backoff elapses → retry
+    expect(callsTo(h.calls, "/kill")).toHaveLength(2);
+    expect(h.delivered).toHaveLength(1); // the real echo did
+  });
+
+  it("a degraded-persistence 200 keeps retrying instead of confirming a kill that may not survive", async () => {
+    const h = harness((n) =>
+      n === 1
+        ? okResponse({ killed: false, killedAgent: "agent-7", persistenceDegraded: true })
+        : okResponse({ killed: false, killedAgent: "agent-7" }),
+    );
+    const degradedAware: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: "limit tripped",
+      confirmDelivery: (body) => {
+        const b = body as Record<string, unknown> | null;
+        return (
+          b !== null && b.persistenceDegraded === undefined && b.killedAgent === "agent-7"
+        );
+      },
+    };
+    h.reporter.report(degradedAware);
+    await settle();
+    expect(h.delivered).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(h.delivered).toHaveLength(1); // retry re-killed and re-persisted cleanly
+  });
+
+  it("requests refuse redirects — some other origin's 200 must never read as the control plane's", async () => {
+    const h = harness(() => okResponse());
+    h.reporter.report(KILL_TRIP);
+    await settle();
+    const redirects = h.calls.map(() => undefined);
+    expect(redirects.length).toBeGreaterThan(0);
+    // the fetch init is not captured by this harness; assert via the source
+    // contract instead: every attempt passes redirect:"error" (pinned here
+    // so a future edit that drops it fails a test, not a review)
+    const source = await import("node:fs").then((fs) =>
+      fs.readFileSync(new URL("./report.ts", import.meta.url), "utf8"),
+    );
+    expect(source).toContain('redirect: "error"');
+  });
 });

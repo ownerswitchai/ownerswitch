@@ -402,10 +402,14 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       options.honeytokens?.reportKill({ canaryIds, tool: call.tool, agentId });
       throw honeytokenTripped(call.tool, canaryIds);
     }
-    // Limits count HERE — the only place a yes becomes an action — so a call
-    // policy refused, or a honeytoken killed, never spends a budget. A
-    // kill-action trip refuses THIS call too: the crossing call is the one
-    // the budget says must not run.
+    // Limits count HERE — where a yes is DISPATCHED — so a call policy
+    // refused, or a honeytoken killed, never spends a budget. Stated
+    // precisely: calls/amount meter ATTEMPTED dispatches — a routed call the
+    // executor still refuses downstream (no grant, ticket refused) has
+    // already spent its unit, deliberately: budgets bound what the agent
+    // tries to make happen, and an attempt-then-refusal loop must drain a
+    // budget rather than probe it for free. A kill-action trip refuses THIS
+    // call too: the crossing call is the one the budget says must not run.
     await observeCallLimits(call);
     const route = executor?.routes[call.tool];
     if (executor !== undefined && route !== undefined) {

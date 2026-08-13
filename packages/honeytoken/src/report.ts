@@ -70,6 +70,14 @@ export interface Trip {
   agentId?: string;
   /** verbatim audit reason; default tripReason(trip)'s honeytoken phrasing */
   reason?: string;
+  /**
+   * When present, a 2xx response counts as DELIVERED only if this predicate
+   * accepts the parsed body — otherwise the attempt is a normal failure and
+   * retries. A kill whose delivery gates a security latch must not be
+   * "confirmed" by any warm body with a 200: the caller states what a real
+   * confirmation looks like (the echoed scope, no degraded persistence).
+   */
+  confirmDelivery?: (body: unknown) => boolean;
 }
 
 export interface DeliveryConfirmation {
@@ -172,11 +180,24 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
         },
         body,
         signal: controller.signal,
+        // the control plane is a directly-addressed loopback origin — a
+        // redirect is never legitimate, and following one would let some
+        // OTHER endpoint's 200 read as the control plane's confirmation
+        redirect: "error",
       });
       if (!res.ok) {
         return { ok: false, status: res.status, detail: `control plane answered HTTP ${res.status}` };
       }
       const parsed: unknown = await res.json().catch(() => undefined);
+      if (trip.confirmDelivery !== undefined && !trip.confirmDelivery(parsed)) {
+        // a 2xx whose body does not look like a real confirmation is a
+        // FAILED attempt: keep retrying rather than latching on a lie
+        return {
+          ok: false,
+          status: res.status,
+          detail: `HTTP ${res.status} but the body is not a valid delivery confirmation`,
+        };
+      }
       return { ok: true, status: res.status, body: parsed, detail: `HTTP ${res.status}` };
     } catch (err) {
       const detail = controller.signal.aborted

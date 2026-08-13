@@ -60,18 +60,25 @@ honeytoken does — the agent that blew its budget stops, the fleet keeps
 running, and restoring it is the owner's 2GO ceremony. `alert`-action
 rules only flag — they never block, whatever tripped them. The durable
 record of a tripped kill is the control plane's persisted scoped kill —
-delivered synchronously on the crossing refusal, to the one store the
+delivered synchronously on the crossing refusal, with the response
+validated (the agent echoed back, no degraded persistence, redirects
+refused) before the latch reads it as confirmed — to the one store the
 agent cannot reach (a gateway-side file would be the agent's own file
 under the stdio deployment's shared uid, so none is kept). Stated
-honestly: counters live in the gateway process and reset with it (one
-budget per gateway — two gateways under one agentId count separately);
-while the control plane is unreachable every call is already denied
-fail-closed, and a crash during exactly such an outage loses the
-undelivered kill and the counter history — never an executed overspend.
-On a `kill`-action rule an unreadable amount trips rather than passing
-unmetered, amounts count in integer atomic units (a rounding budget is
-no budget), and the latch releases only when the owner's 2GO restore is
-observed on `/status` — never by a restart.
+honestly: the counters themselves are gateway-process state (one budget
+per gateway — two gateways under one agentId count separately), and an
+agent that can kill the gateway process can reset them by crashing it
+before a threshold. Arming a `kill`-action budget therefore requires
+`OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK=1` — an explicit
+acknowledgment that either the deployment removes that capability (the
+restricted-runtime profile: no shell, no subagents) or accepts the
+bound; control-plane-side budgets are the tracked follow-up. Budgets
+meter ATTEMPTED dispatches; while the control plane is unreachable
+every call is already denied fail-closed. On a `kill`-action rule an
+unreadable amount trips rather than passing unmetered, amounts count in
+integer atomic units (a rounding budget is no budget), and the latch
+releases only when the owner's 2GO restore is observed on `/status` —
+never by a restart.
 
 ```jsonc
 // gateway config

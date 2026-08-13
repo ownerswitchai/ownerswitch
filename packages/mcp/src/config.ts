@@ -185,6 +185,33 @@ function parseLimitRule(v: unknown, path: string): LimitRule {
   };
 }
 
+/**
+ * KILL-action budgets are PROCESS-LOCAL state, and that is a real bound
+ * under the stdio deployment's shared uid: an agent with any way to kill
+ * the gateway process (a shell, a hostile upstream) can crash it BEFORE
+ * crossing a threshold and restart into fresh counters — no scoped kill
+ * ever fires. Sound deployments either remove that capability (the
+ * restricted-runtime profile: no shell, no subagents) or isolate the agent
+ * from the gateway's uid. Until budgets live in the control plane (the
+ * separate-uid authority; tracked follow-up), arming a kill-action budget
+ * requires acknowledging this bound EXPLICITLY — the same posture as the
+ * GitHub same-uid key risk flag. Alert-action rules need no flag.
+ */
+export function assertKillLimitRiskAccepted(
+  limits: readonly LimitRule[] | undefined,
+  env: Record<string, string | undefined>,
+): void {
+  if (limits === undefined || !limits.some((r) => r.action === "kill")) return;
+  if (env.OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK === "1") return;
+  fail(
+    "kill-action limit rules count in THIS process's memory: an agent that can kill the " +
+      "gateway process can reset its budgets by crashing it before a threshold. Deploy the " +
+      "restricted-runtime profile (or isolate the agent from this uid) and set " +
+      "OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK=1 to acknowledge; " +
+      "alert-action rules need no flag.",
+  );
+}
+
 function parseLimits(v: unknown, path: string): LimitRule[] {
   if (!Array.isArray(v)) return fail(`${path} must be an array of limit rules`);
   const rules = v.map((rule, i) => parseLimitRule(rule, `${path}[${i}]`));

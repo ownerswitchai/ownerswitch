@@ -2,7 +2,13 @@ import { chmodSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfigError, loadConfig, MAX_CONFIG_FILE_BYTES, readConfigFile } from "./config.js";
+import {
+  assertKillLimitRiskAccepted,
+  ConfigError,
+  loadConfig,
+  MAX_CONFIG_FILE_BYTES,
+  readConfigFile,
+} from "./config.js";
 
 const VALID = {
   controlPlaneUrl: "http://127.0.0.1:4600",
@@ -101,6 +107,21 @@ describe("loadConfig", () => {
     ).toThrowError(/regular expression/);
     // duplicate ids would make audit reasons ambiguous
     expect(() => load({ ...VALID, limits: [VALID_LIMIT, VALID_LIMIT] })).toThrowError(/duplicate/);
+  });
+
+  it("kill-action limits demand the explicit process-local-risk flag; alert-only needs none", () => {
+    const killRule = { id: "hard", tool: "*", metric: "calls", max: 5, action: "kill" } as const;
+    const alertRule = { id: "soft", tool: "*", metric: "calls", max: 5, action: "alert" } as const;
+    // an agent that can kill the gateway process can reset process-local
+    // budgets by crashing it pre-threshold — arming a kill budget without
+    // acknowledging that is a startup refusal, not a warning
+    expect(() => assertKillLimitRiskAccepted([killRule], {})).toThrowError(ConfigError);
+    expect(() => assertKillLimitRiskAccepted([killRule], {})).toThrowError(/PROCESS_LOCAL_BUDGET_RISK/);
+    expect(() =>
+      assertKillLimitRiskAccepted([killRule], { OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK: "1" }),
+    ).not.toThrow();
+    expect(() => assertKillLimitRiskAccepted([alertRule], {})).not.toThrow();
+    expect(() => assertKillLimitRiskAccepted(undefined, {})).not.toThrow();
   });
 
   it("rejects an agentId outside the shared contract — an unstoppable agent is a config error", () => {
