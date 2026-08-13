@@ -10,7 +10,8 @@
     "@ownerswitchai/shared": "workspace:*"
   },
   "devDependencies": {
-    "@ownerswitchai/control-plane": "workspace:*"
+    "@ownerswitchai/control-plane": "workspace:*",
+    "@ownerswitchai/escalation": "workspace:*"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

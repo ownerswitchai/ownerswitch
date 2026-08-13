@@ -30,6 +30,9 @@ importers:
       '@ownerswitchai/control-plane':
         specifier: workspace:*
         version: link:../../packages/control-plane
+      '@ownerswitchai/escalation':
+        specifier: workspace:*
+        version: link:../../packages/escalation
 
   packages/button:
     dependencies:

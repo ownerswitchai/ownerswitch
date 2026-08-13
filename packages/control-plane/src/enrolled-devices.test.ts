@@ -624,3 +624,84 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     expect(typeof packageApi.EnrolledDeviceFileStore).toBe("function");
   });
 });
+
+describe("revoke() — the durable severing of a dev_ identity", () => {
+  const SECRET = randomBytes(24).toString("base64url");
+
+  const enrolled = (path: string) => {
+    const registry = registryAt(path);
+    registry.initialize();
+    const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-r", SECRET));
+    const outcome = registry.commitEnrollment(
+      enrollmentSubmission(phone(), fixtureInvite(minted), SECRET),
+      OPTS(),
+    );
+    if (!outcome.ok) throw new Error(outcome.reason);
+    return { registry, deviceId: outcome.device.deviceId };
+  };
+
+  it("publishes the revocation FIRST, mutates memory after, survives a restart, and is idempotent", () => {
+    const path = join(freshDir(), "devices.json");
+    const { registry, deviceId } = enrolled(path);
+    expect(registry.standing(deviceId, 1)).toBe(true);
+
+    const result = registry.revoke(deviceId, 1_234);
+    expect(result).toEqual({ outcome: "revoked", generation: 2 });
+    // memory: revoked, generation bumped, standing dead at BOTH generations
+    expect(registry.get(deviceId)?.revokedAt).toBe(1_234);
+    expect(registry.standing(deviceId, 1)).toBe(false);
+    expect(registry.standing(deviceId, 2)).toBe(false);
+    expect(registry.activeDeviceCount).toBe(0);
+    // disk: a fresh instance over the same file loads the severed record
+    const reloaded = registryAt(path);
+    expect(reloaded.initialize().ok).toBe(true);
+    expect(reloaded.get(deviceId)?.revokedAt).toBe(1_234);
+    expect(reloaded.get(deviceId)?.generation).toBe(2);
+    // idempotent — and the file is untouched (no double bump)
+    expect(registry.revoke(deviceId, 9_999)).toEqual({ outcome: "already-revoked", generation: 2 });
+    expect(registry.get(deviceId)?.revokedAt).toBe(1_234);
+    // unknown ids are unknown, not silently "revoked"
+    expect(registry.revoke("dev_nope", 1)).toEqual({ outcome: "unknown" });
+  });
+
+  it("a publish that cannot PROVE durability quarantines the registry — and the intact file would resurrect the device, which is exactly why the caller must kill", () => {
+    const path = join(freshDir(), "devices.json");
+    const store = storeAt(path);
+    const registry = new EnrolledDeviceRegistry(store, {
+      deviceIdFactory: () => `dev_test_q_${(Math.random() * 1e9) | 0}`,
+    });
+    registry.initialize();
+    const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-q", SECRET));
+    const outcome = registry.commitEnrollment(
+      enrollmentSubmission(phone(), fixtureInvite(minted), SECRET),
+      OPTS(),
+    );
+    if (!outcome.ok) throw new Error(outcome.reason);
+    const deviceId = outcome.device.deviceId;
+
+    // the REAL failing branch: the directory entry cannot be fsynced, so the
+    // publish is visible but its durability is unproven (same injection as
+    // the admit-path quarantine test)
+    type FsyncPatch = { fsyncDir: () => boolean };
+    const realFsyncDir = (store as unknown as FsyncPatch).fsyncDir.bind(store);
+    (store as unknown as FsyncPatch).fsyncDir = () => false;
+    const failed = registry.revoke(deviceId, 5_678);
+    expect(failed.outcome).toBe("publish-failed");
+    if (failed.outcome === "publish-failed") expect(failed.detail).toMatch(/UNPROVEN/);
+    // the registry is QUARANTINED: no standing, no lookups, nothing resolves
+    expect(registry.usable).toBe(false);
+    expect(() => registry.get(deviceId)).toThrow(/not usable/);
+
+    // and the decisive fact the SERVER's kill answers: a restart over the
+    // file (whichever version a power cut left) can hold the device ACTIVE —
+    // in-process quarantine alone dies with the process
+    (store as unknown as FsyncPatch).fsyncDir = realFsyncDir;
+    const restarted = registryAt(path);
+    expect(restarted.initialize().ok).toBe(true);
+    const record = restarted.get(deviceId);
+    expect(record).not.toBeNull();
+    // the file may hold either publish; if it holds the OLD one, the device
+    // is alive again — the exact resurrection the durable kill exists for
+    if (record?.revokedAt === null) expect(restarted.standing(deviceId, 1)).toBe(true);
+  });
+});

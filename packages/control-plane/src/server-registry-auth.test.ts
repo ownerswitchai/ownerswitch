@@ -56,6 +56,7 @@ const enrollmentFor = (devicesFile: string) => ({
 const plane = (opts: {
   devicesFile?: string;
   ownerDeviceKeys?: Record<string, string>;
+  standingFile?: string;
 }): ControlPlane =>
   quiet(() =>
     createControlPlane({
@@ -64,6 +65,7 @@ const plane = (opts: {
       acceptSessionOnlyApprovalRisk: true,
       ...(opts.devicesFile !== undefined ? { enrollment: enrollmentFor(opts.devicesFile) } : {}),
       ...(opts.ownerDeviceKeys !== undefined ? { ownerDeviceKeys: opts.ownerDeviceKeys } : {}),
+      ...(opts.standingFile !== undefined ? { ownerDeviceStandingFile: opts.standingFile } : {}),
     }),
   );
 
@@ -250,5 +252,192 @@ describe("registry in the auth path — ceremony-enrolled devices carry producti
     armWindow(bare, "v-none");
     expect((await fetch(`${base2}/veto/v-none/detail`)).status).toBe(501);
     expect((await fetch(`${base2}/veto/v-none/seen`, { method: "POST", body: "{}" })).status).toBe(501);
+  });
+});
+
+describe("v28: dev_ revocation, alias supersession, standing export", () => {
+  it("REVOKE over HTTP: durable in the registry, exported to the standing file, immediate 401, idempotent, restart-proof", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    const cp = plane({ devicesFile, standingFile });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    armWindow(cp, "v-rv");
+    expect((await signedFetch(base, p.cheapLane, deviceId, "GET", "/veto/v-rv/detail", "")).status).toBe(200);
+
+    // enrollment already EXPORTED the device into the standing file (v2, spki)
+    const afterEnroll = JSON.parse(readFileSync(standingFile, "utf8")) as {
+      version: number;
+      devices: Record<string, { generation: number; revokedAt: number | null; spki?: string }>;
+    };
+    expect(afterEnroll.version).toBe(2);
+    expect(afterEnroll.devices[deviceId].revokedAt).toBeNull();
+    expect(afterEnroll.devices[deviceId].spki).toBe(cp.enrolledDevices?.get(deviceId)?.cheapLaneKeySpki);
+
+    // the revoke (loopback caller — severing must never fail on auth config)
+    const revoke = await fetch(`${base}/devices/${deviceId}/revoke`, { method: "POST" });
+    expect(revoke.status).toBe(200);
+    expect((await revoke.json()) as object).toMatchObject({
+      revoked: true,
+      deviceId,
+      generation: 2,
+      durable: true,
+    });
+    // immediate: the same key + id authenticate NOTHING in this process
+    expect((await signedFetch(base, p.cheapLane, deviceId, "GET", "/veto/v-rv/detail", "")).status).toBe(401);
+    // exported: the escalation reader's view flips at its very next load
+    const afterRevoke = JSON.parse(readFileSync(standingFile, "utf8")) as typeof afterEnroll;
+    expect(afterRevoke.devices[deviceId].revokedAt).not.toBeNull();
+    expect(afterRevoke.devices[deviceId].generation).toBe(2);
+    // idempotent
+    const again = await fetch(`${base}/devices/${deviceId}/revoke`, { method: "POST" });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { alreadyRevoked?: boolean }).alreadyRevoked).toBe(true);
+    // restart-proof: a fresh control plane over the same files still refuses
+    const restarted = plane({ devicesFile, standingFile });
+    const base2 = await start(restarted);
+    armWindow(restarted, "v-rv2");
+    expect(
+      (await signedFetch(base2, p.cheapLane, deviceId, "GET", "/veto/v-rv2/detail", "")).status,
+    ).toBe(401);
+  });
+
+  it("a revocation the registry cannot publish durably answers 503 and engages a DURABLE KILL", async () => {
+    const cp = plane({ devicesFile: join(freshDir(), "devices.json") });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    armWindow(cp, "v-kill");
+
+    // The registry's own publish-failed branch is proven with a REAL fsync
+    // failure in enrolled-devices.test.ts ("quarantines the registry — and
+    // the intact file would resurrect the device"). Here the SERVER's
+    // documented reaction to that outcome is under test, injected at the
+    // registry's public revoke() boundary.
+    const registry = cp.enrolledDevices;
+    if (registry === undefined) throw new Error("registry missing");
+    const realRevoke = registry.revoke.bind(registry);
+    registry.revoke = () => ({ outcome: "publish-failed", detail: "injected: dir entry not durable" });
+    const res = await fetch(`${base}/devices/${deviceId}/revoke`, { method: "POST" });
+    registry.revoke = realRevoke;
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { killed: boolean; quarantined: boolean; error: string };
+    expect(body.killed).toBe(true);
+    expect(body.quarantined).toBe(true);
+    expect(body.error).toMatch(/restart boots killed/);
+    // the kill is REAL and names the sequence
+    expect(cp.killSwitch.killed).toBe(true);
+    expect(cp.killSwitch.lastKill?.reason).toMatch(/registry publish FAILED while revoking/);
+    // and while killed, the permissive lane is closed: the detail mints no
+    // delivery and the ack path accepts no evidence
+    const detail = await signedFetch(base, p.cheapLane, deviceId, "GET", "/veto/v-kill/detail", "");
+    expect(detail.status).toBe(200);
+    expect(((await detail.json()) as { deliveryId: string | null }).deliveryId).toBeNull();
+    const seen = await signedFetch(base, p.cheapLane, deviceId, "POST", "/veto/v-kill/seen", "{}");
+    expect(seen.status).toBe(503);
+  });
+
+  it("ALIAS SUPERSESSION, live: enrolling the static device's own key revokes the static name in the same breath", async () => {
+    const dir = freshDir();
+    const p = phone();
+    const staticSpki = (p.cheapLane.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+    const standingFile = join(dir, "standing.json");
+    const cp = plane({
+      devicesFile: join(dir, "devices.json"),
+      standingFile,
+      ownerDeviceKeys: { "owner-phone": staticSpki },
+    });
+    const base = await start(cp);
+    armWindow(cp, "v-al");
+    // before the enrollment, the static name works
+    expect((await signedFetch(base, p.cheapLane, "owner-phone", "GET", "/veto/v-al/detail", "")).status).toBe(200);
+
+    const deviceId = await enrollPhone(cp, base, p);
+    // after: ONE key, ONE identity — the registry name answers, the static is dead
+    expect((await signedFetch(base, p.cheapLane, deviceId, "GET", "/veto/v-al/detail", "")).status).toBe(200);
+    expect((await signedFetch(base, p.cheapLane, "owner-phone", "GET", "/veto/v-al/detail", "")).status).toBe(401);
+    // and the severing is DURABLE in the shared standing file
+    const standing = JSON.parse(readFileSync(standingFile, "utf8")) as {
+      devices: Record<string, { revokedAt: number | null; spki?: string }>;
+    };
+    expect(standing.devices["owner-phone"].revokedAt).not.toBeNull();
+    expect(standing.devices[deviceId].revokedAt).toBeNull();
+    // revoking the dev_ name later does NOT resurrect the static one
+    await fetch(`${base}/devices/${deviceId}/revoke`, { method: "POST" });
+    expect((await signedFetch(base, p.cheapLane, "owner-phone", "GET", "/veto/v-al/detail", "")).status).toBe(401);
+    expect((await signedFetch(base, p.cheapLane, deviceId, "GET", "/veto/v-al/detail", "")).status).toBe(401);
+  });
+
+  it("ALIAS at BOOT: a restart that re-provisions the enrolled key under a static name refuses the static name", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    const p = phone();
+    // enroll on a registry-only plane
+    const first = plane({ devicesFile, standingFile });
+    const base1 = await start(first);
+    const deviceId = await enrollPhone(first, base1, p);
+    // "operator re-adds the key to the keys file", then restarts
+    const staticSpki = (p.cheapLane.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+    const restarted = plane({
+      devicesFile,
+      standingFile,
+      ownerDeviceKeys: { "owner-phone": staticSpki },
+    });
+    const base2 = await start(restarted);
+    armWindow(restarted, "v-boot");
+    expect(
+      (await signedFetch(base2, p.cheapLane, "owner-phone", "GET", "/veto/v-boot/detail", "")).status,
+    ).toBe(401);
+    expect(
+      (await signedFetch(base2, p.cheapLane, deviceId, "GET", "/veto/v-boot/detail", "")).status,
+    ).toBe(200);
+  });
+
+  it("the dev_ namespace is refused in ownerDeviceKeys — the two id spaces cannot collide", () => {
+    const p = phone();
+    const spki = (p.cheapLane.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+    expect(() =>
+      quiet(() =>
+        createControlPlane({
+          dev: true,
+          killStateFile: null,
+          acceptSessionOnlyApprovalRisk: true,
+          ownerDeviceKeys: { dev_squatter: spki },
+        }),
+      ),
+    ).toThrow(/reserved for/);
+  });
+
+  it("DENY-ONLY: a registry device vetoes with one signature, and can never approve with it", async () => {
+    const cp = plane({ devicesFile: join(freshDir(), "devices.json") });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    const window = armWindow(cp, "v-deny");
+
+    // the one verb a device credential carries here: veto
+    const approve = await signedFetch(
+      base,
+      p.cheapLane,
+      deviceId,
+      "POST",
+      "/veto/v-deny",
+      JSON.stringify({ decision: "approve" }),
+    );
+    expect(approve.status).toBe(403);
+    expect(window.state).not.toBe("vetoed");
+    const veto = await signedFetch(base, p.cheapLane, deviceId, "POST", "/veto/v-deny", "{}");
+    expect(veto.status).toBe(200);
+    expect(window.state).toBe("vetoed");
+    expect(window.vetoedBy).toBe(`owner-device:${deviceId}`);
   });
 });

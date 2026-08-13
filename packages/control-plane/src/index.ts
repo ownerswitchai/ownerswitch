@@ -95,6 +95,7 @@ export type {
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,
+  OwnerDeviceLookup,
   OwnerDeviceVerifyOptions,
 } from "./owner-device.js";
 export { loadOwnerDeviceKeysFile } from "./owner-device-file.js";

@@ -47,10 +47,23 @@ export interface DeviceStanding {
   generation: number;
   /** ms since epoch, or null while the device is in good standing */
   revokedAt: number | null;
+  /**
+   * For CEREMONY-ENROLLED (dev_*) devices only: the cheap-lane public key,
+   * canonical base64url SPKI DER, exported here by the control plane from
+   * its enrolled-device registry. This is how the DISTINCT-UID escalation
+   * reader authenticates dev_* signatures without ever touching the
+   * control-plane-private registry file: the standing file it already
+   * trusts (same boundary walk, same 0600/0640 rule) carries the PUBLIC
+   * key alongside the standing. Operator-keys-file devices never carry
+   * one — their keys stay in the keys file both services load. Version-2
+   * entries only; a version-1 file predates the field.
+   */
+  spki?: string;
 }
 
 export interface PersistedDeviceStanding {
-  version: 1;
+  /** 1: standing only (legacy). 2: enrolled entries may carry `spki`. */
+  version: 1 | 2;
   devices: Record<string, DeviceStanding>;
 }
 
@@ -75,19 +88,36 @@ function asPersistedDeviceStanding(value: unknown): PersistedDeviceStanding | nu
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const { version, devices, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length > 0) return null;
-  if (version !== 1) return null;
+  if (version !== 1 && version !== 2) return null;
   if (typeof devices !== "object" || devices === null || Array.isArray(devices)) return null;
-  const out: Record<string, DeviceStanding> = {};
+  // null-prototype table + forbidden ids: with v2 carrying key material, a
+  // hostile "__proto__" device id must neither vanish into the prototype nor
+  // answer inherited lookups (same rule as the enrolled-device registry)
+  const out: Record<string, DeviceStanding> = Object.create(null) as Record<string, DeviceStanding>;
   for (const [deviceId, standing] of Object.entries(devices)) {
     if (deviceId === "" || deviceId.includes(":")) return null;
+    if (deviceId === "__proto__" || deviceId === "constructor" || deviceId === "prototype") return null;
     if (typeof standing !== "object" || standing === null || Array.isArray(standing)) return null;
-    const { generation, revokedAt, ...standingRest } = standing as Record<string, unknown>;
+    const { generation, revokedAt, spki, ...standingRest } = standing as Record<string, unknown>;
     if (Object.keys(standingRest).length > 0) return null;
     if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1) return null;
     if (revokedAt !== null && (typeof revokedAt !== "number" || !Number.isFinite(revokedAt))) return null;
-    out[deviceId] = { generation, revokedAt: revokedAt as number | null };
+    if (spki !== undefined) {
+      // spki is a version-2 field: a v1 file carrying one was not written by
+      // us. The value here is only checked for SHAPE (non-empty canonical
+      // base64url charset) — the reader's strict SPKI parser
+      // (enrolledOwnerDeviceFromSpki) is the real gate before any key is
+      // trusted, exactly as with the operator keys file.
+      if (version !== 2) return null;
+      if (typeof spki !== "string" || spki === "" || !/^[A-Za-z0-9_-]+$/.test(spki)) return null;
+    }
+    out[deviceId] = {
+      generation,
+      revokedAt: revokedAt as number | null,
+      ...(spki !== undefined ? { spki: spki as string } : {}),
+    };
   }
-  return { version: 1, devices: out };
+  return { version: version as 1 | 2, devices: out };
 }
 
 export interface TrustedStandingPathOptions {
