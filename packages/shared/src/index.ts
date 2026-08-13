@@ -89,3 +89,5 @@ export {
 export type { OwnerDeviceSigFields } from "./owner-device-sig.js";
 export { ENROLL_POP_LABEL, ownerEnrollPopPreimage } from "./enroll-pop.js";
 export type { EnrollPopFields } from "./enroll-pop.js";
+export { enrollmentInviteFromWire } from "./enrollment-invite.js";
+export type { EnrollmentInviteContract, EnrollmentInviteWire } from "./enrollment-invite.js";

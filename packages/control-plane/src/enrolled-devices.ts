@@ -110,7 +110,7 @@ export interface PersistedEnrolledDevice {
 }
 
 export interface PersistedEnrolledDevices {
-  version: 1;
+  version: 2;
   /**
    * The bootstrap generation — bumped in the SAME atomic publish as a
    * successful bootstrap enrolment, so the bootstrap lane self-closes
@@ -119,17 +119,38 @@ export interface PersistedEnrolledDevices {
    */
   bootstrapGeneration: number;
   devices: Record<string, PersistedEnrolledDevice>;
+  /**
+   * Per-owner WebAuthn user handles: `userId` is an OPAQUE CSPRNG value
+   * (never the ownerId re-encoded, never PII — the pinned EnrollmentInvite
+   * user entity), STABLE per owner because it is minted once, durably,
+   * with the owner's first invite. 16–64 decoded bytes, canonical
+   * base64url, unique across owners.
+   */
+  owners: Record<string, { userId: string }>;
 }
 
 export type EnrolledDevicesLoad =
   | { outcome: "absent" }
   | { outcome: "loaded"; state: PersistedEnrolledDevices }
+  | {
+      /**
+       * A well-formed PRE-OWNERS registry (schema v1, written by the
+       * unreleased v18–v21 line): everything except the per-owner user
+       * handles. Served to NOBODY — initialize() migrates it to v2 (one
+       * durable publish, same durability rules as every other write) and
+       * only the migrated state is ever used.
+       */
+      outcome: "legacy-v1";
+      state: { bootstrapGeneration: number; devices: Record<string, PersistedEnrolledDevice> };
+    }
   | { outcome: "corrupt"; detail: string };
 
 /** Generous ceiling for a household-scale device registry; bounds a hostile file. */
 export const MAX_ENROLLED_DEVICES_FILE_BYTES = 512 * 1024;
 /** Active-device ceiling (flood backstop) — households, not fleets. */
 export const MAX_ACTIVE_DEVICES = 64;
+/** Owner-handle ceiling — the same order of magnitude, same reasoning. */
+export const MAX_OWNERS = 128;
 /** The marker is a short fixed note; anything bigger was not written by us. */
 const MAX_MARKER_BYTES = 4096;
 /** the EXACT marker body this store writes — anything else is not our marker */
@@ -176,11 +197,15 @@ function cloneDevice(device: PersistedEnrolledDevice): PersistedEnrolledDevice {
 }
 
 /** Strict shape check — anything we would not have written reads as corrupt. */
-function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | null {
+function asPersistedEnrolledDevices(
+  value: unknown,
+  opts: { maxOwners?: number } = {},
+): PersistedEnrolledDevices | null {
+  const maxOwners = opts.maxOwners ?? MAX_OWNERS;
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const { version, bootstrapGeneration, devices, ...rest } = value as Record<string, unknown>;
+  const { version, bootstrapGeneration, devices, owners, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length > 0) return null;
-  if (version !== 1) return null;
+  if (version !== 2) return null;
   if (
     typeof bootstrapGeneration !== "number" ||
     !Number.isSafeInteger(bootstrapGeneration) ||
@@ -271,7 +296,81 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     if (device.revokedAt === null) active += 1;
   }
   if (active > MAX_ACTIVE_DEVICES) return null;
-  return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries) };
+  // per-owner user handles: same prototype-safety and canonicality rules as
+  // the device table, plus cross-owner uniqueness — a handle is an identity
+  if (typeof owners !== "object" || owners === null || Array.isArray(owners)) return null;
+  const ownerEntries: Array<readonly [string, { userId: string }]> = [];
+  const seenUserIds = new Set<string>();
+  for (const [ownerId, handle] of Object.entries(owners)) {
+    if (ownerId === "" || ownerId.length > 256) return null;
+    if (FORBIDDEN_DEVICE_IDS.has(ownerId)) return null;
+    if (typeof handle !== "object" || handle === null || Array.isArray(handle)) return null;
+    const { userId, ...handleRest } = handle as Record<string, unknown>;
+    if (Object.keys(handleRest).length > 0) return null;
+    if (typeof userId !== "string" || !isCanonicalB64url(userId, 16, 64)) return null;
+    if (seenUserIds.has(userId)) return null;
+    seenUserIds.add(userId);
+    ownerEntries.push([ownerId, { userId }] as const);
+  }
+  if (ownerEntries.length > maxOwners) return null;
+  const ownersOut: Record<string, { userId: string }> = Object.create(null);
+  for (const [ownerId, handle] of ownerEntries) ownersOut[ownerId] = handle;
+  // REFERENTIAL integrity: every device's owner must hold a handle — a v2
+  // state that names an owner without one was not written by this code, and
+  // accepting it would let a later mint generate a SECOND user identity for
+  // the same owner (breaking the stable-WebAuthn-user-handle invariant)
+  for (const [, device] of entries) {
+    if (!Object.hasOwn(ownersOut, device.ownerId)) return null;
+  }
+  return { version: 2, bootstrapGeneration, devices: nullProtoDevices(entries), owners: ownersOut };
+}
+
+/**
+ * The UNRELEASED v1 shape (v18–v21): exactly the v2 shape minus `owners`.
+ * Parsed by wrapping the same strict validator — the device table gets the
+ * identical field-by-field treatment, and only a file that would have
+ * validated under the old code reads as legacy.
+ */
+function asLegacyV1(value: unknown): { bootstrapGeneration: number; devices: Record<string, PersistedEnrolledDevice> } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 3 || keys[0] !== "bootstrapGeneration" || keys[1] !== "devices" || keys[2] !== "version") {
+    return null;
+  }
+  if (record.version !== 1) return null;
+  // synthesize a PLACEHOLDER handle per named owner, purely so the shared
+  // strict validator can check everything else (its referential-integrity
+  // rule demands owner coverage); the placeholders are discarded — the
+  // MIGRATION mints the real handles, and its own explicit ceiling check
+  // refuses an over-limit owner population with a named reason, which is
+  // why the ceiling is not enforced here (maxOwners: unbounded).
+  const syntheticOwners: Record<string, { userId: string }> = {};
+  const taken = new Set<string>();
+  if (typeof record.devices === "object" && record.devices !== null && !Array.isArray(record.devices)) {
+    for (const device of Object.values(record.devices as Record<string, unknown>)) {
+      if (typeof device !== "object" || device === null) continue;
+      const ownerId = (device as Record<string, unknown>).ownerId;
+      if (typeof ownerId !== "string" || ownerId === "") continue;
+      if (Object.prototype.hasOwnProperty.call(syntheticOwners, ownerId)) continue;
+      if (FORBIDDEN_DEVICE_IDS.has(ownerId)) continue; // the validator will refuse the device itself
+      let userId = randomBytes(24).toString("base64url");
+      while (taken.has(userId)) userId = randomBytes(24).toString("base64url");
+      taken.add(userId);
+      syntheticOwners[ownerId] = { userId };
+    }
+  }
+  const upgraded = asPersistedEnrolledDevices(
+    {
+      version: 2,
+      bootstrapGeneration: record.bootstrapGeneration,
+      devices: record.devices,
+      owners: syntheticOwners,
+    },
+    { maxOwners: Number.MAX_SAFE_INTEGER },
+  );
+  if (upgraded === null) return null;
+  return { bootstrapGeneration: upgraded.bootstrapGeneration, devices: upgraded.devices };
 }
 
 export interface EnrolledDeviceStoreOptions {
@@ -470,8 +569,12 @@ export class EnrolledDeviceFileStore {
       return { outcome: "corrupt", detail: `cannot parse ${this.filePath}: ${message(err)}` };
     }
     const state = asPersistedEnrolledDevices(parsed);
+    let legacy: ReturnType<typeof asLegacyV1> = null;
     if (state === null) {
-      return { outcome: "corrupt", detail: `unexpected shape in ${this.filePath}` };
+      legacy = asLegacyV1(parsed);
+      if (legacy === null) {
+        return { outcome: "corrupt", detail: `unexpected shape in ${this.filePath}` };
+      }
     }
     if (marker === "absent") {
       // a registry with state but no marker: the marker must be
@@ -506,7 +609,8 @@ export class EnrolledDeviceFileStore {
           "UNPROVEN and will not be served (a power cut could resurface older state)",
       };
     }
-    return { outcome: "loaded", state };
+    if (legacy !== null) return { outcome: "legacy-v1", state: legacy };
+    return { outcome: "loaded", state: state as PersistedEnrolledDevices };
   }
 
   save(state: PersistedEnrolledDevices): SaveResult {
@@ -520,6 +624,17 @@ export class EnrolledDeviceFileStore {
     if (data.length > MAX_ENROLLED_DEVICES_FILE_BYTES) {
       throw new Error(
         `refusing to publish: serialized registry is ${data.length} bytes, over the ${MAX_ENROLLED_DEVICES_FILE_BYTES}-byte load limit`,
+      );
+    }
+    // ...and the EXACT bytes must pass the loader's own strict validator —
+    // save() can never publish a state its own load() would call corrupt
+    // (the review's scenario: a migration minting more owner handles than
+    // MAX_OWNERS would otherwise "succeed" durably into a self-inflicted
+    // quarantine on the next restart)
+    if (asPersistedEnrolledDevices(JSON.parse(data.toString("utf8"))) === null) {
+      throw new Error(
+        "refusing to publish: the serialized registry does not satisfy the loader's schema — a publish " +
+          "the next restart would refuse is not a publish",
       );
     }
     // Marker before state: a save that dies half-way errs toward
@@ -729,12 +844,64 @@ export class EnrolledDeviceRegistry {
       this.#corruptDetail = null;
       return { ok: true };
     }
+    if (loaded.outcome === "legacy-v1") {
+      // V1 -> V2 MIGRATION, before anything is served: mint a durable opaque
+      // user handle for every owner the device table names, publish the
+      // migrated registry with the same durable-or-refuse / quarantine-on-
+      // unproven rules as every other write, and only then serve. Handles
+      // minted here are the ones every later mint and restart will see.
+      const distinctOwners = new Set(
+        Object.values(loaded.state.devices).map((device) => device.ownerId),
+      );
+      if (distinctOwners.size > MAX_OWNERS) {
+        const detail =
+          `v1 -> v2 registry migration refused: ${distinctOwners.size} distinct owners exceed the ` +
+          `${MAX_OWNERS} owner-handle ceiling — nothing was published (fail closed)`;
+        this.#quarantine(detail);
+        return { ok: false, detail };
+      }
+      const owners: Record<string, { userId: string }> = Object.create(null);
+      const taken = new Set<string>();
+      for (const device of Object.values(loaded.state.devices)) {
+        if (Object.hasOwn(owners, device.ownerId)) continue;
+        let userId = randomBytes(32).toString("base64url");
+        while (taken.has(userId)) userId = randomBytes(32).toString("base64url");
+        taken.add(userId);
+        owners[device.ownerId] = { userId };
+      }
+      const migrated: PersistedEnrolledDevices = {
+        version: 2,
+        bootstrapGeneration: loaded.state.bootstrapGeneration,
+        devices: loaded.state.devices,
+        owners,
+      };
+      let saved: SaveResult;
+      try {
+        saved = this.#store.save(migrated);
+      } catch (err) {
+        const detail = `v1 -> v2 registry migration persist failed: ${message(err)}`;
+        this.#quarantine(detail);
+        return { ok: false, detail };
+      }
+      if (!saved.durable) {
+        const detail = `v1 -> v2 registry migration not durable: ${saved.detail}`;
+        this.#quarantine(detail);
+        return { ok: false, detail };
+      }
+      console.error(
+        `[ownerswitch] enrolled-device registry migrated v1 -> v2 (${Object.keys(owners).length} owner handle(s) minted durably)`,
+      );
+      this.#state = migrated;
+      this.#corruptDetail = null;
+      return { ok: true };
+    }
     // genuine first boot: bootstrap generation starts at 1, persisted NOW —
     // from here on a missing file is corruption, not a fresh start
     const initial: PersistedEnrolledDevices = {
-      version: 1,
+      version: 2,
       bootstrapGeneration: 1,
       devices: nullProtoDevices([]),
+      owners: Object.create(null) as Record<string, { userId: string }>,
     };
     let saved: SaveResult;
     try {
@@ -833,11 +1000,57 @@ export class EnrolledDeviceRegistry {
     };
   }
 
+  /** The owner's stable opaque WebAuthn user handle, or null before their first mint. */
+  ownerUserId(ownerId: string): string | null {
+    const owners = this.#usableState().owners;
+    return Object.hasOwn(owners, ownerId) ? owners[ownerId].userId : null;
+  }
+
+  /**
+   * Ensure the owner has a DURABLE opaque user handle before an invite for
+   * them exists: generated from the CSPRNG (never derived from the
+   * ownerId), published atomically with the same durable-or-refuse /
+   * quarantine-on-unproven rules as the admit path, and only then adopted
+   * in memory. Idempotent for owners that already have one.
+   */
+  #ensureOwnerUserId(ownerId: string): string {
+    const state = this.#usableState();
+    if (Object.hasOwn(state.owners, ownerId)) return state.owners[ownerId].userId;
+    if (Object.keys(state.owners).length >= MAX_OWNERS) {
+      throw new Error(`owner-handle ceiling reached (${MAX_OWNERS}) — nothing mints for new owners`);
+    }
+    let userId = randomBytes(32).toString("base64url");
+    const taken = new Set(Object.values(state.owners).map((handle) => handle.userId));
+    while (taken.has(userId)) userId = randomBytes(32).toString("base64url");
+    const ownersOut: Record<string, { userId: string }> = Object.create(null);
+    for (const [id, handle] of Object.entries(state.owners)) ownersOut[id] = handle;
+    ownersOut[ownerId] = { userId };
+    const next: PersistedEnrolledDevices = { ...state, owners: ownersOut };
+    let saved: SaveResult;
+    try {
+      saved = this.#store.save(next);
+    } catch (err) {
+      throw new Error(`owner user-handle persist FAILED (${message(err)}) — nothing mints`);
+    }
+    if (!saved.durable) {
+      this.#quarantine(`owner user-handle publish durability UNPROVEN: ${saved.detail}`);
+      throw new Error(
+        `owner user-handle publish durability UNPROVEN (${saved.detail}) — registry quarantined until recovery`,
+      );
+    }
+    this.#state = next;
+    return userId;
+  }
+
   /**
    * Mint an invite with the authority fields AND the owner filled from
    * LIVE state (see MintInviteRequest). register()'s own live-witness
    * gate then re-checks everything it is handed — a killed system, a
    * stale fact, or an out-of-standing issuer throws, and nothing minted.
+   * The owner's durable user handle is established here too, BEFORE the
+   * invite exists — the mint response must carry the complete WebAuthn
+   * creation contract, and the handle in it must be the one every later
+   * ceremony for this owner will see.
    */
   mintInvite(kill: LiveKillState, request: MintInviteRequest): InviteRecord {
     const state = this.#usableState();
@@ -863,6 +1076,7 @@ export class EnrolledDeviceRegistry {
       // to claim otherwise; this line is where the fact comes from)
       ownerId = issuer.ownerId;
     }
+    this.#ensureOwnerUserId(ownerId);
     return this.#invites.register(
       {
         inviteId: request.inviteId,
@@ -972,12 +1186,13 @@ export class EnrolledDeviceRegistry {
     // the next durable state: the device, and — bootstrap — the generation
     // bump, in the SAME publish: the lane closes durably with the admit
     const next: PersistedEnrolledDevices = {
-      version: 1,
+      version: 2,
       bootstrapGeneration:
         outcome.invite.origin.kind === "bootstrap"
           ? state.bootstrapGeneration + 1
           : state.bootstrapGeneration,
       devices: nullProtoDevices([...Object.entries(state.devices), [deviceId, device] as const]),
+      owners: state.owners,
     };
     let saved: SaveResult;
     try {

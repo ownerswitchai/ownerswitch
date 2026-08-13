@@ -178,6 +178,13 @@ export interface EnrollmentInvite {
    * invite, single-use with it.
    */
   assertionChallenge: Base64Url;
+  /**
+   * The mint-committed display label, carried IN the payload because the
+   * enrolment request must repeat it EXACTLY (EnrollmentRequest.deviceName
+   * — the echo rule, DESIGN.md §2 step 5): the phone confirms it is
+   * redeeming the invite it was actually shown.
+   */
+  deviceName: string;
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   type RenderableAlertV1,
   type SignedMergeGrant,
   type ToolCall,
+  type EnrollmentInviteContract,
 } from "@ownerswitchai/shared";
 import {
   createOwnerSession,
@@ -28,6 +29,7 @@ import {
   type OwnerSession,
 } from "./auth.js";
 import { canonicalTrustedStandingPath, DeviceStandingFileStore } from "./device-standing.js";
+import { EnrolledDeviceFileStore, EnrolledDeviceRegistry } from "./enrolled-devices.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { isValidAgentId, KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
@@ -245,6 +247,27 @@ export interface ControlPlaneOptions {
    * fall back to session-only ONLY in dev mode; a non-dev control plane
    * with a grant key but no passkey refuses approvals outright.
    */
+  /**
+   * Device-enrollment ceremony wiring (apps/owner/DESIGN.md §2). Absent —
+   * the launch-posture default — the enrollment lane DOES NOT EXIST:
+   * POST /devices/enroll and GET /devices answer 501 and no registry file
+   * is touched. When present, all three fields are required together: the
+   * durable enrolled-device registry path (guarded like every protected
+   * state file; the store additionally canonicalises it and walks the
+   * trusted ancestry), and the exact WebAuthn rpId + origin the ceremony
+   * verifies under — https:// outside dev, because WebAuthn's phishing
+   * resistance IS the origin binding. The registry's mint/spend witnesses
+   * are assembled INSIDE the registry from its durable state plus a kill
+   * snapshot read off the REAL KillSwitch in the handler at call time —
+   * nothing in any request body ever becomes part of a witness.
+   */
+  enrollment?: {
+    devicesFile: string;
+    rpId: string;
+    /** human-readable RP name for the platform's create() UI (EnrollmentInvite.rpName) */
+    rpName: string;
+    origin: string;
+  };
   ownerPasskey?: {
     credentialId: string;
     publicKeyPem: string;
@@ -396,7 +419,40 @@ export interface ControlPlane {
    * what the release-time CAS tests simulate).
    */
   ownerDevices: Map<string, EnrolledOwnerDevice>;
+  /**
+   * HOST-LOCAL bootstrap invite mint — a FUNCTION, never an HTTP route: the
+   * transport is the permission-protected Unix socket (bootstrap-socket.ts)
+   * or the operator's own process, and an HTTP loopback bypass deliberately
+   * does not exist (DESIGN.md §2). The caller submits ONLY the hash
+   * commitment and labels; the server mints the ceremony contract and never
+   * sees or returns a secret.
+   */
+  bootstrapMintInvite: (request: BootstrapMintRequest) => BootstrapMintResult;
+  /** the enrolled-device registry, when enrollment is configured (observability/tests) */
+  enrolledDevices?: EnrolledDeviceRegistry;
 }
+
+/** What the host CLI submits to mint a bootstrap invite — commitment + labels, no secret. */
+export interface BootstrapMintRequest {
+  /** SHA-256 of the LOCALLY generated invite secret, canonical base64url */
+  tokenHash: string;
+  ownerId: string;
+  deviceName: string;
+}
+
+export type BootstrapMintResult =
+  | {
+      ok: true;
+      /**
+       * The COMPLETE, runnable WebAuthn creation contract — the shared
+       * secret-free type (EnrollmentInviteContract = the pinned
+       * EnrollmentInvite minus its token): the CLI appends the locally
+       * generated token and validates the result with the same runtime
+       * validator the phone app uses before it prints anything.
+       */
+      invite: EnrollmentInviteContract;
+    }
+  | { ok: false; error: string };
 
 /**
  * Hard ceiling on ceremony RECORDS held in memory — a memory backstop, not a
@@ -663,6 +719,50 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         ...(opts.ownerDeviceStandingGid !== undefined ? { group: opts.ownerDeviceStandingGid } : {}),
       })
     : null;
+
+  // ---- device-enrollment ceremony wiring (DESIGN.md §2) -------------------
+  // The registry OWNS the whole mint/spend path (enrolled-devices.ts): the
+  // handlers below hand it raw submissions and a kill snapshot read off the
+  // REAL KillSwitch at call time, and nothing else — no witness, no owner,
+  // no authority field ever crosses from a request body into a spend.
+  let enrolledDevices: EnrolledDeviceRegistry | undefined;
+  let enrollmentRp: { rpId: string; rpName: string; origin: string } | undefined;
+  if (opts.enrollment !== undefined) {
+    const { devicesFile, rpId, rpName, origin } = opts.enrollment;
+    if (rpId === "" || rpName === "" || origin === "") {
+      throw new Error(
+        "enrollment.rpId, enrollment.rpName and enrollment.origin are required together with devicesFile",
+      );
+    }
+    if (opts.dev !== true && !origin.startsWith("https://")) {
+      throw new Error(
+        `enrollment.origin must be https:// in production, got "${origin}" — WebAuthn's phishing ` +
+          "resistance is the origin binding",
+      );
+    }
+    const guardedDevicesFile =
+      opts.dev === true ? devicesFile : guardProtectedStatePath("enrolled-devices", devicesFile);
+    // the store canonicalises the path and walks the trusted ancestry itself
+    // (enrolled-devices.ts); dev trusts the caller's temp locations
+    const devicesStore = new EnrolledDeviceFileStore(guardedDevicesFile, {
+      ...(opts.dev === true ? { unsafeAllowUntrustedAncestryForTests: true } : {}),
+    });
+    enrolledDevices = new EnrolledDeviceRegistry(devicesStore, { now });
+    const initialized = enrolledDevices.initialize();
+    if (!initialized.ok) {
+      // fail-closed lane, loudly: the process serves every STOP path as
+      // normal, but nothing enrolls until the registry recovers
+      console.error(
+        `[ownerswitch] enrolled-device registry UNUSABLE — enrollment refuses until recovery: ${initialized.detail}`,
+      );
+    }
+    enrollmentRp = { rpId, rpName, origin };
+  }
+  // The pinned witness rule, restated where it executes: this snapshot is
+  // the ONLY kill fact the registry ever receives, and it is read from the
+  // live KillSwitch inside the handler that uses it — never from a request.
+  const liveKillSnapshot = () => ({ killed: killSwitch.killed, epoch: killSwitch.epoch });
+
   // QUARANTINE: set whenever the registry on disk may disagree with memory in
   // the PERMISSIVE direction (a revocation that could not be durably
   // persisted). While set, no owner-device evidence is accepted and no
@@ -2748,6 +2848,147 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     );
   }
 
+  /** the one UNAUTHENTICATED POST body (the invite secret inside IS the credential) — bounded */
+  const MAX_ENROLL_BODY_BYTES = 256 * 1024;
+
+  async function postDeviceEnroll(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (enrolledDevices === undefined || enrollmentRp === undefined) {
+      return sendJson(res, 501, { error: "device enrollment is not configured" });
+    }
+    if (!enrolledDevices.usable) {
+      return sendJson(res, 503, {
+        error: "enrolled-device registry is not usable — enrollment refuses until recovery",
+      });
+    }
+    // BYTE-accurate cap: chunks are counted as wire bytes BEFORE decoding,
+    // so multibyte UTF-8 cannot slip past a character-counted limit
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
+    for await (const chunk of req) {
+      receivedBytes += (chunk as Buffer).length;
+      if (receivedBytes > MAX_ENROLL_BODY_BYTES) {
+        return sendJson(res, 413, { error: "enrollment request too large" });
+      }
+      chunks.push(chunk as Buffer);
+    }
+    const body = parseJsonBody(Buffer.concat(chunks).toString("utf8"));
+    const outcome = enrolledDevices.commitEnrollment(body, {
+      kill: liveKillSnapshot(),
+      rpId: enrollmentRp.rpId,
+      expectedOrigin: enrollmentRp.origin,
+    });
+    if (!outcome.ok) {
+      // an unproven publish quarantines the registry inside commitEnrollment
+      // — that refusal is a 503 (service state), not the caller's fault; the
+      // rest split on whether the capability survives (retry the proofs) or
+      // is gone (mint a new invite)
+      const status = !enrolledDevices.usable ? 503 : outcome.inviteSurvives ? 400 : 410;
+      return sendJson(res, status, { error: outcome.reason, inviteSurvives: outcome.inviteSurvives });
+    }
+    // the pinned EnrollmentResponse (types.ts): {deviceId}, nothing else —
+    // both lanes registered PUBLIC keys, nothing on this wire is worth
+    // stealing, and the ceremony's own secrets never echo
+    sendJson(res, 201, { deviceId: outcome.device.deviceId });
+  }
+
+  function getDevices(req: IncomingMessage, res: ServerResponse): void {
+    if (enrolledDevices === undefined) {
+      return sendJson(res, 501, { error: "device enrollment is not configured" });
+    }
+    const session = ownerSessionFrom(req);
+    if (session === null) return sendUnauthorized(res);
+    if (!enrolledDevices.usable) {
+      return sendJson(res, 503, { error: "enrolled-device registry is not usable" });
+    }
+    // the REDACTED DeviceSummary (types.ts): ids, labels, standing facts —
+    // never key material, never push material; scoped to the session's owner
+    const devices = enrolledDevices
+      .list()
+      .filter((device) => device.ownerId === session.ownerId)
+      .map((device) => ({
+        deviceId: device.deviceId,
+        name: device.deviceName,
+        enrolledAt: device.enrolledAt,
+        revokedAt: device.revokedAt,
+        // push subscriptions for ceremony-enrolled devices are not wired yet
+        pushRegistered: false,
+      }));
+    sendJson(res, 200, { devices });
+  }
+
+  function bootstrapMintInvite(request: BootstrapMintRequest): BootstrapMintResult {
+    if (enrolledDevices === undefined || enrollmentRp === undefined) {
+      return { ok: false, error: "device enrollment is not configured" };
+    }
+    // EXACT own-key schema — this is the root-of-trust mint request, so an
+    // extra key, an inherited "field", or a non-string refuses outright
+    if (typeof request !== "object" || request === null || Array.isArray(request)) {
+      return { ok: false, error: "request must be a JSON object" };
+    }
+    const record = request as unknown as Record<string, unknown>;
+    const requestKeys = Object.keys(record);
+    const REQUIRED = ["tokenHash", "ownerId", "deviceName"];
+    const ownOk =
+      requestKeys.length === REQUIRED.length &&
+      REQUIRED.every(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(record, key) && typeof record[key] === "string",
+      );
+    const tokenHash = record["tokenHash"] as string;
+    const ownerId = record["ownerId"] as string;
+    const deviceName = record["deviceName"] as string;
+    if (!ownOk || ownerId === "" || ownerId.length > 256 || tokenHash === "" || deviceName === "") {
+      return { ok: false, error: "exactly {tokenHash, ownerId, deviceName} (strings) is required" };
+    }
+    try {
+      const minted = enrolledDevices.mintInvite(liveKillSnapshot(), {
+        inviteId: `inv_${randomBytes(9).toString("base64url")}`,
+        tokenHash,
+        deviceName,
+        challenge: randomBytes(32).toString("base64url"),
+        assertionChallenge: randomBytes(32).toString("base64url"),
+        issuer: { kind: "bootstrap", ownerId },
+      });
+      // the owner's durable opaque user handle was established by the mint
+      const userId = enrolledDevices.ownerUserId(minted.ownerId);
+      if (userId === null) {
+        return { ok: false, error: "owner user handle missing after mint — refusing" };
+      }
+      // the COMPLETE pinned creation contract (EnrollmentInviteContract):
+      // everything navigator.credentials.create() needs, and no secret
+      return {
+        ok: true,
+        invite: {
+          inviteId: minted.inviteId,
+          expiresAt: minted.expiresAt,
+          ownerId: minted.ownerId,
+          rpId: enrollmentRp.rpId,
+          rpName: enrollmentRp.rpName,
+          user: {
+            id: userId,
+            // display-only labels for the platform UI; the opaque handle
+            // above is the identity, these are never parsed
+            name: minted.ownerId,
+            displayName: minted.ownerId,
+          },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            residentKey: "preferred",
+            userVerification: "required",
+          },
+          challenge: minted.challenge,
+          assertionChallenge: minted.assertionChallenge,
+          deviceName: minted.deviceName,
+        },
+      };
+    } catch (err) {
+      // register()'s live-witness gate throws on killed/stale/occupied — the
+      // CLI gets the reason, and nothing was minted
+      return { ok: false, error: err instanceof Error ? err.message : "mint refused" };
+    }
+  }
+
   function handler(req: IncomingMessage, res: ServerResponse): void {
     void route(req, res).catch((err) => {
       // never crash the process: a broken request gets an error response instead
@@ -2779,6 +3020,8 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
+    if (method === "POST" && path === "/devices/enroll") return postDeviceEnroll(req, res);
+    if (method === "GET" && path === "/devices") return getDevices(req, res);
     if (method === "POST" && deviceRevokeMatch) {
       return postDeviceRevoke(req, res, decodeURIComponent(deviceRevokeMatch[1]));
     }
@@ -2807,5 +3050,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 404, { error: "not found" });
   }
 
-  return { handler, killSwitch, vetoWindows, ownerDevices };
+  return {
+    handler,
+    killSwitch,
+    vetoWindows,
+    ownerDevices,
+    bootstrapMintInvite,
+    ...(enrolledDevices !== undefined ? { enrolledDevices } : {}),
+  };
 }

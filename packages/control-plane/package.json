@@ -7,7 +7,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "ownerswitch-license": "./dist/license-cli.js"
+    "ownerswitch-license": "./dist/license-cli.js",
+    "ownerswitch-bootstrap-invite": "./dist/bootstrap-invite-cli.js"
   },
   "dependencies": {
     "@ownerswitchai/shared": "workspace:*"

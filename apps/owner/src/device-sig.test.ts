@@ -1,6 +1,9 @@
 import {
   ENROLL_POP_LABEL as sharedEnrollLabel,
   ownerEnrollPopPreimage,
+  enrollmentInviteFromWire,
+  type EnrollmentInviteContract,
+  type EnrollmentInviteWire,
 } from "@ownerswitchai/shared";
 import { describe, expect, it } from "vitest";
 import { base64urlDecode, base64urlEncode, lengthPrefixed, sha256, utf8 } from "./bytes.js";
@@ -250,5 +253,53 @@ describe("the pinned invite wire contract (drift guard for the control-plane cor
   it("EnrollmentInvite carries BOTH ceremony challenges", () => {
     const keys: Array<keyof EnrollmentInvite> = ["challenge", "assertionChallenge", "token"];
     expect(keys).toContain("assertionChallenge");
+  });
+
+  it("the SHARED wire validator and the pinned EnrollmentInvite are the SAME contract (compile-time, both directions)", () => {
+    // shared -> app: whatever the validator returns IS a pinned invite
+    const fromWire = (wire: EnrollmentInviteWire): EnrollmentInvite => wire;
+    // app -> shared: a pinned invite passes as the wire shape (no missing fields)
+    const toWire = (invite: EnrollmentInvite): EnrollmentInviteWire => invite;
+    // the server's secret-free mint response is EXACTLY the invite minus token
+    const contractToInvite = (contract: EnrollmentInviteContract, token: string): EnrollmentInvite => ({
+      ...contract,
+      token,
+    });
+    const inviteToContract = (invite: EnrollmentInvite): EnrollmentInviteContract => invite;
+    expect([fromWire, toWire, contractToInvite, inviteToContract].every((f) => typeof f === "function")).toBe(
+      true,
+    );
+    // and the runtime validator agrees with the compile-time story: a
+    // fully-populated pinned invite round-trips it unchanged
+    const invite: EnrollmentInvite = {
+      inviteId: "inv_pin",
+      token: Buffer.from("t".repeat(24)).toString("base64url"),
+      expiresAt: 1,
+      ownerId: "owner-adam",
+      rpId: "owner.example",
+      rpName: "OwnerSwitch",
+      user: {
+        id: Buffer.from("u".repeat(32)).toString("base64url"),
+        name: "owner-adam",
+        displayName: "owner-adam",
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        residentKey: "preferred",
+        userVerification: "required",
+      },
+      challenge: Buffer.from("c".repeat(24)).toString("base64url"),
+      assertionChallenge: Buffer.from("a".repeat(24)).toString("base64url"),
+      deviceName: "Adam's phone",
+    };
+    const validated = enrollmentInviteFromWire(invite);
+    expect(validated).not.toBeNull();
+    expect(validated).toEqual(invite);
+    // an extra key is NOT the contract
+    expect(enrollmentInviteFromWire({ ...invite, extra: true })).toBeNull();
+    // a missing creation-contract field is NOT the contract
+    const { authenticatorSelection: _dropped, ...withoutSelection } = invite;
+    expect(enrollmentInviteFromWire(withoutSelection)).toBeNull();
   });
 });
