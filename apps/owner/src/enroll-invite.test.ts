@@ -194,6 +194,13 @@ describe("public/enroll-invite.mjs — drift-pinned to @ownerswitchai/shared", (
     expect(
       (await beginEnrollmentCeremony(payload, {} as unknown as { create: () => Promise<unknown> })).ok,
     ).toBe(false);
+    // an exotic container whose `create` GETTER throws is still a refusal
+    const throwingGetter = Object.defineProperty({}, "create", {
+      get() {
+        throw new Error("hostile getter");
+      },
+    }) as unknown as { create: () => Promise<unknown> };
+    expect((await beginEnrollmentCeremony(payload, throwingGetter)).ok).toBe(false);
     // none of the refusals produced any success-shaped partial state
     for (const outcome of [cancelled, generic]) {
       expect("credential" in outcome).toBe(false);

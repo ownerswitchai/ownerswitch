@@ -577,6 +577,43 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     if (!reloadedInit.ok) expect(reloadedInit.detail).toMatch(/unexpected shape/);
   });
 
+  it("save() DIRECTLY refuses loader-invalid state — and the previous file's bytes are untouched", () => {
+    const path = join(freshDir(), "devices.json");
+    const registry = registryAt(path);
+    registry.initialize();
+    const before = readFileSync(path, "utf8");
+    const store = storeAt(path);
+    // a state the loader would refuse (a device naming a handle-less owner)
+    const invalid = {
+      version: 2 as const,
+      bootstrapGeneration: 1,
+      devices: {
+        dev_x: {
+          deviceId: "dev_x",
+          ownerId: "owner-ghost",
+          deviceName: "ghost",
+          credentialId: randomBytes(16).toString("base64url"),
+          publicKeySpki: (generateKeyPairSync("ec", { namedCurve: "prime256v1" }).publicKey.export({
+            type: "spki",
+            format: "der",
+          }) as Buffer).toString("base64url"),
+          cheapLaneKeySpki: (generateKeyPairSync("ec", { namedCurve: "prime256v1" }).publicKey.export({
+            type: "spki",
+            format: "der",
+          }) as Buffer).toString("base64url"),
+          signCount: 0,
+          generation: 1,
+          revokedAt: null,
+          enrolledAt: 1,
+        },
+      },
+      owners: {},
+    };
+    expect(() => store.save(invalid)).toThrow(/does not satisfy the loader's schema/);
+    // nothing was written — byte for byte the previous publish
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
   it("PACKAGE SURFACE: no invite store, no witness, no low-level spend — the registry is the only door", () => {
     const surface = Object.keys(packageApi);
     for (const name of surface) {

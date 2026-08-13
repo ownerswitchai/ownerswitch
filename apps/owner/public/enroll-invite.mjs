@@ -190,19 +190,21 @@ export async function beginEnrollmentCeremony(payload, credentials, now = Date.n
   if (invite.expiresAt <= now()) {
     return { ok: false, reason: "this invite has expired — mint a fresh one" };
   }
-  if (
-    credentials === null ||
-    credentials === undefined ||
-    typeof credentials.create !== "function"
-  ) {
-    return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
-  }
   // the REAL navigator.credentials.create() reports a user cancel or a
   // timeout as a REJECTED promise (NotAllowedError), not as null — every
   // rejection folds into the same fixed refusal, echoing no exception text
-  // and leaving no partial ceremony state behind
+  // and leaving no partial ceremony state behind. The container LOOKUP is
+  // inside the try too: an exotic object with a throwing `create` getter
+  // is a refusal, never an escaping exception.
   let credential;
   try {
+    if (
+      credentials === null ||
+      credentials === undefined ||
+      typeof credentials.create !== "function"
+    ) {
+      return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
+    }
     credential = await credentials.create({ publicKey: creationOptionsFromInvite(invite) });
   } catch {
     return { ok: false, reason: "credential creation was refused, unavailable, or dismissed" };
