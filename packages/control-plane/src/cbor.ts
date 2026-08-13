@@ -108,13 +108,23 @@ function decodeItem(reader: Reader, depth: number): CborValue {
     }
     case 5: {
       const count = readLength(reader, additional);
-      const out: Record<string, CborValue> = {};
+      // NULL-PROTOTYPE object: on a plain {}, assigning the "__proto__" key
+      // hits the prototype SETTER — it swaps the object's prototype, creates
+      // no own property, bypasses the duplicate check, and hands the caller
+      // an object whose fmt/attStmt/authData can be INHERITED from
+      // attacker-chosen values. Object.create(null) has no such setter, so
+      // every assignment below is a plain own property. The setter-hazard
+      // keys are refused outright as a second, independent belt.
+      const out: Record<string, CborValue> = Object.create(null) as Record<string, CborValue>;
       for (let i = 0; i < count; i++) {
         const key = decodeItem(reader, depth + 1);
         let name: string;
         if (typeof key === "string") name = key;
         else if (typeof key === "number" && Number.isSafeInteger(key)) name = String(key);
         else throw new Error("CBOR: map keys must be text strings or integers");
+        if (name === "__proto__" || name === "constructor" || name === "prototype") {
+          throw new Error(`CBOR: map key ${JSON.stringify(name)} is refused (prototype pollution)`);
+        }
         if (Object.prototype.hasOwnProperty.call(out, name)) {
           throw new Error(`CBOR: duplicate map key ${JSON.stringify(name)}`);
         }

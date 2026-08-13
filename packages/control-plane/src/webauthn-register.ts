@@ -17,8 +17,10 @@
  *    (types.ts EnrolledDevice) — so any OTHER format is refused loudly
  *    instead of half-verified: a format we would not check is a format an
  *    attacker chooses;
- *  - authenticatorData: rpIdHash === SHA-256(rpId); UP+UV flags required
- *    (enrolment must involve a human passing the screen lock); AT required
+ *  - authenticatorData: rpIdHash === SHA-256(rpId); UP+UV flags required as
+ *    SYNTACTIC preconditions (with attestation "none" nothing signs them, so
+ *    they are not by themselves evidence — see RegistrationVerdict: the
+ *    possession-and-UV proof is the paired fresh assertion); AT required
  *    (there must BE attested credential data); the ED flag is refused (no
  *    extensions are requested, so extension bytes are smuggling room);
  *    signCount recorded; the credential id (≤1023 bytes per spec) must
@@ -53,16 +55,55 @@ export interface VerifyRegistrationOptions {
   expectedChallenge: string;
 }
 
+/**
+ * WHAT A PASSING VERDICT MEANS — and, with attestation "none", what it does
+ * not. This verifier proves the registration is STRUCTURALLY sound and
+ * extracts a canonical credential; it does NOT by itself prove the client
+ * possesses the new credential's private key, nor that a platform
+ * authenticator truly performed user verification — with fmt "none" there
+ * is no signature over authenticatorData||SHA-256(clientDataJSON) to check,
+ * so a hostile client could fabricate every byte here (the UP/UV flags are
+ * syntactic requirements, not evidence). The ceremony therefore REQUIRES a
+ * second step before any invite is consumed: a FRESH webauthn.get assertion
+ * with the newly registered credential, over a second server-minted
+ * challenge, verified with webauthn.ts's verifyOwnerAssertion against the
+ * key THIS verdict returned — that assertion is the possession-and-UV
+ * proof. The invite spends only after registration + assertion + cheap-lane
+ * PoP all pass. `signCount` is a starting point for the later counter
+ * tripwire, not a verified fact of this ceremony.
+ */
 export type RegistrationVerdict =
   | {
       ok: true;
       /** base64url, byte-verified against the attested credential data */
       credentialId: string;
-      /** canonical SPKI PEM re-exported by THIS verifier */
-      publicKeyPem: string;
+      /**
+       * THE canonical stored representation (one format everywhere:
+       * RegistrationVerdict → device registry → assertion verifier):
+       * base64url of the canonical SPKI DER this verifier re-exported.
+       * Convert to PEM at the assertion-verify edge with spkiToPem().
+       */
+      publicKeySpki: string;
       signCount: number;
     }
   | { ok: false; reason: string };
+
+/** The one conversion the PEM-taking assertion verifier needs. */
+export function spkiToPem(publicKeySpki: string): string {
+  return createPublicKey({
+    key: Buffer.from(publicKeySpki, "base64url"),
+    format: "der",
+    type: "spki",
+  })
+    .export({ type: "spki", format: "pem" })
+    .toString();
+}
+
+/** Nothing in a legitimate registration is near these; a bigger field is an attack. */
+const MAX_CREDENTIAL_ID_CHARS = 2048;
+const MAX_CLIENT_DATA_CHARS = 16 * 1024;
+const MAX_ATTESTATION_CHARS = 128 * 1024;
+const WIRE_KEYS: ReadonlySet<string> = new Set(["credentialId", "clientDataJSON", "attestationObject"]);
 
 const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
@@ -90,10 +131,53 @@ function constantTimeStringEqual(a: string, b: string): boolean {
 }
 
 export function verifyOwnerRegistration(
-  registration: WebAuthnRegistrationWire,
+  wire: unknown,
+  opts: VerifyRegistrationOptions,
+): RegistrationVerdict {
+  // The outer catch is the LAST belt on the never-throws contract: this
+  // function faces raw request JSON on the future enroll route, and a
+  // malformed body must be a refusal reason, never a 500.
+  try {
+    return verifyOwnerRegistrationInner(wire, opts);
+  } catch (err) {
+    return { ok: false, reason: `malformed registration: ${err instanceof Error ? err.message : "unparseable"}` };
+  }
+}
+
+function verifyOwnerRegistrationInner(
+  wire: unknown,
   opts: VerifyRegistrationOptions,
 ): RegistrationVerdict {
   const refuse = (reason: string): RegistrationVerdict => ({ ok: false, reason });
+
+  /* ---- the WIRE ENVELOPE, before anything is trusted to be a string ---- */
+  if (typeof wire !== "object" || wire === null || Array.isArray(wire)) {
+    return refuse("registration must be a JSON object");
+  }
+  for (const key of Object.keys(wire)) {
+    if (!WIRE_KEYS.has(key)) return refuse(`unexpected registration property ${JSON.stringify(key)}`);
+  }
+  const record = wire as Record<string, unknown>;
+  const credentialIdField = record.credentialId;
+  const clientDataField = record.clientDataJSON;
+  const attestationField = record.attestationObject;
+  if (typeof credentialIdField !== "string" || credentialIdField === "") {
+    return refuse("credentialId must be a non-empty string");
+  }
+  if (typeof clientDataField !== "string" || clientDataField === "") {
+    return refuse("clientDataJSON must be a non-empty string");
+  }
+  if (typeof attestationField !== "string" || attestationField === "") {
+    return refuse("attestationObject must be a non-empty string");
+  }
+  if (credentialIdField.length > MAX_CREDENTIAL_ID_CHARS) return refuse("credentialId is oversized");
+  if (clientDataField.length > MAX_CLIENT_DATA_CHARS) return refuse("clientDataJSON is oversized");
+  if (attestationField.length > MAX_ATTESTATION_CHARS) return refuse("attestationObject is oversized");
+  const registration: WebAuthnRegistrationWire = {
+    credentialId: credentialIdField,
+    clientDataJSON: clientDataField,
+    attestationObject: attestationField,
+  };
 
   /* ---- clientDataJSON ---- */
   const clientDataRaw = fromB64url(registration.clientDataJSON);
@@ -120,7 +204,9 @@ export function verifyOwnerRegistration(
   if (clientData.origin !== opts.expectedOrigin) {
     return refuse(`clientDataJSON.origin is not the owner app (${JSON.stringify(clientData.origin)})`);
   }
-  if (clientData.crossOrigin === true) {
+  // crossOrigin: absent or literally false, nothing else — a non-boolean
+  // value is a client lying about its framing, not a value to interpret
+  if ("crossOrigin" in clientData && clientData.crossOrigin !== false) {
     return refuse("registration was produced cross-origin (an embedding frame) — refused");
   }
   if ("topOrigin" in clientData && clientData.topOrigin !== opts.expectedOrigin) {
@@ -138,6 +224,13 @@ export function verifyOwnerRegistration(
   }
   if (typeof attestation !== "object" || attestation === null || Array.isArray(attestation) || attestation instanceof Uint8Array) {
     return refuse("attestationObject is not a CBOR map");
+  }
+  // EXACT required-key contract: exactly {fmt, attStmt, authData}, all own
+  // properties of the decoder's null-prototype map — nothing rides along,
+  // nothing may be inherited
+  const attestationKeys = Object.keys(attestation).sort();
+  if (attestationKeys.join(",") !== "attStmt,authData,fmt") {
+    return refuse(`attestationObject must carry exactly fmt, attStmt, authData (got ${attestationKeys.join(", ")})`);
   }
   const fmt = attestation.fmt;
   if (fmt !== "none") {
@@ -217,6 +310,12 @@ export function verifyOwnerRegistration(
   if (typeof coseKey !== "object" || coseKey === null || Array.isArray(coseKey) || coseKey instanceof Uint8Array) {
     return refuse("COSE key is not a CBOR map");
   }
+  // EXACT label set: an ES256 EC2 key is exactly {1,3,-1,-2,-3} — an extra
+  // label is smuggling room a "strict" verifier must not carry
+  const coseLabels = Object.keys(coseKey).sort();
+  if (coseLabels.join(",") !== "-1,-2,-3,1,3") {
+    return refuse(`COSE key must carry exactly labels 1,3,-1,-2,-3 (got ${coseLabels.join(", ")})`);
+  }
   // RFC 8152 labels: 1=kty (2=EC2), 3=alg (-7=ES256), -1=crv (1=P-256), -2=x, -3=y
   if (coseKey["1"] !== 2) return refuse("COSE key is not EC2 — only ES256 on P-256 enrolls");
   if (coseKey["3"] !== -7) return refuse("COSE alg is not ES256 — the only algorithm enrolment admits");
@@ -226,18 +325,19 @@ export function verifyOwnerRegistration(
   if (!(x instanceof Uint8Array) || x.length !== 32 || !(y instanceof Uint8Array) || y.length !== 32) {
     return refuse("COSE coordinates must be exactly 32 bytes each");
   }
-  let publicKeyPem: string;
+  let publicKeySpki: string;
   try {
     // import via JWK — node validates the point is ON the curve — and
-    // re-export canonical SPKI so downstream binds verifier-produced bytes
+    // re-export canonical SPKI DER so downstream binds verifier-produced
+    // bytes, in THE one stored representation (base64url DER)
     const key = createPublicKey({
       key: { kty: "EC", crv: "P-256", x: b64url(x), y: b64url(y) },
       format: "jwk",
     });
-    publicKeyPem = key.export({ type: "spki", format: "pem" }).toString();
+    publicKeySpki = b64url(new Uint8Array(key.export({ type: "spki", format: "der" })));
   } catch {
     return refuse("COSE coordinates do not form a valid P-256 point");
   }
 
-  return { ok: true, credentialId: b64url(credentialIdBytes), publicKeyPem, signCount };
+  return { ok: true, credentialId: b64url(credentialIdBytes), publicKeySpki, signCount };
 }

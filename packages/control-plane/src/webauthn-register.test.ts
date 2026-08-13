@@ -1,7 +1,8 @@
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, sign as ecSign } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { cborEncode } from "./cbor-fixture.js";
-import { verifyOwnerRegistration, type WebAuthnRegistrationWire } from "./webauthn-register.js";
+import { verifyOwnerAssertion } from "./webauthn.js";
+import { spkiToPem, verifyOwnerRegistration, type WebAuthnRegistrationWire } from "./webauthn-register.js";
 
 /**
  * Build a SYNTHETIC registration exactly as a platform authenticator would —
@@ -85,17 +86,152 @@ function buildRegistration(over: BuildOptions = {}): WebAuthnRegistrationWire {
 const OPTS = { rpId: RP_ID, expectedOrigin: ORIGIN, expectedChallenge: CHALLENGE };
 
 describe("verifyOwnerRegistration — the enrolment ceremony's registration half", () => {
-  it("accepts a well-formed registration and returns the CANONICAL credential", () => {
+  it("accepts a well-formed registration and returns the CANONICAL credential (SPKI DER base64url)", () => {
     const verdict = verifyOwnerRegistration(buildRegistration(), OPTS);
     expect(verdict.ok).toBe(true);
     if (verdict.ok) {
       expect(verdict.credentialId).toBe(Buffer.from("credential-id-bytes-0001").toString("base64url"));
       expect(verdict.signCount).toBe(7);
-      // the returned PEM is the CANONICAL re-export of the same P-256 point
-      expect(verdict.publicKeyPem).toBe(
+      // THE stored representation: base64url of the canonical SPKI DER…
+      expect(verdict.publicKeySpki).toBe(
+        (keypair.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString("base64url"),
+      );
+      // …and the one conversion to PEM at the assertion-verify edge round-trips
+      expect(spkiToPem(verdict.publicKeySpki)).toBe(
         keypair.publicKey.export({ type: "spki", format: "pem" }).toString(),
       );
     }
+  });
+
+  it("NEVER THROWS on raw request JSON: null, numbers, arrays, extra keys, oversize — all refusal reasons", () => {
+    const cases: unknown[] = [
+      null,
+      undefined,
+      42,
+      "registration",
+      [buildRegistration()],
+      {},
+      { credentialId: "AA" }, // missing fields
+      { ...buildRegistration(), extra: "x" }, // unexpected property
+      { ...buildRegistration(), clientDataJSON: null },
+      { ...buildRegistration(), credentialId: 42 },
+      { ...buildRegistration(), attestationObject: { nested: true } },
+      { ...buildRegistration(), attestationObject: "A".repeat(129 * 1024) }, // oversize
+      { ...buildRegistration(), clientDataJSON: "!!!not-base64url!!!" },
+    ];
+    for (const wire of cases) {
+      const verdict = verifyOwnerRegistration(wire, OPTS);
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(typeof verdict.reason).toBe("string");
+    }
+  });
+
+  it("PROTO INJECTION: __proto__ maps cannot smuggle fmt/attStmt/authData or COSE fields", () => {
+    // outer attestation: { "__proto__": {fmt:"none", attStmt:{}, authData:...} }
+    // — with a setter-based decoder this would INHERIT a passing shape
+    const good = buildRegistration();
+    const authData = (() => {
+      // reuse the good registration's real authData bytes for the payload
+      const decodedGood = Buffer.from(good.attestationObject, "base64url");
+      return decodedGood; // opaque — the hostile map below carries it nested
+    })();
+    const hostileOuter = cborEncode(
+      new Map([["__proto__", new Map<unknown, unknown>([["fmt", "none"], ["attStmt", new Map()], ["authData", new Uint8Array(authData)]])]]),
+    ).toString("base64url");
+    const outer = verifyOwnerRegistration({ ...good, attestationObject: hostileOuter }, OPTS);
+    expect(outer.ok).toBe(false);
+    if (!outer.ok) expect(outer.reason).toMatch(/prototype pollution|__proto__|exactly fmt/);
+
+    // attStmt as { "__proto__": {...} } — must not read as "empty"
+    const smuggledStmt = verifyOwnerRegistration(
+      buildRegistration({ attStmt: new Map([["__proto__", new Map([["sig", 1]])]]) }),
+      OPTS,
+    );
+    expect(smuggledStmt.ok).toBe(false);
+
+    // COSE { "__proto__": {1:2,3:-7,-1:1,-2:x,-3:y} } — must not inherit a key
+    const hostileCose = new Map<unknown, unknown>([
+      [
+        "__proto__",
+        new Map<unknown, unknown>([
+          [1, 2],
+          [3, -7],
+          [-1, 1],
+          [-2, new Uint8Array(X)],
+          [-3, new Uint8Array(Y)],
+        ]),
+      ],
+    ]);
+    // splice the hostile COSE into otherwise-valid authData
+    const credentialId = Buffer.from("credential-id-bytes-0001");
+    const hostileAuthData = Buffer.concat([
+      createHash("sha256").update(RP_ID, "utf8").digest(),
+      Buffer.from([0x45]),
+      Buffer.from([0, 0, 0, 7]),
+      Buffer.alloc(16),
+      Buffer.from([(credentialId.length >> 8) & 0xff, credentialId.length & 0xff]),
+      credentialId,
+      cborEncode(hostileCose),
+    ]);
+    const attestation = new Map<unknown, unknown>([
+      ["fmt", "none"],
+      ["attStmt", new Map()],
+      ["authData", new Uint8Array(hostileAuthData)],
+    ]);
+    const cose = verifyOwnerRegistration(
+      { ...good, attestationObject: cborEncode(attestation).toString("base64url") },
+      OPTS,
+    );
+    expect(cose.ok).toBe(false);
+  });
+
+  it("DIRECTION B composition: registration + a FRESH assertion with the new credential = possession proof; a wrong key fails it", () => {
+    // 1. the registration verifies structurally and yields the canonical key
+    const verdict = verifyOwnerRegistration(buildRegistration(), OPTS);
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) throw new Error("unreachable");
+
+    // 2. the ceremony's SECOND challenge: a webauthn.get assertion signed by
+    //    the NEW credential's private key, verified against the key the
+    //    registration verdict returned — THIS is what proves possession + UV
+    const assertionChallenge = randomBytes(32).toString("base64url");
+    const makeAssertion = (privateKey: typeof keypair.privateKey) => {
+      const clientData = Buffer.from(
+        JSON.stringify({ type: "webauthn.get", challenge: assertionChallenge, origin: ORIGIN }),
+      );
+      const authenticatorData = Buffer.concat([
+        createHash("sha256").update(RP_ID, "utf8").digest(),
+        Buffer.from([0x05]), // UP | UV
+        Buffer.from([0, 0, 0, 8]),
+      ]);
+      const signed = Buffer.concat([authenticatorData, createHash("sha256").update(clientData).digest()]);
+      return {
+        credentialId: verdict.credentialId,
+        clientDataJSON: clientData.toString("base64url"),
+        authenticatorData: authenticatorData.toString("base64url"),
+        signature: ecSign("sha256", signed, privateKey).toString("base64url"), // DER, as verifyOwnerAssertion takes
+      };
+    };
+    const passkey = { credentialId: verdict.credentialId, publicKeyPem: spkiToPem(verdict.publicKeySpki) };
+    const possession = verifyOwnerAssertion(makeAssertion(keypair.privateKey), {
+      passkey,
+      rpId: RP_ID,
+      expectedOrigin: ORIGIN,
+      expectedChallenge: assertionChallenge,
+      lastSignCount: 0,
+    });
+    expect(possession.ok).toBe(true);
+
+    // 3. a client that does NOT hold the new private key cannot complete the pair
+    const thief = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const forged = verifyOwnerAssertion(makeAssertion(thief.privateKey), {
+      passkey,
+      rpId: RP_ID,
+      expectedOrigin: ORIGIN,
+      expectedChallenge: assertionChallenge,
+      lastSignCount: 0,
+    });
+    expect(forged.ok).toBe(false);
   });
 
   it("refuses every clientDataJSON lie: type, challenge, origin, crossOrigin, topOrigin", () => {
@@ -104,6 +240,7 @@ describe("verifyOwnerRegistration — the enrolment ceremony's registration half
       [{ challenge: Buffer.from("x".repeat(32)).toString("base64url") }, /challenge/],
       [{ origin: "https://evil.example" }, /origin/],
       [{ crossOrigin: true }, /cross-origin/],
+      [{ crossOrigin: "yes" as unknown as boolean }, /cross-origin/], // non-boolean lie
       [{ topOrigin: "https://framer.example" }, /top-level origin/],
     ];
     for (const [over, why] of cases) {

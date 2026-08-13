@@ -180,23 +180,29 @@ export function verifyEnrollProofOfPossession(fields: {
   /** base64url raw r||s ECDSA signature over the transcript */
   proof: string;
 }): boolean {
+  // CANONICAL base64url only — Buffer.from is permissive (drops bad chars,
+  // repairs padding), and a transcript built from repaired bytes is a
+  // transcript the signer never signed; a round-trip mismatch refuses.
+  const canonicalB64url = (text: string): Buffer | null => {
+    if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+    const decoded = Buffer.from(text, "base64url");
+    return decoded.toString("base64url") === text ? decoded : null;
+  };
+  const credentialIdBytes = canonicalB64url(fields.credentialId);
+  if (credentialIdBytes === null) return false;
   let preimage: Uint8Array;
   try {
     preimage = ownerEnrollPopPreimage({
       inviteId: fields.inviteId,
       ownerId: fields.ownerId,
-      credentialId: new Uint8Array(Buffer.from(fields.credentialId, "base64url")),
+      credentialId: new Uint8Array(credentialIdBytes),
       spki: new Uint8Array(fields.device.publicKey.export({ type: "spki", format: "der" })),
     });
   } catch {
     return false; // empty field — never a guess
   }
-  let sig: Buffer;
-  try {
-    sig = Buffer.from(fields.proof, "base64url");
-  } catch {
-    return false;
-  }
+  const sig = canonicalB64url(fields.proof);
+  if (sig === null) return false;
   if (sig.length !== 64) return false; // raw r||s for P-256, never DER
   try {
     return cryptoVerify(

@@ -254,7 +254,13 @@ export interface EnrolledDevice {
   ownerId: string;
   name: string;
   credentialId: Base64Url;
-  /** COSE public key — verifies every future assertion */
+  /**
+   * THE canonical stored key representation, everywhere: base64url of the
+   * CANONICAL SPKI DER the control plane's registration verifier
+   * re-exported (never the raw COSE bytes off the wire — one format from
+   * RegistrationVerdict through the durable registry to the assertion
+   * verifier, converted to PEM only at the verify edge).
+   */
   publicKey: Base64Url;
   /**
    * Exportable SPKI public key verifying cheap-lane signatures. Always

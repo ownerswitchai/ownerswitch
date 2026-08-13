@@ -33,6 +33,17 @@ describe("cborDecode — the strict WebAuthn subset", () => {
     expect(() => cborDecodeExact(new Uint8Array([0x1b, 0, 0, 0, 0, 0, 0, 0, 1]))).toThrow(/subset/); // u64 len
   });
 
+  it("PROTO INJECTION: __proto__/constructor/prototype keys are refused, and maps have no prototype", () => {
+    for (const name of ["__proto__", "constructor", "prototype"]) {
+      const hostile = cborEncode(new Map([[name, 1]]));
+      expect(() => cborDecodeExact(new Uint8Array(hostile))).toThrow(/prototype pollution/);
+    }
+    // and a decoded map cannot INHERIT anything: null prototype
+    const clean = cborDecodeExact(new Uint8Array(cborEncode(new Map([["a", 1]]))));
+    expect(Object.getPrototypeOf(clean)).toBeNull();
+    expect((clean as Record<string, unknown>).hasOwnProperty).toBeUndefined();
+  });
+
   it("refuses duplicate map keys — a validator that keeps either copy can be steered by the other", () => {
     // {"a":1,"a":2}
     const dup = Buffer.from([0xa2, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02]);
