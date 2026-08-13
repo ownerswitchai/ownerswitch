@@ -213,7 +213,13 @@ export interface EnrollmentRequest {
   inviteId: string;
   /** the invite secret — the preimage of the committed hash (DESIGN.md §2) */
   token: string;
-  /** human label shown in the device list, e.g. "Adam's phone" */
+  /**
+   * Human label shown in the device list — REQUIRED, and it must repeat
+   * the invite's mint-committed label (InviteMintRequest.deviceName)
+   * EXACTLY: the inviter chose the label; the enrolling phone repeats it
+   * as confirmation it is redeeming the invite it was actually shown. A
+   * mismatch refuses with the invite alive (DESIGN.md §2 step 5).
+   */
   deviceName: string;
   registration: WebAuthnRegistration;
   /**

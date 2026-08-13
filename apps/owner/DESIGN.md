@@ -122,6 +122,25 @@ tightens it back up. So it is designed first.
    is cleared with `history.replaceState` on read, is served under
    `Referrer-Policy: no-referrer`, and is spent in a POST body. No
    invite token is ever written to a log on either end.
+
+   **The pinned wire contract, by name** (`src/types.ts`), so there is
+   exactly one reading of this lifecycle: the mint request is
+   `InviteMintRequest { tokenHash, deviceName }` — the hash commitment
+   plus the invited device's committed display label; the mint
+   *response* carries the ceremony contract (inviteId, both
+   challenges, RP/user entities, TTL) and **no secret**;
+   `EnrollmentInvite` is the **device-to-device payload only** (QR /
+   typed code) — its `token` field is the locally generated secret *in
+   transit between phones*, assembled on the inviting device and never
+   a server-returned value; and `EnrollmentRequest` spends it, carrying
+   the secret as preimage plus the proofs of step 5. Two further rules
+   bind mint to live state: **nothing mints while the kill switch is
+   engaged** (an invite is born and spent inside one live state — an
+   invite created during a kill would be a fresh capability inside a
+   frozen system, spendable after a restore that may not advance the
+   epoch), and the recorded authority facts (kill epoch, bootstrap
+   generation or issuer standing) must be the live ones at mint, or
+   the mint is refused.
 3. **Credential creation.** Inside the installed app, the phone calls
    `navigator.credentials.create()` against the invite's challenge and
    contract from step 2. Attestation stays `"none"` (a deliberate
@@ -178,6 +197,16 @@ tightens it back up. So it is designed first.
    stranger's garbage cannot burn the capability the owner is holding
    mid-enrolment. (The flip side is accepted: an intercepted invite
    stays spendable until its TTL — one more reason the TTL is short.)
+   The request's `deviceName` must repeat the mint-committed label
+   **exactly** — the inviter chose it, the enrolling phone confirms it
+   is redeeming the invite it was shown; a mismatch refuses with the
+   invite alive. Two spend-time exceptions to "a failed attempt
+   consumes nothing", both deliberate: an attempt while the kill
+   switch is **engaged** burns the attempted invite outright (the
+   defense-in-depth twin of the mint-side refusal above), and an
+   authority failure discovered *at* the burn — dead epoch, dead
+   issuer, occupied registry — stays burned: dead authority does not
+   revive.
    On success the control plane stores **one** `EnrolledDevice` record
    holding *both* credentials — the WebAuthn credential and the
    cheap-lane public key belong to the same record, governed by the

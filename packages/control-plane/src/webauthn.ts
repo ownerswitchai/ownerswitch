@@ -44,6 +44,13 @@ export interface WebAuthnAssertion {
   authenticatorData: string;
   /** base64url, ASN.1/DER ECDSA signature */
   signature: string;
+  /**
+   * base64url echo of the credential's user.id, when the authenticator
+   * returned one — opaque metadata, never proof. The enrolment envelope
+   * (invite.ts) validates it as canonical base64url of 1–64 bytes;
+   * verification here does not read it.
+   */
+  userHandle?: string;
 }
 
 export interface VerifyAssertionOptions {

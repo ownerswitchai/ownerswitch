@@ -55,12 +55,12 @@ export type {
   VerifyRegistrationOptions,
   WebAuthnRegistrationWire,
 } from "./webauthn-register.js";
-// NOTE: claimSpendMinter and isMintedAuthorization are deliberately NOT
-// exported here — the minter is claimed exactly once (by enrollment.ts, at
-// module load) and consume() trusts WeakSet MEMBERSHIP, not the prototype
-// chain, so the only package-API path to an invite spend is
-// performEnrollment, which runs the full proof chain first.
-export { InviteStore, SpendAuthorization } from "./invite.js";
+// NOTE: there is deliberately NO spend API on InviteStore — the burn is an
+// ECMAScript #private method whose only accessor is module-scoped inside
+// invite.ts, and performEnrollment (defined in that same module) is the one
+// function that reaches it, after the full proof chain. Nothing here — and
+// no deep import — hands out a spend capability to claim or forge.
+export { InviteStore } from "./invite.js";
 export type {
   InviteConsume,
   InviteFate,
