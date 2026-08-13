@@ -53,6 +53,14 @@ export interface EscalationEnvConfig {
    * escalation share a user. Env: OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID.
    */
   ownerDeviceStandingTrustedUid?: number;
+  /**
+   * The shared read-only group's gid — the SAME value the control plane
+   * publishes the 0640 file with (OWNERSWITCH_OWNER_DEVICE_STANDING_GID on
+   * both services). The reader's load-time boundary check accepts a 0640
+   * registry only when its gid matches this; unset, only a private 0600
+   * registry is accepted (the same-user model).
+   */
+  ownerDeviceStandingGid?: number;
   /** test-only: skip the trusted-ancestry walk (public tmp roots fail it by design) */
   unsafeAllowUntrustedStandingPathForTests?: boolean;
   /** where the webhook server listens */
@@ -267,6 +275,15 @@ export function escalationConfigFromEnv(
     }
     ownerDeviceStandingTrustedUid = parsed;
   }
+  const standingGidRaw = env.OWNERSWITCH_OWNER_DEVICE_STANDING_GID?.trim();
+  let ownerDeviceStandingGid: number | undefined;
+  if (standingGidRaw !== undefined && standingGidRaw !== "") {
+    const parsed = Number(standingGidRaw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_GID must be a non-negative integer gid");
+    }
+    ownerDeviceStandingGid = parsed;
+  }
   return {
     controlPlaneUrl,
     device,
@@ -275,6 +292,7 @@ export function escalationConfigFromEnv(
       ? { ownerDeviceStandingFile }
       : {}),
     ...(ownerDeviceStandingTrustedUid !== undefined ? { ownerDeviceStandingTrustedUid } : {}),
+    ...(ownerDeviceStandingGid !== undefined ? { ownerDeviceStandingGid } : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),

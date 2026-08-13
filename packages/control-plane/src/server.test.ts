@@ -5,7 +5,7 @@ import {
   randomUUID,
   sign as ecSign,
 } from "node:crypto";
-import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
@@ -2665,6 +2665,45 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
           ownerDeviceStandingFile: join(mkdtempSync(join(tmpdir(), "ownerswitch-standing-")), "standing.json"),
         }),
       ).toThrow(/world-writable|group- or world-writable/);
+    } finally {
+      console.error = silenced;
+    }
+  });
+
+  it("ALL-OR-NOTHING: half a 0640 configuration refuses the boot in either direction", () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const base = {
+      now: c.now,
+      dev: true as const,
+      killStateFile: null,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: join(dir, "standing.json"),
+      acceptSessionOnlyApprovalRisk: true,
+    };
+    const silenced = console.error;
+    console.error = () => {};
+    try {
+      // group-readable without a gid: 0640 for the WRONG group
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingGroupReadable: true }),
+      ).toThrow(/requires ownerDeviceStandingGid/);
+      // a gid without group-readable: a group that can read nothing
+      expect(() => createControlPlane({ ...base, ownerDeviceStandingGid: 1234 })).toThrow(
+        /without ownerDeviceStandingGroupReadable/,
+      );
+      // both together boot (and publish 0640 under that gid at boot init)
+      const gid = typeof process.getgid === "function" ? process.getgid() : 0;
+      const cp = createControlPlane({
+        ...base,
+        ownerDeviceStandingGroupReadable: true,
+        ownerDeviceStandingGid: gid,
+      });
+      void cp;
+      const published = statSync(join(dir, "standing.json"));
+      expect(published.mode & 0o777).toBe(0o640);
+      expect(published.gid).toBe(gid);
     } finally {
       console.error = silenced;
     }

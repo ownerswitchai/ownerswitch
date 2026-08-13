@@ -639,6 +639,24 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
           guardProtectedStatePath("device-standing", opts.ownerDeviceStandingFile),
         )
       : (opts.ownerDeviceStandingFile ?? null);
+  // ALL-OR-NOTHING: the 0640 model exists only as (group-readable AND an
+  // explicit gid) together. Half a configuration is one of two silent
+  // failures — 0640 readable by whatever the CP's default group happens to
+  // be (not the escalation's), or a named gid on a file that stays 0600 and
+  // grants that group nothing — so either half alone refuses the boot.
+  if (opts.ownerDeviceStandingGroupReadable === true && opts.ownerDeviceStandingGid === undefined) {
+    throw new Error(
+      "ownerDeviceStandingGroupReadable requires ownerDeviceStandingGid: 0640 without an explicit " +
+        "gid grants group-read to the control plane's default group, not the escalation service's " +
+        "(set OWNERSWITCH_OWNER_DEVICE_STANDING_GID to the shared read-only group).",
+    );
+  }
+  if (opts.ownerDeviceStandingGid !== undefined && opts.ownerDeviceStandingGroupReadable !== true) {
+    throw new Error(
+      "ownerDeviceStandingGid without ownerDeviceStandingGroupReadable does nothing: the file stays " +
+        "0600 and the named group cannot read it. Set both (the 0640 model) or neither (private 0600).",
+    );
+  }
   const standingStore = standingPath
     ? new DeviceStandingFileStore(standingPath, {
         fileMode: opts.ownerDeviceStandingGroupReadable === true ? 0o640 : 0o600,
@@ -687,7 +705,6 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         device.generation += 1;
       }
     } else {
-      let needsInit = false;
       if (loaded.outcome === "loaded") {
         for (const [deviceId, standing] of Object.entries(loaded.state.devices)) {
           const device = ownerDevices.get(deviceId);
@@ -700,30 +717,23 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
             unenrolledStanding[deviceId] = standing;
           }
         }
-        // an enrolled device with NO record is not implicitly trusted — it is
-        // MIGRATED: recorded durably right now, at boot, as an explicit act
-        // (adding the key to the 0600 keys file was the operator's enrolment;
-        // this writes the standing half). Decision-time lookups never default
-        // to trust (witnessStanding refuses unknown devices).
-        for (const deviceId of ownerDevices.keys()) {
-          if (!(deviceId in loaded.state.devices)) needsInit = true;
-        }
-      } else {
-        // absent: a CONFIGURED registry that has never been written. Implicit
-        // "everyone active" would make a wrong path, an empty provisioned
-        // directory, or a lost state+marker pair read as trust — so the full
-        // active snapshot is INITIALIZED durably before the lane may operate.
-        needsInit = true;
       }
-      if (needsInit) {
-        const persisted = persistStanding();
-        if (!persisted.durable) {
-          throw new Error(
-            `[ownerswitch] cannot durably initialize the device-standing registry at ${standingPath}: ` +
-              `${persisted.detail ?? "unknown"} — refusing to start the owner-device lane on ` +
-              "standing that would not survive a restart",
-          );
-        }
+      // Persist at EVERY boot, durable-or-refuse:
+      //  - absent → the full active snapshot is INITIALIZED before the lane
+      //    may operate (implicit "everyone active" would make a wrong path or
+      //    an empty provisioned directory read as trust);
+      //  - loaded → enrolled devices missing a record are MIGRATED (an
+      //    explicit act — decision-time lookups never default to trust), AND
+      //    the published file is re-issued under the CURRENTLY configured
+      //    mode/gid, so a 0600 → 0640+gid transition reconciles here at boot
+      //    instead of leaving a boundary no later save would validate.
+      const persisted = persistStanding();
+      if (!persisted.durable) {
+        throw new Error(
+          `[ownerswitch] cannot durably (re)initialize the device-standing registry at ${standingPath}: ` +
+            `${persisted.detail ?? "unknown"} — refusing to start the owner-device lane on ` +
+            "standing that would not survive a restart",
+        );
       }
     }
   }

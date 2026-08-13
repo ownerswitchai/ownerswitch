@@ -1,4 +1,4 @@
-import { mkdtempSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, mkdtempSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -89,6 +89,53 @@ describe("DeviceStandingFileStore — durable revocation standing", () => {
     expect(published.mode & 0o777).toBe(0o640);
     // the marker carries the same pinned mode (the fchmod the review found missing)
     expect(statSync(store.markerPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("LOAD refuses any boundary that would let someone else write the registry (a protected dir does not protect a writable leaf)", () => {
+    const gid = typeof process.getgid === "function" ? process.getgid() : 0;
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    const setup = (opts?: ConstructorParameters<typeof DeviceStandingFileStore>[1]) => {
+      const file = join(tmp(), "standing.json");
+      const writer = new DeviceStandingFileStore(file, opts);
+      writer.save(state({ d: { generation: 1, revokedAt: null } }));
+      return file;
+    };
+
+    // group- or world-writable modes: well-formed JSON in a writable file IS
+    // the resurrect-the-phone attack — corrupt, never standing
+    for (const mode of [0o660, 0o644, 0o666, 0o620] as const) {
+      const file = setup();
+      chmodSync(file, mode);
+      const loaded = new DeviceStandingFileStore(file).load();
+      expect(loaded.outcome).toBe("corrupt");
+      if (loaded.outcome === "corrupt") expect(loaded.detail).toMatch(/boundary/);
+    }
+
+    // 0640 found by a store with NO configured read-only group -> corrupt
+    const file640 = setup({ fileMode: 0o640, group: gid });
+    expect(new DeviceStandingFileStore(file640).load().outcome).toBe("corrupt");
+    // ...but the properly configured reader (same expected gid) loads it
+    expect(new DeviceStandingFileStore(file640, { fileMode: 0o640, group: gid }).load().outcome).toBe("loaded");
+
+    if (isRoot) {
+      // wrong OWNER: even 0600 under a foreign uid is someone else's pen
+      const foreignOwner = setup();
+      chownSync(foreignOwner, 12345, gid);
+      const owned = new DeviceStandingFileStore(foreignOwner).load();
+      expect(owned.outcome).toBe("corrupt");
+      if (owned.outcome === "corrupt") expect(owned.detail).toMatch(/uid 12345/);
+      // ...unless that uid is EXPLICITLY trusted (the reader's named CP uid)
+      expect(
+        new DeviceStandingFileStore(foreignOwner, { trustedOwnerUids: [0, 12345] }).load().outcome,
+      ).toBe("loaded");
+
+      // wrong GID on a 0640 file: read exposure to an unvetted group -> corrupt
+      const wrongGid = setup({ fileMode: 0o640, group: gid });
+      chownSync(wrongGid, 0, 54321);
+      const badGid = new DeviceStandingFileStore(wrongGid, { fileMode: 0o640, group: gid }).load();
+      expect(badGid.outcome).toBe("corrupt");
+      if (badGid.outcome === "corrupt") expect(badGid.detail).toMatch(/gid 54321/);
+    }
   });
 
   it("canonicalTrustedStandingPath REFUSES a chain with an untrusted-writable ancestor (public /tmp)", () => {

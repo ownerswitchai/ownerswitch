@@ -123,6 +123,21 @@ function main(): void {
       throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_GID must be a non-negative integer gid");
     }
   }
+  // ALL-OR-NOTHING (also enforced inside createControlPlane): half a 0640
+  // configuration is a silent failure in one of two directions — refuse the
+  // boot HERE with the env names the operator actually typed.
+  if (standingGroupReadable && standingGid === undefined) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE=1 requires OWNERSWITCH_OWNER_DEVICE_STANDING_GID — " +
+        "0640 without an explicit gid grants read to the control plane's default group, not the escalation's",
+    );
+  }
+  if (standingGid !== undefined && !standingGroupReadable) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_DEVICE_STANDING_GID without OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE=1 " +
+        "does nothing — the file stays 0600 and the named group cannot read it; set both or neither",
+    );
+  }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");

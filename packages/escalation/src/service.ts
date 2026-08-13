@@ -95,6 +95,12 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   // first use — the reader must not follow a swapped ancestor to an
   // attacker's registry any more than the writer may (the distinct-UID
   // model names the control plane's uid explicitly via config).
+  // The reader enforces the SAME load-time boundary as the writer: the leaf
+  // must be owned by root / this process / the operator-named CP uid, and be
+  // exactly 0600, or 0640 matching the SAME configured read-only gid the CP
+  // publishes with (OWNERSWITCH_OWNER_DEVICE_STANDING_GID on both services).
+  // Anything else loads corrupt → everyone untrusted.
+  const ourUid = typeof process.getuid === "function" ? process.getuid() : 0;
   const standingStore =
     cfg.ownerDeviceStandingFile !== undefined
       ? new DeviceStandingFileStore(
@@ -106,6 +112,14 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
               ? { unsafeAllowUntrustedAncestryForTests: true }
               : {}),
           }),
+          {
+            ...(cfg.ownerDeviceStandingGid !== undefined ? { group: cfg.ownerDeviceStandingGid } : {}),
+            trustedOwnerUids: [
+              0,
+              ourUid,
+              ...(cfg.ownerDeviceStandingTrustedUid !== undefined ? [cfg.ownerDeviceStandingTrustedUid] : []),
+            ],
+          },
         )
       : null;
   function deviceInGoodStanding(deviceId: string): boolean {

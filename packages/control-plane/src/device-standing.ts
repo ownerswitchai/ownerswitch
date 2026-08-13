@@ -189,12 +189,23 @@ export interface DeviceStandingStoreOptions {
    * was requested reports durable:false rather than claiming the boundary.
    */
   group?: number;
+  /**
+   * The uids allowed to OWN the standing file (checked at LOAD, fstat on the
+   * open fd). Default: root and this process. The escalation reader in the
+   * distinct-UID model adds the control plane's uid (the same operator-named
+   * value as the ancestry walk's alsoTrustUids). A leaf owned by anyone else
+   * — however protected the directory — is a writable registry in someone
+   * else's hands: its owner can rewrite revokedAt to null at will, so it
+   * loads as CORRUPT (everyone revoked), never as standing.
+   */
+  trustedOwnerUids?: number[];
 }
 
 export class DeviceStandingFileStore {
   private warnedDirFsync = false;
   private readonly fileMode: number;
   private readonly group: number | undefined;
+  private readonly trustedOwnerUids: ReadonlySet<number>;
 
   constructor(
     readonly filePath: string,
@@ -202,6 +213,39 @@ export class DeviceStandingFileStore {
   ) {
     this.fileMode = opts.fileMode ?? 0o600;
     this.group = opts.group;
+    const ourUid = typeof process.getuid === "function" ? process.getuid() : 0;
+    this.trustedOwnerUids = new Set(opts.trustedOwnerUids ?? [0, ourUid]);
+  }
+
+  /**
+   * The LOAD-TIME boundary rule (the save-time verification's mirror): the
+   * registry is positive authorization state, so a file whose owner, mode,
+   * or group would let an untrusted party rewrite it must never be READ as
+   * standing — a well-formed JSON body in a writable file is exactly the
+   * resurrect-the-phone attack. Accepted, exhaustively:
+   *  - owner in the trusted set (root / this process / the named CP uid);
+   *  - mode EXACTLY 0600, or EXACTLY 0640 when a read-only group is
+   *    configured AND the file's gid matches it;
+   *  - nothing else — 0660/0644/0664, an unexpected 0640, a stray setuid
+   *    bit, all load as corrupt (everyone revoked). A protected directory
+   *    does not protect a directly-writable leaf.
+   */
+  private boundaryViolation(stat: { uid: number; gid: number; mode: number }): string | null {
+    if (!this.trustedOwnerUids.has(stat.uid)) {
+      return `owned by uid ${stat.uid} — not root, this process, or a configured trusted uid`;
+    }
+    const mode = stat.mode & 0o7777;
+    if (mode === 0o600) return null;
+    if (mode === 0o640) {
+      if (this.group === undefined) {
+        return "mode 0640 but no read-only group is configured — group-read to an unvetted group";
+      }
+      if (stat.gid !== this.group) {
+        return `mode 0640 with gid ${stat.gid} — expected the configured read-only group ${this.group}`;
+      }
+      return null;
+    }
+    return `mode ${mode.toString(8)} — only 0600 (private) or 0640 (configured read-only group) is standing`;
   }
 
   /** Once this exists, a MISSING standing file is corruption, not a fresh boot. */
@@ -233,8 +277,13 @@ export class DeviceStandingFileStore {
     }
     let raw: string;
     try {
-      if (!fstatSync(fd).isFile()) {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) {
         return { outcome: "corrupt", detail: `${this.filePath} is not a regular file` };
+      }
+      const violation = this.boundaryViolation(stat);
+      if (violation !== null) {
+        return { outcome: "corrupt", detail: `${this.filePath} fails the standing boundary: ${violation}` };
       }
       const limit = MAX_DEVICE_STANDING_FILE_BYTES;
       const buffer = Buffer.alloc(limit + 1);
