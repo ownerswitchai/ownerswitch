@@ -1,15 +1,21 @@
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   buildRenderableApproval,
   canonicalJson,
+  canonicalRenderableAlert,
+  codePointLength,
   GITHUB_CONNECTOR,
   MERGE_PULL_REQUEST,
   parseMergePrArgs,
+  RENDERABLE_ALERT_FORBIDDEN,
+  RENDERABLE_ALERT_V1_LIMITS,
   sha256Hex,
   signMergeGrant,
+  validateRenderableAlert,
+  type RenderableAlertV1,
   type SignedMergeGrant,
   type ToolCall,
 } from "@ownerswitchai/shared";
@@ -21,9 +27,15 @@ import {
   type DeviceCredential,
   type OwnerSession,
 } from "./auth.js";
+import { canonicalTrustedStandingPath, DeviceStandingFileStore } from "./device-standing.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
 import { verifyLicense } from "./license.js";
+import {
+  enrolledOwnerDeviceFromSpki,
+  verifyOwnerDeviceSignature,
+  type EnrolledOwnerDevice,
+} from "./owner-device.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
 import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
@@ -84,11 +96,12 @@ import { verifyOwnerAssertion, type WebAuthnAssertion } from "./webauthn.js";
  *                     a session may approve) OR device signature (deny-only:
  *                     the escalation ladder's relayed channel stops and the
  *                     owner app's one-tap veto; idempotent on re-veto).
- *  - POST /veto/:id/seen — OWNER-APP signature required (ownerAppSecret, a
- *                     distinct credential from the fleet deviceSecret — this
- *                     is the permissive delivered bit, so no fleet component
- *                     or same-uid agent may forge it); 501 when no owner-app
- *                     secret is enrolled. The production caller of
+ *  - POST /veto/:id/seen — OWNER-APP ASYMMETRIC signature required (ECDSA
+ *                     P-256 over the request, enrolled via ownerDeviceKeys —
+ *                     the phone's non-extractable key; the fleet deviceSecret
+ *                     cannot sign it and no leaked server secret can forge it,
+ *                     because this is the permissive delivered bit); 501 when
+ *                     no owner device is enrolled. The production caller of
  *                     markDelivered(). Refused inside the 60 s response floor
  *                     before the deadline (MIN_VETO_RESPONSE_MS).
  *  - GET  /veto/pending — device signature required; the open-window listing
@@ -108,24 +121,56 @@ export interface ControlPlaneOptions {
   /** Shared secret the physical button / kill triggers sign requests with. */
   deviceSecret?: string;
   /**
-   * The OWNER APP's OWN device secret — a DISTINCT credential from
-   * `deviceSecret`, provisioned only to the enrolled owner app and held by
-   * nothing else (not the gateway, not the button, not the escalation
-   * service). It authenticates exactly one thing: the delivery ack
-   * (`POST /veto/:id/seen`), which flips the permissive `delivered` bit that
-   * lets silence RELEASE a window (veto.ts). That bit is the one place the
-   * veto lane trusts a device to speak for the owner, so it must not ride
-   * the fleet-wide `deviceSecret` — under the same-uid threat model an agent
-   * can forge that (packages/mcp/THREAT-MODEL.md), and forging the ack would
-   * silently convert "held, owner-gated" into "released, runs" while also
-   * standing the escalation ladder down. Absent → `/veto/:id/seen` is 501 and
-   * delivery confirmation stays UNWIRED: every untouched window walks
-   * pending → extended → held → passkey approval, the fail-closed default
-   * (exactly the pre-escalation behavior). The deny-only device endpoints
-   * (`/kill`, the veto relay, `/veto/pending`, the pacing read) keep using
-   * `deviceSecret`: their worst case is a stop, so a forged one is safe.
+   * The enrolled OWNER-APP devices, as `deviceId → SPKI public key` (PEM or
+   * base64 DER). These are the ONLY credential that may flip the permissive
+   * `delivered` bit — the delivery ack (`POST /veto/:id/seen`) that lets
+   * silence RELEASE a window (veto.ts). Verification is ASYMMETRIC (ECDSA
+   * P-256, owner-device.ts): the owner's phone holds a NON-EXTRACTABLE
+   * private key, this map holds only the public halves. So — unlike a
+   * shared HMAC secret — a leaked server-side value cannot forge the owner's
+   * "I saw it", and neither can any fleet component or same-uid agent
+   * (packages/mcp/THREAT-MODEL.md). Absent/empty → `/veto/:id/seen` is 501
+   * and delivery confirmation stays UNWIRED: every untouched window walks
+   * pending → extended → held → passkey approval, the fail-closed default.
+   * The deny-only device endpoints (`/kill`, the veto relay, `/veto/pending`,
+   * the pacing read) keep using the fleet `deviceSecret` HMAC: their worst
+   * case is a stop, so a forged one is safe.
    */
-  ownerAppSecret?: string;
+  ownerDeviceKeys?: Record<string, string>;
+  /**
+   * Where owner-device STANDING ({generation, revokedAt} per device) is
+   * persisted, so a revocation SURVIVES a control-plane restart — without
+   * this, the process's in-memory registry is rebuilt from the static SPKI
+   * keys file on boot and a revoked (stolen) phone comes back to life in
+   * good standing. Same persistence discipline as the kill state (atomic
+   * publish + init marker + fail-closed corrupt handling; device-standing.ts),
+   * and the same production stance: when owner devices are ENROLLED and dev
+   * is not set, this path is REQUIRED — the control plane refuses to start
+   * rather than run a permissive lane whose revocations evaporate. A corrupt
+   * or deleted standing file loads with EVERY device revoked (permissive
+   * lane dead, stop paths untouched). The escalation service reads the same
+   * file, so "revoked" holds across the system, not just this process.
+   */
+  ownerDeviceStandingFile?: string | null;
+  /**
+   * Publish the standing file (and its marker) mode 0640 instead of 0600 —
+   * the DISTINCT-UID deployment model: the control plane owns and writes the
+   * registry; the escalation service runs as a different user in a dedicated
+   * read-only group; the parent directory is 0750 with that group. Without
+   * this, a separate-UID escalation service would read EACCES → corrupt →
+   * everyone-revoked (fail closed but non-functional). Group WRITE is never
+   * granted — standing is positive authorization state.
+   */
+  ownerDeviceStandingGroupReadable?: boolean;
+  /**
+   * The numeric gid the published standing file must belong to — the
+   * escalation read-only group of the 0640 model, applied with fchown before
+   * the rename and VERIFIED after publication. Without it, fchmod(0640)
+   * grants read to whatever the control plane's default group happens to be,
+   * which is generally NOT the escalation service's group — the distinct-UID
+   * model would silently not exist. Env: OWNERSWITCH_OWNER_DEVICE_STANDING_GID.
+   */
+  ownerDeviceStandingGid?: number;
   /**
    * Where the kill switch persists killed state, its reason and the kill
    * epoch across process restarts.
@@ -256,6 +301,66 @@ export const DEFAULT_KILL_STATE_FILE = "ownerswitch-kill-state.json";
  * what is wrong and what the operator must do — a control plane that starts
  * with a tamperable state file is worse than one that refuses to start.
  */
+/**
+ * The production path discipline BOTH persistent security stores share (kill
+ * state and device standing): absolute path, outside the working directory,
+ * in a directory owned by the process user with no group/world write access.
+ * These files are AUTHORIZATION state — whoever can write the directory can
+ * replace them — so an unsafe path refuses the boot with a named fix.
+ * Group/world READ is not refused here: the standing file is deliberately
+ * shareable read-only with the escalation service's group (see
+ * ownerDeviceStandingGroupReadable).
+ */
+function guardProtectedStatePath(kind: string, file: string): string {
+  const refuse = (what: string, fix: string): never => {
+    const msg = `[ownerswitch] refusing to start: ${what}. ${fix} (Pass dev: true only for a development instance.)`;
+    console.error(msg);
+    throw new Error(msg);
+  };
+  if (!isAbsolute(file)) {
+    return refuse(
+      `${kind} "${file}" is a relative path`,
+      "Set an explicit absolute path — a relative path silently points at a different store whenever the working directory changes.",
+    );
+  }
+  const resolved = resolve(file);
+  const rel = relative(process.cwd(), resolved);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    return refuse(
+      `${kind} "${resolved}" resolves inside the working directory ${process.cwd()}`,
+      "The working directory is not a protected location. Put the state file in a dedicated directory such as /var/lib/ownerswitch/.",
+    );
+  }
+  const dir = dirname(resolved);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let stats;
+  try {
+    stats = statSync(dir);
+  } catch (err) {
+    return refuse(
+      `the ${kind} directory ${dir} cannot be inspected (${err instanceof Error ? err.message : String(err)})`,
+      `Create it first, owned by uid ${uid ?? "<process uid>"} with mode 0700: mkdir -p ${dir} && chmod 700 ${dir}.`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    return refuse(`${dir} is not a directory`, `Point ${kind} at a file inside a real, protected directory.`);
+  }
+  if ((stats.mode & 0o022) !== 0) {
+    return refuse(
+      `the ${kind} directory ${dir} is group- or world-writable (mode ${(stats.mode & 0o777).toString(8)})`,
+      `Anyone who can write this directory can tamper with ${kind}. Run: chmod 700 ${dir} (or 750 for a shared read-only group).`,
+    );
+  }
+  // POSIX-only check: without getuid (Windows) ownership cannot be compared.
+  if (uid !== undefined && stats.uid !== uid) {
+    return refuse(
+      `the ${kind} directory ${dir} is owned by uid ${stats.uid}, but the control plane runs as uid ${uid}`,
+      `The directory must belong to the user that runs the control plane. Run: chown ${uid} ${dir}.`,
+    );
+  }
+  return resolved;
+}
+
 function guardKillStatePath(file: string | null | undefined): string {
   const refuse = (what: string, fix: string): never => {
     const msg = `[ownerswitch] refusing to start: ${what}. ${fix} (Pass dev: true only for a development instance.)`;
@@ -274,48 +379,7 @@ function guardKillStatePath(file: string | null | undefined): string {
       "An ephemeral control plane forgets kills on restart. Set an absolute killStateFile.",
     );
   }
-  if (!isAbsolute(file)) {
-    return refuse(
-      `killStateFile "${file}" is a relative path`,
-      "Set an explicit absolute path — a relative path silently points at a different store whenever the working directory changes.",
-    );
-  }
-  const resolved = resolve(file);
-  const rel = relative(process.cwd(), resolved);
-  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
-    return refuse(
-      `killStateFile "${resolved}" resolves inside the working directory ${process.cwd()}`,
-      "The working directory is not a protected location. Put the state file in a dedicated directory such as /var/lib/ownerswitch/.",
-    );
-  }
-  const dir = dirname(resolved);
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  let stats;
-  try {
-    stats = statSync(dir);
-  } catch (err) {
-    return refuse(
-      `the kill-state directory ${dir} cannot be inspected (${err instanceof Error ? err.message : String(err)})`,
-      `Create it first, owned by uid ${uid ?? "<process uid>"} with mode 0700: mkdir -p ${dir} && chmod 700 ${dir}.`,
-    );
-  }
-  if (!stats.isDirectory()) {
-    return refuse(`${dir} is not a directory`, "Point killStateFile at a file inside a real, protected directory.");
-  }
-  if ((stats.mode & 0o022) !== 0) {
-    return refuse(
-      `the kill-state directory ${dir} is group- or world-writable (mode ${(stats.mode & 0o777).toString(8)})`,
-      `Anyone who can write this directory can tamper with kill state. Run: chmod 700 ${dir}.`,
-    );
-  }
-  // POSIX-only check: without getuid (Windows) ownership cannot be compared.
-  if (uid !== undefined && stats.uid !== uid) {
-    return refuse(
-      `the kill-state directory ${dir} is owned by uid ${stats.uid}, but the control plane runs as uid ${uid}`,
-      `The directory must belong to the user that runs the control plane. Run: chown ${uid} ${dir}.`,
-    );
-  }
-  return resolved;
+  return guardProtectedStatePath("kill-state", file);
 }
 
 export interface ControlPlane {
@@ -324,6 +388,14 @@ export interface ControlPlane {
   killSwitch: KillSwitch;
   /** Live veto windows by id; the gateway registers, the API vetoes/reads. */
   vetoWindows: Map<string, VetoWindow>;
+  /**
+   * The live owner-device registry (standing included) — exposed for
+   * observability and tests; treat as read-mostly. Revocation goes through
+   * POST /devices/:id/revoke, which also persists standing and sweeps
+   * evidence; mutating records here directly bypasses both (which is exactly
+   * what the release-time CAS tests simulate).
+   */
+  ownerDevices: Map<string, EnrolledOwnerDevice>;
 }
 
 /**
@@ -345,6 +417,13 @@ export const MAX_CEREMONY_RECORDS = 256;
  * to veto. A floor, not a knob to zero out.
  */
 export const MIN_VETO_RESPONSE_MS = 60_000;
+
+/**
+ * How long a minted foreground-detail delivery may be echoed by an ack. Short
+ * on purpose: the ack should follow the render within seconds, and a stale
+ * delivery must not confirm a window the owner looked at minutes ago.
+ */
+export const DELIVERY_TTL_MS = 2 * 60_000;
 
 /** Thrown when the request body is not valid JSON — maps to 400. */
 class BadJsonError extends Error {}
@@ -399,6 +478,16 @@ function headerValue(req: IncomingMessage, name: string): string | undefined {
 
 /** All four x-device-* headers, or null when the request doesn't attempt device auth. */
 function deviceCredentialFrom(req: IncomingMessage): DeviceCredential | null {
+  const deviceId = headerValue(req, "x-device-id");
+  const timestamp = headerValue(req, "x-device-timestamp");
+  const nonce = headerValue(req, "x-device-nonce");
+  const signature = headerValue(req, "x-device-signature");
+  if (!deviceId || !timestamp || !nonce || !signature) return null;
+  return { deviceId, timestamp: Number(timestamp), nonce, signature };
+}
+
+/** The owner-app device credential (same headers; the signature is ECDSA r||s base64url). */
+function ownerDeviceCredentialFrom(req: IncomingMessage) {
   const deviceId = headerValue(req, "x-device-id");
   const timestamp = headerValue(req, "x-device-timestamp");
   const nonce = headerValue(req, "x-device-nonce");
@@ -518,6 +607,181 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   );
   const vetoWindows = new Map<string, VetoWindow>();
   const seenNonces = new Map<string, number>();
+  // Enrolled owner-app devices (deviceId → P-256 public key), built once at
+  // startup. A bad key fails the boot with a named reason rather than turning
+  // every future ack into a silent 401.
+  const ownerDevices = new Map<string, EnrolledOwnerDevice>();
+  for (const [deviceId, spki] of Object.entries(opts.ownerDeviceKeys ?? {})) {
+    ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
+  }
+  // Durable standing: without it, every boot resurrects revoked phones from
+  // the static keys file. Production with enrolled devices REQUIRES the
+  // path; dev runs may omit it (ephemeral standing, like ephemeral kill
+  // state) — the same trade, opted into the same way.
+  if (ownerDevices.size > 0 && opts.dev !== true && !opts.ownerDeviceStandingFile) {
+    throw new Error(
+      "ownerDeviceKeys are enrolled but ownerDeviceStandingFile is not set. A revocation must " +
+        "survive a restart — without a durable standing registry, a revoked (stolen) phone comes " +
+        "back to life in good standing on the next boot. Set ownerDeviceStandingFile " +
+        "(env OWNERSWITCH_OWNER_DEVICE_STANDING_FILE), or dev: true for a deliberately ephemeral run.",
+    );
+  }
+  // The standing path is a SECURITY BOUNDARY (positive authorization state:
+  // rewriting revokedAt to null resurrects a stolen phone), so production
+  // gets the kill-state discipline PLUS the keys-file discipline: the
+  // directory-level checks, then realpath + a full trusted-ancestry walk,
+  // and the CANONICAL resolved path is what the store opens from then on —
+  // a post-boot rename or symlink swap of an ancestor cannot silently
+  // redirect the registry. Dev trusts the caller.
+  const standingPath =
+    opts.ownerDeviceStandingFile && opts.dev !== true
+      ? canonicalTrustedStandingPath(
+          guardProtectedStatePath("device-standing", opts.ownerDeviceStandingFile),
+        )
+      : (opts.ownerDeviceStandingFile ?? null);
+  // ALL-OR-NOTHING: the 0640 model exists only as (group-readable AND an
+  // explicit gid) together. Half a configuration is one of two silent
+  // failures — 0640 readable by whatever the CP's default group happens to
+  // be (not the escalation's), or a named gid on a file that stays 0600 and
+  // grants that group nothing — so either half alone refuses the boot.
+  if (opts.ownerDeviceStandingGroupReadable === true && opts.ownerDeviceStandingGid === undefined) {
+    throw new Error(
+      "ownerDeviceStandingGroupReadable requires ownerDeviceStandingGid: 0640 without an explicit " +
+        "gid grants group-read to the control plane's default group, not the escalation service's " +
+        "(set OWNERSWITCH_OWNER_DEVICE_STANDING_GID to the shared read-only group).",
+    );
+  }
+  if (opts.ownerDeviceStandingGid !== undefined && opts.ownerDeviceStandingGroupReadable !== true) {
+    throw new Error(
+      "ownerDeviceStandingGid without ownerDeviceStandingGroupReadable does nothing: the file stays " +
+        "0600 and the named group cannot read it. Set both (the 0640 model) or neither (private 0600).",
+    );
+  }
+  const standingStore = standingPath
+    ? new DeviceStandingFileStore(standingPath, {
+        fileMode: opts.ownerDeviceStandingGroupReadable === true ? 0o640 : 0o600,
+        ...(opts.ownerDeviceStandingGid !== undefined ? { group: opts.ownerDeviceStandingGid } : {}),
+      })
+    : null;
+  // QUARANTINE: set whenever the registry on disk may disagree with memory in
+  // the PERMISSIVE direction (a revocation that could not be durably
+  // persisted). While set, no owner-device evidence is accepted and no
+  // release on silence happens — a crash/restart cannot silently return a
+  // revoked phone to trusted, because until durability is restored the lane
+  // is simply closed. Lifted the moment a persist succeeds.
+  let standingQuarantined = false;
+  // Standing records for devices NOT currently enrolled in the keys file —
+  // loaded at boot and preserved verbatim on every persist. Removing a key
+  // from the keys file must not erase its standing history: a phone that was
+  // revoked, removed, and whose key is later re-added boots REVOKED from
+  // this record, not fresh.
+  const unenrolledStanding: Record<string, { generation: number; revokedAt: number | null }> = {};
+  /** Persist the CURRENT standing of every enrolled device (+ retained history). */
+  function persistStanding(): { durable: boolean; detail?: string } {
+    if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
+    const devices: Record<string, { generation: number; revokedAt: number | null }> = {
+      ...unenrolledStanding,
+    };
+    for (const [deviceId, device] of ownerDevices) {
+      devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
+    }
+    try {
+      return standingStore.save({ version: 1, devices });
+    } catch (err) {
+      return { durable: false, detail: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  if (standingStore !== null && ownerDevices.size > 0) {
+    const loaded = standingStore.load();
+    if (loaded.outcome === "corrupt") {
+      // fail CLOSED: a standing file we cannot trust revokes every device —
+      // the permissive lane dies, windows walk to held, stop paths untouched.
+      console.error(
+        `[ownerswitch] device-standing registry is corrupt (${loaded.detail}) — ` +
+          "ALL owner devices boot REVOKED; the ack lane is dead until the registry is repaired",
+      );
+      for (const device of ownerDevices.values()) {
+        device.revokedAt = 0;
+        device.generation += 1;
+      }
+    } else {
+      if (loaded.outcome === "loaded") {
+        for (const [deviceId, standing] of Object.entries(loaded.state.devices)) {
+          const device = ownerDevices.get(deviceId);
+          if (device !== undefined) {
+            device.generation = standing.generation;
+            device.revokedAt = standing.revokedAt;
+          } else {
+            // not currently enrolled — keep the history so a later re-add of
+            // the key cannot launder a revocation (see unenrolledStanding)
+            unenrolledStanding[deviceId] = standing;
+          }
+        }
+      }
+      // Persist at EVERY boot, durable-or-refuse:
+      //  - absent → the full active snapshot is INITIALIZED before the lane
+      //    may operate (implicit "everyone active" would make a wrong path or
+      //    an empty provisioned directory read as trust);
+      //  - loaded → enrolled devices missing a record are MIGRATED (an
+      //    explicit act — decision-time lookups never default to trust), AND
+      //    the published file is re-issued under the CURRENTLY configured
+      //    mode/gid, so a 0600 → 0640+gid transition reconciles here at boot
+      //    instead of leaving a boundary no later save would validate.
+      const persisted = persistStanding();
+      if (!persisted.durable) {
+        throw new Error(
+          `[ownerswitch] cannot durably (re)initialize the device-standing registry at ${standingPath}: ` +
+            `${persisted.detail ?? "unknown"} — refusing to start the owner-device lane on ` +
+            "standing that would not survive a restart",
+        );
+      }
+    }
+  }
+  /**
+   * The release-time witness check injected into every server-registered
+   * window (veto.ts tick()): the acking device must still exist, unrevoked,
+   * at the generation it acked under, and the standing registry must not be
+   * quarantined. Evidence with no witness identity cannot be validated and
+   * is refused — fail closed.
+   *
+   * SINGLE-WRITER RULE: at runtime this process is the ONLY standing writer
+   * (POST /devices/:id/revoke); the answer comes from the in-memory registry,
+   * which the revoke handler mutates before persisting. Another process's
+   * write to the shared file is honored at the NEXT BOOT (the load above) —
+   * it is not re-read per decision. The escalation service is a READER only.
+   */
+  function witnessStanding(deviceId: string | null, generation: number | null): boolean {
+    // While KILLED, no witness stands: a kill may exist precisely because a
+    // revocation could not be persisted (see the revoke handler), so the
+    // post-restart process — where the in-memory quarantine is gone — must
+    // still refuse every release. Windows are additionally epoch-bound, but
+    // this keeps the evidence chain itself closed too.
+    if (killSwitch.killed) return false;
+    if (standingQuarantined) return false;
+    if (deviceId === null || generation === null) return false;
+    const device = ownerDevices.get(deviceId);
+    return device !== undefined && device.revokedAt === null && device.generation === generation;
+  }
+  // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
+  // consumed by the ack. Keyed by deliveryId; each binds the exact window,
+  // revision, rendered-content hash, the hash of the exact call bytes
+  // (callHash), AND the fetching device at its revocation generation — so an
+  // ack can only confirm the CURRENT showing of THIS window and THIS call,
+  // once, from the SAME still-trusted device that fetched the detail
+  // (apps/owner DESIGN.md §3).
+  const ownerDeliveries = new Map<
+    string,
+    {
+      windowId: string;
+      revision: number;
+      renderHash: string;
+      callHash: string;
+      deviceId: string;
+      deviceGeneration: number;
+      expiresAt: number;
+      consumed: boolean;
+    }
+  >();
   // Window ids whose single-use MergeGrant has already been minted. A window
   // authorizes exactly ONE merge: the first releasing read mints the grant
   // and records the id here; every later read of the same window is served
@@ -609,14 +873,24 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   }
 
   /**
-   * The deviceId behind a valid signature made with the OWNER APP's own
-   * secret — the only credential that may drive a PERMISSIVE outcome
-   * (`markDelivered()`). Verified against `ownerAppSecret`, never the
-   * fleet `deviceSecret`, so a fleet-secret holder (a same-uid agent, the
-   * gateway, the escalation service) cannot forge the owner's "I saw it".
+   * The deviceId behind a valid OWNER-APP signature — the only credential
+   * that may drive a PERMISSIVE outcome (`markDelivered()`). ASYMMETRIC:
+   * ECDSA P-256 over the canonical preimage (method + path+query + body hash
+   * + timestamp + nonce), verified against the enrolled device's PUBLIC key
+   * (owner-device.ts). No server-side secret exists to leak or forge, and no
+   * fleet-secret holder can sign it. The signed path+query must be the exact
+   * request target as sent, so the signature is bound to THIS route and body.
    */
-  function validOwnerAppDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
-    return validSignatureAgainst(req, rawBody, opts.ownerAppSecret);
+  function validOwnerDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
+    if (ownerDevices.size === 0) return null;
+    const credential = ownerDeviceCredentialFrom(req);
+    if (credential === null) return null;
+    const method = (req.method ?? "").toUpperCase();
+    const pathAndQuery = req.url ?? "";
+    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDevices, {
+      now,
+      seenNonces,
+    });
   }
 
   function validSignatureAgainst(
@@ -1361,8 +1635,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     id: string,
     raw: string,
   ): Promise<void> {
-    const deviceId = validDeviceIdFrom(req, raw);
-    if (deviceId === null) {
+    // Two device credentials may STOP here, both deny-only: the fleet device
+    // HMAC (the escalation ladder's relayed channel stops) and the OWNER APP's
+    // asymmetric device signature (its one-tap veto — the same non-extractable
+    // key that acks delivery). Either is enough to veto; NEITHER can approve
+    // (that stays the owner session + passkey). The owner-app key gets the
+    // stronger label, but the verb is identical: stop.
+    const fleetId = validDeviceIdFrom(req, raw);
+    const ownerDeviceId = fleetId === null ? validOwnerDeviceIdFrom(req, raw) : null;
+    if (fleetId === null && ownerDeviceId === null) {
       sendUnauthorized(res);
       return;
     }
@@ -1378,7 +1659,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       });
       return;
     }
-    let attribution = `device:${deviceId}`;
+    let attribution = fleetId !== null ? `device:${fleetId}` : `owner-device:${ownerDeviceId}`;
     if (body.attribution !== undefined) {
       if (
         typeof body.attribution !== "string" ||
@@ -1417,13 +1698,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * POST /veto/:id/seen — the production caller of markDelivered(), and the
    * ONLY caller (escalation DESIGN.md §3): the enrolled device reports the
    * alert was rendered in front of a human. Authenticated with the OWNER
-   * APP's own secret (`ownerAppSecret`), NEVER the fleet `deviceSecret` —
-   * this is the PERMISSIVE bit of the veto lane (it lets silence release a
-   * held call), so it must ride a credential no fleet component and no
-   * same-uid agent holds. Nothing a carrier, a webhook, an owner session, or
-   * a fleet-signed request may flip it.
+   * APP's ASYMMETRIC device signature (ECDSA P-256 over the request; the
+   * phone holds a non-extractable private key, this plane holds only the
+   * public key), NEVER the fleet `deviceSecret` — this is the PERMISSIVE bit
+   * of the veto lane (it lets silence release a held call), so it must ride
+   * a credential no fleet component, no same-uid agent, and no leaked
+   * server-side secret can produce. Nothing a carrier, a webhook, an owner
+   * session, or a fleet-signed request may flip it.
    *
-   * When no owner-app secret is enrolled the endpoint is 501 and delivery
+   * When no owner device is enrolled the endpoint is 501 and delivery
    * confirmation stays UNWIRED — every window then walks to held → passkey
    * approval, the fail-closed default, rather than trusting a weaker
    * credential to speak for the owner.
@@ -1433,18 +1716,198 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * deadline) the ack is refused, the window extends or holds on its own
    * clock, and the device is told to re-ack against the new deadline.
    */
+  /**
+   * A DECISION-COMPLETE summary that names the concrete operation, or null if
+   * this window cannot be rendered decision-completely. "github/merge_pull_request"
+   * is not a decision — the owner must see WHICH pr into WHICH branch at WHICH
+   * head. So:
+   *  - the one grant-eligible purpose (github.merge_pull_request) renders a full
+   *    sentence from its parsed, display-safe args;
+   *  - a purpose we have no decision-complete renderer for returns null;
+   *  - a plain forwarded tool renders the exact canonical call bytes — but we
+   *    NEVER truncate a decisive summary or strip characters out of it: if the
+   *    full, display-safe args do not fit the V1 limit, or carry any FORBIDDEN
+   *    character, the summary is null.
+   * A null summary makes the window NON-ACKABLE (below): no delivery is minted,
+   * so silence can never release it — it walks to held (full approval). This is
+   * the fail-closed stance the ack path depends on (apps/owner DESIGN.md §3).
+   */
+  function decisionCompleteSummary(window: VetoWindow): string | null {
+    const purpose = window.purpose;
+    if (purpose !== undefined) {
+      if (purpose.connector !== GITHUB_CONNECTOR || purpose.operation !== MERGE_PULL_REQUEST) {
+        return null; // no decision-complete renderer for this purpose → hold
+      }
+      const canonicalArgs = grantEligibleArgs(window);
+      if (canonicalArgs === null) return null;
+      let approval;
+      try {
+        approval = buildRenderableApproval(parseMergePrArgs(canonicalArgs));
+      } catch {
+        return null;
+      }
+      const method = approval.mergeMethod === "default" ? "merge" : approval.mergeMethod;
+      // owner/repo/base/head are proven ASCII-display-safe by parseMergePrArgs.
+      return (
+        `Merge ${approval.owner}/${approval.repo}#${approval.pullNumber} ` +
+        `into ${approval.expectedBaseRef} — ${method}, head ${approval.expectedHeadSha.slice(0, 12)}`
+      );
+    }
+    // Plain forwarded tool: the exact canonical call bytes, verbatim. The tool
+    // name is already its own envelope field, so the summary is the arguments.
+    const canonicalArgs = canonicalJson(window.call.args ?? {});
+    const summary = canonicalArgs === "{}" ? "(no arguments)" : canonicalArgs;
+    if (RENDERABLE_ALERT_FORBIDDEN.test(summary)) return null; // never strip-and-hide
+    if (codePointLength(summary) > RENDERABLE_ALERT_V1_LIMITS.summary) return null; // never truncate
+    return summary;
+  }
+
+  /**
+   * The ACKABLE content — the strict RenderableAlertV1 whose hash the delivery
+   * binds and the ack echoes. Returns null when the window cannot be rendered
+   * decision-completely (a null summary) OR when the agent-supplied agentId /
+   * tool themselves fail V1 conformance (oversized or FORBIDDEN). A null here
+   * is the whole fail-closed guarantee: no delivery, so no release on silence.
+   */
+  function ackableContent(window: VetoWindow): RenderableAlertV1 | null {
+    const summary = decisionCompleteSummary(window);
+    if (summary === null) return null;
+    const alert = {
+      v: 1 as const,
+      agentId: window.call.agentId,
+      tool: window.call.tool,
+      summary,
+    };
+    return validateRenderableAlert(alert) === null ? alert : null;
+  }
+
+  /**
+   * The fields the app DISPLAYS. On the ack path these are exactly the ackable
+   * envelope (so the hash the client can recompute matches). Off it (a terminal
+   * window, or one we cannot render decision-completely) there is no ack and no
+   * hash, so a lossy, stripped, bounded render is acceptable here — the owner
+   * still sees who/what, and the summary states that full approval is required.
+   */
+  function displayEnvelope(
+    window: VetoWindow,
+    ackable: RenderableAlertV1 | null,
+  ): { agentId: string; tool: string; summary: string } {
+    if (ackable !== null) {
+      return { agentId: ackable.agentId, tool: ackable.tool, summary: ackable.summary };
+    }
+    const strip = (text: string, cap: number): string =>
+      [...String(text)].filter((ch) => !RENDERABLE_ALERT_FORBIDDEN.test(ch)).slice(0, cap).join("");
+    return {
+      agentId: strip(window.call.agentId, RENDERABLE_ALERT_V1_LIMITS.agentId),
+      tool: strip(window.call.tool, RENDERABLE_ALERT_V1_LIMITS.tool),
+      summary: "This action needs full owner approval — open OwnerSwitch to review.",
+    };
+  }
+
+  /**
+   * renderContentHash — base64url(sha256(canonical RenderableAlertV1)), over
+   * EXACTLY {v, agentId, tool, summary} and nothing else, so the owner app can
+   * recompute it from the very fields it rendered. Not sha256Hex over an ad-hoc
+   * object: status/revision/deadline are carried and CAS-checked separately, and
+   * must not ride the content hash (the client cannot reproduce them).
+   */
+  const renderContentHashOf = (alert: RenderableAlertV1): string =>
+    createHash("sha256").update(canonicalRenderableAlert(alert), "utf8").digest("base64url");
+
+  /** The hash of the exact canonical call bytes the delivery is bound to. */
+  const callHashOf = (window: VetoWindow): string => sha256Hex(canonicalJson(window.call.args ?? {}));
+
+  /**
+   * GET /veto/:id/detail — owner-device-signed. Returns the RenderableAlertV1
+   * the app must render AND mints a single-use foreground-detail delivery
+   * bound to {windowId, current revision, render hash}. The ack echoes that
+   * delivery; nothing else can produce ack evidence. Terminal windows return
+   * status only and mint no delivery (there is nothing left to confirm).
+   */
+  async function getVetoDetail(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const raw = await readRawBody(req);
+    if (ownerDevices.size === 0) {
+      sendJson(res, 501, { error: "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys)" });
+      return;
+    }
+    const fetchingDeviceId = validOwnerDeviceIdFrom(req, raw);
+    if (fetchingDeviceId === null) {
+      sendUnauthorized(res);
+      return;
+    }
+    const window = vetoWindows.get(id);
+    if (!window) {
+      sendJson(res, 404, { error: `no veto window "${id}"` });
+      return;
+    }
+    const status = window.tick();
+    // Ackable content only for a still-open window; a terminal window has
+    // nothing to confirm. A live window we cannot render decision-completely
+    // yields null too — it mints no delivery and, never delivered, fails
+    // closed to held rather than releasing on silence. A QUARANTINED standing
+    // registry mints nothing either, and neither does a KILLED control plane
+    // (a kill may exist because a revocation could not persist — see the
+    // revoke handler): an ack would be refused anyway, so the detail honestly
+    // renders without a delivery instead of arming one.
+    const ackable =
+      !standingQuarantined && !killSwitch.killed && (status === "pending" || status === "extended")
+        ? ackableContent(window)
+        : null;
+    const disp = displayEnvelope(window, ackable);
+    const base = {
+      v: 1 as const,
+      windowId: id,
+      agentId: disp.agentId,
+      tool: disp.tool,
+      summary: disp.summary,
+      status,
+      revision: window.revision,
+      deadline: window.deadlineAt,
+    };
+    if (ackable === null) {
+      // terminal, or non-ackable (held-bound) — render state, mint no delivery
+      sendJson(res, 200, { ...base, deliveryId: null });
+      return;
+    }
+    const renderHash = renderContentHashOf(ackable);
+    const deliveryId = `del_${randomBytes(12).toString("hex")}`;
+    ownerDeliveries.set(deliveryId, {
+      windowId: id,
+      revision: window.revision,
+      renderHash,
+      callHash: callHashOf(window),
+      deviceId: fetchingDeviceId,
+      // the generation this delivery is minted under — a later revocation
+      // bumps the device's generation and this delivery dies with it
+      deviceGeneration: ownerDevices.get(fetchingDeviceId)?.generation ?? 0,
+      expiresAt: now() + DELIVERY_TTL_MS,
+      consumed: false,
+    });
+    sendJson(res, 200, {
+      ...base,
+      // The EXACT envelope the hash is over, nested and verbatim — the client
+      // validates and hashes THIS object (wire version included), renders its
+      // fields, and reads them back from the DOM before acking. The flat
+      // fields above are display metadata; the contract object is this one.
+      renderable: ackable,
+      deliveryId,
+      renderContentHash: renderHash,
+      deliveryExpiresAt: now() + DELIVERY_TTL_MS,
+    });
+  }
+
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (opts.ownerAppSecret === undefined) {
+    if (ownerDevices.size === 0) {
       sendJson(res, 501, {
         error:
-          "delivery confirmation is not wired: no owner-app credential is enrolled on this control " +
+          "delivery confirmation is not wired: no owner-app device is enrolled on this control " +
           "plane, so no device may flip the release-permitting 'delivered' bit — windows walk to " +
-          "held (passkey approval) instead. Provision ownerAppSecret (OWNERSWITCH_OWNER_APP_SECRET).",
+          "held (passkey approval) instead. Enroll an owner device public key (ownerDeviceKeys).",
       });
       return;
     }
-    const deviceId = validOwnerAppDeviceIdFrom(req, raw);
+    const deviceId = validOwnerDeviceIdFrom(req, raw);
     if (deviceId === null) {
       sendUnauthorized(res);
       return;
@@ -1454,26 +1917,218 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       sendJson(res, 404, { error: `no veto window "${id}"` });
       return;
     }
-    // idempotent: a delivered window stays delivered; re-acks succeed
+    // idempotent: a delivered window stays delivered; re-acks succeed without
+    // requiring a fresh delivery (the permissive bit cannot un-flip)
     if (window.isDelivered) {
       sendJson(res, 200, { status: window.tick(), delivered: true, deadline: window.deadlineAt });
       return;
     }
-    const status = window.tick();
-    if (status !== "pending" && status !== "extended") {
-      sendJson(res, 409, { error: `cannot ack in status "${status}"` });
-      return;
-    }
-    if (now() > window.deadlineAt - MIN_VETO_RESPONSE_MS) {
-      sendJson(res, 409, {
+    const reject = (msg: string) => sendJson(res, 409, { error: msg });
+    // While quarantined (a revocation exists that could not be durably
+    // persisted) or KILLED (possibly BECAUSE of exactly that, persisted
+    // across the restart by the kill store), NO evidence is accepted: the
+    // registry on disk may disagree with memory in the permissive direction,
+    // so the lane is closed — never a release built on standing a restart
+    // forgets.
+    if (standingQuarantined || killSwitch.killed) {
+      sendJson(res, 503, {
         error:
-          "ack arrived inside the minimum veto-response floor (60 s before the deadline) — not counted; " +
-          "the window will extend or hold, re-ack against the new deadline",
+          "no delivery evidence is accepted right now: the control plane is " +
+          (killSwitch.killed ? "KILLED" : "standing-quarantined (a revocation could not be durably persisted)") +
+          " — the owner-device lane reopens after recovery/restore",
       });
       return;
     }
-    window.markDelivered(deviceId);
-    sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt });
+    const status = window.tick();
+    if (status !== "pending" && status !== "extended") {
+      return reject(`cannot ack in status "${status}"`);
+    }
+    const body = parseJsonBody(raw);
+    const deliveryId = typeof body.deliveryId === "string" ? body.deliveryId : "";
+    const echoedRevision = body.revision;
+    const echoedHash = typeof body.renderContentHash === "string" ? body.renderContentHash : "";
+
+    const delivery = ownerDeliveries.get(deliveryId);
+    // The versioned-delivery rule, judged in one synchronous transaction: a
+    // named, unexpired, unconsumed foreground-detail delivery for THIS window,
+    // whose revision and render hash still equal the window's CURRENT showing,
+    // and whose echoed revision/hash match. Anything else is refused — a stale
+    // detail (from before an extension) cannot confirm the advanced window.
+    if (delivery === undefined) return reject("unknown or expired delivery — fetch GET /veto/:id/detail first");
+    if (delivery.consumed) return reject("this delivery was already used to confirm — fetch a fresh detail");
+    if (now() >= delivery.expiresAt) {
+      ownerDeliveries.delete(deliveryId);
+      return reject("delivery expired — fetch a fresh detail");
+    }
+    if (delivery.windowId !== id) return reject("delivery is for a different window");
+    // The delivery belongs to the device that FETCHED the detail, at the
+    // generation it then held: another device cannot spend it (one device's
+    // render is not another's evidence), and a revocation in between bumps
+    // the generation so the orphaned delivery can never confirm anything.
+    if (delivery.deviceId !== deviceId) return reject("delivery belongs to a different device");
+    const ackingDevice = ownerDevices.get(deviceId);
+    if (ackingDevice === undefined || delivery.deviceGeneration !== ackingDevice.generation) {
+      ownerDeliveries.delete(deliveryId);
+      return reject("delivery was minted under a superseded device generation — fetch a fresh detail");
+    }
+
+    // revision CAS: the delivery, the echoed revision, and the window must all
+    // agree on the SAME current revision
+    if (delivery.revision !== window.revision || echoedRevision !== window.revision) {
+      return reject("stale delivery — the window advanced since it was rendered; re-fetch the detail");
+    }
+    // the render hash must match the delivery AND the window's current
+    // renderable (recomputed now), so the ack proves the concrete current view.
+    // A window that stopped being ackable (e.g. its args no longer render
+    // decision-completely) has no current hash and cannot be confirmed.
+    const currentAckable = ackableContent(window);
+    if (currentAckable === null) {
+      return reject("this window is no longer ackable — it requires full owner approval");
+    }
+    const currentHash = renderContentHashOf(currentAckable);
+    if (delivery.renderHash !== currentHash || echoedHash !== currentHash) {
+      return reject("render hash mismatch — the detail does not match the current window");
+    }
+    // the exact call bytes the delivery was bound to must still be the window's
+    // call bytes — a delivery cannot confirm a call other than the one rendered
+    if (delivery.callHash !== callHashOf(window)) {
+      return reject("call mismatch — the detail was minted for different call bytes");
+    }
+    if (now() > window.deadlineAt - MIN_VETO_RESPONSE_MS) {
+      return reject(
+        "ack arrived inside the minimum veto-response floor (60 s before the deadline) — not counted; " +
+          "the window will extend or hold, re-ack against the new deadline",
+      );
+    }
+    delivery.consumed = true; // single-use, consumed only on a fully valid ack
+    window.markDelivered(deviceId, ackingDevice.generation);
+    sendJson(res, 200, { status, delivered: true, deadline: window.deadlineAt, revision: window.revision });
+  }
+
+  /**
+   * POST /devices/:id/revoke — sever an owner device's standing (a lost or
+   * stolen phone). Auth keeps the asymmetry of the switch: like /kill, this
+   * REMOVES authority, so a fleet device signature, an owner session, or a
+   * loopback caller may all revoke — revocation must never fail because auth
+   * was misconfigured, and at worst it forces windows onto the held/passkey
+   * path (fail closed, never fail open). NOT accepted: the owner-device
+   * signature of the target itself as the only credential — a thief holding
+   * the phone must not be able to silently sever the owner's own lane and
+   * mask it, so revocation rides the fleet/owner/host credential classes.
+   * (The full design adds a fresh UV assertion, purpose "device-revoke",
+   * once the enrollment ceremony lands — this endpoint is its deny-only
+   * core.)
+   *
+   * Atomically, in one synchronous section: the device record is marked
+   * revoked and its generation bumped (everything minted under the old one
+   * dies at its next check), its unspent foreground-detail deliveries are
+   * purged, and every still-open window whose delivered evidence names this
+   * device has that evidence CLEARED — the release decision is
+   * deadline-anchored, so a window whose deadline already passed with the
+   * evidence valid stays released, and every open one walks extend→held
+   * instead of releasing on a dead witness. Idempotent: re-revoking is a
+   * successful no-op (the relay may blind-retry).
+   */
+  async function postDeviceRevoke(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const raw = await readRawBody(req);
+    const authenticated = hasValidDeviceSignature(req, raw) || ownerSessionFrom(req) !== null;
+    if (!authenticated && !isLoopbackAddress(req.socket.remoteAddress)) {
+      sendUnauthorized(res);
+      return;
+    }
+    const device = ownerDevices.get(id);
+    if (device === undefined) {
+      sendJson(res, 404, { error: `no enrolled owner device "${id}"` });
+      return;
+    }
+    if (device.revokedAt !== null) {
+      // Idempotent — already severed, nothing left to clear. But if an
+      // earlier persist FAILED (quarantine), this retry is the recovery
+      // path: attempt the persist again and lift the quarantine on success.
+      if (standingQuarantined && standingStore !== null) {
+        const retried = persistStanding();
+        if (retried.durable) {
+          standingQuarantined = false;
+        } else {
+          sendJson(res, 503, {
+            revoked: true,
+            deviceId: id,
+            generation: device.generation,
+            alreadyRevoked: true,
+            durable: false,
+            quarantined: true,
+            error: `revoked IN MEMORY ONLY — standing persistence still failing (${retried.detail ?? "unknown"}); the owner-device lane stays closed`,
+          });
+          return;
+        }
+      }
+      sendJson(res, 200, { revoked: true, deviceId: id, generation: device.generation, alreadyRevoked: true });
+      return;
+    }
+    device.revokedAt = now();
+    device.generation += 1;
+    for (const [deliveryId, delivery] of ownerDeliveries) {
+      if (delivery.deviceId === id) ownerDeliveries.delete(deliveryId);
+    }
+    let evidenceCleared = 0;
+    for (const window of vetoWindows.values()) {
+      if (window.revokeDeliveryEvidence(id)) evidenceCleared += 1;
+    }
+    // The revocation holds IN MEMORY no matter what — severing must never
+    // fail on a disk problem; the dangerous direction is the phone STAYING
+    // trusted. Then it persists to the standing registry, and the RESPONSE
+    // tells the truth about which of those two states the system is in:
+    //  - persisted durably → 200, done;
+    //  - persist FAILED with a registry configured → 503 + QUARANTINE, and a
+    //    DURABLE KILL. The in-memory quarantine closes the lane in THIS
+    //    process, but it dies with the process — a supervisor restart would
+    //    load the stale (still-active) standing file and resurrect the
+    //    phone. So the failure also engages the kill switch, whose OWN store
+    //    is a separate, already-trusted path with a fail-closed degrade():
+    //    the next boot comes up KILLED, where no delivery is minted, no ack
+    //    is accepted, and no window releases (its epoch is superseded). The
+    //    operator repairs the registry, re-runs the revoke (idempotent, now
+    //    durable), and restores via 2GO — the kill reason names exactly this
+    //    sequence. The 503 makes the failure impossible to mistake for
+    //    success; a plain 200/durable:false proved too easy to read as done.
+    const persisted = persistStanding();
+    if (standingStore !== null && !persisted.durable) {
+      standingQuarantined = true;
+      killSwitch.engage(
+        "api",
+        `device-standing persistence FAILED while revoking "${id}" (${persisted.detail ?? "unknown"}) — ` +
+          "fail-closed kill so a restart cannot resurrect the device from the stale registry. " +
+          "Repair the standing path, re-run the revoke, then restore via 2GO.",
+      );
+      // the same voids a kill from any other source performs (see postKill)
+      approvalChallenges.clear();
+      loginChallenges.clear();
+      restoreChallenges.clear();
+      sendJson(res, 503, {
+        revoked: true,
+        deviceId: id,
+        generation: device.generation,
+        evidenceCleared,
+        durable: false,
+        quarantined: true,
+        killed: true,
+        error:
+          `revoked IN MEMORY ONLY — standing persistence failed (${persisted.detail ?? "unknown"}); ` +
+          "the owner-device lane is quarantined and the KILL SWITCH is engaged (durably), so a " +
+          "restart boots killed instead of resurrecting the device. Repair the registry, retry " +
+          "this revoke, then restore via 2GO.",
+      });
+      return;
+    }
+    standingQuarantined = false;
+    sendJson(res, 200, {
+      revoked: true,
+      deviceId: id,
+      generation: device.generation,
+      evidenceCleared,
+      durable: persisted.durable,
+      ...(persisted.durable ? {} : { durabilityDetail: persisted.detail }),
+    });
   }
 
   /**
@@ -1792,6 +2447,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // which gateway retries it or whether that gateway restarted meanwhile.
     const window = new VetoWindow(call, killSwitch.epoch, {
       now,
+      witnessStanding, // release-time CAS: no release on a dead witness
       ...(purpose !== undefined ? { purpose } : {}),
     });
     vetoWindows.set(id, window);
@@ -1953,9 +2609,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     const path = reqUrl.pathname;
     const vetoMatch = /^\/veto\/([^/]+)$/.exec(path);
     const vetoSeenMatch = /^\/veto\/([^/]+)\/seen$/.exec(path);
+    const vetoDetailMatch = /^\/veto\/([^/]+)\/detail$/.exec(path);
     const approvalChallengeMatch = /^\/veto\/([^/]+)\/approval-challenge$/.exec(path);
     const restoreChallengeMatch = /^\/restore\/ceremony\/([^/]+)\/challenge$/.exec(path);
     const ceremonyMatch = /^\/restore\/ceremony\/([^/]+)$/.exec(path);
+    const deviceRevokeMatch = /^\/devices\/([^/]+)\/revoke$/.exec(path);
 
     if (method === "GET" && path === "/status") return getStatus(res);
     if (method === "GET" && path === "/kill-state") return getSignedKillState(reqUrl, res);
@@ -1967,6 +2625,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     if (method === "POST" && path === "/kill") return postKill(req, res);
     if (method === "POST" && path === "/alert") return postAlert(req, res);
+    if (method === "POST" && deviceRevokeMatch) {
+      return postDeviceRevoke(req, res, decodeURIComponent(deviceRevokeMatch[1]));
+    }
     if (method === "POST" && path === "/restore/ceremony") return postCeremonyStart(req, res);
     if (method === "POST" && restoreChallengeMatch) {
       return postRestoreChallenge(req, res, decodeURIComponent(restoreChallengeMatch[1]));
@@ -1981,6 +2642,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (method === "POST" && vetoSeenMatch) {
       return postVetoSeen(req, res, decodeURIComponent(vetoSeenMatch[1]));
     }
+    if (method === "GET" && vetoDetailMatch) {
+      return getVetoDetail(req, res, decodeURIComponent(vetoDetailMatch[1]));
+    }
     if (vetoMatch) {
       const id = decodeURIComponent(vetoMatch[1]);
       if (method === "POST") return postVeto(req, res, id);
@@ -1989,5 +2653,5 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     sendJson(res, 404, { error: "not found" });
   }
 
-  return { handler, killSwitch, vetoWindows };
+  return { handler, killSwitch, vetoWindows, ownerDevices };
 }

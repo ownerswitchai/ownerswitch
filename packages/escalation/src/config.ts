@@ -1,3 +1,4 @@
+import { loadOwnerDeviceKeysFile } from "@ownerswitchai/control-plane";
 import { DEFAULT_LIMITS } from "./ladder.js";
 import type { LadderRung, RateLimits } from "./types.js";
 
@@ -26,14 +27,42 @@ export interface EscalationEnvConfig {
   controlPlaneUrl: string;
   device: { id: string; secret: string };
   /**
-   * The OWNER APP's own secret (distinct from `device.secret`), required to
-   * enroll a push subscription (POST /push/subscription). Enrollment picks
-   * who receives every future alert, so it must not ride the fleet device
-   * secret the escalation service itself holds — otherwise a fleet-secret
-   * holder could redirect the owner's push channel to their own endpoint.
-   * Absent → enrollment is 501 and no subscription can be set over HTTP.
+   * The owner app's enrolled device PUBLIC keys (deviceId → ECDSA P-256 SPKI
+   * PEM), required to authenticate a push-subscription enrollment
+   * (POST /push/subscription). Enrollment picks who receives every future
+   * alert, so it is gated on the owner's ASYMMETRIC device signature — the
+   * same non-extractable key that signs the delivery ack — not the fleet
+   * device secret this service holds. A fleet-secret holder therefore cannot
+   * redirect the owner's push channel. Absent/empty → enrollment is 501.
    */
-  ownerAppSecret?: string;
+  ownerDeviceKeys?: Record<string, string>;
+  /**
+   * The SAME durable standing registry the control plane writes
+   * ({deviceId → {generation, revokedAt}}, device-standing.ts). Re-read on
+   * every owner-device operation here, so a revocation on the control plane
+   * severs this service's surfaces too: a revoked phone can no longer update
+   * the push subscription, and a subscription it enrolled stops receiving
+   * alerts. Absent → standing is not consulted (dev), matching an ephemeral
+   * control plane. A corrupt registry reads as ALL devices revoked.
+   */
+  ownerDeviceStandingFile?: string;
+  /**
+   * The control plane's uid, for the distinct-UID model: the standing path's
+   * real ancestry must be owned by root, THIS process, or this explicitly
+   * named uid (never guessed from the filesystem). Unset when CP and
+   * escalation share a user. Env: OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID.
+   */
+  ownerDeviceStandingTrustedUid?: number;
+  /**
+   * The shared read-only group's gid — the SAME value the control plane
+   * publishes the 0640 file with (OWNERSWITCH_OWNER_DEVICE_STANDING_GID on
+   * both services). The reader's load-time boundary check accepts a 0640
+   * registry only when its gid matches this; unset, only a private 0600
+   * registry is accepted (the same-user model).
+   */
+  ownerDeviceStandingGid?: number;
+  /** test-only: skip the trusted-ancestry walk (public tmp roots fail it by design) */
+  unsafeAllowUntrustedStandingPathForTests?: boolean;
   /** where the webhook server listens */
   listenHost: string;
   listenPort: number;
@@ -43,6 +72,13 @@ export interface EscalationEnvConfig {
   stateFile?: string;
   twilio?: { accountSid: string; authToken: string; from: string; to: string };
   vapid?: { publicKey: string; privateKey: string; subject: string };
+  email?: {
+    from: string;
+    to: string;
+    /** https base of the owner app; alerts deep-link here (no one-click stop) */
+    ownerAppUrl: string;
+    ses: { region: string; accessKeyId: string; secretAccessKey: string };
+  };
   rungs: LadderRung[];
   limits: RateLimits;
   /** control-plane poll cadence; default 5000 ms */
@@ -68,6 +104,12 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return value;
 }
 
+/** Owner-app device public keys (deviceId → P-256 SPKI PEM) from a hardened JSON file. */
+function loadOwnerDeviceKeys(file: string | undefined): Record<string, string> {
+  if (file === undefined || file === "") return {};
+  return loadOwnerDeviceKeysFile(file);
+}
+
 export function escalationConfigFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): EscalationEnvConfig {
@@ -78,14 +120,26 @@ export function escalationConfigFromEnv(
   };
   if (device.id.includes(".")) throw new Error('OWNERSWITCH_ESCALATION_DEVICE_ID must not contain "."');
 
-  const ownerAppSecret = env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
-  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === device.secret) {
+  // The same production stance as the control plane, checked BEFORE the keys
+  // even load: enrolled owner devices WITHOUT the shared standing registry
+  // would leave this service trusting a phone the control plane has revoked
+  // (it would keep accepting the key and keep pushing alerts to it) — a
+  // configuration fail-open. Refuse to start instead; the control plane
+  // writes the file, this service only reads it.
+  const ownerDeviceKeysFile = env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim();
+  const standingFileEnv = env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
+  if (
+    ownerDeviceKeysFile !== undefined &&
+    ownerDeviceKeysFile !== "" &&
+    (standingFileEnv === undefined || standingFileEnv === "")
+  ) {
     throw new Error(
-      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner app's " +
-        "push-enrollment credential is deliberately separate from the fleet device secret the " +
-        "escalation service holds",
+      "OWNERSWITCH_OWNER_DEVICE_KEYS_FILE is set but OWNERSWITCH_OWNER_DEVICE_STANDING_FILE is not — " +
+        "without the shared standing registry a revoked phone stays trusted here. Point it at the " +
+        "same file the control plane persists standing to.",
     );
   }
+  const ownerDeviceKeys = loadOwnerDeviceKeys(ownerDeviceKeysFile);
 
   const sid = env.OWNERSWITCH_TWILIO_ACCOUNT_SID;
   const twilioVars = [
@@ -134,10 +188,40 @@ export function escalationConfigFromEnv(
         }
       : undefined;
 
-  if (twilio === undefined && vapid === undefined) {
+  const emailVars = [
+    env.OWNERSWITCH_EMAIL_FROM,
+    env.OWNERSWITCH_EMAIL_TO,
+    env.OWNERSWITCH_OWNER_APP_URL,
+    env.OWNERSWITCH_SES_REGION,
+    env.OWNERSWITCH_SES_ACCESS_KEY_ID,
+    env.OWNERSWITCH_SES_SECRET_ACCESS_KEY,
+  ];
+  const emailSet = emailVars.filter((v) => v !== undefined && v !== "").length;
+  if (emailSet > 0 && emailSet < 6) {
+    throw new Error(
+      "partial email configuration: set all of OWNERSWITCH_EMAIL_FROM, OWNERSWITCH_EMAIL_TO, " +
+        "OWNERSWITCH_OWNER_APP_URL, OWNERSWITCH_SES_REGION, OWNERSWITCH_SES_ACCESS_KEY_ID, " +
+        "OWNERSWITCH_SES_SECRET_ACCESS_KEY — or none",
+    );
+  }
+  const email =
+    emailSet === 6
+      ? {
+          from: env.OWNERSWITCH_EMAIL_FROM as string,
+          to: env.OWNERSWITCH_EMAIL_TO as string,
+          ownerAppUrl: env.OWNERSWITCH_OWNER_APP_URL as string,
+          ses: {
+            region: env.OWNERSWITCH_SES_REGION as string,
+            accessKeyId: env.OWNERSWITCH_SES_ACCESS_KEY_ID as string,
+            secretAccessKey: env.OWNERSWITCH_SES_SECRET_ACCESS_KEY as string,
+          },
+        }
+      : undefined;
+
+  if (twilio === undefined && vapid === undefined && email === undefined) {
     throw new Error(
       "no channel is configured — the escalation service would poll and never reach the owner. " +
-        "Configure Web Push (VAPID) and/or Twilio; see packages/escalation/README.md",
+        "Configure Web Push (VAPID), Twilio, and/or email (SES); see packages/escalation/README.md",
     );
   }
 
@@ -157,11 +241,12 @@ export function escalationConfigFromEnv(
     );
   }
 
-  // Rungs assemble from what exists (DESIGN.md §1 offsets). Email has no
-  // shipped channel yet, so it earns no rung — a rung that silently does
-  // nothing would be a lie in the audit trail.
+  // Rungs assemble from what exists (DESIGN.md §1 offsets): push + email at
+  // 0:00, SMS at 2:30, voice at 5:00. A channel with no config earns no rung
+  // — a rung that silently does nothing would be a lie in the audit trail.
   const rungs: LadderRung[] = [];
   if (vapid !== undefined) rungs.push({ afterMs: 0, channel: "push" });
+  if (email !== undefined) rungs.push({ afterMs: 0, channel: "email" });
   if (twilio !== undefined) {
     rungs.push({ afterMs: 2.5 * 60_000, channel: "sms" });
     rungs.push({ afterMs: 5 * 60_000, channel: "voice" });
@@ -180,16 +265,41 @@ export function escalationConfigFromEnv(
     throw new Error("OWNERSWITCH_ESCALATION_MAX_DAILY_SPEND_USD must be a non-negative number");
   }
 
+  const ownerDeviceStandingFile = standingFileEnv;
+  const trustedUidRaw = env.OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID?.trim();
+  let ownerDeviceStandingTrustedUid: number | undefined;
+  if (trustedUidRaw !== undefined && trustedUidRaw !== "") {
+    const parsed = Number(trustedUidRaw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_TRUSTED_UID must be a non-negative integer uid");
+    }
+    ownerDeviceStandingTrustedUid = parsed;
+  }
+  const standingGidRaw = env.OWNERSWITCH_OWNER_DEVICE_STANDING_GID?.trim();
+  let ownerDeviceStandingGid: number | undefined;
+  if (standingGidRaw !== undefined && standingGidRaw !== "") {
+    const parsed = Number(standingGidRaw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_GID must be a non-negative integer gid");
+    }
+    ownerDeviceStandingGid = parsed;
+  }
   return {
     controlPlaneUrl,
     device,
-    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
+    ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
+    ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
+      ? { ownerDeviceStandingFile }
+      : {}),
+    ...(ownerDeviceStandingTrustedUid !== undefined ? { ownerDeviceStandingTrustedUid } : {}),
+    ...(ownerDeviceStandingGid !== undefined ? { ownerDeviceStandingGid } : {}),
     listenHost: env.OWNERSWITCH_ESCALATION_HOST ?? "127.0.0.1",
     listenPort: intEnv(env, "OWNERSWITCH_ESCALATION_PORT", DEFAULT_PORT),
     ...(webhookBaseUrl !== undefined && webhookBaseUrl !== "" ? { webhookBaseUrl } : {}),
     ...(stateFile !== undefined && stateFile !== "" ? { stateFile } : {}),
     ...(twilio !== undefined ? { twilio } : {}),
     ...(vapid !== undefined ? { vapid } : {}),
+    ...(email !== undefined ? { email } : {}),
     rungs,
     limits,
     pollMs: intEnv(env, "OWNERSWITCH_ESCALATION_POLL_MS", DEFAULT_POLL_MS),

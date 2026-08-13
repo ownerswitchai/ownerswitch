@@ -40,12 +40,15 @@
     </nav>
 
     <div class="scaffold-note">
-      STATIC DESIGN SCAFFOLD — nothing here is wired: no push, no
-      WebAuthn, no network calls. Placeholder data throughout; every
-      live control is disabled. The repository provides no supported
-      install path — serving this manually may register the no-op
-      service worker, but no functional OwnerSwitch app results. The
-      contract this will implement is DESIGN.md.
+      DESIGN SHELL. The veto lane is LIVE when the deployment serves a
+      config.js defining window.OWNERSWITCH_CONFIG ({ deviceId,
+      controlPlaneUrl, escalationUrl, vapidPublicKey }): the app then
+      generates its non-extractable device key, enrolls for push, and
+      on an #alert=&lt;windowId&gt; deep link renders the window and sends
+      the device-signed delivery ack from that render (app.js,
+      owner-runtime.mjs, owner-crypto.mjs). Without that config it stays
+      this static shell with placeholder data. Approve/Restore/Devices
+      (the passkey lanes) remain scaffold — see DESIGN.md.
     </div>
 
     <div class="tabs" id="tabs">

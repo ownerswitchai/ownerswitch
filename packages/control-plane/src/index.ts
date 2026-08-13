@@ -41,4 +41,25 @@ export {
   verifyDeviceSignature,
   verifyOwnerSession,
 } from "./auth.js";
+
+export { enrolledOwnerDeviceFromSpki, verifyOwnerDeviceSignature } from "./owner-device.js";
+export type {
+  EnrolledOwnerDevice,
+  OwnerDeviceCredential,
+  OwnerDeviceVerifyOptions,
+} from "./owner-device.js";
+export { loadOwnerDeviceKeysFile } from "./owner-device-file.js";
+export type { LoadOwnerDeviceKeysOptions } from "./owner-device-file.js";
+export {
+  canonicalTrustedStandingPath,
+  DeviceStandingFileStore,
+  MAX_DEVICE_STANDING_FILE_BYTES,
+} from "./device-standing.js";
+export type {
+  DeviceStanding,
+  DeviceStandingLoad,
+  DeviceStandingStoreOptions,
+  PersistedDeviceStanding,
+  TrustedStandingPathOptions,
+} from "./device-standing.js";
 export type { DeviceCredential, DeviceVerifyOptions, OwnerSession, SessionOptions } from "./auth.js";

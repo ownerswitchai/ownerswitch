@@ -1,11 +1,19 @@
-import { createHmac, randomUUID } from "node:crypto";
-import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
+import {
+  createHash,
+  createHmac,
+  generateKeyPairSync,
+  randomUUID,
+  sign as ecSign,
+} from "node:crypto";
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
+import { Readable } from "node:stream";
 import { join } from "node:path";
-import { canonicalJson, verifyMergeGrant } from "@ownerswitchai/shared";
+import { canonicalJson, ownerDeviceSigPreimage, verifyMergeGrant } from "@ownerswitchai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOwnerSession, signDeviceRequest } from "./auth.js";
+import { DeviceStandingFileStore } from "./device-standing.js";
 import { generateLicenseKeys, mintLicense } from "./license.js";
 import {
   createControlPlane,
@@ -21,7 +29,13 @@ const clock = (start = 0) => {
 };
 
 const DEVICE_SECRET = "button-secret";
-const OWNER_APP_SECRET = "owner-app-secret";
+
+// The owner app's asymmetric device key: a non-extractable P-256 key on the
+// phone in production; here a test keypair whose SPKI is enrolled and whose
+// private half signs the delivery ack (owner-device.ts).
+const ownerKeypair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const OWNER_DEVICE_SPKI = ownerKeypair.publicKey.export({ format: "pem", type: "spki" }).toString();
+const OWNER_DEVICE_KEYS: Record<string, string> = { "owner-app": OWNER_DEVICE_SPKI };
 
 /** Headers for a device-signed request over `body`, signed "now". */
 const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
@@ -36,22 +50,38 @@ const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random(
   ),
 });
 
-/** Headers signed with the OWNER APP's own secret — the delivery-ack credential. */
+/**
+ * Headers signed with the OWNER APP's asymmetric device key — the delivery-ack
+ * credential (ECDSA P-256, r||s, over the method+path+body preimage). The
+ * signed path must be the exact request target, so the caller passes it.
+ */
 const ownerAppHeaders = (
+  method: string,
+  pathAndQuery: string,
   body: string,
   at: number,
   nonce = `oa-${at}-${Math.random().toString(36).slice(2)}`,
-) => ({
-  "content-type": "application/json",
-  "x-device-id": "owner-app",
-  "x-device-timestamp": String(at),
-  "x-device-nonce": nonce,
-  "x-device-signature": signDeviceRequest(
-    { deviceId: "owner-app", timestamp: at, nonce },
-    body,
-    OWNER_APP_SECRET,
-  ),
-});
+) => {
+  const preimage = ownerDeviceSigPreimage({
+    deviceId: "owner-app",
+    method,
+    pathAndQuery,
+    bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+    timestamp: at,
+    nonce,
+  });
+  const signature = ecSign("sha256", preimage, {
+    key: ownerKeypair.privateKey,
+    dsaEncoding: "ieee-p1363",
+  }).toString("base64url");
+  return {
+    "content-type": "application/json",
+    "x-device-id": "owner-app",
+    "x-device-timestamp": String(at),
+    "x-device-nonce": nonce,
+    "x-device-signature": signature,
+  };
+};
 
 const bearer = (token: string) => ({
   "content-type": "application/json",
@@ -1931,34 +1961,120 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     return window;
   };
 
-  it("POST /veto/:id/seen (owner-app-signed) flips delivered, records the device, and silence then releases", async () => {
+  /** Fetch the foreground detail (owner-app-signed) and return its delivery echo. */
+  const fetchDetail = async (url: string, windowId: string, c: { now: () => number }) => {
+    const p = `/veto/${windowId}/detail`;
+    const res = await fetch(`${url}${p}`, { headers: ownerAppHeaders("GET", p, "", c.now()) });
+    return { res, detail: (await res.json()) as Record<string, unknown> };
+  };
+
+  /** Full versioned ack: fetch detail, echo {deliveryId, revision, renderContentHash}, POST /seen. */
+  const ackWindow = async (url: string, windowId: string, c: { now: () => number }) => {
+    const { detail } = await fetchDetail(url, windowId, c);
+    const p = `/veto/${windowId}/seen`;
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    return fetch(`${url}${p}`, { method: "POST", headers: ownerAppHeaders("POST", p, ackBody, c.now()), body: ackBody });
+  };
+
+  it("GET /veto/:id/detail returns the renderable + a delivery; the echoed ack flips delivered and silence releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
-    const res = await fetch(`${url}/veto/v-1/seen`, {
-      method: "POST",
-      headers: ownerAppHeaders("", c.now()),
-      body: "",
-    });
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.agentId).toBe("agent-1");
+    expect(detail.tool).toBe("bash");
+    expect(detail.revision).toBe(1);
+    expect(typeof detail.deliveryId).toBe("string");
+    expect(typeof detail.renderContentHash).toBe("string");
+
+    const res = await ackWindow(url, "v-1", c);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      status: "pending",
-      delivered: true,
-      deadline: 1_000 + 4 * 60_000,
-    });
+    expect(((await res.json()) as { delivered: boolean }).delivered).toBe(true);
     expect(window.isDelivered).toBe(true);
     expect(window.deliveredBy).toBe("owner-app");
-    expect(window.deliveredAt).toBe(c.now());
 
     c.advance(4 * 60_000);
     expect(await (await fetch(`${url}/veto/v-1`)).json()).toEqual({ status: "released" });
   });
 
+  it("an ack with no delivery echo (blank ack) is refused — a blank render cannot confirm", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const res = await fetch(`${url}/veto/v-1/seen`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/delivery/);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("a delivery minted for revision N cannot confirm the window after it extends (stale delivery)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c, "v-1", 60_000); // short 1-min window (< 2-min delivery TTL)
+
+    const { detail } = await fetchDetail(url, "v-1", c); // revision 1
+    // window extends undelivered → revision bumps to 2, but the delivery is
+    // still UNEXPIRED (fetched <2 min ago), so it is REVISION that rejects it
+    c.advance(60_001);
+    expect(window.tick()).toBe("extended");
+    expect(window.revision).toBe(2);
+
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision, // stale revision 1
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/stale|advanced/);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("an expired delivery cannot confirm (2 min TTL), even while the window is still open", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c); // 4 min window
+    const { detail } = await fetchDetail(url, "v-1", c);
+
+    c.advance(2 * 60_000 + 1); // past DELIVERY_TTL_MS, still before the 4-min deadline (revision unchanged)
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/expired/);
+    expect(window.isDelivered).toBe(false);
+  });
+
   it("the FLEET device secret cannot flip the permissive bit — only the owner-app secret", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
@@ -1981,7 +2097,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(501);
@@ -1997,7 +2113,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("POST /veto/:id/seen without a valid signature -> 401; no session variant exists", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
@@ -2018,15 +2134,25 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
   it("an ack inside the 60 s response floor is refused and the window extends, never releases", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
 
-    c.advance(4 * 60_000 - 30_000); // 30 s before the deadline — inside the floor
-    const res = await fetch(`${url}/veto/v-1/seen`, {
+    // fetch a fresh detail close to the floor (so the delivery is unexpired
+    // when the ack lands inside the floor), then advance into the floor
+    c.advance(4 * 60_000 - 90_000); // 2:30 in — delivery TTL runs to 4:30
+    const { detail } = await fetchDetail(url, "v-1", c);
+    c.advance(60_000); // now 30 s before the deadline — inside the floor
+    const p = "/veto/v-1/seen";
+    const floorBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
-      body: "",
+      headers: ownerAppHeaders("POST", p, floorBody, c.now()),
+      body: floorBody,
     });
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toMatch(/response floor/);
@@ -2035,26 +2161,23 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     c.advance(30_000); // deadline passes undelivered -> extended, not released
     expect(window.tick()).toBe("extended");
 
-    // against the NEW deadline there is time again; the re-ack counts
-    const again = await fetch(`${url}/veto/v-1/seen`, {
-      method: "POST",
-      headers: ownerAppHeaders("", c.now()),
-      body: "",
-    });
+    // against the NEW deadline there is time again; a FRESH detail's ack counts
+    const again = await ackWindow(url, "v-1", c);
     expect(again.status).toBe(200);
     expect(window.isDelivered).toBe(true);
   });
 
   it("re-acking a delivered window is an idempotent success; a terminal window refuses", async () => {
     const c = clock(1_000);
-    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerAppSecret: OWNER_APP_SECRET });
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
     const url = await start(cp);
     const window = openWindow(cp, c);
     window.markDelivered("owner-app");
 
+    // an already-delivered window re-acks idempotently, no fresh delivery needed
     const res = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -2065,7 +2188,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     window.veto("adam");
     const deliveredTerminal = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-1/seen", "", c.now()),
       body: "",
     });
     expect(deliveredTerminal.status).toBe(200);
@@ -2075,11 +2198,791 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     openWindow(cp, c, "v-2").veto("adam");
     const terminal = await fetch(`${url}/veto/v-2/seen`, {
       method: "POST",
-      headers: ownerAppHeaders("", c.now()),
+      headers: ownerAppHeaders("POST", "/veto/v-2/seen", "", c.now()),
       body: "",
     });
     expect(terminal.status).toBe(409);
     expect(((await terminal.json()) as { error: string }).error).toMatch(/vetoed/);
+  });
+
+  it("the detail summary NAMES the concrete merge (repo#pr into base @ head), not just the operation", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      {
+        agentId: "agent-1",
+        tool: "github.merge_pr",
+        args: {
+          owner: "ownerswitchai",
+          repo: "ownerswitch",
+          pullNumber: 43,
+          expectedHeadSha: "a".repeat(40),
+          expectedBaseRef: "main",
+          mergeMethod: "squash",
+        },
+      },
+      cp.killSwitch.epoch,
+      { now: c.now, purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "" } },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    // decision-complete: WHICH pr, into WHICH branch, at WHICH head — not "github/merge_pull_request"
+    expect(detail.summary).toBe("Merge ownerswitchai/ownerswitch#43 into main — squash, head aaaaaaaaaaaa");
+    expect(typeof detail.deliveryId).toBe("string");
+
+    // and it is ackable end-to-end
+    const res = await ackWindow(url, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+  });
+
+  it("a plain tool's summary is its exact canonical args; a short, clean call is ackable", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "stripe.payout", args: { amount: 5000, to: "acct_x" } },
+      cp.killSwitch.epoch,
+      { now: c.now },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.summary).toBe('{"amount":5000,"to":"acct_x"}');
+    const res = await ackWindow(url, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+  });
+
+  it("a window whose summary cannot be rendered decision-completely is NON-ACKABLE and fails closed to held", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    // an oversized argument: the full display-safe args exceed the V1 summary
+    // limit, so we refuse to truncate — no delivery is minted
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "bash", args: { script: "x".repeat(300) } },
+      cp.killSwitch.epoch,
+      { now: c.now, windowMs: 60_000 },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.deliveryId).toBeNull(); // non-ackable: no delivery to echo
+    // and any attempt to ack (with a fabricated echo) is refused
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({ deliveryId: "del_forged", revision: 1, renderContentHash: "x" });
+    const forged = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(forged.status).toBe(409);
+    expect(window.isDelivered).toBe(false);
+
+    // never delivered → silence extends then holds (fail closed), never releases
+    c.advance(60_001);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000 + 1);
+    expect(window.tick()).toBe("held");
+  });
+
+  it("a bidi/control character in an agent-supplied envelope field makes the window non-ackable (V1 conformance)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    // a right-to-left override in the RAW tool field (the envelope carries
+    // agentId/tool verbatim, not JSON-escaped): FORBIDDEN → non-conformant
+    const window = new VetoWindow(
+      { agentId: "agent-1", tool: "git‮hsab", args: {} },
+      cp.killSwitch.epoch,
+      { now: c.now },
+    );
+    cp.vetoWindows.set("v-1", window);
+
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(detail.deliveryId).toBeNull();
+    // display still shows who (stripped) and states approval is required
+    expect(detail.agentId).toBe("agent-1");
+    expect(detail.tool).toBe("githsab"); // the override stripped for display only
+    expect(detail.summary).toMatch(/full owner approval/);
+  });
+
+  it("REVOCATION: a revoked device authenticates nothing — detail, ack, and veto all 401", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    openWindow(cp, c);
+
+    // sever the device (loopback caller — the host can always revoke)
+    const revoke = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(revoke.status).toBe(200);
+    expect(((await revoke.json()) as { revoked: boolean }).revoked).toBe(true);
+
+    // every owner-device-signed surface now refuses the key
+    const { res } = await fetchDetail(url, "v-1", c);
+    expect(res.status).toBe(401);
+    const p = "/veto/v-1/seen";
+    const seen = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, "", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(401);
+
+    // idempotent re-revoke
+    const again = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { alreadyRevoked?: boolean }).alreadyRevoked).toBe(true);
+
+    // unknown device -> 404
+    const unknown = await fetch(`${url}/devices/ghost/revoke`, { method: "POST", body: "" });
+    expect(unknown.status).toBe(404);
+  });
+
+  it("REVOCATION clears a still-open window's delivered evidence: silence then holds, never releases on a dead witness", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c); // 4-min window
+
+    // the device sees and acks the alert — delivered, on course to release
+    const ack = await ackWindow(url, "v-1", c);
+    expect(ack.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+    expect(window.deliveredByGeneration).toBe(1);
+
+    // the phone is reported stolen BEFORE the deadline
+    const revoke = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(((await revoke.json()) as { evidenceCleared: number }).evidenceCleared).toBe(1);
+    expect(window.isDelivered).toBe(false); // the dead witness's evidence is gone
+
+    // silence now fails CLOSED: extend, then held — never released
+    c.advance(4 * 60_000 + 1);
+    expect(window.tick()).toBe("extended");
+    c.advance(6 * 60_000 + 1);
+    expect(window.tick()).toBe("held");
+  });
+
+  it("REVOCATION after the deadline leaves the release standing — the decision was made while the witness was valid", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    const ack = await ackWindow(url, "v-1", c);
+    expect(ack.status).toBe(200);
+
+    // the deadline passes with the evidence valid — silence became approval
+    c.advance(4 * 60_000 + 1);
+    // revoke lands AFTER the decision moment (even before any tick ran)
+    await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(window.tick()).toBe("released");
+    expect(window.releasedAt).toBe(1_000 + 4 * 60_000);
+  });
+
+  it("a delivery minted before revocation cannot be spent after it (generation CAS), even with a then-valid signature", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // fetch the detail (mints a delivery under generation 1)…
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(typeof detail.deliveryId).toBe("string");
+    // …but the ack never arrives; the phone is revoked meanwhile. The purge
+    // removes the delivery AND the revoked key fails auth — belt and braces:
+    // even a replayed pre-revocation request body has nothing left to name.
+    await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, ackBody, c.now()),
+      body: ackBody,
+    });
+    expect(res.status).toBe(401); // the revoked key signs nothing
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("a fleet-device signature authenticates a revoke (the stop direction)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const body = JSON.stringify({ reason: "phone stolen" });
+    const res = await fetch(`${url}/devices/owner-app/revoke`, {
+      method: "POST",
+      headers: deviceHeaders(body, c.now()),
+      body,
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { revoked: boolean }).revoked).toBe(true);
+  });
+
+  /**
+   * Drive the handler with a FABRICATED non-loopback socket — an HTTP server
+   * bound to 127.0.0.1 can never produce one, so this is the only way to
+   * prove the loopback bypass does not extend to remote callers.
+   */
+  const callFromRemote = (
+    cp: ControlPlane,
+    method: string,
+    path: string,
+    headers: Record<string, string>,
+    body: string,
+  ) =>
+    new Promise<{ status: number; body: Record<string, unknown> }>((resolve, reject) => {
+      const req = Readable.from([Buffer.from(body)]) as unknown as IncomingMessage;
+      req.method = method;
+      req.url = path;
+      req.headers = headers;
+      (req as unknown as { socket: { remoteAddress: string } }).socket = {
+        remoteAddress: "203.0.113.9",
+      };
+      const chunks: Buffer[] = [];
+      let status = 0;
+      const res = {
+        writeHead(code: number) {
+          status = code;
+          return this;
+        },
+        end(chunk?: unknown) {
+          if (chunk !== undefined) chunks.push(Buffer.from(chunk as string));
+          resolve({ status, body: JSON.parse(Buffer.concat(chunks).toString() || "{}") });
+        },
+        writableEnded: false,
+      } as unknown as ServerResponse;
+      try {
+        cp.handler(req, res);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+
+  it("NON-LOOPBACK revoke: unauthenticated or bad-signature refused; a valid fleet signature accepted", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const path = "/devices/owner-app/revoke";
+    const body = JSON.stringify({ reason: "stolen" });
+
+    // no auth at all from a remote address -> 401 (the loopback bypass is gone)
+    const bare = await callFromRemote(cp, "POST", path, { "content-type": "application/json" }, body);
+    expect(bare.status).toBe(401);
+
+    // a WRONG fleet signature -> still 401
+    const wrong = await callFromRemote(
+      cp,
+      "POST",
+      path,
+      { ...deviceHeaders(body, c.now()), "x-device-signature": "not-a-real-signature" },
+      body,
+    );
+    expect(wrong.status).toBe(401);
+    expect(cp.ownerDevices.get("owner-app")?.revokedAt).toBeNull(); // nothing severed yet
+
+    // a VALID fleet signature from the same remote address -> 200
+    const ok = await callFromRemote(cp, "POST", path, deviceHeaders(body, c.now()), body);
+    expect(ok.status).toBe(200);
+    expect(ok.body.revoked).toBe(true);
+    expect(cp.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
+  });
+
+  it("a revoked device's deny-only VETO signature is refused too (E2E)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+    await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+
+    const p = "/veto/v-1";
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, "", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(401);
+    expect(window.state).toBe("pending"); // the stop did not land from the dead key
+  });
+
+  it("TWO PHONES: device B cannot spend device A's delivery", async () => {
+    const c = clock(1_000);
+    const phoneB = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const keys = {
+      ...OWNER_DEVICE_KEYS,
+      "owner-b": phoneB.publicKey.export({ format: "pem", type: "spki" }).toString(),
+    };
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: keys });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // A fetches the detail — the delivery is A's
+    const { detail } = await fetchDetail(url, "v-1", c);
+    expect(typeof detail.deliveryId).toBe("string");
+
+    // B echoes A's delivery with B's own VALID signature
+    const p = "/veto/v-1/seen";
+    const ackBody = JSON.stringify({
+      deliveryId: detail.deliveryId,
+      revision: detail.revision,
+      renderContentHash: detail.renderContentHash,
+    });
+    const at = c.now();
+    const nonce = "b-1";
+    const preimage = ownerDeviceSigPreimage({
+      deviceId: "owner-b",
+      method: "POST",
+      pathAndQuery: p,
+      bodyHash: new Uint8Array(createHash("sha256").update(ackBody).digest()),
+      timestamp: at,
+      nonce,
+    });
+    const res = await fetch(`${url}${p}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-device-id": "owner-b",
+        "x-device-timestamp": String(at),
+        "x-device-nonce": nonce,
+        "x-device-signature": ecSign("sha256", preimage, {
+          key: phoneB.privateKey,
+          dsaEncoding: "ieee-p1363",
+        }).toString("base64url"),
+      },
+      body: ackBody,
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/different device/);
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("RESTART: a revocation persisted to the standing registry survives a control-plane restart", async () => {
+    const c = clock(1_000);
+    const standingFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-standing-")), "standing.json");
+
+    // first process: revoke, durably
+    const cp1 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    const url1 = await start(cp1);
+    const revoke = await fetch(`${url1}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(revoke.status).toBe(200);
+    expect(((await revoke.json()) as { durable: boolean }).durable).toBe(true);
+    server?.close();
+    server = undefined;
+
+    // second process, SAME static keys file semantics + SAME standing registry
+    const cp2 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    const url2 = await start(cp2);
+    openWindow(cp2, c);
+
+    // the stolen phone is NOT resurrected: still revoked, still 401 everywhere
+    expect(cp2.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
+    expect(cp2.ownerDevices.get("owner-app")?.generation).toBe(2);
+    const { res } = await fetchDetail(url2, "v-1", c);
+    expect(res.status).toBe(401);
+  });
+
+  it("RESTART: deleting the standing file does not resurrect either — corrupt boots ALL-REVOKED", async () => {
+    const c = clock(1_000);
+    const standingFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-standing-")), "standing.json");
+    const cp1 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    const url1 = await start(cp1);
+    await fetch(`${url1}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    server?.close();
+    server = undefined;
+
+    rmSync(standingFile); // the resurrection attempt: delete the registry
+    const silenced = console.error;
+    console.error = () => {};
+    let cp2;
+    try {
+      cp2 = ephemeral({
+        now: c.now,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        ownerDeviceStandingFile: standingFile,
+      });
+    } finally {
+      console.error = silenced;
+    }
+    expect(cp2.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull(); // fail closed
+  });
+
+  it("PRODUCTION GUARD: enrolled owner devices without a standing registry refuse to start (dev opts out)", () => {
+    const c = clock(1_000);
+    expect(() =>
+      createControlPlane({
+        now: c.now,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        killStateFile: tempStateFile(),
+      }),
+    ).toThrow(/ownerDeviceStandingFile/);
+  });
+
+  it("PATH GUARD: a production standing path gets the kill-state discipline (relative and in-cwd refused)", () => {
+    const c = clock(1_000);
+    const base = {
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      killStateFile: tempStateFile(),
+    };
+    const silenced = console.error;
+    console.error = () => {};
+    try {
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingFile: "relative/standing.json" }),
+      ).toThrow(/relative path/);
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingFile: join(process.cwd(), "standing.json") }),
+      ).toThrow(/working directory/);
+      // and past the directory checks, the FULL real-ancestry walk runs: a
+      // chain through world-writable /tmp is refused even though the
+      // immediate parent (mkdtemp, 0700, owned) looks fine
+      expect(() =>
+        createControlPlane({
+          ...base,
+          ownerDeviceStandingFile: join(mkdtempSync(join(tmpdir(), "ownerswitch-standing-")), "standing.json"),
+        }),
+      ).toThrow(/world-writable|group- or world-writable/);
+    } finally {
+      console.error = silenced;
+    }
+  });
+
+  it("ALL-OR-NOTHING: half a 0640 configuration refuses the boot in either direction", () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const base = {
+      now: c.now,
+      dev: true as const,
+      killStateFile: null,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: join(dir, "standing.json"),
+      acceptSessionOnlyApprovalRisk: true,
+    };
+    const silenced = console.error;
+    console.error = () => {};
+    try {
+      // group-readable without a gid: 0640 for the WRONG group
+      expect(() =>
+        createControlPlane({ ...base, ownerDeviceStandingGroupReadable: true }),
+      ).toThrow(/requires ownerDeviceStandingGid/);
+      // a gid without group-readable: a group that can read nothing
+      expect(() => createControlPlane({ ...base, ownerDeviceStandingGid: 1234 })).toThrow(
+        /without ownerDeviceStandingGroupReadable/,
+      );
+      // both together boot (and publish 0640 under that gid at boot init)
+      const gid = typeof process.getgid === "function" ? process.getgid() : 0;
+      const cp = createControlPlane({
+        ...base,
+        ownerDeviceStandingGroupReadable: true,
+        ownerDeviceStandingGid: gid,
+      });
+      void cp;
+      const published = statSync(join(dir, "standing.json"));
+      expect(published.mode & 0o777).toBe(0o640);
+      expect(published.gid).toBe(gid);
+    } finally {
+      console.error = silenced;
+    }
+  });
+
+  it("BOOT INIT: a configured-but-absent registry is durably initialized with the active snapshot; missing records are migrated", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "standing.json");
+
+    // absent → boot writes the full active snapshot BEFORE the lane operates
+    const cp1 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    void cp1;
+    const store = new DeviceStandingFileStore(standingFile);
+    const initialized = store.load();
+    expect(initialized.outcome).toBe("loaded");
+    if (initialized.outcome === "loaded") {
+      expect(initialized.state.devices["owner-app"]).toEqual({ generation: 1, revokedAt: null });
+    }
+
+    // a registry that lacks a record for an ENROLLED device gets it migrated
+    // durably at boot (explicit act), never implied at decision time
+    store.save({ version: 1, devices: { "some-other": { generation: 3, revokedAt: 5 } } });
+    const cp2 = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: OWNER_DEVICE_KEYS,
+      ownerDeviceStandingFile: standingFile,
+    });
+    void cp2;
+    const migrated = store.load();
+    expect(migrated.outcome).toBe("loaded");
+    if (migrated.outcome === "loaded") {
+      expect(migrated.state.devices["owner-app"]).toEqual({ generation: 1, revokedAt: null });
+      expect(migrated.state.devices["some-other"]).toEqual({ generation: 3, revokedAt: 5 }); // preserved
+    }
+  });
+
+  it("QUARANTINE: a revoke whose persist FAILS answers 503, closes the whole lane, and a later durable retry reopens it", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "sub", "standing.json");
+    const phoneB = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const keys = {
+      ...OWNER_DEVICE_KEYS,
+      "owner-b": phoneB.publicKey.export({ format: "pem", type: "spki" }).toString(),
+    };
+    const cp = ephemeral({
+      now: c.now,
+      deviceSecret: DEVICE_SECRET,
+      ownerDeviceKeys: keys,
+      ownerDeviceStandingFile: standingFile,
+    });
+    const url = await start(cp);
+
+    // a window registered through the API (so the server's witnessStanding rides it)
+    const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
+    const reg = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    const { id } = (await reg.json()) as { id: string };
+    const window = cp.vetoWindows.get(id);
+    if (window === undefined) throw new Error("window not registered");
+    const ack1 = await ackWindow(url, id, c);
+    expect(ack1.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+
+    // BREAK persistence: the registry's parent directory becomes a plain file
+    rmSync(join(dir, "sub"), { recursive: true, force: true });
+    writeFileSync(join(dir, "sub"), "not a directory");
+
+    // the revoke is HONEST about the state: 503, revoked in memory,
+    // quarantined — and the DURABLE kill switch engaged (v11): the failure
+    // must survive a restart, so it is recorded in the kill store, not only
+    // in this process's memory
+    const failed = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(failed.status).toBe(503);
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+    expect(failedBody.revoked).toBe(true);
+    expect(failedBody.quarantined).toBe(true);
+    expect(failedBody.killed).toBe(true);
+    expect(cp.killSwitch.killed).toBe(true);
+    expect(cp.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
+
+    // the WHOLE lane is closed while quarantined — for the UN-REVOKED device
+    // B too: its detail mints no delivery, and the already-acked window
+    // cannot release on silence. (owner-app itself is revoked → plain 401.)
+    const bFetchDetail = async (windowId: string) => {
+      const p = `/veto/${windowId}/detail`;
+      const at = c.now();
+      const nonce = `qb-${at}-${Math.random().toString(36).slice(2)}`;
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-b",
+        method: "GET",
+        pathAndQuery: p,
+        bodyHash: new Uint8Array(createHash("sha256").update("").digest()),
+        timestamp: at,
+        nonce,
+      });
+      const res = await fetch(`${url}${p}`, {
+        headers: {
+          "x-device-id": "owner-b",
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": ecSign("sha256", preimage, {
+            key: phoneB.privateKey,
+            dsaEncoding: "ieee-p1363",
+          }).toString("base64url"),
+        },
+      });
+      return { res, detail: (await res.json()) as Record<string, unknown> };
+    };
+    const during = await bFetchDetail(id);
+    expect(during.res.status).toBe(200);
+    expect(during.detail.deliveryId).toBeNull();
+    c.advance(4 * 60_000 + 1);
+    expect(window.tick()).not.toBe("released");
+
+    // RECOVERY step 1: restore the directory, retry the (idempotent) revoke —
+    // the persist now lands durably and the standing quarantine lifts
+    rmSync(join(dir, "sub"));
+    const retried = await fetch(`${url}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(retried.status).toBe(200);
+    const onDisk = new DeviceStandingFileStore(standingFile).load();
+    expect(onDisk.outcome).toBe("loaded");
+    if (onDisk.outcome === "loaded") {
+      expect(onDisk.state.devices["owner-app"]?.revokedAt).not.toBeNull();
+    }
+
+    // RECOVERY step 2 is the owner's, not this test's: the kill engaged by
+    // the failed persist stays in force until a 2GO restore — so the lane
+    // remains CLOSED even though standing is durable again. Deliberate: the
+    // failure was a security event; reopening is a human ceremony.
+    expect(cp.killSwitch.killed).toBe(true);
+    const window2 = openWindow(cp, c, "v-post");
+    void window2;
+    const after = await bFetchDetail("v-post");
+    expect(after.res.status).toBe(200);
+    expect(after.detail.deliveryId).toBeNull(); // still killed → still no delivery
+  });
+
+  it("DECISION-POINT CAS on a server-registered window: a sweep-bypassing revocation still cannot release", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+
+    // register through the API so the server injects its witnessStanding
+    const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
+    const reg = await fetch(`${url}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    expect(reg.status).toBe(201);
+    const { id } = (await reg.json()) as { id: string };
+    const window = cp.vetoWindows.get(id);
+    if (window === undefined) throw new Error("window not registered");
+
+    const ack = await ackWindow(url, id, c);
+    expect(ack.status).toBe(200);
+    expect(window.isDelivered).toBe(true);
+
+    // revoke WITHOUT the endpoint (no sweep, no delivery purge): the path an
+    // admin tool or another process's registry write would take
+    const device = cp.ownerDevices.get("owner-app");
+    if (device === undefined) throw new Error("device missing");
+    device.revokedAt = c.now();
+    device.generation += 1;
+
+    // the deadline passes; the release decision itself must refuse the witness
+    c.advance(4 * 60_000 + 1);
+    expect(window.tick()).toBe("extended"); // NOT released
+    expect(window.isDelivered).toBe(false);
+  });
+
+  it("DURABLE KILL on failed revoke persist: even a restart onto STALE-ACTIVE standing yields zero delivery/ack/release", async () => {
+    const c = clock(1_000);
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-standing-"));
+    const standingFile = join(dir, "sub", "standing.json");
+    const killFile = join(dir, "kill-state.json");
+    const silence = () => {
+      const original = console.error;
+      console.error = () => {};
+      return () => (console.error = original);
+    };
+
+    // first process: real (dev-mode) kill persistence + standing registry
+    let restore = silence();
+    let cp1;
+    try {
+      cp1 = createControlPlane({
+        now: c.now,
+        dev: true,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        ownerDeviceStandingFile: standingFile,
+        killStateFile: killFile,
+        acceptSessionOnlyApprovalRisk: true,
+      });
+    } finally {
+      restore();
+    }
+    const url1 = await start(cp1);
+
+    // break standing persistence AFTER boot init (dir/sub becomes a file)
+    rmSync(join(dir, "sub"), { recursive: true, force: true });
+    writeFileSync(join(dir, "sub"), "not a directory");
+
+    // the failed-persist revoke engages the DURABLE kill switch
+    const failed = await fetch(`${url1}/devices/owner-app/revoke`, { method: "POST", body: "" });
+    expect(failed.status).toBe(503);
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+    expect(failedBody.killed).toBe(true);
+    expect(cp1.killSwitch.killed).toBe(true);
+    server?.close();
+    server = undefined;
+
+    // model the review's exact scenario: the DISK kept the STALE, still-ACTIVE
+    // standing (the revocation never landed there)
+    rmSync(join(dir, "sub"));
+    new DeviceStandingFileStore(standingFile).save({
+      version: 1,
+      devices: { "owner-app": { generation: 1, revokedAt: null } },
+    });
+
+    // second process: standing loads ACTIVE — but the kill store remembers
+    restore = silence();
+    let cp2;
+    try {
+      cp2 = createControlPlane({
+        now: c.now,
+        dev: true,
+        deviceSecret: DEVICE_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
+        ownerDeviceStandingFile: standingFile,
+        killStateFile: killFile,
+        acceptSessionOnlyApprovalRisk: true,
+      });
+    } finally {
+      restore();
+    }
+    expect(cp2.killSwitch.killed).toBe(true); // the kill survived the restart
+    expect(cp2.ownerDevices.get("owner-app")?.revokedAt).toBeNull(); // stale-active, as feared
+    const url2 = await start(cp2);
+    openWindow(cp2, c);
+
+    // ZERO delivery: the detail mints nothing while killed
+    const { res, detail } = await fetchDetail(url2, "v-1", c);
+    expect(res.status).toBe(200);
+    expect(detail.deliveryId).toBeNull();
+    // ZERO ack: /seen is closed while killed
+    const p = "/veto/v-1/seen";
+    const seen = await fetch(`${url2}${p}`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", p, "", c.now()),
+      body: "",
+    });
+    expect(seen.status).toBe(503);
+    // ZERO release: the witness check refuses everything while killed —
+    // even artificially delivered evidence cannot release
+    const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
+    const reg = await fetch(`${url2}/veto`, {
+      method: "POST",
+      headers: deviceHeaders(registerBody, c.now()),
+      body: registerBody,
+    });
+    const { id } = (await reg.json()) as { id: string };
+    const window2 = cp2.vetoWindows.get(id);
+    if (window2 === undefined) throw new Error("window not registered");
+    window2.markDelivered("owner-app", 1); // even if evidence somehow existed
+    c.advance(4 * 60_000 + 1);
+    expect(window2.tick()).not.toBe("released");
   });
 
   it("device-signed POST /veto/:id relays a channel stop with honest attribution, idempotently", async () => {
@@ -2108,6 +3011,34 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     expect(retry.status).toBe(200);
     expect(await retry.json()).toEqual({ status: "vetoed" });
     expect(window.vetoedBy).toBe("channel:sms-reply"); // first attribution stands
+  });
+
+  it("the owner app's ECDSA device signature vetoes on POST /veto/:id (deny-only, E2E)", async () => {
+    const c = clock(1_000);
+    const cp = ephemeral({ now: c.now, deviceSecret: DEVICE_SECRET, ownerDeviceKeys: OWNER_DEVICE_KEYS });
+    const url = await start(cp);
+    const window = openWindow(cp, c);
+
+    // the same owner-device key that acks delivery signs the one-tap veto
+    const res = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", "/veto/v-1", "", c.now()),
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "vetoed" });
+    expect(window.vetoedBy).toBe("owner-device:owner-app");
+
+    // but that same credential can NEVER approve
+    const approveBody = JSON.stringify({ decision: "approve" });
+    openWindow(cp, c, "v-appr");
+    const approve = await fetch(`${url}/veto/v-appr`, {
+      method: "POST",
+      headers: ownerAppHeaders("POST", "/veto/v-appr", approveBody, c.now()),
+      body: approveBody,
+    });
+    expect(approve.status).toBe(403);
+    expect(((await approve.json()) as { error: string }).error).toMatch(/one verb/);
   });
 
   it("without an attribution a device stop is recorded against the signing device", async () => {
@@ -2273,7 +3204,7 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
       cp = ephemeral({
         now: c.now,
         deviceSecret: DEVICE_SECRET,
-        ownerAppSecret: OWNER_APP_SECRET,
+        ownerDeviceKeys: OWNER_DEVICE_KEYS,
         licensing: { vendorPublicKeyPem: keys.publicKeyPem }, // no token
       });
     } finally {
@@ -2286,16 +3217,9 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     expect(kill.status).toBe(200);
     expect(cp.killSwitch.killed).toBe(true);
 
-    // the deny direction is free: the delivery ack (owner-app-signed) and the
-    // device veto relay both work with no license
+    // the deny direction is free: the device veto relay works with no license
     const window = new VetoWindow({ agentId: "a", tool: "bash" }, cp.killSwitch.epoch, { now: c.now });
     cp.vetoWindows.set("v-free", window);
-    const seen = await fetch(`${url}/veto/v-free/seen`, {
-      method: "POST",
-      headers: ownerAppHeaders("", c.now()),
-      body: "",
-    });
-    expect(seen.status).toBe(200);
     const veto = await fetch(`${url}/veto/v-free`, {
       method: "POST",
       headers: deviceHeaders("", c.now()),

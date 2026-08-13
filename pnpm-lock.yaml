@@ -21,7 +21,15 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.20.1)
 
-  apps/owner: {}
+  apps/owner:
+    dependencies:
+      '@ownerswitchai/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
+    devDependencies:
+      '@ownerswitchai/control-plane':
+        specifier: workspace:*
+        version: link:../../packages/control-plane
 
   packages/button:
     dependencies:

@@ -50,6 +50,21 @@ export interface VetoOptions {
   extensionMs?: number;
   /** the canonical purpose the registering gateway declared, if any */
   purpose?: VetoPurpose;
+  /**
+   * The release-time witness check: does the device named by the ack
+   * evidence STILL exist, in good standing, at the SAME generation it held
+   * when it acked? Consulted INSIDE tick() at the release decision itself —
+   * not only by the revocation handler's proactive sweep — so any in-process
+   * path that changed standing without running the sweep, standing loaded at
+   * boot from a previous lifetime, and a quarantined registry are all
+   * enforced exactly where they would otherwise release. (The control plane
+   * is the SINGLE standing writer at runtime; a write by another process to
+   * the shared file is honored at the next boot, not re-read per decision —
+   * see server.ts witnessStanding.) A missing checker (unit tests,
+   * non-owner-device windows) trusts the delivered bit as before; the server
+   * always injects one for windows it registers.
+   */
+  witnessStanding?: (deviceId: string | null, generation: number | null) => boolean;
   now?: () => number;
 }
 
@@ -57,7 +72,9 @@ export class VetoWindow {
   private status: VetoStatus = "pending";
   private delivered = false;
   private deliveredByDevice: string | null = null;
+  private deliveredByGenerationValue: number | null = null;
   private deliveredAtMs: number | null = null;
+  private revisionValue = 1;
   private deadline: number;
   private releasedAtMs: number | null = null;
   private approvedByOwner: string | null = null;
@@ -65,6 +82,9 @@ export class VetoWindow {
   private approvalEpochValue: number | null = null;
   private readonly extensionMs: number;
   private readonly now: () => number;
+  private readonly witnessStanding:
+    | ((deviceId: string | null, generation: number | null) => boolean)
+    | undefined;
   readonly purpose: VetoPurpose | undefined;
   vetoedBy: string | null = null;
 
@@ -87,6 +107,7 @@ export class VetoWindow {
     this.extensionMs = opts.extensionMs ?? 6 * 60_000;
     this.deadline = this.now() + (opts.windowMs ?? 4 * 60_000);
     this.purpose = opts.purpose;
+    this.witnessStanding = opts.witnessStanding;
   }
 
   /**
@@ -95,15 +116,38 @@ export class VetoWindow {
    * after a SIM swap it's proof the attacker's handset got the bytes,
    * not that the owner did. See packages/escalation/DESIGN.md §3.
    */
-  markDelivered(deviceId?: string): void {
+  markDelivered(deviceId?: string, deviceGeneration?: number): void {
     // First ack wins the attribution: a "released on silence" must be
-    // explainable from one recorded (device, time) pair, not the last of
-    // many retries.
+    // explainable from one recorded (device, generation, time) triple, not
+    // the last of many retries.
     if (!this.delivered) {
       this.delivered = true;
       this.deliveredByDevice = deviceId ?? null;
+      this.deliveredByGenerationValue = deviceGeneration ?? null;
       this.deliveredAtMs = this.now();
     }
+  }
+
+  /**
+   * The ONE event that may clear delivered evidence: the witnessing device
+   * was REVOKED. The release decision is deadline-anchored (see tick), so
+   * this first advances the clock — a window whose deadline already passed
+   * with valid evidence has RELEASED (silence became approval while the
+   * witness was still trusted) and stays released; evidence on a still-open
+   * window from the revoked device is cleared, so the window walks
+   * extend→held (fail closed) instead of releasing on a dead witness. A
+   * different device's evidence is untouched. Returns whether evidence was
+   * cleared.
+   */
+  revokeDeliveryEvidence(deviceId: string): boolean {
+    const status = this.tick(); // decide any already-due release FIRST
+    if (status !== "pending" && status !== "extended") return false;
+    if (!this.delivered || this.deliveredByDevice !== deviceId) return false;
+    this.delivered = false;
+    this.deliveredByDevice = null;
+    this.deliveredByGenerationValue = null;
+    this.deliveredAtMs = null;
+    return true;
   }
 
   /**
@@ -151,6 +195,26 @@ export class VetoWindow {
     if (this.status !== "pending" && this.status !== "extended") return this.status;
     if (this.now() < this.deadline) return this.status;
 
+    // THE RELEASE-TIME CAS: before "delivered" may become "released", the
+    // witnessing device must still exist, unrevoked, at the SAME generation
+    // it acked under — checked HERE, at the decision itself, not only by the
+    // revocation handler's proactive sweep (which stays as an accelerator:
+    // it clears evidence eagerly and preserves deadline-anchored releases
+    // for revocations arriving through the API). Any in-process standing
+    // change the sweep never saw, standing loaded at boot from a previous
+    // lifetime, and a quarantined registry are all enforced here, and the
+    // failure direction is held/passkey, never a release on a dead witness.
+    if (
+      this.delivered &&
+      this.witnessStanding !== undefined &&
+      !this.witnessStanding(this.deliveredByDevice, this.deliveredByGenerationValue)
+    ) {
+      this.delivered = false;
+      this.deliveredByDevice = null;
+      this.deliveredByGenerationValue = null;
+      this.deliveredAtMs = null;
+    }
+
     if (this.delivered) {
       this.status = "released";
       // The release happened at the DEADLINE — the moment silence became
@@ -162,6 +226,11 @@ export class VetoWindow {
     } else if (this.status === "pending") {
       this.status = "extended";
       this.deadline += this.extensionMs;
+      // The rendered content just changed (the deadline moved), so any
+      // foreground-detail delivery minted for the previous revision is now
+      // stale: an ack echoing revision N must not confirm the extended
+      // window. Bump so the server can reject it (apps/owner DESIGN.md §3).
+      this.revisionValue += 1;
     } else {
       this.status = "held"; // unreachable owner: escalate to active approval
     }
@@ -170,6 +239,16 @@ export class VetoWindow {
 
   get state(): VetoStatus {
     return this.status;
+  }
+
+  /**
+   * The window's showing revision — 1 at registration, +1 on extension (the
+   * one event that changes what the owner would render). A delivery ack must
+   * echo the revision it was minted for AND match this, so a detail fetched
+   * for revision N cannot confirm the window after it has advanced.
+   */
+  get revision(): number {
+    return this.revisionValue;
   }
 
   /** When silence next decides this window (ms). Moves once, on extension. */
@@ -185,6 +264,11 @@ export class VetoWindow {
   /** The enrolled device whose ack flipped delivered, or null. */
   get deliveredBy(): string | null {
     return this.deliveredByDevice;
+  }
+
+  /** The revocation generation the witnessing device held at ack, or null. */
+  get deliveredByGeneration(): number | null {
+    return this.deliveredByGenerationValue;
   }
 
   /** When the ack landed (ms), or null. */

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import {
   createControlPlane,
+  loadOwnerDeviceKeysFile,
   OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
 } from "@ownerswitchai/control-plane";
 import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
@@ -41,6 +42,20 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *                                            vendor key (self-hosted forks)
  *   OWNERSWITCH_DEPLOYMENT_ID                required by deployment-bound
  *                                            licenses (theft containment)
+ *
+ * Owner-app delivery ack (apps/owner):
+ *   OWNERSWITCH_OWNER_DEVICE_KEYS_FILE       JSON {deviceId: ECDSA P-256 SPKI
+ *                                            PEM} enrolling the owner app's
+ *                                            device public keys — the only
+ *                                            credential that may confirm
+ *                                            delivery; absent → /veto/:id/seen
+ *                                            is 501 (fail closed)
+ *   OWNERSWITCH_OWNER_DEVICE_STANDING_FILE   durable {generation, revokedAt}
+ *                                            registry — REQUIRED when device
+ *                                            keys are enrolled, so a
+ *                                            revocation survives a restart;
+ *                                            shared with the escalation
+ *                                            service
  */
 
 function required(name: string): string {
@@ -48,6 +63,7 @@ function required(name: string): string {
   if (value === undefined || value === "") throw new Error(`${name} is required`);
   return value;
 }
+
 
 /**
  * Refuse to start if a Node PRELOAD vector is present in the environment.
@@ -76,18 +92,50 @@ function main(): void {
   const port = Number(process.env.OWNERSWITCH_CONTROL_PLANE_PORT ?? 4600);
   const host = process.env.OWNERSWITCH_CONTROL_PLANE_HOST ?? "127.0.0.1";
   const deviceSecret = required("OWNERSWITCH_DEVICE_SECRET");
-  // The owner app's OWN secret — distinct from the fleet device secret, and
-  // the only credential that may flip the release-permitting delivered bit
-  // (POST /veto/:id/seen). Optional: absent, delivery confirmation is 501 and
-  // windows walk to passkey approval (fail closed). It must NOT equal the
-  // fleet secret — that would re-merge the two credential classes the split
-  // exists to keep apart.
-  const ownerAppSecret = process.env.OWNERSWITCH_OWNER_APP_SECRET?.trim();
-  if (ownerAppSecret !== undefined && ownerAppSecret !== "" && ownerAppSecret === deviceSecret) {
+  // Enrolled owner-app devices — the ONLY credential that may flip the
+  // release-permitting delivered bit (POST /veto/:id/seen). ASYMMETRIC:
+  // a JSON file mapping deviceId → ECDSA P-256 SPKI PEM (the phone's PUBLIC
+  // key; the private half never leaves the device). Optional: absent,
+  // delivery confirmation is 501 and windows walk to passkey approval (fail
+  // closed). No shared secret exists here to leak or to collide with the
+  // fleet secret — that whole failure mode is gone by construction.
+  const ownerDeviceKeysFile = process.env.OWNERSWITCH_OWNER_DEVICE_KEYS_FILE?.trim();
+  const ownerDeviceKeys =
+    ownerDeviceKeysFile !== undefined && ownerDeviceKeysFile !== ""
+      ? loadOwnerDeviceKeysFile(ownerDeviceKeysFile)
+      : {};
+  // Durable owner-device STANDING ({generation, revokedAt}) — REQUIRED by
+  // createControlPlane whenever owner devices are enrolled (dev:false): a
+  // revocation must survive a restart, or a stolen phone resurrects on the
+  // next boot. The escalation service points at the SAME file.
+  const ownerDeviceStandingFile = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_FILE?.trim();
+  // 0640 publication for the distinct-UID model (escalation in a dedicated
+  // read-only group); default 0600 when CP and escalation share a user.
+  const standingGroupReadable = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE === "1";
+  // The escalation read-only group's numeric gid — fchowned onto the file
+  // before publication and verified after; without it, 0640 grants read to
+  // whatever the CP's default group is, not the escalation service's.
+  const standingGidRaw = process.env.OWNERSWITCH_OWNER_DEVICE_STANDING_GID?.trim();
+  let standingGid: number | undefined;
+  if (standingGidRaw !== undefined && standingGidRaw !== "") {
+    standingGid = Number(standingGidRaw);
+    if (!Number.isInteger(standingGid) || standingGid < 0) {
+      throw new Error("OWNERSWITCH_OWNER_DEVICE_STANDING_GID must be a non-negative integer gid");
+    }
+  }
+  // ALL-OR-NOTHING (also enforced inside createControlPlane): half a 0640
+  // configuration is a silent failure in one of two directions — refuse the
+  // boot HERE with the env names the operator actually typed.
+  if (standingGroupReadable && standingGid === undefined) {
     throw new Error(
-      "OWNERSWITCH_OWNER_APP_SECRET must differ from OWNERSWITCH_DEVICE_SECRET — the owner-app " +
-        "delivery-ack credential is deliberately separate from the fleet device secret; reusing the " +
-        "fleet secret lets any fleet component (or a same-uid agent) forge the owner's 'I saw it'",
+      "OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE=1 requires OWNERSWITCH_OWNER_DEVICE_STANDING_GID — " +
+        "0640 without an explicit gid grants read to the control plane's default group, not the escalation's",
+    );
+  }
+  if (standingGid !== undefined && !standingGroupReadable) {
+    throw new Error(
+      "OWNERSWITCH_OWNER_DEVICE_STANDING_GID without OWNERSWITCH_OWNER_DEVICE_STANDING_GROUP_READABLE=1 " +
+        "does nothing — the file stays 0600 and the named group cannot read it; set both or neither",
     );
   }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
@@ -141,7 +189,12 @@ function main(): void {
   // assertion. A misconfiguration refuses to start with a named reason.
   const controlPlane = createControlPlane({
     deviceSecret,
-    ...(ownerAppSecret !== undefined && ownerAppSecret !== "" ? { ownerAppSecret } : {}),
+    ...(Object.keys(ownerDeviceKeys).length > 0 ? { ownerDeviceKeys } : {}),
+    ...(ownerDeviceStandingFile !== undefined && ownerDeviceStandingFile !== ""
+      ? { ownerDeviceStandingFile }
+      : {}),
+    ...(standingGroupReadable ? { ownerDeviceStandingGroupReadable: true } : {}),
+    ...(standingGid !== undefined ? { ownerDeviceStandingGid: standingGid } : {}),
     killStateFile,
     dev: false,
     grantKey,

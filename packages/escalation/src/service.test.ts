@@ -1,17 +1,19 @@
-import { createHmac } from "node:crypto";
-import { readFileSync, mkdtempSync, statSync } from "node:fs";
+import { createHash, createHmac, generateKeyPairSync, sign as ecSign } from "node:crypto";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ownerDeviceSigPreimage } from "@ownerswitchai/shared";
 import {
   createControlPlane,
+  DeviceStandingFileStore,
   signDeviceRequest,
   VetoWindow,
   type ControlPlane,
 } from "@ownerswitchai/control-plane";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEscalationService, type EscalationService } from "./service.js";
-import type { EscalationEnvConfig } from "./config.js";
+import { escalationConfigFromEnv, type EscalationEnvConfig } from "./config.js";
 import type { Channel, EscalationAlert } from "./types.js";
 
 const DEVICE_SECRET = "escalation-shared-secret";
@@ -71,12 +73,15 @@ const TWILIO = {
   to: "+36301234567",
 };
 
-const OWNER_APP_SECRET = "owner-app-shared-secret";
+// The owner app's asymmetric device key (non-extractable P-256 in production).
+const ownerKeypair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const OWNER_DEVICE_SPKI = ownerKeypair.publicKey.export({ format: "pem", type: "spki" }).toString();
+const OWNER_DEVICE_KEYS: Record<string, string> = { "owner-app": OWNER_DEVICE_SPKI };
 
 const baseConfig = (cpUrl: string, stateFile: string): EscalationEnvConfig => ({
   controlPlaneUrl: cpUrl,
   device: { id: "escalation", secret: DEVICE_SECRET },
-  ownerAppSecret: OWNER_APP_SECRET,
+  ownerDeviceKeys: OWNER_DEVICE_KEYS,
   listenHost: "127.0.0.1",
   listenPort: 0,
   webhookBaseUrl: "https://esc.example",
@@ -231,7 +236,7 @@ describe("escalation service against a live control plane", () => {
     expect(window.state).toBe("pending");
   });
 
-  it("push enrollment requires the OWNER-APP secret (not the fleet secret), persists 0600, refuses replays", async () => {
+  it("push enrollment requires the OWNER-APP device signature (not the fleet secret), persists 0600, refuses replays", async () => {
     const { c, service, stateFile } = await setup();
     const url = await listen(service.webhookHandler, servers);
     const subscription = {
@@ -239,47 +244,221 @@ describe("escalation service against a live control plane", () => {
       keys: { p256dh: "BPub", auth: "QXV0aA" },
     };
     const body = JSON.stringify({ subscription });
+    const pathAndQuery = "/push/subscription";
 
-    const enroll = (secret: string, nonce: string, at = c.now()) =>
-      fetch(`${url}/push/subscription`, {
+    // owner-app asymmetric signature over the exact request
+    const ownerSig = (nonce: string, at: number) => {
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-app",
+        method: "POST",
+        pathAndQuery,
+        bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+        timestamp: at,
+        nonce,
+      });
+      return ecSign("sha256", preimage, { key: ownerKeypair.privateKey, dsaEncoding: "ieee-p1363" }).toString(
+        "base64url",
+      );
+    };
+    const enrollOwner = (nonce: string, at = c.now()) =>
+      fetch(`${url}${pathAndQuery}`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-device-id": "owner-app",
           "x-device-timestamp": String(at),
           "x-device-nonce": nonce,
-          "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce }, body, secret),
+          "x-device-signature": ownerSig(nonce, at),
         },
         body,
       });
 
-    const unsigned = await fetch(`${url}/push/subscription`, { method: "POST", body });
+    const unsigned = await fetch(`${url}${pathAndQuery}`, { method: "POST", body });
     expect(unsigned.status).toBe(401);
     expect(service.subscription()).toBeNull();
 
-    // the FLEET device secret (which this escalation service itself holds)
+    // the FLEET device secret (an HMAC the escalation service itself holds)
     // must NOT be able to redirect the owner's push channel
-    const viaFleet = await enroll(DEVICE_SECRET, "fleet-1");
+    const at = c.now();
+    const viaFleet = await fetch(`${url}${pathAndQuery}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-device-id": "owner-app",
+        "x-device-timestamp": String(at),
+        "x-device-nonce": "fleet-1",
+        "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce: "fleet-1" }, body, DEVICE_SECRET),
+      },
+      body,
+    });
     expect(viaFleet.status).toBe(401);
     expect(service.subscription()).toBeNull();
 
-    // the owner-app secret enrolls
-    const signed = await enroll(OWNER_APP_SECRET, "n-1");
+    // the owner's device signature enrolls
+    const signed = await enrollOwner("n-1");
     expect(signed.status).toBe(200);
     expect(service.subscription()).toEqual(subscription);
-    expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription });
+    expect(JSON.parse(readFileSync(stateFile, "utf8"))).toEqual({ subscription, enrolledBy: "owner-app" });
     expect(statSync(stateFile).mode & 0o777).toBe(0o600);
 
     // a replayed enrollment (same nonce) is refused
-    const replay = await enroll(OWNER_APP_SECRET, "n-1");
+    const replay = await enrollOwner("n-1");
     expect(replay.status).toBe(401);
   });
 
-  it("with no owner-app secret configured, push enrollment is 501", async () => {
+  it("REVOCATION standing (shared registry): a revoked device cannot enroll, and its subscription goes inactive", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const stateFile = join(dir, "state.json");
+    const standingFile = join(dir, "standing.json");
+    const push = fakePush();
+    const service = createEscalationService({
+      config: {
+        ...baseConfig("http://127.0.0.1:1", stateFile),
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
+      channels: { push: push.channel },
+      now: c.now,
+      log: () => {},
+    });
+    const url = await listen(service.webhookHandler, servers);
+
+    const subscription = {
+      endpoint: "https://push.example/send/abc",
+      keys: { p256dh: "BPub", auth: "QXV0aA" },
+    };
+    const body = JSON.stringify({ subscription });
+    const pathAndQuery = "/push/subscription";
+    const enroll = (nonce: string) => {
+      const at = c.now();
+      const preimage = ownerDeviceSigPreimage({
+        deviceId: "owner-app",
+        method: "POST",
+        pathAndQuery,
+        bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+        timestamp: at,
+        nonce,
+      });
+      return fetch(`${url}${pathAndQuery}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-device-id": "owner-app",
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": ecSign("sha256", preimage, {
+            key: ownerKeypair.privateKey,
+            dsaEncoding: "ieee-p1363",
+          }).toString("base64url"),
+        },
+        body,
+      });
+    };
+
+    // an ABSENT registry is NOT trust: the control plane has never
+    // initialized it, so nothing here may treat the device as active
+    expect((await enroll("s-0")).status).toBe(403);
+
+    // the CONTROL PLANE initializes the registry at its boot (active snapshot)
+    const registry = new DeviceStandingFileStore(standingFile);
+    registry.save({ version: 1, devices: { "owner-app": { generation: 1, revokedAt: null } } });
+
+    // explicit active record — enrollment lands
+    expect((await enroll("s-1")).status).toBe(200);
+    expect(service.subscription()).toEqual(subscription);
+
+    // a device with NO record in a loaded registry is untrusted too
+    registry.save({ version: 1, devices: { "some-other": { generation: 1, revokedAt: null } } });
+    expect(service.subscription()).toBeNull();
+    expect((await enroll("s-1b")).status).toBe(403);
+
+    // the CONTROL PLANE (another process) revokes the phone by writing the
+    // SHARED standing registry; this service saw no event at all
+    registry.save({
+      version: 1,
+      devices: { "owner-app": { generation: 2, revokedAt: c.now() } },
+    });
+
+    // the subscription the revoked phone enrolled is now INACTIVE — the lost
+    // phone stops receiving decision-critical alerts...
+    expect(service.subscription()).toBeNull();
+    // ...and the revoked key cannot re-point the alert channel either
+    expect((await enroll("s-2")).status).toBe(403);
+  });
+
+  it("UPGRADE: a legacy subscription (no enrolledBy) is INACTIVE under a standing regime until re-enrolled", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const stateFile = join(dir, "state.json");
+    const standingFile = join(dir, "standing.json");
+    const subscription = {
+      endpoint: "https://push.example/send/legacy",
+      keys: { p256dh: "BPub", auth: "QXV0aA" },
+    };
+    // the pre-standing on-disk format: no enrolledBy at all
+    writeFileSync(stateFile, JSON.stringify({ subscription }), { mode: 0o600 });
+    // the device is even ACTIVE in the registry — but the legacy record names
+    // no device, so no revocation could ever sever it; it must not be trusted
+    new DeviceStandingFileStore(standingFile).save({
+      version: 1,
+      devices: { "owner-app": { generation: 1, revokedAt: null } },
+    });
+    const push = fakePush();
+    const service = createEscalationService({
+      config: {
+        ...baseConfig("http://127.0.0.1:1", stateFile),
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
+      channels: { push: push.channel },
+      now: c.now,
+      log: () => {},
+    });
+    expect(service.subscription()).toBeNull(); // fail closed: re-enrollment stamps it
+  });
+
+  it("PATH BOUNDARY: the reader refuses a standing path whose real ancestry is untrusted", () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const push = fakePush();
+    // no unsafe test flag: the canonical walk runs and /tmp (1777) refuses
+    expect(() =>
+      createEscalationService({
+        config: {
+          ...baseConfig("http://127.0.0.1:1", join(dir, "state.json")),
+          ownerDeviceStandingFile: join(dir, "standing.json"),
+        },
+        channels: { push: push.channel },
+        now: c.now,
+        log: () => {},
+      }),
+    ).toThrow(/world-writable|group- or world-writable/);
+  });
+
+  it("PRODUCTION GUARD: owner device keys without the standing registry refuse to start", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-"));
+    const env = {
+      OWNERSWITCH_DEVICE_SECRET: "s".repeat(64),
+      OWNERSWITCH_OWNER_DEVICE_KEYS_FILE: join(dir, "keys.json"),
+      // OWNERSWITCH_OWNER_DEVICE_STANDING_FILE deliberately unset
+    };
+    // the guard fires BEFORE the keys file is even opened
+    expect(() => escalationConfigFromEnv(env)).toThrow(/STANDING_FILE/);
+    // with the registry named, the config proceeds PAST the standing guard —
+    // the next failure (if any) is about the keys file itself, never standing
+    try {
+      escalationConfigFromEnv({ ...env, OWNERSWITCH_OWNER_DEVICE_STANDING_FILE: join(dir, "standing.json") });
+    } catch (err) {
+      expect(String(err)).not.toMatch(/STANDING_FILE/);
+    }
+  });
+
+  it("with no owner device enrolled, push enrollment is 501", async () => {
     const c = clock();
     const push = fakePush();
     const stateFile = join(mkdtempSync(join(tmpdir(), "ownerswitch-esc-")), "state.json");
-    const { ownerAppSecret: _drop, ...noOwnerApp } = baseConfig("http://127.0.0.1:1", stateFile);
+    const { ownerDeviceKeys: _drop, ...noOwnerApp } = baseConfig("http://127.0.0.1:1", stateFile);
     const service = createEscalationService({
       config: noOwnerApp,
       channels: { push: push.channel },

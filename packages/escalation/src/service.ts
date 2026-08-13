@@ -2,7 +2,16 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
-import { signDeviceRequest, verifyDeviceSignature } from "@ownerswitchai/control-plane";
+import {
+  canonicalTrustedStandingPath,
+  DeviceStandingFileStore,
+  enrolledOwnerDeviceFromSpki,
+  signDeviceRequest,
+  verifyOwnerDeviceSignature,
+  type EnrolledOwnerDevice,
+  type OwnerDeviceCredential,
+} from "@ownerswitchai/control-plane";
+import { createEmailChannel, createSesSender } from "./channels/email.js";
 import { createTwilioSmsChannel, createTwilioVoiceChannel, TWILIO_PATHS } from "./channels/twilio.js";
 import { createWebPushChannel, type PushSubscriptionJson } from "./channels/webpush.js";
 import { LadderEngine } from "./ladder.js";
@@ -60,28 +69,117 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   const doFetch = opts.fetchImpl ?? fetch;
   const log = opts.log ?? ((line: string) => console.error(`[ownerswitch-escalation] ${line}`));
 
+  // Enrolled owner-app device public keys — the credential push enrollment is
+  // gated on. Built once; a bad key would have failed the config load.
+  const ownerDevices = new Map<string, EnrolledOwnerDevice>();
+  for (const [deviceId, spki] of Object.entries(cfg.ownerDeviceKeys ?? {})) {
+    ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
+  }
+
+  // The SHARED durable standing registry the control plane writes (and
+  // initializes at ITS boot with the full active snapshot). Re-read on every
+  // owner-device decision here (the file is tiny, the operations are rare):
+  // a revocation on the control plane severs THIS service's surfaces at the
+  // very next request, without any cross-process notification channel. No
+  // configured store (dev, no owner devices) → standing is not consulted.
+  // With a store configured, ONLY an explicit active record is trust:
+  //  - ABSENT registry → untrusted (the control plane has never initialized
+  //    it — a wrong path or an empty provisioned directory must read as "not
+  //    wired yet", never as "everyone active");
+  //  - a device with NO record → untrusted (enrollment lands in the registry
+  //    at the control plane's boot migration, not by implication here);
+  //  - CORRUPT → untrusted, everyone.
+  // Fail closed in every branch: alerts stop, stop paths (SMS, voice, the
+  // veto relay) are untouched.
+  // The path is canonicalized and its REAL ancestry proven trusted before
+  // first use — the reader must not follow a swapped ancestor to an
+  // attacker's registry any more than the writer may (the distinct-UID
+  // model names the control plane's uid explicitly via config).
+  // The reader enforces the SAME load-time boundary as the writer: the leaf
+  // must be owned by root / this process / the operator-named CP uid, and be
+  // exactly 0600, or 0640 matching the SAME configured read-only gid the CP
+  // publishes with (OWNERSWITCH_OWNER_DEVICE_STANDING_GID on both services).
+  // Anything else loads corrupt → everyone untrusted.
+  const ourUid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const standingStore =
+    cfg.ownerDeviceStandingFile !== undefined
+      ? new DeviceStandingFileStore(
+          canonicalTrustedStandingPath(cfg.ownerDeviceStandingFile, {
+            ...(cfg.ownerDeviceStandingTrustedUid !== undefined
+              ? { alsoTrustUids: [cfg.ownerDeviceStandingTrustedUid] }
+              : {}),
+            ...(cfg.unsafeAllowUntrustedStandingPathForTests === true
+              ? { unsafeAllowUntrustedAncestryForTests: true }
+              : {}),
+          }),
+          {
+            ...(cfg.ownerDeviceStandingGid !== undefined ? { group: cfg.ownerDeviceStandingGid } : {}),
+            trustedOwnerUids: [
+              0,
+              ourUid,
+              ...(cfg.ownerDeviceStandingTrustedUid !== undefined ? [cfg.ownerDeviceStandingTrustedUid] : []),
+            ],
+          },
+        )
+      : null;
+  function deviceInGoodStanding(deviceId: string): boolean {
+    if (standingStore === null) return true;
+    const loaded = standingStore.load();
+    if (loaded.outcome !== "loaded") return false; // absent or corrupt: no trust without a registry
+    const standing = loaded.state.devices[deviceId];
+    return standing !== undefined && standing.revokedAt === null;
+  }
+
   /* ---------------- push subscription store (0600, atomic) ------------- */
 
-  let storedSubscription: PushSubscriptionJson | null = loadSubscription();
+  let storedSubscription: PushSubscriptionJson | null = null;
+  // who enrolled the subscription — a revocation of THAT device deactivates
+  // it (null on legacy stores written before this field existed)
+  let subscriptionEnrolledBy: string | null = null;
+  loadSubscription();
 
-  function loadSubscription(): PushSubscriptionJson | null {
-    if (cfg.stateFile === undefined) return null;
+  function loadSubscription(): void {
+    if (cfg.stateFile === undefined) return;
     try {
       const parsed: unknown = JSON.parse(readFileSync(cfg.stateFile, "utf8"));
-      const sub = (parsed as { subscription?: unknown }).subscription;
-      return isSubscription(sub) ? sub : null;
+      const record = parsed as { subscription?: unknown; enrolledBy?: unknown };
+      if (isSubscription(record.subscription)) {
+        storedSubscription = record.subscription;
+        subscriptionEnrolledBy = typeof record.enrolledBy === "string" ? record.enrolledBy : null;
+      }
     } catch {
-      return null; // absent or unreadable: no subscription until re-enrolled
+      /* absent or unreadable: no subscription until re-enrolled */
     }
   }
 
-  function persistSubscription(sub: PushSubscriptionJson): void {
+  /**
+   * The subscription the dispatcher may actually SEND to. Under a standing
+   * regime (a registry is configured), a subscription is active ONLY when it
+   * names its enrolling device AND that device is in good standing:
+   *  - the enrolling device was revoked → inactive (the lost phone must not
+   *    keep receiving decision-critical alerts);
+   *  - a LEGACY record with no enrolledBy → inactive too. It cannot be tied
+   *    to any device, so a revocation can never sever it — waiting for the
+   *    lost phone to "voluntarily re-enroll" is not a revocation story. The
+   *    owner's app re-enrolls on its next open (subscribeAndEnroll is called
+   *    on every launch), which stamps the record and reactivates push.
+   * With no registry configured (dev), the stored subscription is served
+   * as-is — there is no standing to consult.
+   */
+  function activeSubscription(): PushSubscriptionJson | null {
+    if (storedSubscription === null) return null;
+    if (standingStore === null) return storedSubscription;
+    if (subscriptionEnrolledBy === null) return null; // legacy: fail closed
+    return deviceInGoodStanding(subscriptionEnrolledBy) ? storedSubscription : null;
+  }
+
+  function persistSubscription(sub: PushSubscriptionJson, enrolledBy: string): void {
     if (cfg.stateFile === undefined) return;
     // atomic replace, private from birth: the subscription is a send
     // capability, and a half-written store must not exist even briefly
     mkdirSync(dirname(cfg.stateFile), { recursive: true, mode: 0o700 });
     const tmp = `${cfg.stateFile}.${randomBytes(6).toString("hex")}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ subscription: sub }, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({ subscription: sub, enrolledBy }, null, 2), { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, cfg.stateFile);
   }
@@ -105,7 +203,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         vapidPublicKey: cfg.vapid.publicKey,
         vapidPrivateKey: cfg.vapid.privateKey,
         subject: cfg.vapid.subject,
-        getSubscription: () => storedSubscription,
+        getSubscription: activeSubscription,
         fetch: doFetch,
         now,
       }),
@@ -120,6 +218,18 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     };
     channels.set("sms", createTwilioSmsChannel(twilioCfg));
     channels.set("voice", createTwilioVoiceChannel(twilioCfg));
+  }
+  if (cfg.email !== undefined) {
+    channels.set(
+      "email",
+      createEmailChannel({
+        from: cfg.email.from,
+        to: cfg.email.to,
+        ownerAppUrl: cfg.email.ownerAppUrl,
+        sendEmail: createSesSender({ ...cfg.email.ses, fetch: doFetch }),
+        now,
+      }),
+    );
   }
   for (const [kind, channel] of Object.entries(opts.channels ?? {})) {
     if (channel !== undefined) channels.set(kind as ChannelKind, channel);
@@ -267,27 +377,45 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     }
 
     // enrollment: the owner app registers its push subscription, signed with
-    // the OWNER APP's own secret — NOT the fleet device secret this service
-    // holds. Enrollment picks who receives every future alert, so gating it
-    // on the fleet secret would let any fleet-secret holder redirect the
-    // owner's push channel to their own endpoint. Absent an owner-app secret,
-    // enrollment is simply unavailable (501).
+    // the OWNER APP's ASYMMETRIC device key (ECDSA P-256) — NOT the fleet
+    // device secret this service holds. Enrollment picks who receives every
+    // future alert, so gating it on the fleet secret would let any
+    // fleet-secret holder redirect the owner's push channel to their own
+    // endpoint; an asymmetric signature the service can only VERIFY (never
+    // produce) closes that. Absent an enrolled owner device, enrollment is
+    // simply unavailable (501).
     if (method === "POST" && path === "/push/subscription") {
-      if (cfg.ownerAppSecret === undefined) {
+      if (ownerDevices.size === 0) {
         send(
           res,
           501,
           "application/json",
           JSON.stringify({
             error:
-              "push enrollment is not available: no owner-app credential is configured " +
-              "(OWNERSWITCH_OWNER_APP_SECRET)",
+              "push enrollment is not available: no owner-app device is enrolled " +
+              "(OWNERSWITCH_OWNER_DEVICE_KEYS_FILE)",
           }),
         );
         return;
       }
-      if (!validSignature(req, rawBody, cfg.ownerAppSecret)) {
+      const enrolledBy = verifyOwnerDeviceSignature(
+        ownerCredentialFrom(req),
+        (req.method ?? "").toUpperCase(),
+        req.url ?? "",
+        rawBody,
+        ownerDevices,
+        { now, seenNonces },
+      );
+      if (enrolledBy === null) {
         send(res, 401, "application/json", JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      // The signature proves possession of the enrolled key; STANDING proves
+      // the control plane still trusts it. Re-read from the shared registry
+      // on every enrollment, so a revoked (stolen) phone cannot redirect the
+      // owner's alert channel even though this process never saw the revoke.
+      if (!deviceInGoodStanding(enrolledBy)) {
+        send(res, 403, "application/json", JSON.stringify({ error: "device revoked — enrollment refused" }));
         return;
       }
       let sub: unknown;
@@ -302,7 +430,8 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         return;
       }
       storedSubscription = sub;
-      persistSubscription(sub);
+      subscriptionEnrolledBy = enrolledBy;
+      persistSubscription(sub, enrolledBy);
       log("push subscription enrolled");
       send(res, 200, "application/json", JSON.stringify({ ok: true }));
       return;
@@ -360,22 +489,18 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     send(res, 200, "text/xml", `<?xml version="1.0" encoding="UTF-8"?><Response/>`);
   }
 
-  function validSignature(req: IncomingMessage, rawBody: string, secret: string): boolean {
+  /** The owner-app device credential from the request headers, for verification. */
+  function ownerCredentialFrom(req: IncomingMessage): OwnerDeviceCredential {
     const header = (name: string) => {
       const value = req.headers[name];
       return Array.isArray(value) ? value[0] : value;
     };
-    const deviceId = header("x-device-id");
-    const timestamp = header("x-device-timestamp");
-    const nonce = header("x-device-nonce");
-    const signature = header("x-device-signature");
-    if (!deviceId || !timestamp || !nonce || !signature) return false;
-    return verifyDeviceSignature(
-      { deviceId, timestamp: Number(timestamp), nonce, signature },
-      rawBody,
-      secret,
-      { now, seenNonces },
-    );
+    return {
+      deviceId: header("x-device-id") ?? "",
+      timestamp: Number(header("x-device-timestamp") ?? NaN),
+      nonce: header("x-device-nonce") ?? "",
+      signature: header("x-device-signature") ?? "",
+    };
   }
   const seenNonces = new Map<string, number>();
 
@@ -395,5 +520,9 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     res.end(body);
   }
 
-  return { tickOnce, webhookHandler, subscription: () => storedSubscription };
+  // The accessor answers what the PUSH CHANNEL would actually use — standing
+  // included — so the doctor and tests see the same truth the dispatcher does:
+  // a subscription whose enrolling device was revoked (or a legacy record
+  // that names no device) reads as none.
+  return { tickOnce, webhookHandler, subscription: activeSubscription };
 }
