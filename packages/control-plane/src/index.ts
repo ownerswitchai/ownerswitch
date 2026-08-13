@@ -21,6 +21,9 @@ export { RestoreCeremony } from "./twogo.js";
 export type { RestoreAuthorization, CeremonyState, TwoGoOptions } from "./twogo.js";
 
 export { createControlPlane, DEFAULT_KILL_STATE_FILE, MIN_VETO_RESPONSE_MS } from "./server.js";
+export type { BootstrapMintRequest, BootstrapMintResult } from "./server.js";
+export { createBootstrapInviteSocket } from "./bootstrap-socket.js";
+export type { BootstrapSocketOptions } from "./bootstrap-socket.js";
 
 export {
   generateLicenseKeys,

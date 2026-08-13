@@ -2,6 +2,7 @@ import { createPublicKey } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import {
+  createBootstrapInviteSocket,
   createControlPlane,
   loadOwnerDeviceKeysFile,
   OWNERSWITCH_VENDOR_LICENSE_PUBLIC_KEY_PEM,
@@ -50,6 +51,16 @@ import { loadOwnerPasskeyPublicKey } from "./passkey-key.js";
  *                                            credential that may confirm
  *                                            delivery; absent → /veto/:id/seen
  *                                            is 501 (fail closed)
+ *   OWNERSWITCH_ENROLLED_DEVICES_FILE        durable ceremony-enrolled device
+ *                                            registry (DESIGN.md §2); set with
+ *                                            _ENROLLMENT_RP_ID + _ENROLLMENT_ORIGIN
+ *                                            or not at all — absent, the
+ *                                            enrollment lane is 501 (launch default)
+ *   OWNERSWITCH_ENROLLMENT_RP_ID             WebAuthn rpId of the owner app
+ *   OWNERSWITCH_ENROLLMENT_ORIGIN            exact https:// owner-app origin
+ *   OWNERSWITCH_BOOTSTRAP_SOCKET             Unix-socket path for the host-local
+ *                                            bootstrap invite mint (requires the
+ *                                            enrollment trio; never an HTTP route)
  *   OWNERSWITCH_OWNER_DEVICE_STANDING_FILE   durable {generation, revokedAt}
  *                                            registry — REQUIRED when device
  *                                            keys are enrolled, so a
@@ -138,6 +149,38 @@ function main(): void {
         "does nothing — the file stays 0600 and the named group cannot read it; set both or neither",
     );
   }
+  // Device-enrollment ceremony wiring — ALL-OR-NOTHING: the registry path
+  // and the WebAuthn rp/origin the ceremony verifies under only mean
+  // anything together, so a partial trio refuses the boot with the env
+  // names the operator typed. Absent (the launch default), the enrollment
+  // lane is 501 and no registry file is touched.
+  const enrolledDevicesFile = process.env.OWNERSWITCH_ENROLLED_DEVICES_FILE?.trim();
+  const enrollmentRpId = process.env.OWNERSWITCH_ENROLLMENT_RP_ID?.trim();
+  const enrollmentOrigin = process.env.OWNERSWITCH_ENROLLMENT_ORIGIN?.trim();
+  const enrollmentEnvs = [enrolledDevicesFile, enrollmentRpId, enrollmentOrigin];
+  const enrollmentSet = enrollmentEnvs.filter((value) => value !== undefined && value !== "");
+  if (enrollmentSet.length !== 0 && enrollmentSet.length !== enrollmentEnvs.length) {
+    throw new Error(
+      "device enrollment needs OWNERSWITCH_ENROLLED_DEVICES_FILE, OWNERSWITCH_ENROLLMENT_RP_ID and " +
+        "OWNERSWITCH_ENROLLMENT_ORIGIN together (or none of them) — a partial trio would verify the " +
+        "ceremony against the wrong RP or persist devices nowhere",
+    );
+  }
+  const enrollment =
+    enrollmentSet.length === enrollmentEnvs.length
+      ? {
+          devicesFile: enrolledDevicesFile as string,
+          rpId: enrollmentRpId as string,
+          origin: enrollmentOrigin as string,
+        }
+      : undefined;
+  const bootstrapSocketPath = process.env.OWNERSWITCH_BOOTSTRAP_SOCKET?.trim();
+  if (bootstrapSocketPath !== undefined && bootstrapSocketPath !== "" && enrollment === undefined) {
+    throw new Error(
+      "OWNERSWITCH_BOOTSTRAP_SOCKET requires the enrollment trio (OWNERSWITCH_ENROLLED_DEVICES_FILE, " +
+        "_ENROLLMENT_RP_ID, _ENROLLMENT_ORIGIN) — a bootstrap socket with no registry mints nothing",
+    );
+  }
   const killStateFile = required("OWNERSWITCH_KILL_STATE_FILE");
   const grantKey = required("OWNERSWITCH_GRANT_KEY");
   const killStateKey = required("OWNERSWITCH_KILL_STATE_KEY");
@@ -200,8 +243,20 @@ function main(): void {
     grantKey,
     killStateKey,
     ownerPasskey: { credentialId, publicKeyPem, rpId, origin },
+    ...(enrollment !== undefined ? { enrollment } : {}),
     licensing,
   });
+
+  // The bootstrap invite mint rides a permission-protected Unix socket —
+  // deliberately NEVER an HTTP route (DESIGN.md §2): filesystem permission
+  // to the socket IS the authorization to mint the root of trust.
+  if (bootstrapSocketPath !== undefined && bootstrapSocketPath !== "") {
+    createBootstrapInviteSocket({
+      socketPath: bootstrapSocketPath,
+      mint: controlPlane.bootstrapMintInvite,
+    });
+    console.error(`[ownerswitch] bootstrap invite socket at ${bootstrapSocketPath} (mode 0600)`);
+  }
 
   createServer(controlPlane.handler).listen(port, host, () => {
     // No secrets, no owner token: this is production, not the quickstart.
