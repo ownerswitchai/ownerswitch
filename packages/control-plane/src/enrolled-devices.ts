@@ -28,11 +28,14 @@
  *     never an unpersisted device); an UNPROVEN publish (visible but the
  *     directory entry's durability unverifiable) QUARANTINES the whole
  *     registry — no standing, no witness, no mint, no enrollment — until
- *     a fresh initialize() establishes what actually survived on disk.
+ *     a recovery PROVES durability: load() itself ends with a durability
+ *     barrier (fsync of the state file's open fd, then of the directory
+ *     entry), so no state — in-process recovery and process restart
+ *     alike — is ever served while a power cut could still undo it.
  *
  *  4. FAIL-CLOSED REGISTRY, WHOLE-NAMESPACE. The file store demands an
  *     absolute path, canonicalises it, walks the REAL ancestor chain
- *     (root/this-process/named-uid owners, никогда group- or
+ *     (root/this-process/named-uid owners, never group- or
  *     world-writable — the same boundary as the standing store), PINS the
  *     directory identity (dev+ino) and re-verifies it on every load and
  *     save; the leaf and the `.initialized` marker are both opened
@@ -75,6 +78,7 @@ import {
   type InviteRecord,
   type InviteSpendWitness,
 } from "./invite.js";
+import { storedSpkiToPem } from "./webauthn-register.js";
 
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
@@ -128,6 +132,10 @@ export const MAX_ENROLLED_DEVICES_FILE_BYTES = 512 * 1024;
 export const MAX_ACTIVE_DEVICES = 64;
 /** The marker is a short fixed note; anything bigger was not written by us. */
 const MAX_MARKER_BYTES = 4096;
+/** the EXACT marker body this store writes — anything else is not our marker */
+const MARKER_NOTE =
+  "This marker records that the OwnerSwitch enrolled-device registry has been written.\n" +
+  "While it exists, a missing registry file loads as CORRUPT (no enrollment, no witness).\n";
 
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
@@ -212,10 +220,11 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
     if (typeof ownerId !== "string" || ownerId === "" || ownerId.length > 256) return null;
     if (typeof deviceName !== "string" || deviceName === "" || deviceName.length > 200) return null;
     if (typeof credentialId !== "string" || !isCanonicalB64url(credentialId, 1, 1024)) return null;
-    if (typeof publicKeySpki !== "string" || !isCanonicalB64url(publicKeySpki, 1, 4096)) return null;
-    if (typeof cheapLaneKeySpki !== "string" || !isCanonicalB64url(cheapLaneKeySpki, 1, 4096)) {
-      return null;
-    }
+    // both stored keys must be REAL P-256 SPKI DER, full-consumption — the
+    // same hardened validator the ceremony used at admit (a registry field
+    // that merely LOOKS like base64url must not reach the auth wiring)
+    if (typeof publicKeySpki !== "string" || !storedSpkiToPem(publicKeySpki).ok) return null;
+    if (typeof cheapLaneKeySpki !== "string" || !storedSpkiToPem(cheapLaneKeySpki).ok) return null;
     if (typeof signCount !== "number" || !Number.isSafeInteger(signCount) || signCount < 0) return null;
     if (transports !== undefined) {
       if (!Array.isArray(transports) || transports.length > 8) return null;
@@ -254,6 +263,14 @@ function asPersistedEnrolledDevices(value: unknown): PersistedEnrolledDevices | 
       },
     ] as const);
   }
+  // the durable shape enforces the same active ceiling the admit path does —
+  // a file claiming more active devices than the system would ever admit was
+  // not written by this code
+  let active = 0;
+  for (const [, device] of entries) {
+    if (device.revokedAt === null) active += 1;
+  }
+  if (active > MAX_ACTIVE_DEVICES) return null;
   return { version: 1, bootstrapGeneration, devices: nullProtoDevices(entries) };
 }
 
@@ -362,6 +379,18 @@ export class EnrolledDeviceFileStore {
       if (stat.size > MAX_MARKER_BYTES) {
         return { corrupt: `${this.markerPath} is ${stat.size} bytes — not the marker this store writes` };
       }
+      // EXACT content: the marker is a constant note, so "is this our
+      // marker" is a byte-equality fact, not a heuristic
+      const buffer = Buffer.alloc(MAX_MARKER_BYTES + 1);
+      let total = 0;
+      for (;;) {
+        const bytesRead = readSync(fd, buffer, total, buffer.length - total, null);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+      }
+      if (buffer.toString("utf8", 0, total) !== MARKER_NOTE) {
+        return { corrupt: `${this.markerPath} does not carry this store's marker note` };
+      }
       return "valid";
     } catch (err) {
       return { corrupt: `cannot stat ${this.markerPath}: ${message(err)}` };
@@ -416,6 +445,19 @@ export class EnrolledDeviceFileStore {
         }
       }
       raw = buffer.toString("utf8", 0, total);
+      // DURABILITY BARRIER, part 1: the state file's own data. A state is
+      // only ever SERVED once its durability is proven at read time — this
+      // is what makes quarantine recovery honest: re-reading a visible but
+      // unproven publish (in this process or after a restart) must not
+      // resurrect authority a power cut could still undo.
+      try {
+        fsyncSync(fd);
+      } catch (err) {
+        return {
+          outcome: "corrupt",
+          detail: `${this.filePath} is visible but cannot be fsynced (${message(err)}) — refusing to serve a state a power cut may undo`,
+        };
+      }
     } catch (err) {
       return { outcome: "corrupt", detail: `cannot read ${this.filePath}: ${message(err)}` };
     } finally {
@@ -451,6 +493,18 @@ export class EnrolledDeviceFileStore {
           detail: "registry state exists but its marker could not be established DURABLY (fsync failed)",
         };
       }
+    }
+    // DURABILITY BARRIER, part 2: the DIRECTORY ENTRY naming this file.
+    // This is the exact half an unproven publish is missing — if it cannot
+    // be established now, the visible state stays unserved and the caller
+    // stays quarantined, however many times it retries or restarts.
+    if (!this.fsyncDir()) {
+      return {
+        outcome: "corrupt",
+        detail:
+          `the directory entry for ${this.filePath} could not be fsynced — the visible registry is ` +
+          "UNPROVEN and will not be served (a power cut could resurface older state)",
+      };
     }
     return { outcome: "loaded", state };
   }
@@ -521,11 +575,7 @@ export class EnrolledDeviceFileStore {
     try {
       fd = openSync(this.markerPath, CREATE_FLAGS, 0o600);
       fchmodSync(fd, 0o600);
-      const note = Buffer.from(
-        "This marker records that the OwnerSwitch enrolled-device registry has been written.\n" +
-          "While it exists, a missing registry file loads as CORRUPT (no enrollment, no witness).\n",
-        "utf8",
-      );
+      const note = Buffer.from(MARKER_NOTE, "utf8");
       let written = 0;
       while (written < note.length) {
         written += writeSync(fd, note, written, note.length - written);

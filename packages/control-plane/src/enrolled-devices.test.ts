@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -196,7 +196,7 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     if (!malformed.ok) expect(malformed.inviteSurvives).toBe(true);
   });
 
-  it("an UNPROVEN publish QUARANTINES the registry — the new device serves nothing until recovery re-reads disk", () => {
+  it("an UNPROVEN publish QUARANTINES the registry, and recovery is IMPOSSIBLE until the durability barrier succeeds", () => {
     const path = join(freshDir(), "devices.json");
     const store = storeAt(path);
     const registry = new EnrolledDeviceRegistry(store, {
@@ -204,13 +204,15 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     });
     registry.initialize();
     const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-1", SECRET));
-    // inject the review's exact scenario: the publish is VISIBLE but its
-    // durability is unproven (directory fsync failed)
-    const realSave = store.save.bind(store);
-    (store as unknown as { save: typeof store.save }).save = (state) => {
-      realSave(state);
-      return { durable: false, detail: "injected: directory fsync failed" };
-    };
+    // the REAL failing branch: the directory entry cannot be fsynced — the
+    // publish becomes visible, but its durability is genuinely unprovable.
+    // (fsyncDir is the one primitive both save() and the load-time barrier
+    // stand on, so disabling it models a directory whose entries cannot be
+    // made durable, not a lie about an already-durable save.)
+    type FsyncPatch = { fsyncDir: () => boolean };
+    const realFsyncDir = (store as unknown as FsyncPatch).fsyncDir.bind(store);
+    (store as unknown as FsyncPatch).fsyncDir = () => false;
+
     const refused = registry.commitEnrollment(enrollmentSubmission(phone(), fixtureInvite(minted), SECRET), OPTS());
     expect(refused.ok).toBe(false);
     if (!refused.ok) {
@@ -225,12 +227,33 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     const enrollRefused = registry.commitEnrollment({}, OPTS());
     expect(enrollRefused.ok).toBe(false);
     if (!enrollRefused.ok) expect(enrollRefused.reason).toMatch(/not usable/);
-    // RECOVERY is explicit: a fresh initialize() reads what disk actually
-    // holds (here: the visible publish survived) and resumes from that
-    const recovered = registryAt(path);
-    expect(recovered.initialize().ok).toBe(true);
-    expect(recovered.activeDeviceCount).toBe(1);
-    expect(recovered.bootstrapGeneration).toBe(2);
+
+    // RECOVERY DENIED while durability stays unprovable: re-initializing the
+    // SAME store — and a restart-shaped attempt through a store whose
+    // directory still cannot fsync — both stay corrupt. Re-reading a
+    // visible file proves nothing.
+    const sameStoreRetry = registry.initialize();
+    expect(sameStoreRetry.ok).toBe(false);
+    if (!sameStoreRetry.ok) expect(sameStoreRetry.detail).toMatch(/could not be fsynced/);
+    expect(registry.usable).toBe(false);
+    const restartStore = storeAt(path);
+    (restartStore as unknown as FsyncPatch).fsyncDir = () => false;
+    const restarted = new EnrolledDeviceRegistry(restartStore, {
+      deviceIdFactory: () => `dev_test_${(deviceSeq += 1)}`,
+    });
+    const restartAttempt = restarted.initialize();
+    expect(restartAttempt.ok).toBe(false);
+    expect(restarted.usable).toBe(false);
+
+    // ONLY a successful barrier lifts the quarantine: the directory can
+    // fsync again, and load() proves the visible state durable BEFORE
+    // serving it — the admitted device resumes authority exactly here
+    (store as unknown as FsyncPatch).fsyncDir = realFsyncDir;
+    const recovered = registry.initialize();
+    expect(recovered.ok).toBe(true);
+    expect(registry.usable).toBe(true);
+    expect(registry.activeDeviceCount).toBe(1);
+    expect(registry.bootstrapGeneration).toBe(2);
   });
 
   it("a FAILED publish admits nothing: the invite burns, memory and disk stay consistent, registry stays usable", () => {
@@ -358,6 +381,41 @@ describe("EnrolledDeviceRegistry — durable, crash-atomic, registry-private spe
     const badMarker = registryAt(path2).initialize();
     expect(badMarker.ok).toBe(false);
     if (!badMarker.ok) expect(badMarker.detail).toMatch(/EXACTLY 0600/);
+  });
+
+  it("a marker with foreign CONTENT or an oversized body is corrupt — the marker is a byte-exact constant", () => {
+    const path = join(freshDir(), "devices.json");
+    registryAt(path).initialize();
+    writeFileSync(`${path}.initialized`, "SOMEONE ELSE'S NOTE\n", { mode: 0o600 });
+    const foreign = registryAt(path).initialize();
+    expect(foreign.ok).toBe(false);
+    if (!foreign.ok) expect(foreign.detail).toMatch(/marker note/);
+
+    const path2 = join(freshDir(), "devices.json");
+    registryAt(path2).initialize();
+    writeFileSync(`${path2}.initialized`, "x".repeat(5000), { mode: 0o600 });
+    const oversized = registryAt(path2).initialize();
+    expect(oversized.ok).toBe(false);
+    if (!oversized.ok) expect(oversized.detail).toMatch(/bytes — not the marker/);
+  });
+
+  it("a stored key that is canonical base64url but NOT a real P-256 SPKI is corrupt", () => {
+    const path = join(freshDir(), "devices.json");
+    const registry = registryAt(path);
+    registry.initialize();
+    const minted = registry.mintInvite(LIVE_KILL, mintRequest("inv-1", SECRET));
+    expect(registry.commitEnrollment(enrollmentSubmission(phone(), fixtureInvite(minted), SECRET), OPTS()).ok).toBe(true);
+    // tamper: swap the persisted WebAuthn key for bytes that only LOOK like a key
+    const raw = JSON.parse(readFileSync(path, "utf8")) as {
+      devices: Record<string, { publicKeySpki: string }>;
+    };
+    for (const device of Object.values(raw.devices)) {
+      device.publicKeySpki = randomBytes(40).toString("base64url");
+    }
+    writeFileSync(path, JSON.stringify(raw), { mode: 0o600 });
+    const reloaded = registryAt(path).initialize();
+    expect(reloaded.ok).toBe(false);
+    if (!reloaded.ok) expect(reloaded.detail).toMatch(/unexpected shape/);
   });
 
   it("the store demands an ABSOLUTE path", () => {
