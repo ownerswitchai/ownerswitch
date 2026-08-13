@@ -126,10 +126,11 @@ export interface ProxyOptions {
   /**
    * Cumulative limit rules — spend, error and call budgets counted across
    * calls (@ownerswitchai/gateway LimitTracker; shared limit-rule.ts is the
-   * model). Counting happens only where a call would actually act: forwarded
-   * calls feed calls/amount metrics, failed executions feed errors. A
-   * kill-action trip refuses the crossing call, reports a SCOPED signed
-   * kill, and latches locally so every later call is refused while the kill
+   * model). Counting happens only where a call is ATTEMPTED for dispatch:
+   * calls/amount meter pre-dispatch (the crossing call is refused before it
+   * runs), errors meter post-dispatch (the crossing execution already ran —
+   * only the NEXT call is stopped). A kill-action trip reports a SCOPED
+   * signed kill and latches, so every later call is refused while the kill
    * propagates; an alert-action trip only flags and the call proceeds.
    */
   limits?: LimitEnforcement;
@@ -331,7 +332,13 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     // confirmed trip releases (budgets re-armed) when the agent later
     // leaves the list — that absence is the owner's 2GO restore.
     if (observedKill !== undefined && !observedKill.killed) {
-      options.limits?.tracker.observeKillState(observedKill.killedAgents);
+      options.limits?.tracker.observeKillState(observedKill.killedAgents, {
+        // ordering + durability, both load-bearing: a pre-kill answer that
+        // lands late must not read as the owner's restore, and a control
+        // plane with degraded persistence proves nothing durable at all
+        ...(observedKill.epoch !== undefined ? { epoch: observedKill.epoch } : {}),
+        durable: observedKill.durable !== false,
+      });
     }
     // A SCOPED kill of this gateway's agent is a lockdown too, not a policy
     // deny: the engine already denied the call (killedAgents outranks every
@@ -458,6 +465,21 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
   async function observeCallLimits(call: ToolCall): Promise<void> {
     const limits = options.limits;
     if (limits === undefined) return;
+    // ADMISSION, synchronously: re-read the latch HERE, in the same block
+    // as the counting, with no await in between. The handler's own check
+    // happens before several awaits (the live lookup, the head pin, the
+    // veto lane), so a concurrent call can pass it while an earlier call
+    // is still awaiting its kill delivery — and by then the counter is
+    // already over max, so no NEW trip would fire to stop it. This is the
+    // one place that sees both the latch and the dispatch.
+    const latched = limits.tracker.killTripped;
+    if (latched !== undefined) {
+      throw limitTripped(
+        call.tool,
+        latched.ruleId,
+        `limit "${latched.ruleId}" tripped for agent "${agentId}" — this agent is stopped`,
+      );
+    }
     const trips = limits.tracker.observeCall(call);
     let killTrip: LimitTrip | undefined;
     for (const trip of trips) {

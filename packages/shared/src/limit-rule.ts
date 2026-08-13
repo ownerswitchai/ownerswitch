@@ -23,6 +23,14 @@
  *    unreadable amount, an overflowed window — the flag fires and the call
  *    still runs. Only `kill`-action rules are fail-closed enforcement;
  *    "alert" is visibility.
+ *  - WHEN a metric counts decides what its kill can promise:
+ *      `calls` / `amount` meter PRE-dispatch — the crossing call is refused
+ *        before it runs, so the budget bounds what actually happens;
+ *      `errors` meters POST-dispatch — an error exists only after the call
+ *        ran, so the crossing execution ALREADY HAPPENED (possibly
+ *        partially, possibly ambiguously) and the kill stops the NEXT call.
+ *    An error budget is a circuit breaker on a failing agent, never a
+ *    promise that the failure which crossed it was prevented.
  */
 
 export type LimitMetric =

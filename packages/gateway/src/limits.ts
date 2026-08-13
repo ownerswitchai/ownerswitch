@@ -67,6 +67,17 @@ export interface LatchedLimitTrip {
   reason: string;
   at: number;
   confirmed: boolean;
+  /**
+   * The lowest control-plane kill epoch whose answer can possibly include
+   * THIS trip's scoped kill: the last epoch observed before the trip, plus
+   * one (every scoped kill bumps the epoch). Any `/status` answer at or
+   * below the pre-trip epoch is a pre-kill snapshot — its empty
+   * `killedAgents` says nothing about our kill, and reading it as the
+   * owner's restore would be fail-open. Undefined only when the tracker
+   * had never observed an epoch at trip time (no live lookup yet); then
+   * the floor is learned from the first answer that LISTS the agent.
+   */
+  epochFloor?: number;
 }
 
 /**
@@ -130,6 +141,8 @@ export class LimitTracker {
   private readonly now: () => number;
   private readonly maxWindowEvents: number;
   private latch: LatchState = { phase: "armed" };
+  /** newest control-plane kill epoch this tracker has been shown */
+  private lastObservedEpoch?: number;
 
   constructor(
     rules: readonly LimitRule[],
@@ -171,22 +184,66 @@ export class LimitTracker {
    * already fetched for its own decision. Two transitions, both explicit:
    *  - UNCONFIRMED + agent listed  → CONFIRMED (the kill landed)
    *  - CONFIRMED  + agent absent   → released (the owner's 2GO restore):
-   *    the latch clears, the store clears, and EVERY budget re-arms fresh.
-   * An UNCONFIRMED latch is deliberately deaf to absence — before the kill
-   * lands the agent is absent too, and releasing on that would be fail-open.
+   *    the latch clears and EVERY budget re-arms fresh.
+   *
+   * Three things gate those transitions, each closing a fail-open path:
+   *
+   *  1. An UNCONFIRMED latch is deaf to absence — before the kill lands the
+   *     agent is absent too, and releasing on that would be fail-open.
+   *  2. ORDERING. Answers can arrive out of order: a `/status` fetched
+   *     before the kill can land after the confirmation, and its empty
+   *     `killedAgents` would look exactly like the owner's restore. Every
+   *     scoped kill bumps the control plane's epoch, so an answer at or
+   *     below the trip's `epochFloor` is a pre-kill snapshot and is
+   *     ignored. (A restore does NOT bump the epoch, so a genuine
+   *     post-restore answer still carries the kill's epoch and passes.)
+   *  3. DURABILITY. A control plane whose persistence is degraded lists a
+   *     kill it may lose on restart: confirming from such an answer would
+   *     let a restart erase the kill and the next answer's absence re-arm
+   *     the budget with no owner ceremony. A degraded answer drives no
+   *     transition at all — neither confirm nor release.
    */
-  observeKillState(killedAgents: readonly string[]): void {
-    if (this.latch.phase === "unconfirmed" && killedAgents.includes(this.latch.record.agentId)) {
+  observeKillState(
+    killedAgents: readonly string[],
+    opts: { epoch?: number; durable?: boolean } = {},
+  ): void {
+    const { epoch, durable = true } = opts;
+    if (epoch !== undefined) this.lastObservedEpoch = epoch;
+    if (!durable) return; // says nothing trustworthy in either direction
+    const listed =
+      this.latch.phase !== "armed" && killedAgents.includes(this.latch.record.agentId);
+
+    if (this.latch.phase === "unconfirmed" && listed) {
+      // The authoritative confirmation: the kill is IN this answer, so this
+      // answer's epoch is exactly the floor every later answer must clear.
+      // Set it BEFORE confirming — confirmKillDelivered copies the record.
+      if (epoch !== undefined) this.latch.record.epochFloor = epoch;
       this.confirmKillDelivered();
       return;
     }
-    if (this.latch.phase === "confirmed" && !killedAgents.includes(this.latch.record.agentId)) {
-      this.latch = { phase: "armed" };
-      for (const state of this.states) {
-        state.lifetimeTotal = 0;
-        state.events.length = 0;
-        state.saturatedUntil = undefined;
+    if (this.latch.phase !== "confirmed") return;
+    if (listed) {
+      // Still killed. If the floor is unknown (confirmed by DELIVERY alone,
+      // before any epoch was observed), learn it here: seeing the kill in
+      // force at this epoch means every answer from this epoch on is fresh
+      // enough to speak about it.
+      if (this.latch.record.epochFloor === undefined && epoch !== undefined) {
+        this.latch.record.epochFloor = epoch;
       }
+      return;
+    }
+
+    const floor = this.latch.record.epochFloor;
+    // Without a floor we cannot tell a stale pre-kill answer from a
+    // restore, and cannot prove our kill was ever visible — hold.
+    if (floor === undefined) return;
+    if (epoch === undefined || epoch < floor) return; // stale/unknown: hold
+
+    this.latch = { phase: "armed" };
+    for (const state of this.states) {
+      state.lifetimeTotal = 0;
+      state.events.length = 0;
+      state.saturatedUntil = undefined;
     }
   }
 
@@ -280,6 +337,11 @@ export class LimitTracker {
       reason: limitTripReason(trip, call.agentId),
       at: this.now(),
       confirmed: false,
+      // the kill this trip is about to fire will bump the epoch, so only an
+      // answer strictly past the last one we saw can reflect it
+      ...(this.lastObservedEpoch !== undefined
+        ? { epochFloor: this.lastObservedEpoch + 1 }
+        : {}),
     };
     this.latch = { phase: "unconfirmed", record };
   }

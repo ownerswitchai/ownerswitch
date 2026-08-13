@@ -709,6 +709,46 @@ describe("cumulative limits", () => {
     await t.close();
   });
 
+  it("a concurrent call cannot slip past a latch set while an earlier call awaits its kill", async () => {
+    // The race the top-of-handler latch check alone cannot catch: A crosses
+    // the budget and blocks on delivering its kill; B enters the handler
+    // meanwhile, and by the time B counts, the total is ALREADY over max —
+    // so no new trip fires for it. Only a synchronous admission check at
+    // the counting/dispatch boundary stops B.
+    let releaseKill: (() => void) | undefined;
+    const killDelivering = new Promise<void>((resolve) => {
+      releaseKill = resolve;
+    });
+    const kills: LimitTrip[] = [];
+    const limits = {
+      tracker: new LimitTracker([
+        { id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" } as LimitRule,
+      ]),
+      reportKill: (trip: LimitTrip): Promise<void> => {
+        kills.push(trip);
+        return killDelivering; // hangs until the test releases it
+      },
+      reportAlert: (): void => {},
+    };
+    const t = await startProxy(createFakeControlPlane(), undefined, limits);
+
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a" } }); // 1, under
+    const crossing = t.client.callTool({ name: "read_file", arguments: { path: "/b" } }); // trips, blocks
+    await vi.waitFor(() => expect(kills).toHaveLength(1));
+
+    // B arrives while A's kill is still in flight
+    const concurrent = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/c" } }),
+    );
+    expect(concurrent.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(t.upstream.calls).toHaveLength(1); // ONLY the first, under-budget call ran
+
+    releaseKill?.();
+    expect((await refusalOf(crossing)).code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(t.upstream.calls).toHaveLength(1);
+    await t.close();
+  });
+
   it("the full trip lifecycle: refused in flight → scope-killed → owner restore re-arms the budget", async () => {
     const r = recordingLimits([
       { id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" },
@@ -727,7 +767,9 @@ describe("cumulative limits", () => {
     expect(inFlight.message).toContain("in flight");
 
     // the control plane applies the scoped kill (epoch bumps, agent listed):
-    // the refusal becomes the authoritative scoped lockdown
+    // the refusal becomes the authoritative scoped lockdown. The epoch bump
+    // is what later lets the tracker tell the owner's restore from a stale
+    // pre-kill answer.
     cp.state.epoch += 1;
     cp.state.killedAgents = ["test-agent"];
     const killed = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));

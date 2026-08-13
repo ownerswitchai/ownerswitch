@@ -31,6 +31,18 @@ export interface KillState {
    */
   killedAgents: readonly string[];
   /**
+   * False when the control plane reported its durable kill state as
+   * DEGRADED or UNHEALTHY (`persistenceDegraded` / `unhealthy` on
+   * `/status`): the answer is authoritative about what is in force RIGHT
+   * NOW, but not about what survives a restart. `evaluate()` does not
+   * consult it — a kill in memory still denies everything — but consumers
+   * that treat `/status` as PROOF of a durable record (the limit tracker's
+   * trip lifecycle) must not, and they read this. Optional and defaulting
+   * to durable so hand-built values stay valid; the fetched answers always
+   * populate it (client.ts).
+   */
+  durable?: boolean;
+  /**
    * The control plane's kill epoch — a monotone count of every kill this
    * deployment has ever had; a restore never resets it. `evaluate()` itself
    * does not consult it: `killed` is enough to decide a policy call. It

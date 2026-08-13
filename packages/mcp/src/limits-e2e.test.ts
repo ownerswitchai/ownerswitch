@@ -16,6 +16,7 @@ import { createControlPlane, createOwnerSession } from "@ownerswitchai/control-p
 import { LimitTracker, limitTripReason, type LimitTrip } from "@ownerswitchai/gateway";
 import { createTripReporter } from "@ownerswitchai/honeytoken";
 import type { LimitRule } from "@ownerswitchai/shared";
+import { isLimitKillConfirmation } from "./limit-kill-confirmation.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const DEVICE_SECRET = "limits-e2e-device-secret";
@@ -86,6 +87,9 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       source: "limit",
       agentId: AGENT_ID,
       reason: limitTripReason(trip, AGENT_ID),
+      // the PRODUCTION predicate, not a test stand-in: this run proves the
+      // real control plane's answer satisfies what the CLI demands
+      confirmDelivery: (body) => isLimitKillConfirmation(body, AGENT_ID),
     });
     const { delivered } = await reporter.flush({ maxAttempts: 4 });
     expect(delivered).toBe(true);
@@ -95,6 +99,7 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     const status = (await (await fetch(`${url}/status`)).json()) as {
       killed: boolean;
       killedAgents: string[];
+      epoch: number;
     };
     expect(status.killed).toBe(false); // the fleet is running
     expect(status.killedAgents).toEqual([AGENT_ID]);
@@ -102,8 +107,9 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     expect(killEntry?.type === "agent-kill" && killEntry.event.source).toBe("limit");
     expect(killEntry?.type === "agent-kill" && killEntry.event.reason).toContain('"e2e-budget"');
 
-    // ...and the tracker, observing the same /status a gateway would, stays latched
-    tracker.observeKillState(status.killedAgents);
+    // ...and the tracker, observing the same /status a gateway would (epoch
+    // included — that is what orders the answers), stays latched
+    tracker.observeKillState(status.killedAgents, { epoch: status.epoch });
     expect(tracker.killTripped?.ruleId).toBe("e2e-budget");
 
     // 3b. THE DURABILITY LEG: restart the control plane onto the same state
@@ -133,8 +139,13 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     });
     const statusAfterReboot = (await (await fetch(`${url2}/status`)).json()) as {
       killedAgents: string[];
+      epoch: number;
     };
     expect(statusAfterReboot.killedAgents).toEqual([AGENT_ID]);
+
+    // a STALE pre-kill answer arriving late must not read as the restore
+    tracker.observeKillState([], { epoch: status.epoch - 1 });
+    expect(tracker.killTripped?.ruleId).toBe("e2e-budget");
 
     // 4. the owner's scoped 2GO restore over the real HTTP surface
     const session = createOwnerSession("adam", { now: c.now });
@@ -155,9 +166,12 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     expect(await restore.json()).toEqual({ killed: false, restoredAgent: AGENT_ID });
 
     // 5. the tracker sees the restore on /status and releases — budgets re-armed
-    const after = (await (await fetch(`${url2}/status`)).json()) as { killedAgents: string[] };
+    const after = (await (await fetch(`${url2}/status`)).json()) as {
+      killedAgents: string[];
+      epoch: number;
+    };
     expect(after.killedAgents).toEqual([]);
-    tracker.observeKillState(after.killedAgents);
+    tracker.observeKillState(after.killedAgents, { epoch: after.epoch });
     expect(tracker.killTripped).toBeUndefined();
     expect(tracker.observeCall({ agentId: AGENT_ID, tool: "stripe.payout" })).toHaveLength(1); // fresh crossing
 

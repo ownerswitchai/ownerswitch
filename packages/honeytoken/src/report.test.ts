@@ -32,12 +32,14 @@ interface FetchCall {
 
 function harness(behavior: (call: number, url: string) => Response) {
   const calls: FetchCall[] = [];
+  const inits: RequestInit[] = [];
   const logs: string[] = [];
   const delivered: Array<{ trip: Trip; confirmation: DeliveryConfirmation }> = [];
 
   const fetchImpl = (async (url: URL | RequestInfo, init?: RequestInit) => {
     const u = String(url);
     calls.push({ url: u, headers: { ...(init?.headers as Record<string, string>) }, body: String(init?.body) });
+    inits.push(init ?? {});
     return behavior(calls.length, u);
   }) as typeof fetch;
 
@@ -50,7 +52,7 @@ function harness(behavior: (call: number, url: string) => Response) {
     onDelivered: (trip, confirmation) => delivered.push({ trip, confirmation }),
   });
 
-  return { reporter, calls, logs, delivered };
+  return { reporter, calls, inits, logs, delivered };
 }
 
 const settle = () => vi.advanceTimersByTimeAsync(0);
@@ -423,14 +425,7 @@ describe("trip reporter", () => {
     const h = harness(() => okResponse());
     h.reporter.report(KILL_TRIP);
     await settle();
-    const redirects = h.calls.map(() => undefined);
-    expect(redirects.length).toBeGreaterThan(0);
-    // the fetch init is not captured by this harness; assert via the source
-    // contract instead: every attempt passes redirect:"error" (pinned here
-    // so a future edit that drops it fails a test, not a review)
-    const source = await import("node:fs").then((fs) =>
-      fs.readFileSync(new URL("./report.ts", import.meta.url), "utf8"),
-    );
-    expect(source).toContain('redirect: "error"');
+    expect(h.inits).toHaveLength(1);
+    expect(h.inits[0].redirect).toBe("error"); // the actual request init
   });
 });

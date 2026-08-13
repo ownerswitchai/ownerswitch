@@ -58,8 +58,15 @@ sliding window or the process lifetime), and a tripped `kill`-action
 rule refuses the crossing call and fires the same signed, scoped kill a
 honeytoken does — the agent that blew its budget stops, the fleet keeps
 running, and restoring it is the owner's 2GO ceremony. `alert`-action
-rules only flag — they never block, whatever tripped them. The durable
-record of a tripped kill is the control plane's persisted scoped kill —
+rules only flag — they never block, whatever tripped them. When a metric
+counts decides what its kill can promise: `calls` and `amount` meter
+**before** dispatch, so the crossing call is refused and never runs;
+`errors` meters **after** dispatch — the failing call already happened,
+and the kill stops the next one. An error budget is a circuit breaker on
+a failing agent, not a promise that the failure which crossed it was
+prevented.
+
+The durable record of a tripped kill is the control plane's persisted scoped kill —
 delivered synchronously on the crossing refusal, with the response
 validated (the agent echoed back, no degraded persistence, redirects
 refused) before the latch reads it as confirmed — to the one store the

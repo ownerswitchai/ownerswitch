@@ -10,6 +10,7 @@ const FAIL_CLOSED = {
   killed: true,
   reason: "control plane unreachable — fail closed",
   killedAgents: [],
+  durable: false,
 };
 
 const jsonResponse =
@@ -37,7 +38,7 @@ describe("createControlPlaneClient", () => {
   it("passes a healthy killed:false through, epoch intact", async () => {
     await expect(
       client(jsonResponse({ killed: false, epoch: 0, killedAgents: [] })).fetchKillState(),
-    ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [] });
+    ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [], durable: true });
   });
 
   it("requests /status with caching defeated — no-store, at the fetch layer and on the wire", async () => {
@@ -62,7 +63,13 @@ describe("createControlPlaneClient", () => {
     const state = await client(
       jsonResponse({ killed: true, reason: "honeytoken tripped", at: 1_000, epoch: 3, killedAgents: [] }),
     ).fetchKillState();
-    expect(state).toEqual({ killed: true, reason: "honeytoken tripped", epoch: 3, killedAgents: [] });
+    expect(state).toEqual({
+      killed: true,
+      reason: "honeytoken tripped",
+      epoch: 3,
+      killedAgents: [],
+      durable: true,
+    });
   });
 
   it("fails closed on network rejection instead of throwing", async () => {
@@ -130,7 +137,7 @@ describe("createControlPlaneClient", () => {
     it("a genuine epoch of 0 (first boot, never killed) is accepted", async () => {
       await expect(
         client(jsonResponse({ killed: false, epoch: 0, killedAgents: [] })).fetchKillState(),
-      ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [] });
+      ).resolves.toEqual({ killed: false, epoch: 0, killedAgents: [], durable: true });
     });
   });
 
@@ -138,7 +145,7 @@ describe("createControlPlaneClient", () => {
     it("passes a populated scoped-kill list through", async () => {
       await expect(
         client(jsonResponse({ killed: false, epoch: 2, killedAgents: ["agent-7"] })).fetchKillState(),
-      ).resolves.toEqual({ killed: false, epoch: 2, killedAgents: ["agent-7"] });
+      ).resolves.toEqual({ killed: false, epoch: 2, killedAgents: ["agent-7"], durable: true });
     });
 
     it("fails closed when killedAgents is absent from an otherwise-healthy body", async () => {
@@ -197,6 +204,25 @@ describe("createControlPlaneClient", () => {
           client(jsonResponse({ killed: false, epoch: 0, killedAgents: [bad] })).fetchKillState(),
         ).resolves.toEqual(FAIL_CLOSED);
       }
+    });
+
+    it("carries durability through: degraded/unhealthy answers are marked not-durable", async () => {
+      // in force NOW, but not proof of anything that survives a restart —
+      // the limit tracker's lifecycle refuses to confirm from these
+      await expect(
+        client(
+          jsonResponse({ killed: false, epoch: 3, killedAgents: ["a1"], persistenceDegraded: true }),
+        ).fetchKillState(),
+      ).resolves.toMatchObject({ killed: false, killedAgents: ["a1"], durable: false });
+      await expect(
+        client(
+          jsonResponse({ killed: false, epoch: 3, killedAgents: [], unhealthy: "repair the store" }),
+        ).fetchKillState(),
+      ).resolves.toMatchObject({ durable: false });
+      // a healthy answer says so
+      await expect(
+        client(jsonResponse({ killed: false, epoch: 3, killedAgents: [] })).fetchKillState(),
+      ).resolves.toMatchObject({ durable: true });
     });
 
     it("fails closed on a response body too large to be a real /status answer", async () => {

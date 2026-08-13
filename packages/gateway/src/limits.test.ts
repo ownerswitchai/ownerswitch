@@ -228,20 +228,21 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
   it("an UNCONFIRMED latch never releases on absence — before the kill lands the agent is absent too", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"));
-    tracker.observeKillState([]); // control plane does not (yet) list the agent
-    tracker.observeKillState([]);
+    tracker.observeKillState([], { epoch: 9 }); // control plane does not (yet) list the agent
+    tracker.observeKillState([], { epoch: 9 });
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still latched — fail closed
   });
 
   it("seen listed → CONFIRMED; later absence → released and budgets re-armed", () => {
     const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeKillState([], { epoch: 4 }); // the world before the trip
     tracker.observeCall(call("x"));
 
-    tracker.observeKillState(["a1"]); // the scoped kill landed on /status
+    tracker.observeKillState(["a1"], { epoch: 5 }); // the scoped kill landed on /status
     expect(tracker.killTripped?.confirmed).toBe(true);
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still refusing, honestly
 
-    tracker.observeKillState([]); // the owner's 2GO restore
+    tracker.observeKillState([], { epoch: 5 }); // the owner's 2GO restore
     expect(tracker.killTripped).toBeUndefined();
     // budgets re-armed FRESH: the very next call is a new crossing, not a
     // stale continuation of the pre-restore totals
@@ -250,12 +251,66 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     expect(trips[0].cause).toBe("threshold-crossed");
   });
 
+  it("a STALE pre-kill answer never releases a confirmed latch — ordering is enforced by epoch", () => {
+    // the race: a /status fetched BEFORE the kill lands after the
+    // confirmation. Its empty killedAgents looks exactly like the owner's
+    // restore; only the epoch tells them apart (a kill bumps it, a restore
+    // does not).
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeKillState([], { epoch: 7 }); // the world before the trip
+    tracker.observeCall(call("x")); // trips; the kill will make epoch 8
+    tracker.observeKillState(["a1"], { epoch: 8 }); // the kill landed → confirmed
+    expect(tracker.killTripped?.confirmed).toBe(true);
+
+    tracker.observeKillState([], { epoch: 7 }); // the stale answer, arriving late
+    expect(tracker.killTripped?.ruleId).toBe("hard"); // NOT released
+    tracker.observeKillState([], { epoch: 6 }); // even older
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+
+    tracker.observeKillState([], { epoch: 8 }); // the genuine restore (epoch unchanged by restore)
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("an epoch-less or floor-less answer holds the latch rather than guessing", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x")); // no epoch ever observed → no floor
+    tracker.confirmKillDelivered(); // POST-confirmed, but we never saw it listed
+    tracker.observeKillState([]); // no epoch, no floor: cannot prove a restore
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+    // learning the floor from a listing answer makes release possible again
+    tracker.observeKillState(["a1"], { epoch: 4 });
+    tracker.observeKillState([], { epoch: 4 });
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
+  it("a DEGRADED answer drives no transition — a kill that may not survive a restart proves nothing", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeKillState([], { epoch: 1 });
+    tracker.observeCall(call("x"));
+    // listed, but the control plane admits its persistence is degraded:
+    // confirming here would let a CP restart erase the kill and the next
+    // absence re-arm the budget with no owner ceremony
+    tracker.observeKillState(["a1"], { epoch: 2, durable: false });
+    expect(tracker.killTripped?.confirmed).toBe(false);
+    // a healthy answer confirms properly...
+    tracker.observeKillState(["a1"], { epoch: 2 });
+    expect(tracker.killTripped?.confirmed).toBe(true);
+    // ...and a degraded absence cannot release it either
+    tracker.observeKillState([], { epoch: 2, durable: false });
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+    tracker.observeKillState([], { epoch: 2 });
+    expect(tracker.killTripped).toBeUndefined();
+  });
+
   it("confirmKillDelivered() is the same transition as being seen listed", () => {
     const tracker = new LimitTracker([KILL_RULE]);
-    tracker.observeCall(call("x"));
+    tracker.observeKillState([], { epoch: 2 });
+    tracker.observeCall(call("x")); // floor = 3 (the kill will bump 2 → 3)
     tracker.confirmKillDelivered(); // POST /kill confirmed by the reporter
     expect(tracker.killTripped?.confirmed).toBe(true);
-    tracker.observeKillState([]); // absence after confirmation = restore
+    tracker.observeKillState([], { epoch: 2 }); // a stale pre-kill answer: holds
+    expect(tracker.killTripped?.ruleId).toBe("hard");
+    tracker.observeKillState([], { epoch: 3 }); // the post-kill world: restore
     expect(tracker.killTripped).toBeUndefined();
   });
 });
