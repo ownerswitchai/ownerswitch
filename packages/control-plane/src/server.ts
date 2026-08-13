@@ -763,6 +763,42 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // live KillSwitch inside the handler that uses it — never from a request.
   const liveKillSnapshot = () => ({ killed: killSwitch.killed, epoch: killSwitch.epoch });
 
+  // ---- the DYNAMIC owner-device lane (ceremony-enrolled registry) --------
+  // Key material AND standing for ceremony-enrolled (dev_*) devices come
+  // from the durable EnrolledDeviceRegistry: the registry RECORD is the
+  // standing — its generation/revokedAt persist crash-atomically with the
+  // same discipline as everything else in that file — so this population
+  // needs no separate standing-file entry. Standing is read LIVE on every
+  // resolution; only the parsed key object is cached (keyed by the SPKI
+  // bytes, so a changed record can never serve a stale key). Fail
+  // direction: an unusable (corrupt/quarantined) registry resolves
+  // NOTHING — every enrolled-device request 401s while operator-keys-file
+  // devices and every stop path continue untouched.
+  const enrolledKeyCache = new Map<string, { spki: string; device: EnrolledOwnerDevice }>();
+  function resolveOwnerDevice(deviceId: string): EnrolledOwnerDevice | undefined {
+    const provisioned = ownerDevices.get(deviceId);
+    if (provisioned !== undefined) return provisioned;
+    if (enrolledDevices === undefined || !enrolledDevices.usable) return undefined;
+    const record = enrolledDevices.get(deviceId);
+    if (record === null) return undefined;
+    const cached = enrolledKeyCache.get(deviceId);
+    if (cached !== undefined && cached.spki === record.cheapLaneKeySpki) {
+      cached.device.generation = record.generation;
+      cached.device.revokedAt = record.revokedAt;
+      return cached.device;
+    }
+    const device = enrolledOwnerDeviceFromSpki(deviceId, record.cheapLaneKeySpki);
+    device.generation = record.generation;
+    device.revokedAt = record.revokedAt;
+    enrolledKeyCache.set(deviceId, { spki: record.cheapLaneKeySpki, device });
+    return device;
+  }
+  // the verifier only ever calls .get() — this adapter is the ONE bridge
+  const ownerDeviceResolver = {
+    get: (deviceId: string) => resolveOwnerDevice(deviceId),
+  } as unknown as ReadonlyMap<string, EnrolledOwnerDevice>;
+  const ownerDeviceLaneWired = () => ownerDevices.size > 0 || enrolledDevices !== undefined;
+
   // QUARANTINE: set whenever the registry on disk may disagree with memory in
   // the PERMISSIVE direction (a revocation that could not be durably
   // persisted). While set, no owner-device evidence is accepted and no
@@ -859,7 +895,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (killSwitch.killed) return false;
     if (standingQuarantined) return false;
     if (deviceId === null || generation === null) return false;
-    const device = ownerDevices.get(deviceId);
+    const device = resolveOwnerDevice(deviceId);
     return device !== undefined && device.revokedAt === null && device.generation === generation;
   }
   // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
@@ -988,12 +1024,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * request target as sent, so the signature is bound to THIS route and body.
    */
   function validOwnerDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
-    if (ownerDevices.size === 0) return null;
+    if (!ownerDeviceLaneWired()) return null;
     const credential = ownerDeviceCredentialFrom(req);
     if (credential === null) return null;
     const method = (req.method ?? "").toUpperCase();
     const pathAndQuery = req.url ?? "";
-    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDevices, {
+    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDeviceResolver, {
       now,
       seenNonces,
     });
@@ -2067,8 +2103,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    */
   async function getVetoDetail(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (ownerDevices.size === 0) {
-      sendJson(res, 501, { error: "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys)" });
+    if (!ownerDeviceLaneWired()) {
+      sendJson(res, 501, {
+        error:
+          "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys or the enrollment registry)",
+      });
       return;
     }
     const fetchingDeviceId = validOwnerDeviceIdFrom(req, raw);
@@ -2120,7 +2159,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       deviceId: fetchingDeviceId,
       // the generation this delivery is minted under — a later revocation
       // bumps the device's generation and this delivery dies with it
-      deviceGeneration: ownerDevices.get(fetchingDeviceId)?.generation ?? 0,
+      deviceGeneration: resolveOwnerDevice(fetchingDeviceId)?.generation ?? 0,
       expiresAt: now() + DELIVERY_TTL_MS,
       consumed: false,
     });
@@ -2139,12 +2178,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (ownerDevices.size === 0) {
+    if (!ownerDeviceLaneWired()) {
       sendJson(res, 501, {
         error:
           "delivery confirmation is not wired: no owner-app device is enrolled on this control " +
-          "plane, so no device may flip the release-permitting 'delivered' bit — windows walk to " +
-          "held (passkey approval) instead. Enroll an owner device public key (ownerDeviceKeys).",
+          "plane (neither ownerDeviceKeys nor the enrollment registry), so no device may flip the " +
+          "release-permitting 'delivered' bit — windows walk to held (passkey approval) instead.",
       });
       return;
     }
@@ -2207,7 +2246,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // render is not another's evidence), and a revocation in between bumps
     // the generation so the orphaned delivery can never confirm anything.
     if (delivery.deviceId !== deviceId) return reject("delivery belongs to a different device");
-    const ackingDevice = ownerDevices.get(deviceId);
+    const ackingDevice = resolveOwnerDevice(deviceId);
     if (ackingDevice === undefined || delivery.deviceGeneration !== ackingDevice.generation) {
       ownerDeliveries.delete(deliveryId);
       return reject("delivery was minted under a superseded device generation — fetch a fresh detail");
