@@ -99,6 +99,78 @@
     return runtime;
   }
 
+  // ENROLLMENT (DESIGN.md §2): paste the invite → the whole ceremony runs in
+  // enroll-ceremony.mjs (validate → create → possession assertion →
+  // cheap-lane PoP → POST /devices/enroll). The pasted text is parsed as
+  // JSON here and validated there; a refusal renders as TEXT in the status
+  // line, never as markup. The cheap-lane pair is the SAME IndexedDB-
+  // persisted key the ack path uses (ensureDeviceKey) — its persistence
+  // round-trip is exercised on every load and its service-worker signing by
+  // the push path.
+  var enrollButton = document.getElementById("enroll-button");
+  if (enrollButton) {
+    enrollButton.addEventListener("click", function () {
+      var input = document.getElementById("enroll-input");
+      var raw = input ? input.value : "";
+      setText("enroll-status", "enrolling…");
+      enrollButton.disabled = true;
+      var payload = null;
+      try {
+        payload = JSON.parse(raw);
+      } catch (e) {
+        setText("enroll-status", "that is not an invite (invalid JSON)");
+        enrollButton.disabled = false;
+        return;
+      }
+      Promise.all([import("./enroll-ceremony.mjs"), loadRuntime()])
+        .then(function (mods) {
+          var ceremony = mods[0];
+          var rt = mods[1];
+          return rt.ensureDeviceKey().then(function (pair) {
+            return ceremony.completeEnrollmentCeremony(payload, {
+              credentials: navigator.credentials,
+              cheapLane: pair,
+              fetchImpl: fetch.bind(self),
+              baseUrl: config.controlPlaneUrl,
+            });
+          });
+        })
+        .then(function (outcome) {
+          if (outcome.ok) {
+            // ADOPT the server-assigned identity DURABLY before claiming
+            // success: from here every signed request uses the registry's
+            // name for this key, not the deployment-config id
+            return loadRuntime()
+              .then(function (rt) {
+                return rt.adoptEnrolledIdentity(outcome.deviceId);
+              })
+              .then(function () {
+                setText("enroll-status", "enrolled as " + outcome.deviceId + " — signed requests now use this identity");
+                if (input) input.value = ""; // the secret leaves the DOM
+              })
+              .catch(function () {
+                setText(
+                  "enroll-status",
+                  "enrolled as " + outcome.deviceId + " on the SERVER, but this phone could not persist the identity — reload and check the device list before retrying",
+                );
+              });
+          } else {
+            setText(
+              "enroll-status",
+              outcome.reason +
+                (outcome.inviteSurvives === false ? " (the invite is spent — mint a new one)" : ""),
+            );
+          }
+        })
+        .catch(function () {
+          setText("enroll-status", "enrolment failed — nothing was spent that the server did not report");
+        })
+        .then(function () {
+          enrollButton.disabled = false;
+        });
+    });
+  }
+
   // Register the service worker (module worker so it can import owner-crypto),
   // then ensure the device key and enroll for push — best effort; a failure
   // here degrades to SMS/voice/held, never to a false "reached".
