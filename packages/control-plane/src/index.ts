@@ -71,6 +71,23 @@ export type {
 } from "./invite.js";
 export { performEnrollment } from "./enrollment.js";
 export type { EnrollmentOutcome, PerformEnrollmentOptions } from "./enrollment.js";
+export {
+  EnrolledDeviceFileStore,
+  EnrolledDeviceRegistry,
+  MAX_ACTIVE_DEVICES,
+  MAX_ENROLLED_DEVICES_FILE_BYTES,
+} from "./enrolled-devices.js";
+export type {
+  CommitEnrollmentOptions,
+  CommitEnrollmentOutcome,
+  EnrolledDeviceRegistryOptions,
+  EnrolledDevicesLoad,
+  EnrolledDeviceStoreOptions,
+  LiveKillState,
+  MintInviteRequest,
+  PersistedEnrolledDevice,
+  PersistedEnrolledDevices,
+} from "./enrolled-devices.js";
 export type {
   EnrolledOwnerDevice,
   OwnerDeviceCredential,
