@@ -1,5 +1,5 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
-import { rulesMatchingTool } from "@ownerswitchai/gateway";
+import { MAX_LIMIT_MAX, rulesMatchingTool } from "@ownerswitchai/gateway";
 import {
   isValidAgentId,
   MAX_AGENT_ID_CHARS,
@@ -57,6 +57,13 @@ export interface OwnerSwitchMcpConfig {
    * SCOPED kill of this gateway's agent; an alert-action trip only flags.
    */
   limits?: LimitRule[];
+  /**
+   * Where a kill-action limit trip survives a gateway restart (the durable
+   * latch of gateway/limits.ts's trip lifecycle). Strongly recommended with
+   * kill-action limits: without it a crash between the trip and the kill's
+   * delivery re-opens the budget on the next boot, and the CLI warns loudly.
+   */
+  limitStateFile?: string;
 }
 
 /** Configuration problems are startup errors: message only, no stack noise. */
@@ -156,9 +163,12 @@ function parseLimitRule(v: unknown, path: string): LimitRule {
         : `${path}.amountPath is only meaningful when metric is "amount"`,
     );
   }
+  // max: a non-negative SAFE INTEGER, capped far below the checked-add
+  // clamp — amounts count in atomic units (integer cents), and a max the
+  // clamp could not exceed would let an overflowed total read as in-budget
   const max = v.max;
-  if (typeof max !== "number" || !Number.isFinite(max) || max < 0) {
-    return fail(`${path}.max must be a finite number >= 0`);
+  if (typeof max !== "number" || !Number.isSafeInteger(max) || max < 0 || max > MAX_LIMIT_MAX) {
+    return fail(`${path}.max must be a non-negative safe integer <= ${MAX_LIMIT_MAX} (atomic units)`);
   }
   const windowMs = v.windowMs;
   if (
@@ -322,6 +332,9 @@ export function parseConfig(v: unknown): OwnerSwitchMcpConfig {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(executorRoutes !== undefined ? { executorRoutes } : {}),
     ...(v.limits !== undefined ? { limits: parseLimits(v.limits, "limits") } : {}),
+    ...(v.limitStateFile !== undefined
+      ? { limitStateFile: requireString(v.limitStateFile, "limitStateFile") }
+      : {}),
   };
 }
 
@@ -354,6 +367,9 @@ function fromEnv(env: Record<string, string | undefined>): unknown {
     ...(env.OWNERSWITCH_AGENT_ID !== undefined ? { agentId: env.OWNERSWITCH_AGENT_ID } : {}),
     ...(env.OWNERSWITCH_LIMITS !== undefined
       ? { limits: parseJson(env.OWNERSWITCH_LIMITS, "OWNERSWITCH_LIMITS") }
+      : {}),
+    ...(env.OWNERSWITCH_LIMIT_STATE_FILE !== undefined
+      ? { limitStateFile: env.OWNERSWITCH_LIMIT_STATE_FILE }
       : {}),
     ...(env.OWNERSWITCH_TIMEOUT_MS !== undefined
       ? { timeoutMs: Number(env.OWNERSWITCH_TIMEOUT_MS) }

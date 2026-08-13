@@ -11,10 +11,18 @@
  *
  * Counting happens where the calls are seen — in the gateway process
  * (@ownerswitchai/gateway `LimitTracker`), per agent, since the control
- * plane never sees allow-lane calls. Stated honestly: counters live in
- * gateway memory and reset when that process restarts; the KILL a tripped
- * rule fires is durable and authoritative (persisted scoped kill on the
- * control plane), the counters that led to it are not.
+ * plane never sees allow-lane calls. Stated honestly:
+ *  - counters live in gateway memory and reset when that process restarts;
+ *    the tripped-kill LATCH is the one thing that survives (via the trip
+ *    store), because the latch is enforcement — the counters that led to
+ *    it are bookkeeping;
+ *  - each gateway process counts alone: two gateways running under the
+ *    same agentId hold two separate budgets. Deploy one gateway per agent
+ *    when a budget must be a single number;
+ *  - `alert`-action rules NEVER block: on any trip — a crossing, an
+ *    unreadable amount, an overflowed window — the flag fires and the call
+ *    still runs. Only `kill`-action rules are fail-closed enforcement;
+ *    "alert" is visibility.
  */
 
 export type LimitMetric =

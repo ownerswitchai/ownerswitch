@@ -33,6 +33,8 @@ import {
   honeytokenTripped,
   limitTripped,
   lockdown,
+  OwnerSwitchErrorCode,
+  OwnerSwitchRefusal,
   ownerVetoed,
   policyDenied,
   routedCallRefused,
@@ -316,6 +318,14 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     };
     const verdict = await evaluateRemote(call, options.policy, observing);
     if (observedKill?.killed) throw lockdown(call.tool, observedKill.reason);
+    // Drive the limit-trip lifecycle off the SAME live answer this decision
+    // used, BEFORE any refusal below can cut the turn short: an unconfirmed
+    // trip becomes confirmed when the agent shows up scope-killed, and a
+    // confirmed trip releases (budgets re-armed) when the agent later
+    // leaves the list — that absence is the owner's 2GO restore.
+    if (observedKill !== undefined && !observedKill.killed) {
+      options.limits?.tracker.observeKillState(observedKill.killedAgents);
+    }
     // A SCOPED kill of this gateway's agent is a lockdown too, not a policy
     // deny: the engine already denied the call (killedAgents outranks every
     // rule), but the agent must hear "you are stopped, stop retrying" rather
@@ -325,13 +335,17 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     }
     // A latched kill-action limit trip is the same lockdown, locally held:
     // the signed scoped kill is propagating (or retrying) toward the control
-    // plane, and this gateway must not keep acting in the meantime.
+    // plane, or the kill has landed and awaits the owner's restore. Released
+    // only by the lifecycle above — never by a restart alone.
     const latched = options.limits?.tracker.killTripped;
     if (latched !== undefined) {
       throw limitTripped(
         call.tool,
-        latched.id,
-        `limit "${latched.id}" already tripped for agent "${agentId}" — the scoped kill is in flight`,
+        latched.ruleId,
+        latched.confirmed
+          ? `limit "${latched.ruleId}" tripped for agent "${agentId}" — scope-killed; ` +
+              `an owner's 2GO restore re-arms it`
+          : `limit "${latched.ruleId}" tripped for agent "${agentId}" — the scoped kill is in flight`,
       );
     }
 
@@ -391,7 +405,17 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       try {
         return await runRouted(call, executor, route, verdict, mintEpoch, grant);
       } catch (err) {
-        observeErrorLimits(call);
+        // The error budget measures the AGENT'S FAILING EXECUTIONS, not
+        // OwnerSwitch's refusals: a routed call refused before dispatch
+        // (no grant, ticket refused, lockdown) never ran, so it spends
+        // nothing. ExecutionFailed — the connector genuinely ran and
+        // failed — counts, as does any non-refusal throw.
+        if (
+          !(err instanceof OwnerSwitchRefusal) ||
+          err.code === OwnerSwitchErrorCode.ExecutionFailed
+        ) {
+          observeErrorLimits(call);
+        }
         throw err;
       }
     }
@@ -436,17 +460,26 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
   }
 
   /**
-   * Feed a FAILED execution to the error budget. Never throws: the call
-   * already ran (and failed) — the agent must receive that outcome. A kill
-   * trip here reports the scoped kill and latches, so the NEXT call is
-   * refused at the top of the handler.
+   * Feed a FAILED execution to the error budget. Never throws — enforced,
+   * not assumed: the call already ran (and failed) and the agent must
+   * receive that outcome, so a tracker or report-callback failure is logged
+   * and swallowed rather than replacing the real result. A kill trip here
+   * reports the scoped kill and latches, so the NEXT call is refused at the
+   * top of the handler.
    */
   function observeErrorLimits(call: ToolCall): void {
     const limits = options.limits;
     if (limits === undefined) return;
-    for (const trip of limits.tracker.observeError(call)) {
-      if (trip.rule.action === "kill") limits.reportKill(trip);
-      else limits.reportAlert(trip);
+    try {
+      for (const trip of limits.tracker.observeError(call)) {
+        if (trip.rule.action === "kill") limits.reportKill(trip);
+        else limits.reportAlert(trip);
+      }
+    } catch (err) {
+      console.error(
+        `[ownerswitch-mcp] error-budget observation failed (tool "${call.tool}"): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

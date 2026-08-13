@@ -58,10 +58,14 @@ sliding window or the process lifetime), and a tripped `kill`-action
 rule refuses the crossing call and fires the same signed, scoped kill a
 honeytoken does — the agent that blew its budget stops, the fleet keeps
 running, and restoring it is the owner's 2GO ceremony. `alert`-action
-rules only flag. Stated honestly: counters live in the gateway process
-and reset with it; the kill they fire is durable. An unreadable amount
-on a metered call trips the rule rather than passing unmetered —
-fail-closed, like everything else here.
+rules only flag — they never block, whatever tripped them. Stated
+honestly: counters live in the gateway process and reset with it (one
+budget per gateway — two gateways under one agentId count separately);
+the tripped-kill latch survives restarts via `limitStateFile` and the
+kill it fires is durable. On a `kill`-action rule an unreadable amount
+trips rather than passing unmetered, amounts count in integer atomic
+units (a rounding budget is no budget), and the latch releases only
+when the owner's 2GO restore is observed — never by a restart.
 
 ```jsonc
 // gateway config
@@ -70,7 +74,8 @@ fail-closed, like everything else here.
     "max": 10000, "windowMs": 3600000, "action": "kill" },
   { "id": "errors", "tool": "*", "metric": "errors", "max": 20, "action": "kill" },
   { "id": "rate",   "tool": "*", "metric": "calls",  "max": 300, "windowMs": 60000, "action": "alert" }
-]
+],
+"limitStateFile": "/var/lib/ownerswitch/limit-trip.json"
 ```
 
 **Where this is headed:** once the credential broker above ships, KILL

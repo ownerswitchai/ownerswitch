@@ -705,6 +705,44 @@ describe("cumulative limits", () => {
     await t.close();
   });
 
+  it("the full trip lifecycle: refused in flight → scope-killed → owner restore re-arms the budget", async () => {
+    const r = recordingLimits([
+      { id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" },
+    ]);
+    const cp = createFakeControlPlane();
+    const t = await startProxy(cp, undefined, r.limits);
+
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a" } });
+    const crossing = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/b" } }));
+    expect(crossing.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(1);
+
+    // the kill has NOT landed yet: refusals say so, and an empty killedAgents
+    // list must not release anything (fail closed)
+    const inFlight = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/c" } }));
+    expect(inFlight.message).toContain("in flight");
+
+    // the control plane applies the scoped kill (epoch bumps, agent listed):
+    // the refusal becomes the authoritative scoped lockdown
+    cp.state.epoch += 1;
+    cp.state.killedAgents = ["test-agent"];
+    const killed = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));
+    expect(killed.code).toBe(OwnerSwitchErrorCode.Lockdown);
+    expect(killed.message).toContain("scope-killed");
+
+    // the owner's 2GO restore: the agent leaves the list — the latch
+    // releases WITHOUT a gateway restart and the budgets re-arm fresh
+    cp.state.killedAgents = [];
+    const revived = await t.client.callTool({ name: "read_file", arguments: { path: "/e" } });
+    expect(text(revived)).toContain("upstream ran read_file");
+
+    // re-armed: the budget counts from zero again and can trip again
+    const retrip = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/f" } }));
+    expect(retrip.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(2);
+    await t.close();
+  });
+
   it("calls that never act never spend a budget: denied and approval-gated calls do not count", async () => {
     const r = recordingLimits([
       { id: "any-call", tool: "*", metric: "calls", max: 0, action: "kill" },

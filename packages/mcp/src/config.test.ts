@@ -89,9 +89,11 @@ describe("loadConfig", () => {
     expect(() =>
       load({ ...VALID, limits: [{ ...VALID_LIMIT, metric: "calls" }] }),
     ).toThrowError(/only meaningful/);
-    // bounds
+    // bounds: max is a safe integer in atomic units, capped below the clamp
     expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: Number.NaN }] })).toThrowError(/max/);
     expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: -1 }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: 10.5 }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: 2 ** 51 }] })).toThrowError(/max/);
     expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, windowMs: 0 }] })).toThrowError(/windowMs/);
     // a broken regex is a startup error, never an observe-time throw
     expect(() =>
@@ -99,6 +101,11 @@ describe("loadConfig", () => {
     ).toThrowError(/regular expression/);
     // duplicate ids would make audit reasons ambiguous
     expect(() => load({ ...VALID, limits: [VALID_LIMIT, VALID_LIMIT] })).toThrowError(/duplicate/);
+    // the durable-latch path parses (the store itself validates the path at startup)
+    expect(
+      load({ ...VALID, limits: [VALID_LIMIT], limitStateFile: "/var/lib/ownerswitch/trip.json" })
+        .limitStateFile,
+    ).toBe("/var/lib/ownerswitch/trip.json");
   });
 
   it("rejects an agentId outside the shared contract — an unstoppable agent is a config error", () => {

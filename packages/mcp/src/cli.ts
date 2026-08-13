@@ -27,6 +27,7 @@ import {
   LimitTracker,
   type LimitTrip,
 } from "@ownerswitchai/gateway";
+import type { LimitRule } from "@ownerswitchai/shared";
 import {
   createTripReporter,
   createTripwire,
@@ -35,6 +36,7 @@ import {
   type Tripwire,
 } from "@ownerswitchai/honeytoken";
 import { ConfigError, loadConfig } from "./config.js";
+import { createFileLimitTripStore } from "./limit-trip-store.js";
 import { doctorMain } from "./doctor.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
@@ -207,15 +209,44 @@ async function runGateway(argv: string[]): Promise<void> {
   // and a tripped kill-action rule fires a device-signed SCOPED kill of this
   // gateway's agent through the same retrying reporter the honeytoken
   // tripwire uses — one delivery discipline for every gateway-side tripwire.
+  // The trip itself follows a durable lifecycle (gateway/limits.ts): with a
+  // limitStateFile it survives crashes and is RE-FIRED at startup; delivery
+  // confirmation and the owner's restore drive the latch, never a restart.
   const effectiveAgentId = config.agentId ?? PROXY_NAME;
-  const limitReporter =
-    config.limits !== undefined && config.limits.length > 0
-      ? createTripReporter({ controlPlaneUrl, deviceId: device.id, secret: device.secret })
+  const armLimits = config.limits !== undefined && config.limits.length > 0;
+  const tripStore =
+    armLimits && config.limitStateFile !== undefined
+      ? createFileLimitTripStore(config.limitStateFile)
       : undefined;
+  if (armLimits && tripStore === undefined && config.limits?.some((r) => r.action === "kill")) {
+    console.error(
+      "[ownerswitch-mcp] WARNING: kill-action limits are armed WITHOUT limitStateFile — " +
+        "a crash between a trip and its kill's delivery re-opens the budget on the next " +
+        "boot. Set limitStateFile (or OWNERSWITCH_LIMIT_STATE_FILE) for a durable latch.",
+    );
+  }
+  const limitTracker = armLimits
+    ? new LimitTracker(config.limits as LimitRule[], {
+        ...(tripStore !== undefined ? { tripStore } : {}),
+      })
+    : undefined;
+  const limitReporter = armLimits
+    ? createTripReporter({
+        controlPlaneUrl,
+        deviceId: device.id,
+        secret: device.secret,
+        // delivery confirmation advances the trip lifecycle: the kill landed
+        onDelivered: (trip) => {
+          if (trip.tier === "kill" && trip.source === "limit") {
+            limitTracker?.confirmKillDelivered();
+          }
+        },
+      })
+    : undefined;
   const limits =
-    limitReporter !== undefined && config.limits !== undefined
+    limitTracker !== undefined && limitReporter !== undefined
       ? {
-          tracker: new LimitTracker(config.limits),
+          tracker: limitTracker,
           reportKill: (trip: LimitTrip) =>
             limitReporter.report({
               tier: "kill",
@@ -231,10 +262,30 @@ async function runGateway(argv: string[]): Promise<void> {
               canaryIds: [],
               how: "",
               source: "limit",
+              // structured attribution on the alert too, for the audit trail
+              agentId: effectiveAgentId,
               reason: limitTripReason(trip, effectiveAgentId),
             }),
         }
       : undefined;
+  // A trip persisted by a previous life whose kill was never confirmed:
+  // re-fire it NOW, before any call is served — the latch is already armed
+  // (the tracker loaded it), and the kill must not stay unsent.
+  const pendingTrip = limitTracker?.pendingKillReport;
+  if (pendingTrip !== undefined && limitReporter !== undefined) {
+    console.error(
+      `[ownerswitch-mcp] re-firing an UNCONFIRMED limit kill from a previous run ` +
+        `(rule "${pendingTrip.ruleId}", agent "${pendingTrip.agentId}")`,
+    );
+    limitReporter.report({
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: pendingTrip.agentId,
+      reason: pendingTrip.reason,
+    });
+  }
 
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,
