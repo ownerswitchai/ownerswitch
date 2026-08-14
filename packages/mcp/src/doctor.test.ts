@@ -7,12 +7,16 @@ import {
   checkControlPlane,
   checkDeviceCredentials,
   checkNodeVersion,
+  checkStartupGates,
   checkUpstreamHandshake,
   doctorMain,
   formatDoctorReport,
   runDoctor,
+  undeclaredUpstreamEnv,
+  upstreamTimeoutFrom,
   type DoctorCheck,
 } from "./doctor.js";
+import { loadConfig } from "./config.js";
 
 const VALID_CONFIG = {
   controlPlaneUrl: "http://127.0.0.1:4600",
@@ -170,6 +174,41 @@ describe("checkUpstreamHandshake", () => {
     expect(check.fix).toContain("stdio MCP server");
   });
 
+  it("names the ambient env the child will NOT inherit — the works-by-hand trap", async () => {
+    // The failure that sends people in circles: the identical command runs
+    // fine in their shell, so the config "must" be right. The difference is
+    // the environment, and only doctor is in a position to say so.
+    const check = await checkUpstreamHandshake(
+      { command: "npx", args: ["-y", "some-server"] },
+      {
+        transportFactory: silentUpstreamFactory,
+        timeoutMs: 20,
+        env: { HTTPS_PROXY: "http://proxy:8080", NODE_EXTRA_CA_CERTS: "/etc/ca.pem", HOME: "/root" },
+      },
+    );
+    expect(check.status).toBe("fail");
+    expect(check.fix).toContain("STRIPPED environment");
+    expect(check.fix).toContain("HTTPS_PROXY");
+    expect(check.fix).toContain("NODE_EXTRA_CA_CERTS");
+    expect(check.fix).not.toContain("HOME"); // the child DOES inherit that one
+    expect(check.fix).toContain("upstream.env");
+    // and the cold-download case, which looks identical from here
+    expect(check.fix).toContain("--upstream-timeout");
+  });
+
+  it("does not blame the environment for vars the config already declares", async () => {
+    const check = await checkUpstreamHandshake(
+      { command: "npx", args: [], env: { HTTPS_PROXY: "http://proxy:8080" } },
+      {
+        transportFactory: silentUpstreamFactory,
+        timeoutMs: 20,
+        env: { HTTPS_PROXY: "http://proxy:8080" },
+      },
+    );
+    expect(check.fix).toContain("STRIPPED environment");
+    expect(check.fix).not.toContain("HTTPS_PROXY"); // declared — not the problem
+  });
+
   it("fails with ENOENT guidance when the command isn't found", async () => {
     const check = await checkUpstreamHandshake(
       { command: "not-a-real-cmd", args: [] },
@@ -177,6 +216,72 @@ describe("checkUpstreamHandshake", () => {
     );
     expect(check.status).toBe("fail");
     expect(check.detail).toContain("not found");
+  });
+});
+
+describe("checkStartupGates — the gate doctor could not see", () => {
+  const configWith = (extra: Record<string, unknown>, env: Record<string, string | undefined> = {}) =>
+    checkStartupGates(
+      loadConfig(["--config", "/etc/ownerswitch.json"], {}, fileWith({ ...VALID_CONFIG, ...extra })),
+      env,
+    );
+
+  it("catches a kill-action budget with no risk acknowledgment — the gateway would refuse to start", () => {
+    // Before this check existed, doctor printed "All checks passed" for this
+    // config and the MCP client showed only a closed connection.
+    const check = configWith({
+      limits: [{ id: "rate", tool: "*", metric: "calls", max: 5, action: "kill" }],
+    });
+    expect(check.status).toBe("fail");
+    expect(check.detail).toContain("OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK");
+    expect(check.fix).toContain("REFUSES TO START");
+
+    // ...and passes once the deployment says it accepted the bound
+    const accepted = configWith(
+      { limits: [{ id: "rate", tool: "*", metric: "calls", max: 5, action: "kill" }] },
+      { OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK: "1" },
+    );
+    expect(accepted.status).toBe("pass");
+    expect(accepted.detail).toContain("1 limit rule(s)");
+  });
+
+  it("catches a half-configured honeytoken registry", () => {
+    const check = configWith({}, { OWNERSWITCH_HONEYTOKEN_REGISTRY: "/tmp/registry.json" });
+    expect(check.status).toBe("fail");
+    expect(check.detail).toContain("OWNERSWITCH_CANARY_KEY");
+  });
+
+  it("catches a gateway credential passed to the upstream through argv", () => {
+    const check = configWith({
+      upstream: { command: "npx", args: ["--token", VALID_CONFIG.device.secret] },
+    });
+    expect(check.status).toBe("fail");
+    expect(check.detail).not.toContain(VALID_CONFIG.device.secret); // names the arg, never the value
+  });
+
+  it("passes a plain policy-only config and says nothing else is armed", () => {
+    const check = configWith({});
+    expect(check.status).toBe("pass");
+    expect(check.detail).toContain("nothing beyond policy is armed");
+  });
+});
+
+describe("--upstream-timeout", () => {
+  it("takes the flag, then the env var, and ignores garbage rather than refusing to run", () => {
+    expect(upstreamTimeoutFrom(["--upstream-timeout", "60000"], {})).toEqual({ timeoutMs: 60_000 });
+    expect(upstreamTimeoutFrom([], { OWNERSWITCH_UPSTREAM_TIMEOUT_MS: "45000" })).toEqual({
+      timeoutMs: 45_000,
+    });
+    for (const bad of ["", "soon", "-1", "1.5", undefined]) {
+      expect(upstreamTimeoutFrom(["--upstream-timeout", bad as string], {}), String(bad)).toEqual({});
+    }
+  });
+
+  it("undeclaredUpstreamEnv reports only what is set AND not declared", () => {
+    expect(
+      undeclaredUpstreamEnv({ command: "x" }, { HTTP_PROXY: "p", PATH: "/bin", NO_PROXY: "" }),
+    ).toEqual(["HTTP_PROXY"]);
+    expect(undeclaredUpstreamEnv({ command: "x", env: { HTTP_PROXY: "p" } }, { HTTP_PROXY: "p" })).toEqual([]);
   });
 });
 
@@ -188,10 +293,12 @@ describe("runDoctor", () => {
     expect(checks.map((c) => c.name)).toEqual([
       "node version",
       "config",
+      "startup gates",
       "control plane",
       "device credentials",
       "upstream command",
     ]);
+    expect(checks.find((c) => c.name === "startup gates")?.detail).toContain("skipped");
     expect(checks.find((c) => c.name === "control plane")?.detail).toContain("skipped");
     expect(checks.find((c) => c.name === "device credentials")?.detail).toContain("skipped");
     expect(checks.find((c) => c.name === "upstream command")?.detail).toContain("skipped");

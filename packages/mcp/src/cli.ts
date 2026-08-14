@@ -29,22 +29,16 @@ import {
   type LimitTrip,
 } from "@ownerswitchai/gateway";
 import type { LimitRule } from "@ownerswitchai/shared";
-import {
-  createTripReporter,
-  createTripwire,
-  loadRegistry,
-  readRegistryFile,
-  type Tripwire,
-} from "@ownerswitchai/honeytoken";
-import { assertKillLimitRiskAccepted, ConfigError, loadConfig } from "./config.js";
+import { createTripReporter, createTripwire, type Tripwire } from "@ownerswitchai/honeytoken";
+import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import {
   isLimitKillConfirmation,
   parseLimitKillConfirmation,
 } from "./limit-kill-confirmation.js";
-import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
-import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
+import { runStartupGates } from "./startup-gates.js";
+import { upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
 
@@ -55,50 +49,29 @@ import { verifyMain } from "./verify.js";
  */
 const KNOWN_CREDENTIAL_ENV_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "DEVICE_SECRET", "CANARY_KEY"];
 
-/**
- * Arm the honeytoken tripwire when a registry is configured. Opt-in, and
- * explicit: the canary key is DEDICATED (never the device secret), and the
- * deployment id must match the one the registry was minted for — loadRegistry
- * rejects a tampered or foreign registry loudly. Returns undefined when no
- * registry is configured (the gateway runs without honeytoken scanning).
- */
-function armTripwire(controlPlaneUrl: string, device: { id: string; secret: string }): Tripwire | undefined {
-  const registryPath = process.env.OWNERSWITCH_HONEYTOKEN_REGISTRY;
-  if (registryPath === undefined) return undefined;
-
-  const canaryKey = process.env.OWNERSWITCH_CANARY_KEY;
-  const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID;
-  if (!canaryKey || !deploymentId) {
-    throw new ConfigError(
-      "OWNERSWITCH_HONEYTOKEN_REGISTRY is set but OWNERSWITCH_CANARY_KEY and/or " +
-        "OWNERSWITCH_DEPLOYMENT_ID are missing — the registry cannot be verified without them",
-    );
-  }
-  let serialized: string;
-  try {
-    // readRegistryFile refuses to follow a symlink at registryPath and caps
-    // the file size before the bytes are read into memory — a locally
-    // replaced huge or symlinked file is rejected here, before parsing.
-    serialized = readRegistryFile(registryPath);
-  } catch (err) {
-    throw new ConfigError(
-      `cannot read honeytoken registry "${registryPath}": ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  let registry;
-  try {
-    registry = loadRegistry(serialized, { canaryKey, deploymentId });
-  } catch (err) {
-    throw new ConfigError(`honeytoken registry rejected: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return createTripwire({ controlPlaneUrl, deviceId: device.id, secret: device.secret, registry });
-}
-
 async function runGateway(argv: string[]): Promise<void> {
   const config = loadConfig(argv, process.env);
   const { controlPlaneUrl, device, timeoutMs = 1500 } = config;
 
-  const tripwire = armTripwire(controlPlaneUrl, device);
+  // EVERY pre-serve gate, in one call — the same one `doctor` makes, so a
+  // green doctor can no longer be followed by a gateway that refuses to
+  // start (which an MCP client shows only as a dead connection). New gates
+  // belong in startup-gates.ts, never inline here.
+  const gates = runStartupGates(config, process.env);
+
+  // Arm the honeytoken tripwire when the gates loaded a registry. Opt-in and
+  // explicit: the canary key is DEDICATED (never the device secret) and the
+  // registry must have been minted for THIS deployment id. No registry
+  // configured → the gateway runs without honeytoken scanning.
+  const tripwire: Tripwire | undefined =
+    gates.honeytokenRegistry !== undefined
+      ? createTripwire({
+          controlPlaneUrl,
+          deviceId: device.id,
+          secret: device.secret,
+          registry: gates.honeytokenRegistry,
+        })
+      : undefined;
   const controlPlane = createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs });
 
   // Executor routing, when configured: routed tools are performed by the
@@ -141,7 +114,7 @@ async function runGateway(argv: string[]): Promise<void> {
   // agent sees.
   const routes = config.executorRoutes;
   const githubToken = process.env.OWNERSWITCH_GITHUB_TOKEN;
-  const connectorEnv = resolveGitHubConnectorEnv(process.env);
+  const connectorEnv = gates.connector;
   const ledger = createSecretLedger();
   let githubClient: GitHubMergeClient | undefined;
   let githubAppKeyPem: string | undefined;
@@ -221,9 +194,6 @@ async function runGateway(argv: string[]): Promise<void> {
   // background; delivery confirmation advances the tracker's lifecycle.
   const effectiveAgentId = config.agentId ?? PROXY_NAME;
   const armLimits = config.limits !== undefined && config.limits.length > 0;
-  // Kill-action budgets demand the explicit process-local-risk flag —
-  // rationale and contract in config.ts assertKillLimitRiskAccepted.
-  assertKillLimitRiskAccepted(config.limits, process.env);
   const limitTracker = armLimits ? new LimitTracker(config.limits as LimitRule[]) : undefined;
   const limitReporter = armLimits
     ? createTripReporter({
@@ -341,10 +311,8 @@ async function runGateway(argv: string[]): Promise<void> {
     process.env.OWNERSWITCH_CANARY_KEY,
     process.env.OWNERSWITCH_DEVICE_SECRET,
   ];
-  // Command-line arguments are a worse leak surface than an environment
-  // variable (visible via /proc/<pid>/cmdline, `ps aux`, …) — refuse to
-  // start rather than filter, naming the offending argument, never its value.
-  assertUpstreamArgsCredentialFree(config.upstream.args, gatewaySecretValues);
+  // (argv is checked for these same values by the startup gates above —
+  // a credential in argv is a refusal to start, not something to filter.)
 
   await proxy.connectUpstream(
     new StdioClientTransport({

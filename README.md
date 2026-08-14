@@ -13,6 +13,10 @@ discipline on your side, not a guarantee OwnerSwitch enforces.
 
 *One press to stop. Two GOs to start.*
 
+**→ [Your first kill, in 10 minutes](FIRST-KILL.md)** — clone to a stopped
+agent and back again, on a machine that has never seen OwnerSwitch. No agent
+needed for the first eight minutes; you press the button yourself.
+
 ## How a tool call is decided
 
 | Decision | Meaning |
@@ -135,10 +139,14 @@ packages/control-plane— policies, kill state, audit (stub)
 ## Dev
 
 ```bash
-pnpm install
+pnpm install       # installs AND builds the workspace (root `prepare`)
 pnpm typecheck
 pnpm test
 ```
+
+The packages import each other's build output, so an installed-but-unbuilt
+tree fails with `ERR_MODULE_NOT_FOUND … /dist/index.js`. `pnpm install`
+builds; if you ever see that error anyway, `pnpm build` is the fix.
 
 ## Status
 

@@ -50,7 +50,29 @@ const controlPlane = createControlPlane({
 });
 const owner = createOwnerSession("owner-dev");
 
-createServer(controlPlane.handler).listen(port, "127.0.0.1", () => {
+const server = createServer(controlPlane.handler);
+
+// A raw EADDRINUSE stack is the wrong first impression of a tool whose whole
+// pitch is "every refusal says what to do about it" — and this one happens to
+// nearly everyone, because the natural way to restart the quickstart is to
+// open a second terminal and run it again.
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `[ownerswitch] port ${port} is already in use — a dev control plane is probably still ` +
+        `running in another terminal.\n` +
+        `  keep that one:   curl http://127.0.0.1:${port}/status\n` +
+        `  or take it over: stop the other process, or start this one elsewhere with ` +
+        `OWNERSWITCH_CONTROL_PLANE_PORT=4601\n` +
+        `  (a second instance on another port needs its own OWNERSWITCH_KILL_STATE_FILE too — ` +
+        `two control planes sharing one kill-state file will overwrite each other's answer)`,
+    );
+    process.exit(1);
+  }
+  throw err;
+});
+
+server.listen(port, "127.0.0.1", () => {
   const base = `http://127.0.0.1:${port}`;
   console.log(`OwnerSwitch dev control plane listening on ${base}`);
   console.log(`  device secret : ${deviceSecret}  (put this in your gateway config)`);
