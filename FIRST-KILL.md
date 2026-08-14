@@ -22,8 +22,8 @@ provides one where your Node install ships Corepack), a Unix-like OS
 (Linux or macOS — the demo sandbox requires `O_NOFOLLOW` and refuses to
 run without it, deliberately), and three terminals: the control plane, the
 agent, and you — the owner.
-`jq` is used once, to pull the restore ceremony's id into a variable;
-without it, copy the id by hand — that step shows how. The `curl` calls use `-fsS` so an HTTP
+The one step that parses JSON out of a response uses `node` itself — no
+`jq` or anything else beyond the prerequisites above. The `curl` calls use `-fsS` so an HTTP
 error fails the step loudly instead of printing an error body that scrolls
 past looking like success — the one place that is dropped is called out.
 
@@ -107,8 +107,11 @@ budget on a slow link; `--upstream-timeout 60000` raises it.
 
 ## 4. Prove enforcement, before an agent is anywhere near it (≈1 min)
 
+Terminal 1 printed a ready-to-paste export line for exactly this — copy
+**that** line, not the placeholder below:
+
 ```bash
-export OWNERSWITCH_OWNER_TOKEN=<the owner token from terminal 1>
+export OWNERSWITCH_OWNER_TOKEN='the-token-terminal-1-printed'
 npx tsx src/cli.ts verify --config examples/first-kill.config.json
 ```
 
@@ -147,7 +150,7 @@ The curl is one line on purpose: multi-line pastes with `\` get mangled by
 some terminals.
 
 ```bash
-export OWNERSWITCH_OWNER_TOKEN=<the owner token from terminal 1>
+export OWNERSWITCH_OWNER_TOKEN='the-token-terminal-1-printed'   # ← paste the real line from terminal 1
 curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'
 # → {"status":"vetoed"}
 ```
@@ -196,11 +199,12 @@ curl -fsS http://127.0.0.1:4600/status    # still {"killed":true,…}
 ```
 
 Restarting is not a restore. There is exactly one way back — and the
-restart just **invalidated your owner token**: it printed a fresh one in
-terminal 1. Re-export it in terminal 3 before the next step:
+restart just **invalidated your owner token**: terminal 1 printed a fresh
+ready-to-paste export line. Copy that new line into terminal 3 before the
+next step:
 
 ```bash
-export OWNERSWITCH_OWNER_TOKEN=<the NEW token from terminal 1>
+export OWNERSWITCH_OWNER_TOKEN='the-NEW-token-terminal-1-printed'   # ← paste the real line
 ```
 
 ## 7. Be the owner: the two GOs (≈2 min)
@@ -208,20 +212,16 @@ export OWNERSWITCH_OWNER_TOKEN=<the NEW token from terminal 1>
 Restoring is meant to be the expensive direction: an owner session, a
 mandatory cooldown, and a single-use ceremony that expires.
 
+GO 1/2 opens the ceremony, and the deliberate **early** GO 2/2 rides in
+the same paste — the two must land inside the 30-second cooldown, so they
+run back to back with no reading time in between. The early try must fail;
+it is the one command that wants the status code, so it drops the `-f`
+that makes the others fail loudly. (`node` pulls the ceremony id out of
+the response — it is already a prerequisite.) Paste the whole block:
+
 ```bash
 OWNER=$OWNERSWITCH_OWNER_TOKEN   # the FRESH token from the restart
-
-# GO 1/2 — open the ceremony (jq pulls the ceremony id into a variable)
-CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | jq -r .id)
-# no jq? run the curl by itself, copy the "id" out of the JSON, and set it:
-# CER=cer_...
-```
-
-Now try GO 2/2 **immediately, on purpose** — the cooldown has not drained,
-so this must fail. It is the one command that wants the status code, so it
-drops the `-f` that makes the others fail loudly:
-
-```bash
+CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).id')
 curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
 # {"error":"restore rejected"}
 # HTTP 409
@@ -231,6 +231,8 @@ That is all you get, whatever went wrong. The body never says which check
 failed (wrong owner, wrong epoch, too early, replayed), because that answer
 would be a map for someone who is not you. `cooldownRemainingMs` below is
 the number to read; it is yours to ask for, and asking requires your token.
+And the failed early try spent nothing: the SAME ceremony completes the
+restore below (the control-plane suite pins exactly this sequence).
 
 ```bash
 # the cooldown is real; watch it drain

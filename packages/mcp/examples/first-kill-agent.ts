@@ -108,8 +108,8 @@ if (write.kind === "HELD") {
     console.log(
       `\nthe write is HELD in veto window "${windowId}". Be the owner — in another terminal.\n` +
         `(That terminal needs OWNERSWITCH_OWNER_TOKEN exported — every NEW terminal does; the\n` +
-        `control plane's terminal shows the current token. The command is one line on purpose:\n` +
-        `multi-line pastes get mangled by some terminals.)\n\n` +
+        `control plane's terminal prints a ready-to-paste export line. The command is one line\n` +
+        `on purpose: multi-line pastes get mangled by some terminals.)\n\n` +
         `  curl -fsS -X POST http://127.0.0.1:4600/veto/${windowId} -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'\n`,
     );
     const rl = createInterface({ input: process.stdin, output: process.stdout });

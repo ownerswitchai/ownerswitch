@@ -78,6 +78,8 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`  device secret : ${deviceSecret}  (put this in your gateway config)`);
   console.log(`  owner token   : ${owner.token}`);
   console.log(`                  (15 min TTL — restart to mint a fresh one)`);
+  console.log(`                  copy this ready line into EVERY owner terminal:`);
+  console.log(`                    export OWNERSWITCH_OWNER_TOKEN='${owner.token}'`);
   console.log(`  kill state    : ${controlPlane.killSwitch.killed ? "KILLED (restore takes the 2GO ceremony)" : "armed"}`);
   console.log(`                  persists at ${killStateFile}`);
   console.log(`                  (set OWNERSWITCH_KILL_STATE_FILE to move it)`);
