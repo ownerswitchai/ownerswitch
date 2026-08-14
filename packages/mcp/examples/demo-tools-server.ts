@@ -38,10 +38,11 @@ import {
 // predictable name to race, and replacing its entry requires this uid.
 // (realpath immediately: mkdtemp's result may traverse platform links like
 // macOS /var, and the sandbox demands a symlink-free lexical chain.)
-// Explicit paths go through the full chain/parent/root verification and
-// are the operator's own trust decision. Each server start is a FRESH
-// sandbox; the demo re-seeds it, nothing in the tutorial relies on
-// persistence between runs.
+// Explicit paths go through the FULL-chain verification (every ancestor
+// trusted, no symlink anywhere) and are the operator's own trust
+// decision. Each server start is a FRESH sandbox; the demo re-seeds it,
+// nothing in the tutorial relies on persistence between runs, and the
+// abandoned directories are ordinary temp entries the OS reaper collects.
 const DEMO_DIR = ensureSandboxRoot(
   process.argv[2] ??
     process.env.OWNERSWITCH_DEMO_DIR ??

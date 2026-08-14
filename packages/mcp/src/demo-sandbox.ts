@@ -134,43 +134,70 @@ function assertTrustedParentDir(parent: string): void {
   }
 }
 
-/** the per-operation form: verify the parent that holds the root's entry */
-function assertParentTrusted(root: string): void {
-  assertTrustedParentDir(dirname(root));
-}
-
 /**
- * Every EXISTING component of the lexical path must be a real directory —
- * a symlink ANYWHERE in the chain is namespace laundering: realpath would
- * resolve it to some (possibly trusted-looking) target and every later
- * check would authenticate the target's world instead of the attacker's
- * directory the entry actually sits in. Only the final leaf may be absent
- * (it is the one thing ensureSandboxRoot creates, non-recursively). This
- * also means recursive mkdir never runs across an unverified chain.
+ * The WHOLE ancestor chain must be trusted, not just the direct parent —
+ * an untrusted directory anywhere above lets its owner rename a middle
+ * component and splice in a symlink AFTER initialization, permanently
+ * redirecting every later (path-based) operation. So every EXISTING
+ * component is lstat-checked (a symlink anywhere refuses — namespace
+ * laundering), and every directory that HOLDS a component's entry must
+ * pass the same trust rule as the direct parent: ours or root's, no
+ * group/world write unless sticky. Only the final leaf may be absent (it
+ * is the one thing ensureSandboxRoot creates, non-recursively — and only
+ * after this walk, so mkdir can never write through an unverified chain).
+ * Re-run before every operation: a chain that was trusted at startup and
+ * widened since refuses the next operation instead of becoming a swap
+ * window. With every ancestor requiring THIS uid (or root, non-writable)
+ * to modify, a swapped component is outside the demo's threat model —
+ * which is exactly what makes the remaining path-based readdir/rename
+ * sound where node offers no dirfd-relative alternative.
  */
-function assertChainSymlinkFree(lexical: string): void {
+function assertTrustedChain(lexical: string): void {
   const parts = lexical.split(sep).filter((p) => p !== "");
   let current: string = sep;
-  for (const part of parts) {
-    current = join(current, part);
+  const ancestors: string[] = [sep];
+  for (let i = 0; i < parts.length - 1; i++) {
+    current = join(current, parts[i]);
+    ancestors.push(current);
+  }
+  for (const ancestor of ancestors) {
     let stat: Stats;
     try {
-      stat = lstatSync(current);
+      stat = lstatSync(ancestor);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT" && current === lexical) return;
-      throw new Error(
-        `demo sandbox path component "${current}" does not exist — only the final directory is ` +
-          "created here; create (and own) the parent chain yourself, or use the default sandbox",
-      );
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(
+          `demo sandbox path component "${ancestor}" does not exist — only the final directory ` +
+            "is created here; create (and own) the parent chain yourself, or use the default sandbox",
+        );
+      }
+      throw err; // EACCES/ENOTDIR/… surface as themselves, never as "does not exist"
     }
     if (stat.isSymbolicLink()) {
       throw new Error(
-        `demo sandbox path component "${current}" is a symlink — an explicit sandbox path must ` +
+        `demo sandbox path component "${ancestor}" is a symlink — an explicit sandbox path must ` +
           "not traverse symlinks anywhere (a resolved link would launder the namespace into a " +
           "different directory's trust); use the default sandbox, or a fully real path",
       );
     }
+    assertTrustedParentDir(ancestor);
   }
+  // the leaf itself: may be absent (created next); an existing one must
+  // not be a symlink — its directory-ness/mode is assertRootBoundary's job
+  try {
+    if (lstatSync(lexical).isSymbolicLink()) {
+      throw new Error(
+        `demo sandbox root "${lexical}" is a symlink — refusing to follow it; remove the link and re-run`,
+      );
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; // EACCES/ENOTDIR/… surface as themselves
+  }
+}
+
+/** the per-operation form: the root's WHOLE chain, then the root itself */
+function assertParentTrusted(root: string): void {
+  assertTrustedChain(root);
 }
 
 /**
@@ -189,10 +216,9 @@ function assertChainSymlinkFree(lexical: string): void {
 export function ensureSandboxRoot(dir: string): string {
   requireNoFollow(constants.O_NOFOLLOW);
   const lexical = resolve(dir);
-  assertChainSymlinkFree(lexical);
-  assertTrustedParentDir(dirname(lexical));
+  assertTrustedChain(lexical);
   try {
-    mkdirSync(lexical, { mode: 0o700 }); // NON-recursive: only under the verified parent
+    mkdirSync(lexical, { mode: 0o700 }); // NON-recursive: only under the verified chain
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
   }

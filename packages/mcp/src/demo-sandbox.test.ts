@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -35,7 +36,7 @@ import {
  */
 const dirs: string[] = [];
 const fresh = () => {
-  const dir = mkdtempSync(join(tmpdir(), "ownerswitch-demo-sbx-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "ownerswitch-demo-sbx-")));
   dirs.push(dir);
   return dir;
 };
@@ -159,6 +160,33 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
       /component .* is a symlink/,
     );
     expect(readFileSync(join(dotSsh, "id_ed25519"), "utf8")).toBe("PRIVATE KEY MATERIAL");
+  });
+
+  it("a DEEP untrusted ancestor refuses — the WHOLE chain is authenticated, not just the direct parent", () => {
+    // the review's /shared case: a world-writable non-sticky GRANDparent
+    // above perfectly trusted 0700 directories lets its owner rename the
+    // middle component and splice in a symlink after init — so it must
+    // refuse at init AND at every later operation
+    const grand = join(fresh(), "shared");
+    mkdirSync(grand);
+    chmodSync(grand, 0o777); // world-writable, NOT sticky
+    const mid = join(grand, "a");
+    mkdirSync(mid);
+    chmodSync(mid, 0o700);
+    expect(() => ensureSandboxRoot(join(mid, "sandbox"))).toThrow(/not a trusted directory/);
+    // per-operation too: a chain trusted at init that widens ABOVE the
+    // parent refuses the next operation
+    const okGrand = join(fresh(), "ok");
+    mkdirSync(okGrand);
+    chmodSync(okGrand, 0o700);
+    const okMid = join(okGrand, "a");
+    mkdirSync(okMid);
+    chmodSync(okMid, 0o700);
+    const root = ensureSandboxRoot(join(okMid, "sandbox"));
+    writeSandboxFile(root, "note.txt", "hi");
+    chmodSync(okGrand, 0o777); // widened two levels up
+    expect(() => readSandboxFile(root, "note.txt")).toThrow(/not a trusted directory/);
+    expect(() => listSandboxFiles(root)).toThrow(/not a trusted directory/);
   });
 
   it("a MISSING intermediate refuses — only the final leaf is created, never a recursive chain", () => {
