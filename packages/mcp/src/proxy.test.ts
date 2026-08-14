@@ -10,14 +10,19 @@ import {
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { verifyDeviceSignature, type VetoStatus } from "@ownerswitchai/control-plane";
-import { createControlPlaneClient } from "@ownerswitchai/gateway";
+import {
+  createControlPlaneClient,
+  LimitTracker,
+  type LatchingLimitTrip,
+  type LimitTrip,
+} from "@ownerswitchai/gateway";
 import {
   createTripwire,
   generateHoneytoken,
   HoneytokenRegistry,
   scanForHoneytokens,
 } from "@ownerswitchai/honeytoken";
-import type { Policy } from "@ownerswitchai/shared";
+import type { LimitRule, Policy } from "@ownerswitchai/shared";
 import { OwnerSwitchErrorCode } from "./errors.js";
 import { createOwnerSwitchProxy, type ProxyOptions } from "./proxy.js";
 import { createVetoClient } from "./veto-client.js";
@@ -75,6 +80,13 @@ function createFakeUpstream() {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: UPSTREAM_TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     calls.push({ name: req.params.name, args: req.params.arguments });
+    if ((req.params.arguments as { path?: string } | undefined)?.path === "/fails") {
+      // the tool RAN and reports its own failure — the error-budget case
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: `upstream ${req.params.name} failed` }],
+      };
+    }
     return {
       content: [{ type: "text" as const, text: `upstream ran ${req.params.name}` }],
     };
@@ -144,6 +156,7 @@ function createFakeControlPlane() {
 async function startProxy(
   controlPlane = createFakeControlPlane(),
   honeytokens?: ProxyOptions["honeytokens"],
+  limits?: ProxyOptions["limits"],
 ) {
   const upstream = createFakeUpstream();
   const [upstreamClientSide, upstreamServerSide] = InMemoryTransport.createLinkedPair();
@@ -164,6 +177,7 @@ async function startProxy(
       fetchImpl: controlPlane.fetchImpl,
     }),
     ...(honeytokens !== undefined ? { honeytokens } : {}),
+    ...(limits !== undefined ? { limits } : {}),
   });
   await proxy.connectUpstream(upstreamClientSide);
 
@@ -611,6 +625,342 @@ describe("honeytoken tripwire", () => {
     const token = generateHoneytoken({ kind: "generic" });
     const result = await t.client.callTool({ name: "read_file", arguments: { path: token.value } });
     expect(text(result)).toBe("upstream ran read_file");
+    await t.close();
+  });
+});
+
+describe("cumulative limits", () => {
+  /**
+   * Mirrors the CLI's wiring: reportKill delivers and then confirms the
+   * latch with the CONTROL PLANE'S OWN commit epoch (`commitEpoch`), which
+   * is the only thing that can. `/status` never confirms — see
+   * gateway/limits.ts — so a helper that skipped this would leave every
+   * latch unconfirmed and never release.
+   */
+  const recordingLimits = (
+    rules: LimitRule[],
+    opts: { commitEpoch?: number; autoConfirm?: boolean } = {},
+  ) => {
+    const { commitEpoch = 1, autoConfirm = true } = opts;
+    const kills: LatchingLimitTrip[] = [];
+    const alerts: LimitTrip[] = [];
+    const tracker = new LimitTracker(rules);
+    return {
+      kills,
+      alerts,
+      /**
+       * The CLI's step: the control plane's own commit epoch confirms, bound
+       * to the latch generation the kill was sent for (a late answer for an
+       * already-restored kill must not anchor the next latch).
+       */
+      confirm: () => tracker.confirmKillDelivered(commitEpoch, kills[kills.length - 1].latchGeneration),
+      limits: {
+        tracker,
+        reportKill: (trip: LatchingLimitTrip): void => {
+          kills.push(trip);
+          if (autoConfirm) tracker.confirmKillDelivered(commitEpoch, trip.latchGeneration);
+        },
+        reportAlert: (trip: LimitTrip): void => {
+          alerts.push(trip);
+        },
+      },
+    };
+  };
+
+  it("a kill-action call budget refuses the crossing call, reports the scoped kill, and latches", async () => {
+    const r = recordingLimits([
+      { id: "read-budget", tool: "read_*", metric: "calls", max: 2, action: "kill" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a" } });
+    await t.client.callTool({ name: "read_file", arguments: { path: "/b" } });
+    const err = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/c" } }));
+    expect(err.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(err.message).toContain("read-budget");
+    expect(t.upstream.calls).toHaveLength(2); // the crossing call never forwarded
+    expect(r.kills).toHaveLength(1);
+    expect(r.kills[0].rule.id).toBe("read-budget");
+
+    // latched: EVERY later call is refused while the scoped kill propagates —
+    // even one the budget does not count
+    const later = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));
+    expect(later.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(later.message).toContain("2GO restore"); // delivered → confirmed wording
+    expect(t.upstream.calls).toHaveLength(2);
+    await t.close();
+  });
+
+  it("an alert-action limit flags and the calls keep running", async () => {
+    const r = recordingLimits([
+      { id: "read-watch", tool: "read_*", metric: "calls", max: 0, action: "alert" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    const result = await t.client.callTool({ name: "read_file", arguments: { path: "/a" } });
+    expect(text(result)).toContain("upstream ran read_file");
+    await t.client.callTool({ name: "read_file", arguments: { path: "/b" } });
+    expect(r.alerts).toHaveLength(1); // one crossing, one alert — no flood
+    expect(r.kills).toHaveLength(0);
+    expect(t.upstream.calls).toHaveLength(2);
+    await t.close();
+  });
+
+  it("an error budget counts failed executions; the failing result still reaches the agent", async () => {
+    const r = recordingLimits([
+      { id: "error-budget", tool: "read_*", metric: "errors", max: 1, action: "kill" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    const first = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(first.isError).toBe(true); // the agent sees its failure
+    expect(r.kills).toHaveLength(0); // 1 error == max: not over yet
+
+    const second = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(second.isError).toBe(true); // the crossing failure STILL returns
+    expect(r.kills).toHaveLength(1); // ...and the scoped kill fired
+
+    // the latch refuses the next call before it reaches upstream
+    const err = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/ok" } }));
+    expect(err.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(t.upstream.calls).toHaveLength(2);
+    await t.close();
+  });
+
+  it("a concurrent call cannot slip past a latch set while an earlier call awaits its kill", async () => {
+    // The race the top-of-handler latch check alone cannot catch: A crosses
+    // the budget and blocks on delivering its kill; B enters the handler
+    // meanwhile, and by the time B counts, the total is ALREADY over max —
+    // so no new trip fires for it. Only a synchronous admission check at
+    // the counting/dispatch boundary stops B.
+    let releaseKill: (() => void) | undefined;
+    const killDelivering = new Promise<void>((resolve) => {
+      releaseKill = resolve;
+    });
+    const kills: LimitTrip[] = [];
+    const limits = {
+      tracker: new LimitTracker([
+        { id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" } as LimitRule,
+      ]),
+      reportKill: (trip: LimitTrip): Promise<void> => {
+        kills.push(trip);
+        return killDelivering; // hangs until the test releases it
+      },
+      reportAlert: (): void => {},
+    };
+    const t = await startProxy(createFakeControlPlane(), undefined, limits);
+
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a" } }); // 1, under
+    const crossing = t.client.callTool({ name: "read_file", arguments: { path: "/b" } }); // trips, blocks
+    await vi.waitFor(() => expect(kills).toHaveLength(1));
+
+    // B arrives while A's kill is still in flight
+    const concurrent = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/c" } }),
+    );
+    expect(concurrent.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(t.upstream.calls).toHaveLength(1); // ONLY the first, under-budget call ran
+
+    releaseKill?.();
+    expect((await refusalOf(crossing)).code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(t.upstream.calls).toHaveLength(1);
+    await t.close();
+  });
+
+  it("the full trip lifecycle: refused in flight → scope-killed → owner restore re-arms the budget", async () => {
+    const cp = createFakeControlPlane();
+    // autoConfirm off: the kill is "in flight" until the control plane's
+    // response comes back — exactly the window the wording describes
+    const r = recordingLimits(
+      [{ id: "hard", tool: "read_*", metric: "calls", max: 1, action: "kill" }],
+      { commitEpoch: cp.state.epoch + 1, autoConfirm: false },
+    );
+    const t = await startProxy(cp, undefined, r.limits);
+
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a" } });
+    const crossing = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/b" } }));
+    expect(crossing.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(1);
+
+    // the kill has NOT landed yet: refusals say so, and an empty killedAgents
+    // list must not release anything (fail closed)
+    const inFlight = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/c" } }));
+    expect(inFlight.message).toContain("in flight");
+
+    // the control plane applies the scoped kill and answers our request: the
+    // commit epoch confirms the latch (only this can — a /status listing
+    // never does, since any kill of this agent produces one), and the
+    // refusal becomes the authoritative scoped lockdown
+    cp.state.epoch += 1;
+    cp.state.killedAgents = ["test-agent"];
+    r.confirm();
+    const killed = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/d" } }));
+    expect(killed.code).toBe(OwnerSwitchErrorCode.Lockdown);
+    expect(killed.message).toContain("scope-killed");
+
+    // the owner's 2GO restore: the agent leaves the list — the latch
+    // releases WITHOUT a gateway restart and the budgets re-arm fresh
+    cp.state.killedAgents = [];
+    const revived = await t.client.callTool({ name: "read_file", arguments: { path: "/e" } });
+    expect(text(revived)).toContain("upstream ran read_file");
+
+    // re-armed: the budget counts from zero again and can trip again
+    const retrip = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/f" } }));
+    expect(retrip.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(2);
+    await t.close();
+  });
+
+  it("one call crossing TWO kill rules fires ONE scoped kill — the owner's single restore covers both", async () => {
+    // The v8 finding: a payout can cross a `calls` budget and an `amount`
+    // budget in the SAME observation. A second POST /kill would bump the
+    // control plane's epoch again while the latch is anchored to the FIRST
+    // commit epoch — the second kill would then be unanchored, and the
+    // owner's restore of the first would release the latch and re-arm every
+    // budget while that second kill was still in flight. So exactly one kill
+    // goes out per latch; the co-crossing rule is audited and covered by it.
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cp = createFakeControlPlane();
+    const r = recordingLimits(
+      [
+        { id: "call-budget", tool: "read_*", metric: "calls", max: 1, action: "kill" },
+        {
+          id: "spend-budget",
+          tool: "read_*",
+          metric: "amount",
+          amountPath: "cents",
+          max: 100,
+          action: "kill",
+        },
+      ],
+      { commitEpoch: cp.state.epoch + 1, autoConfirm: false },
+    );
+    const t = await startProxy(cp, undefined, r.limits);
+
+    // under both budgets: dispatched
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a", cents: 50 } });
+    expect(t.upstream.calls).toHaveLength(1);
+
+    // this one crosses BOTH: calls 2 > 1 and cents 110 > 100
+    const crossing = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/b", cents: 60 } }),
+    );
+    expect(crossing.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(crossing.message).toContain("call-budget");
+    expect(t.upstream.calls).toHaveLength(1); // the crossing call never ran
+
+    // ONE kill, deterministically the first (latched) trip
+    expect(r.kills).toHaveLength(1);
+    expect(r.kills[0].rule.id).toBe("call-budget");
+    expect(r.kills[0].latchGeneration).toBe(1);
+    // ...and the co-crossing rule is not silently dropped — it is audited
+    expect(audit.mock.calls.flat().join("\n")).toContain("spend-budget");
+
+    // while that single kill is in flight: zero downstream dispatch
+    const during = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/c", cents: 1 } }),
+    );
+    expect(during.message).toContain("in flight");
+    expect(t.upstream.calls).toHaveLength(1);
+
+    // the control plane commits OUR one kill and answers it: E+1 anchors
+    cp.state.epoch += 1;
+    cp.state.killedAgents = ["test-agent"];
+    r.confirm();
+    expect(r.kills).toHaveLength(1); // still exactly one, after confirmation
+    const killed = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/d", cents: 1 } }),
+    );
+    expect(killed.code).toBe(OwnerSwitchErrorCode.Lockdown);
+
+    // the owner's single 2GO restore: because only ONE kill was ever sent,
+    // this absence cannot leave another kill of this agent behind
+    cp.state.killedAgents = [];
+    const revived = await t.client.callTool({ name: "read_file", arguments: { path: "/e", cents: 50 } });
+    expect(text(revived)).toContain("upstream ran read_file");
+
+    // BOTH budgets re-armed together — and the next double crossing is
+    // again exactly one kill, one generation later
+    const retrip = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/f", cents: 60 } }),
+    );
+    expect(retrip.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(2);
+    expect(r.kills[1].latchGeneration).toBe(2);
+    audit.mockRestore();
+    await t.close();
+  });
+
+  it("an error budget crossing alongside another kill rule reports one kill too", async () => {
+    // the same rule on the error path: a failed execution can cross an
+    // `errors` budget while a second kill rule crosses on the same failure
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = recordingLimits([
+      { id: "error-budget", tool: "read_*", metric: "errors", max: 0, action: "kill" },
+      { id: "error-budget-2", tool: "*", metric: "errors", max: 0, action: "kill" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    const failed = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(failed.isError).toBe(true); // the agent still hears its failure
+    expect(r.kills).toHaveLength(1);
+    expect(r.kills[0].rule.id).toBe("error-budget");
+    expect(audit.mock.calls.flat().join("\n")).toContain("error-budget-2");
+    audit.mockRestore();
+    await t.close();
+  });
+
+  it("a throwing alert lane cannot swallow the kill report queued behind it", async () => {
+    // best-effort visibility must never stand between a crossed kill budget
+    // and its scoped kill — on the error path as on the call path
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const kills: LatchingLimitTrip[] = [];
+    const limits = {
+      tracker: new LimitTracker([
+        { id: "noisy-watch", tool: "*", metric: "errors", max: 0, action: "alert" } as LimitRule,
+        { id: "error-budget", tool: "*", metric: "errors", max: 0, action: "kill" } as LimitRule,
+      ]),
+      reportKill: (trip: LatchingLimitTrip): void => {
+        kills.push(trip);
+      },
+      reportAlert: (): void => {
+        throw new Error("alert lane is broken");
+      },
+    };
+    const t = await startProxy(createFakeControlPlane(), undefined, limits);
+
+    const failed = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(failed.isError).toBe(true);
+    expect(kills).toHaveLength(1); // the kill still went out
+    expect(kills[0].rule.id).toBe("error-budget");
+    audit.mockRestore();
+    await t.close();
+  });
+
+  it("calls that never act never spend a budget: denied and approval-gated calls do not count", async () => {
+    const r = recordingLimits([
+      { id: "any-call", tool: "*", metric: "calls", max: 0, action: "kill" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    const denied = await refusalOf(t.client.callTool({ name: "delete_file", arguments: { path: "/x" } }));
+    expect(denied.code).toBe(OwnerSwitchErrorCode.PolicyDenied); // not LimitTripped
+    const gated = await refusalOf(t.client.callTool({ name: "mystery_tool", arguments: {} }));
+    expect(gated.code).toBe(OwnerSwitchErrorCode.ApprovalRequired);
+    expect(r.kills).toHaveLength(0);
+    expect(r.alerts).toHaveLength(0);
     await t.close();
   });
 });

@@ -53,6 +53,8 @@ const failClosed = (): KillState => ({
   killed: true,
   reason: "control plane unreachable — fail closed",
   killedAgents: [],
+  // an answer we never got proves nothing about durable state either
+  durable: false,
 });
 
 /**
@@ -113,11 +115,13 @@ export function createControlPlaneClient(
         return failClosed();
       }
       if (typeof body !== "object" || body === null) return failClosed();
-      const { killed, reason, epoch, killedAgents } = body as {
+      const { killed, reason, epoch, killedAgents, persistenceDegraded, unhealthy } = body as {
         killed?: unknown;
         reason?: unknown;
         epoch?: unknown;
         killedAgents?: unknown;
+        persistenceDegraded?: unknown;
+        unhealthy?: unknown;
       };
       if (typeof killed !== "boolean") return failClosed();
       // A missing or unparseable epoch must never be treated as epoch 0 —
@@ -130,10 +134,15 @@ export function createControlPlaneClient(
       // "nobody is scope-killed" — same doctrine, same direction.
       const scoped = parseKilledAgents(killedAgents);
       if (scoped === null) return failClosed();
-      if (!killed) return { killed: false, epoch, killedAgents: scoped };
+      // Durability, carried through rather than dropped: a control plane
+      // whose persistence is degraded or unhealthy is telling the truth
+      // about NOW and nothing about after a restart. Anything treating this
+      // answer as proof of a durable record must know (see KillState.durable).
+      const durable = persistenceDegraded === undefined && unhealthy === undefined;
+      if (!killed) return { killed: false, epoch, killedAgents: scoped, durable };
       return typeof reason === "string"
-        ? { killed: true, reason, epoch, killedAgents: scoped }
-        : { killed: true, epoch, killedAgents: scoped };
+        ? { killed: true, reason, epoch, killedAgents: scoped, durable }
+        : { killed: true, epoch, killedAgents: scoped, durable };
     } catch {
       return failClosed();
     } finally {

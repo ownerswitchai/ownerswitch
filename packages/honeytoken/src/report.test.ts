@@ -32,12 +32,14 @@ interface FetchCall {
 
 function harness(behavior: (call: number, url: string) => Response) {
   const calls: FetchCall[] = [];
+  const inits: RequestInit[] = [];
   const logs: string[] = [];
   const delivered: Array<{ trip: Trip; confirmation: DeliveryConfirmation }> = [];
 
   const fetchImpl = (async (url: URL | RequestInfo, init?: RequestInit) => {
     const u = String(url);
     calls.push({ url: u, headers: { ...(init?.headers as Record<string, string>) }, body: String(init?.body) });
+    inits.push(init ?? {});
     return behavior(calls.length, u);
   }) as typeof fetch;
 
@@ -50,7 +52,7 @@ function harness(behavior: (call: number, url: string) => Response) {
     onDelivered: (trip, confirmation) => delivered.push({ trip, confirmation }),
   });
 
-  return { reporter, calls, logs, delivered };
+  return { reporter, calls, inits, logs, delivered };
 }
 
 const settle = () => vi.advanceTimersByTimeAsync(0);
@@ -325,5 +327,133 @@ describe("trip reporter", () => {
 
     h.reporter.report({ ...ALERT_TRIP, canaryIds: ["LATE12345678"] });
     expect(h.logs.some((l) => l.includes("NOT delivered"))).toBe(true);
+  });
+
+  it("override trips (source, agentId, reason) ride the same lanes with a SCOPED, attributed body", async () => {
+    const h = harness(() => okResponse());
+    const trip: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: 'limit "spend" tripped for agent "agent-7": total 1200 exceeded max 1000',
+    };
+    h.reporter.report(trip);
+    // duplicate collapses on the OVERRIDE reason, not the honeytoken phrasing
+    h.reporter.report({ ...trip });
+    await settle();
+    const kills = callsTo(h.calls, "/kill");
+    expect(kills).toHaveLength(1);
+    const body = JSON.parse(kills[0].body) as Record<string, unknown>;
+    expect(body).toEqual({
+      source: "limit",
+      agentId: "agent-7", // scoped: stops one agent, not the fleet
+      reason: 'limit "spend" tripped for agent "agent-7": total 1200 exceeded max 1000',
+    });
+    // still device-signed over the exact bytes on the wire
+    expect(
+      verifyDeviceSignature(
+        {
+          deviceId: kills[0].headers["x-device-id"],
+          timestamp: Number(kills[0].headers["x-device-timestamp"]),
+          nonce: kills[0].headers["x-device-nonce"],
+          signature: kills[0].headers["x-device-signature"],
+        },
+        kills[0].body,
+        SECRET,
+      ),
+    ).toBe(true);
+    expect(h.logs.some((l) => l.includes("[limit]"))).toBe(true);
+  });
+
+  it("confirmDelivery gates a 2xx: a non-conforming body is a FAILED attempt that retries", async () => {
+    // first answer: 200 with a body no real scoped-kill confirmation has;
+    // second answer: the genuine echo — only that one confirms
+    const h = harness((n) =>
+      n === 1
+        ? okResponse({ killed: false }) // 200, but no killedAgent echo
+        : okResponse({ killed: false, killedAgent: "agent-7" }),
+    );
+    const trip: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: "limit tripped",
+      confirmDelivery: (body) =>
+        typeof body === "object" && body !== null &&
+        (body as Record<string, unknown>).killedAgent === "agent-7",
+    };
+    h.reporter.report(trip);
+    await settle();
+    expect(h.delivered).toHaveLength(0); // the lying 200 did not confirm
+    await vi.advanceTimersByTimeAsync(250); // first backoff elapses → retry
+    expect(callsTo(h.calls, "/kill")).toHaveLength(2);
+    expect(h.delivered).toHaveLength(1); // the real echo did
+  });
+
+  it("a per-report onDelivered fires for ITS report only, before the reporter-wide hook", async () => {
+    // What the limit latch needs: the reporter-wide hook cannot tell two
+    // kill reports apart, so the confirmation that advances ONE trip's
+    // lifecycle has to travel with that trip.
+    const h = harness(() => okResponse({ killed: false, killedAgent: "agent-7" }));
+    const first: number[] = [];
+    const second: number[] = [];
+    const trip = (reason: string, seen: number[]): Trip => ({
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason,
+      onDelivered: (confirmation) => seen.push(confirmation.status),
+    });
+    h.reporter.report(trip("budget A", first));
+    h.reporter.report(trip("budget B", second));
+    await settle();
+
+    expect(first).toEqual([200]);
+    expect(second).toEqual([200]);
+    // the reporter-wide hook still sees both, and each per-report hook ran
+    // before its own reporter-wide call
+    expect(h.delivered).toHaveLength(2);
+    expect(h.delivered.map((d) => d.trip.reason)).toEqual(["budget A", "budget B"]);
+  });
+
+  it("a degraded-persistence 200 keeps retrying instead of confirming a kill that may not survive", async () => {
+    const h = harness((n) =>
+      n === 1
+        ? okResponse({ killed: false, killedAgent: "agent-7", persistenceDegraded: true })
+        : okResponse({ killed: false, killedAgent: "agent-7" }),
+    );
+    const degradedAware: Trip = {
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason: "limit tripped",
+      confirmDelivery: (body) => {
+        const b = body as Record<string, unknown> | null;
+        return (
+          b !== null && b.persistenceDegraded === undefined && b.killedAgent === "agent-7"
+        );
+      },
+    };
+    h.reporter.report(degradedAware);
+    await settle();
+    expect(h.delivered).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(h.delivered).toHaveLength(1); // retry re-killed and re-persisted cleanly
+  });
+
+  it("requests refuse redirects — some other origin's 200 must never read as the control plane's", async () => {
+    const h = harness(() => okResponse());
+    h.reporter.report(KILL_TRIP);
+    await settle();
+    expect(h.inits).toHaveLength(1);
+    expect(h.inits[0].redirect).toBe("error"); // the actual request init
   });
 });

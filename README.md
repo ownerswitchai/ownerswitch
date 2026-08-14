@@ -48,6 +48,59 @@ if more than 64 agents pile up scope-killed, the next one escalates to
 the global kill rather than being refused: stopping never fails on a
 capacity ceiling.
 
+**Cumulative limits — declared budgets with teeth.** The community
+`KILLSWITCH.md` convention declares agent boundaries in prose — spending
+thresholds, error budgets, call-rate ceilings — that an agent is free to
+ignore. OwnerSwitch enforces the same boundaries as configuration:
+`limits` rules in the gateway config count across calls (`calls`,
+`errors`, or an `amount` read off the call's own arguments, over a
+sliding window or the process lifetime), and a tripped `kill`-action
+rule refuses the crossing call and fires the same signed, scoped kill a
+honeytoken does — the agent that blew its budget stops, the fleet keeps
+running, and restoring it is the owner's 2GO ceremony. `alert`-action
+rules only flag — they never block, whatever tripped them. When a metric
+counts decides what its kill can promise: `calls` and `amount` meter
+**before** dispatch, so the crossing call is refused and never runs;
+`errors` meters **after** dispatch — the failing call already happened,
+and the kill stops the next one. An error budget is a circuit breaker on
+a failing agent, not a promise that the failure which crossed it was
+prevented.
+
+The durable record of a tripped kill is the control plane's persisted scoped kill —
+delivered synchronously on the crossing refusal, with the response
+validated (the agent echoed back, its commit epoch carried, no degraded
+persistence, redirects refused) before the latch reads it as confirmed.
+That commit epoch matters because the epoch line is shared: without it a
+neighbouring agent's kill epoch could pass for this kill's world and a
+stale snapshot could look like the owner's restore. The record goes to
+the one store the
+agent cannot reach (a gateway-side file would be the agent's own file
+under the stdio deployment's shared uid, so none is kept). Stated
+honestly: the counters themselves are gateway-process state (one budget
+per gateway — two gateways under one agentId count separately), and an
+agent that can kill the gateway process can reset them by crashing it
+before a threshold. Arming a `kill`-action budget therefore requires
+`OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK=1` — an explicit
+acknowledgment that either the deployment removes that capability (the
+restricted-runtime profile: no shell, no subagents) or accepts the
+bound; control-plane-side budgets are the tracked follow-up. Budgets
+meter ATTEMPTED dispatches; while the control plane is unreachable
+every call is already denied fail-closed. On a `kill`-action rule an
+unreadable amount trips rather than passing unmetered, amounts count in
+integer atomic units (a rounding budget is no budget), and the latch
+releases only when the owner's 2GO restore is observed on `/status` —
+never by a restart.
+
+```jsonc
+// gateway config
+"limits": [
+  { "id": "spend",  "tool": "stripe.*", "metric": "amount", "amountPath": "cents",
+    "max": 10000, "windowMs": 3600000, "action": "kill" },
+  { "id": "errors", "tool": "*", "metric": "errors", "max": 20, "action": "kill" },
+  { "id": "rate",   "tool": "*", "metric": "calls",  "max": 300, "windowMs": 60000, "action": "alert" }
+]
+```
+
 **Where this is headed:** once the credential broker above ships, KILL
 also means no more tokens — the shorter the TTL, the smaller the window
 between KILL and everything downstream going dark. That's the

@@ -1277,8 +1277,14 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       // leave it stopped. Say which switch actually flipped; echoing
       // `killedAgent` for a scoped kill that did not happen would be a lie
       // the caller acts on.
+      // The post-commit epoch rides along: a consumer that treats this
+      // response as PROOF its kill landed (the limit tracker's latch) must
+      // be able to bind that proof to an exact point in the epoch line —
+      // otherwise a later answer from some OTHER kill's epoch could pass
+      // for this one's world. Cheap here, load-bearing there.
       sendJson(res, 200, {
         killed: killSwitch.killed,
+        epoch: killSwitch.epoch,
         ...(escalated ? { escalatedToGlobal: true as const } : { killedAgent: agentId }),
         ...degradedFields(),
       });
@@ -1300,8 +1306,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // is the belt to that suspenders and keeps the map from holding corpses.
     restoreChallenges.clear();
     // The kill is in force in memory no matter what; the response only claims
-    // durability when the persist actually succeeded.
-    sendJson(res, 200, { killed: true, ...degradedFields() });
+    // durability when the persist actually succeeded. `epoch` matches the
+    // scoped branch above — one response shape for both kill kinds.
+    sendJson(res, 200, { killed: true, epoch: killSwitch.epoch, ...degradedFields() });
   }
 
   async function postAlert(req: IncomingMessage, res: ServerResponse): Promise<void> {

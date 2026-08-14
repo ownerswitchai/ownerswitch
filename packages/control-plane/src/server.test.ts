@@ -211,7 +211,7 @@ describe("control-plane HTTP API", () => {
 
     const res = await fetch(`${url}/kill`, { method: "POST" });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: true });
+    expect(await res.json()).toEqual({ killed: true, epoch: 1 });
 
     expect(cp.killSwitch.killed).toBe(true);
     const [entry] = cp.killSwitch.auditLog();
@@ -910,6 +910,7 @@ describe("control-plane HTTP API", () => {
       // the kill is in force, but the response does not claim durability it lacks
       expect(await kill.json()).toEqual({
         killed: true,
+        epoch: cp.killSwitch.epoch,
         persistenceDegraded: true,
         unhealthy: expect.stringContaining("owner intervention"),
       });
@@ -3320,7 +3321,7 @@ describe("scoped (per-agent) kills over HTTP", () => {
 
     const res = await scopedKill(url, "agent-7", "looping on stripe.payout");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: false, killedAgent: "agent-7" });
+    expect(await res.json()).toEqual({ killed: false, epoch: 1, killedAgent: "agent-7" });
 
     expect(await (await fetch(`${url}/status`)).json()).toEqual({
       killed: false,
@@ -3532,7 +3533,7 @@ describe("scoped (per-agent) kills over HTTP", () => {
     for (let i = 0; i < 64; i += 1) cp.killSwitch.engageAgent(`agent-${i}`, "api");
     const res = await scopedKill(url, "agent-overflow", "one too many");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ killed: true, escalatedToGlobal: true });
+    expect(await res.json()).toEqual({ killed: true, epoch: 65, escalatedToGlobal: true });
     expect(cp.killSwitch.agentKilled("agent-overflow")).toBe(false); // the global switch answered
   });
 

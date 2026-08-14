@@ -21,12 +21,29 @@ import {
   type ActionTicket,
   type GitHubMergeClient,
 } from "@ownerswitchai/executor";
-import { createControlPlaneClient } from "@ownerswitchai/gateway";
-import { createTripwire, loadRegistry, readRegistryFile, type Tripwire } from "@ownerswitchai/honeytoken";
-import { ConfigError, loadConfig } from "./config.js";
+import {
+  createControlPlaneClient,
+  limitTripReason,
+  LimitTracker,
+  type LatchingLimitTrip,
+  type LimitTrip,
+} from "@ownerswitchai/gateway";
+import type { LimitRule } from "@ownerswitchai/shared";
+import {
+  createTripReporter,
+  createTripwire,
+  loadRegistry,
+  readRegistryFile,
+  type Tripwire,
+} from "@ownerswitchai/honeytoken";
+import { assertKillLimitRiskAccepted, ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
+import {
+  isLimitKillConfirmation,
+  parseLimitKillConfirmation,
+} from "./limit-kill-confirmation.js";
 import { resolveGitHubConnectorEnv } from "./github-app-env.js";
-import { createOwnerSwitchProxy } from "./proxy.js";
+import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
 import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
@@ -192,6 +209,89 @@ async function runGateway(argv: string[]): Promise<void> {
         })()
       : undefined;
 
+  // Cumulative limit rules, when configured: the tracker counts in-process,
+  // and a tripped kill-action rule fires a device-signed SCOPED kill of this
+  // gateway's agent. The DURABLE latch authority is the control plane's
+  // persisted scoped kill (separate uid, fsync'd, deletion-protected) — a
+  // gateway-side file could never be one within the agent's uid — so
+  // reportKill delivers SYNCHRONOUSLY: the crossing refusal returns only
+  // after the kill landed (or after bounded retries against an unreachable
+  // control plane — a state in which the fail-closed /status client is
+  // already denying every call). An undelivered kill keeps pumping in the
+  // background; delivery confirmation advances the tracker's lifecycle.
+  const effectiveAgentId = config.agentId ?? PROXY_NAME;
+  const armLimits = config.limits !== undefined && config.limits.length > 0;
+  // Kill-action budgets demand the explicit process-local-risk flag —
+  // rationale and contract in config.ts assertKillLimitRiskAccepted.
+  assertKillLimitRiskAccepted(config.limits, process.env);
+  const limitTracker = armLimits ? new LimitTracker(config.limits as LimitRule[]) : undefined;
+  const limitReporter = armLimits
+    ? createTripReporter({
+        controlPlaneUrl,
+        deviceId: device.id,
+        secret: device.secret,
+      })
+    : undefined;
+  const limits =
+    limitTracker !== undefined && limitReporter !== undefined
+      ? {
+          tracker: limitTracker,
+          reportKill: async (trip: LatchingLimitTrip): Promise<void> => {
+            // The latch this kill belongs to — carried by the type, since
+            // only a latched trip may be reported. Binding the confirmation
+            // to that generation keeps a late-landing answer (one whose kill
+            // has since been restored) from confirming, and so anchoring,
+            // the NEXT latch.
+            const generation = trip.latchGeneration;
+            limitReporter.report({
+              tier: "kill",
+              canaryIds: [],
+              how: "",
+              source: "limit",
+              agentId: effectiveAgentId,
+              reason: limitTripReason(trip, effectiveAgentId),
+              // delivery confirmation advances THIS trip's lifecycle: the
+              // control plane's OWN commit epoch anchors the latch, because
+              // the epoch line is shared and only that number distinguishes
+              // our kill's world from a neighbouring kill's.
+              onDelivered: (confirmation) => {
+                const confirmed = parseLimitKillConfirmation(confirmation.body, effectiveAgentId);
+                if (confirmed === null) return;
+                limitTracker.confirmKillDelivered(confirmed.epoch, generation);
+              },
+              // A 2xx alone must not confirm the latch — the body has to be
+              // the control plane's real answer for THIS scoped kill (see
+              // limit-kill-confirmation.ts for every rejected shape). A
+              // degraded 200 keeps retrying: each retry re-kills
+              // (idempotent) and re-persists, so a recovered disk confirms a
+              // later attempt; a broken one keeps the latch fail-closed.
+              confirmDelivery: (body: unknown) => isLimitKillConfirmation(body, effectiveAgentId),
+            });
+            // Synchronous delivery: a bounded flush (backoff 200/400/800 ms)
+            // so the crossing refusal returns with the kill already durable
+            // on the control plane in the healthy case.
+            const { delivered } = await limitReporter.flush({ maxAttempts: 4 });
+            if (!delivered) {
+              // Control plane unreachable: stay latched (the tracker already
+              // is) and keep pumping in the background until it lands —
+              // onDelivered will confirm. Every call is meanwhile denied by
+              // the fail-closed /status lookup anyway.
+              void limitReporter.flush({ maxAttempts: Number.MAX_SAFE_INTEGER }).catch(() => {});
+            }
+          },
+          reportAlert: (trip: LimitTrip) =>
+            limitReporter.report({
+              tier: "alert",
+              canaryIds: [],
+              how: "",
+              source: "limit",
+              // structured attribution on the alert too, for the audit trail
+              agentId: effectiveAgentId,
+              reason: limitTripReason(trip, effectiveAgentId),
+            }),
+        }
+      : undefined;
+
   const proxy = createOwnerSwitchProxy({
     policy: config.policy,
     agentId: config.agentId,
@@ -199,6 +299,7 @@ async function runGateway(argv: string[]): Promise<void> {
     vetoClient: createVetoClient({ baseUrl: controlPlaneUrl, device, timeoutMs }),
     ...(tripwire !== undefined ? { honeytokens: tripwire } : {}),
     ...(executor !== undefined ? { executor } : {}),
+    ...(limits !== undefined ? { limits } : {}),
   });
 
   let shuttingDown = false;
@@ -213,6 +314,13 @@ async function runGateway(argv: string[]): Promise<void> {
         tripwire.stop();
         if (!delivered) {
           console.error(`[ownerswitch-mcp] exiting with ${pending} honeytoken report(s) UNCONFIRMED`);
+        }
+      }
+      if (limitReporter !== undefined) {
+        const { delivered, pending } = await limitReporter.flush();
+        limitReporter.stop();
+        if (!delivered) {
+          console.error(`[ownerswitch-mcp] exiting with ${pending} limit report(s) UNCONFIRMED`);
         }
       }
       process.exit(code);
@@ -268,7 +376,8 @@ async function runGateway(argv: string[]): Promise<void> {
     `[ownerswitch-mcp] guarding "${config.upstream.command}" — ` +
       `policy: ${config.policy.rules.length} rule(s), default ${config.policy.defaultDecision}; ` +
       `control plane: ${controlPlaneUrl}; honeytoken tripwires: ${tripwire !== undefined ? "armed" : "off (no registry configured)"}; ` +
-      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}`,
+      `executor routes: ${executor !== undefined ? `${Object.keys(executor.routes).join(", ")} (${connectorState})` : "none (all yes-decisions forward upstream)"}; ` +
+      `limits: ${limits !== undefined ? `${config.limits?.length ?? 0} rule(s) armed for agent "${effectiveAgentId}"` : "none"}`,
   );
 }
 

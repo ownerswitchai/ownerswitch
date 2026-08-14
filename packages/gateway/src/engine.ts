@@ -31,6 +31,18 @@ export interface KillState {
    */
   killedAgents: readonly string[];
   /**
+   * False when the control plane reported its durable kill state as
+   * DEGRADED or UNHEALTHY (`persistenceDegraded` / `unhealthy` on
+   * `/status`): the answer is authoritative about what is in force RIGHT
+   * NOW, but not about what survives a restart. `evaluate()` does not
+   * consult it — a kill in memory still denies everything — but consumers
+   * that treat `/status` as PROOF of a durable record (the limit tracker's
+   * trip lifecycle) must not, and they read this. Optional and defaulting
+   * to durable so hand-built values stay valid; the fetched answers always
+   * populate it (client.ts).
+   */
+  durable?: boolean;
+  /**
    * The control plane's kill epoch — a monotone count of every kill this
    * deployment has ever had; a restore never resets it. `evaluate()` itself
    * does not consult it: `killed` is enough to decide a policy call. It
@@ -49,6 +61,16 @@ const globToRegex = (glob: string) =>
   new RegExp("^" + glob.split("*").map(escapeRe).join(".*") + "$");
 
 /**
+ * The engine's own tool-glob semantics, exported so every other matcher in
+ * the system (rulesMatchingTool below, the LimitTracker's rule matching)
+ * shares ONE definition instead of re-deriving glob behavior that could
+ * drift.
+ */
+export function toolGlobMatches(glob: string, tool: string): boolean {
+  return globToRegex(glob).test(tool);
+}
+
+/**
  * The rules whose tool glob matches `tool`, in policy order — the exact
  * candidate set evaluate() walks (argsPattern then decides per call which
  * candidate fires). Exported so callers that need to reason about a tool
@@ -57,7 +79,7 @@ const globToRegex = (glob: string) =>
  * glob semantics that could drift.
  */
 export function rulesMatchingTool(policy: Policy, tool: string): PolicyRule[] {
-  return policy.rules.filter((rule) => globToRegex(rule.tool).test(tool));
+  return policy.rules.filter((rule) => toolGlobMatches(rule.tool, tool));
 }
 
 /**

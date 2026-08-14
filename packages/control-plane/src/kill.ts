@@ -26,9 +26,16 @@ import type { RestoreAuthorization } from "./twogo.js";
  * agents (their kill was never the thing restored), and a global kill does
  * not erase them — it outranks them while it lasts.
  */
-export type KillSource = "button" | "honeytoken" | "app" | "voice" | "api";
+export type KillSource = "button" | "honeytoken" | "app" | "voice" | "api" | "limit";
 
-export const KILL_SOURCES: readonly KillSource[] = ["button", "honeytoken", "app", "voice", "api"];
+export const KILL_SOURCES: readonly KillSource[] = [
+  "button",
+  "honeytoken",
+  "app",
+  "voice",
+  "api",
+  "limit",
+];
 
 /**
  * The agentId contract lives in @ownerswitchai/shared — ONE validator for

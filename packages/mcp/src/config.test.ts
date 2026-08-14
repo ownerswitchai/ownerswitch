@@ -2,7 +2,13 @@ import { chmodSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfigError, loadConfig, MAX_CONFIG_FILE_BYTES, readConfigFile } from "./config.js";
+import {
+  assertKillLimitRiskAccepted,
+  ConfigError,
+  loadConfig,
+  MAX_CONFIG_FILE_BYTES,
+  readConfigFile,
+} from "./config.js";
 
 const VALID = {
   controlPlaneUrl: "http://127.0.0.1:4600",
@@ -64,6 +70,58 @@ describe("loadConfig", () => {
     expect(() => load({ ...VALID, device: undefined })).toThrowError(ConfigError);
     expect(() => load({ ...VALID, device: undefined })).toThrowError(/device/);
     expect(() => load({ ...VALID, device: { id: "gw-1" } })).toThrowError(/device\.secret/);
+  });
+
+  it("parses limit rules and rejects the shapes an author misread", () => {
+    const VALID_LIMIT = {
+      id: "spend",
+      tool: "stripe.*",
+      metric: "amount",
+      amountPath: "cents",
+      max: 10_000,
+      windowMs: 3_600_000,
+      action: "kill",
+    };
+    const loaded = load({ ...VALID, limits: [VALID_LIMIT] });
+    expect(loaded.limits).toEqual([VALID_LIMIT]);
+
+    // metric/action enums are closed
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, metric: "spend" }] })).toThrowError(/metric/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, action: "warn" }] })).toThrowError(/action/);
+    // amountPath and the amount metric come together or not at all
+    expect(() =>
+      load({ ...VALID, limits: [{ ...VALID_LIMIT, amountPath: undefined }] }),
+    ).toThrowError(/amountPath is required/);
+    expect(() =>
+      load({ ...VALID, limits: [{ ...VALID_LIMIT, metric: "calls" }] }),
+    ).toThrowError(/only meaningful/);
+    // bounds: max is a safe integer in atomic units, capped below the clamp
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: Number.NaN }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: -1 }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: 10.5 }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, max: 2 ** 51 }] })).toThrowError(/max/);
+    expect(() => load({ ...VALID, limits: [{ ...VALID_LIMIT, windowMs: 0 }] })).toThrowError(/windowMs/);
+    // a broken regex is a startup error, never an observe-time throw
+    expect(() =>
+      load({ ...VALID, limits: [{ ...VALID_LIMIT, argsPattern: "(" }] }),
+    ).toThrowError(/regular expression/);
+    // duplicate ids would make audit reasons ambiguous
+    expect(() => load({ ...VALID, limits: [VALID_LIMIT, VALID_LIMIT] })).toThrowError(/duplicate/);
+  });
+
+  it("kill-action limits demand the explicit process-local-risk flag; alert-only needs none", () => {
+    const killRule = { id: "hard", tool: "*", metric: "calls", max: 5, action: "kill" } as const;
+    const alertRule = { id: "soft", tool: "*", metric: "calls", max: 5, action: "alert" } as const;
+    // an agent that can kill the gateway process can reset process-local
+    // budgets by crashing it pre-threshold — arming a kill budget without
+    // acknowledging that is a startup refusal, not a warning
+    expect(() => assertKillLimitRiskAccepted([killRule], {})).toThrowError(ConfigError);
+    expect(() => assertKillLimitRiskAccepted([killRule], {})).toThrowError(/PROCESS_LOCAL_BUDGET_RISK/);
+    expect(() =>
+      assertKillLimitRiskAccepted([killRule], { OWNERSWITCH_LIMITS_ACCEPT_PROCESS_LOCAL_BUDGET_RISK: "1" }),
+    ).not.toThrow();
+    expect(() => assertKillLimitRiskAccepted([alertRule], {})).not.toThrow();
+    expect(() => assertKillLimitRiskAccepted(undefined, {})).not.toThrow();
   });
 
   it("rejects an agentId outside the shared contract — an unstoppable agent is a config error", () => {
