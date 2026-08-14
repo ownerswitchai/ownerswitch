@@ -98,6 +98,9 @@ export interface DoctorDeps {
 
 const MIN_NODE_MAJOR = 22;
 
+/** commands whose FIRST run may download the server before it speaks MCP */
+const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx", "pnpm", "yarn"]);
+
 const skipped = (name: string, why: string): DoctorCheck => ({
   name,
   status: "fail",
@@ -440,10 +443,15 @@ export async function checkUpstreamHandshake(
         fix:
           `${envHint}.\n` +
           `    Then check the command itself launches a stdio MCP server — try it by hand: ` +
-          `${spec.command} ${spec.args.join(" ")}\n` +
-          `    A first "npx -y <package>" run also downloads before it speaks; --upstream-timeout <ms> ` +
-          `raises the ${timeoutMs}ms budget if that is all it is (or use the in-repo demo upstream, ` +
-          `examples/demo-tools-server.ts, which downloads nothing)`,
+          `${spec.command} ${spec.args.join(" ")}` +
+          // the download note only where it can apply: a package runner's
+          // first run fetches before it speaks; for any other command the
+          // sentence would just send the reader chasing the wrong cause
+          (PACKAGE_RUNNERS.has(spec.command)
+            ? `\n    A first "${spec.command} -y <package>" run also downloads before it speaks; ` +
+              `--upstream-timeout <ms> raises the ${timeoutMs}ms budget if that is all it is (or ` +
+              `use the in-repo demo upstream, examples/demo-tools-server.ts, which downloads nothing)`
+            : ""),
       };
     }
     const code = (err as NodeJS.ErrnoException).code;
