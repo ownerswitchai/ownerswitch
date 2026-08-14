@@ -145,6 +145,13 @@ export interface LimitEnforcement {
    * the control plane — the separate-uid latch authority — before the agent
    * even hears "no". On failure the tracker stays latched (unconfirmed) and
    * the implementation keeps retrying in the background.
+   *
+   * Called at most ONCE per latch generation, always with the trip the
+   * tracker latched (`trip.latchGeneration` is set). Co-crossing kill rules
+   * are audited, not re-killed — a second kill would open a control-plane
+   * epoch the latch cannot anchor to. The implementation should bind the
+   * delivery confirmation it feeds back to `confirmKillDelivered` to that
+   * same generation, so a late answer cannot confirm a later latch.
    */
   reportKill(trip: LimitTrip): void | Promise<void>;
   /** fire-and-forget alert report for a tripped alert-action rule — best effort */
@@ -486,33 +493,54 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     // THIS call's own pre-dispatch epoch anchors any trip it fires — never
     // a shared field a concurrent call could have moved underneath it.
     const trips = limits.tracker.observeCall(call, { ...(epoch !== undefined ? { epoch } : {}) });
-    let killTrip: LimitTrip | undefined;
     for (const trip of trips) {
-      if (trip.rule.action === "kill") {
-        try {
-          await limits.reportKill(trip);
-        } catch (err) {
-          // the tracker latched at observe time; delivery keeps retrying in
-          // the implementation — the refusal below stands either way
-          console.error(
-            `[ownerswitch-mcp] limit kill report failed (rule "${trip.rule.id}"): ` +
-              `${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        killTrip ??= trip;
-      } else {
-        try {
-          limits.reportAlert(trip);
-        } catch (err) {
-          console.error(
-            `[ownerswitch-mcp] limit alert report failed (rule "${trip.rule.id}"): ` +
-              `${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+      if (trip.rule.action === "kill") continue;
+      try {
+        limits.reportAlert(trip);
+      } catch (err) {
+        console.error(
+          `[ownerswitch-mcp] limit alert report failed (rule "${trip.rule.id}"): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
-    if (killTrip !== undefined) {
-      throw limitTripped(call.tool, killTrip.rule.id, limitTripReason(killTrip, agentId));
+    const killTrips = trips.filter((t) => t.rule.action === "kill");
+    // AT MOST ONE scoped kill per observation — see LimitTrip.latchGeneration.
+    // One call can cross several kill rules together (a `calls` budget and an
+    // `amount` budget on the same payout); the tracker latches the first and
+    // stamps only that one. Reporting the others would open control-plane
+    // epochs the latch is not anchored to, and the owner's restore of the
+    // anchored kill would then re-arm every budget while another kill of this
+    // agent was still in flight. They are audited here and covered by the same
+    // scoped kill: the agent stops either way, and one 2GO restore re-arms all
+    // of them together.
+    const latchedTrip = killTrips.find((t) => t.latchGeneration !== undefined);
+    for (const trip of killTrips) {
+      if (trip === latchedTrip) continue;
+      console.error(
+        `[ownerswitch-mcp] limit "${trip.rule.id}" also crossed on this call ` +
+          `(${limitTripReason(trip, agentId)}) — covered by the scoped kill ` +
+          `already in flight; not re-killed`,
+      );
+    }
+    if (latchedTrip !== undefined) {
+      try {
+        await limits.reportKill(latchedTrip);
+      } catch (err) {
+        // the tracker latched at observe time; delivery keeps retrying in
+        // the implementation — the refusal below stands either way
+        console.error(
+          `[ownerswitch-mcp] limit kill report failed (rule "${latchedTrip.rule.id}"): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    // A kill-action crossing refuses this call whether or not IT was the
+    // trip that latched: an unstamped crossing means a kill is already
+    // latched (a concurrent call's), and the budget still says stop.
+    const cited = latchedTrip ?? killTrips[0];
+    if (cited !== undefined) {
+      throw limitTripped(call.tool, cited.rule.id, limitTripReason(cited, agentId));
     }
   }
 
@@ -532,8 +560,21 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
         ...(epoch !== undefined ? { epoch } : {}),
       });
       for (const trip of observed) {
-        if (trip.rule.action === "kill") await limits.reportKill(trip);
-        else limits.reportAlert(trip);
+        if (trip.rule.action !== "kill") {
+          limits.reportAlert(trip);
+          continue;
+        }
+        // Same single-kill rule as the call path: only the trip the tracker
+        // LATCHED is reported, so one observation never opens two epochs.
+        if (trip.latchGeneration === undefined) {
+          console.error(
+            `[ownerswitch-mcp] limit "${trip.rule.id}" also crossed on this failure ` +
+              `(${limitTripReason(trip, agentId)}) — covered by the scoped kill ` +
+              `already in flight; not re-killed`,
+          );
+          continue;
+        }
+        await limits.reportKill(trip);
       }
     } catch (err) {
       console.error(

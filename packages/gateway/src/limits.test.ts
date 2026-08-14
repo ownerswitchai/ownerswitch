@@ -413,6 +413,57 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     tracker.confirmKillDelivered(10); // the real one
     expect(tracker.killTripped?.confirmed).toBe(true);
   });
+
+  it("ONE call crossing TWO kill rules latches ONCE — only that trip carries a kill", () => {
+    // The v8 finding: a payout can cross a `calls` budget and an `amount`
+    // budget in the same observation. Reporting both would fire two scoped
+    // kills, each bumping the control plane's epoch, while the latch is
+    // anchored to ONE commit epoch — the second kill would then have no
+    // anchor, and the owner's restore of the first would re-arm every budget
+    // while the agent was still killed by the second, with no ceremony for
+    // it. Exactly one trip is stamped, and the stamp IS the instruction.
+    const tracker = new LimitTracker([
+      { id: "call-budget", tool: "*", metric: "calls", max: 0, action: "kill" },
+      { id: "spend-budget", tool: "*", metric: "amount", amountPath: "cents", max: 0, action: "kill" },
+      { id: "watch", tool: "*", metric: "calls", max: 0, action: "alert" },
+    ]);
+    const trips = tracker.observeCall(call("stripe.payout", { cents: 900 }), { epoch: 4 });
+
+    // every crossing is REPORTED to the caller — nothing is hidden
+    expect(trips.map((t) => t.rule.id)).toEqual(["call-budget", "spend-budget", "watch"]);
+    // ...but exactly one of them carries the kill
+    const stamped = trips.filter((t) => t.latchGeneration !== undefined);
+    expect(stamped).toHaveLength(1);
+    expect(stamped[0].rule.id).toBe("call-budget"); // deterministically the first
+    expect(stamped[0].latchGeneration).toBe(1);
+    expect(tracker.killTripped).toMatchObject({ ruleId: "call-budget", generation: 1 });
+
+    // and the single kill covers everything: one commit epoch anchors the
+    // latch, one owner restore re-arms BOTH budgets
+    tracker.confirmKillDelivered(5, 1);
+    tracker.observeKillState([], { epoch: 5 });
+    expect(tracker.killTripped).toBeUndefined();
+    const again = tracker.observeCall(call("stripe.payout", { cents: 900 }), { epoch: 5 });
+    expect(again.filter((t) => t.latchGeneration !== undefined)).toHaveLength(1);
+  });
+
+  it("a confirmation is BOUND to its latch: a late answer cannot anchor the NEXT latch", () => {
+    const tracker = new LimitTracker([KILL_RULE]);
+    tracker.observeCall(call("x"), { epoch: 5 }); // latch 1
+    expect(tracker.killTripped?.generation).toBe(1);
+    tracker.confirmKillDelivered(6, 1);
+    tracker.observeKillState([], { epoch: 6 }); // the owner's restore of latch 1
+    expect(tracker.killTripped).toBeUndefined();
+
+    // a NEW trip, with no epoch of its own — nothing but the generation can
+    // tell the retry's late answer apart from this latch's own
+    tracker.observeCall(call("x"));
+    expect(tracker.killTripped?.generation).toBe(2);
+    tracker.confirmKillDelivered(6, 1); // latch 1's retry, landing late
+    expect(tracker.killTripped?.confirmed).toBe(false); // not ours: still holding
+    tracker.confirmKillDelivered(7, 2); // latch 2's own answer
+    expect(tracker.killTripped?.confirmed).toBe(true);
+  });
 });
 
 describe("safe-integer arithmetic — an overspend must never round into invisibility", () => {

@@ -31,6 +31,13 @@
  *    absence is the owner's 2GO restore for OUR kill, and it re-arms every
  *    budget fresh. An UNCONFIRMED latch ignores `/status` in both
  *    directions and simply holds.
+ *    Exactly ONE kill per latch generation, therefore: a single call can
+ *    cross several kill rules at once, but only the first LATCHES, and only
+ *    the latched trip carries `latchGeneration` — the caller's instruction
+ *    to send one scoped kill and audit the rest. A second kill would open a
+ *    second epoch with nothing anchored to it, and the restore of the
+ *    anchored one would re-arm the budgets while that kill was still in
+ *    flight.
  *  - counters are process-local and honest about it: a gateway restart
  *    resets them (documented in limit-rule.ts). The accepted residual,
  *    stated plainly: a crash while the control plane was UNREACHABLE at
@@ -54,6 +61,22 @@ export interface LimitTrip {
   total: number;
   /** why the trip fired — a threshold crossing, or a fail-closed refusal to guess */
   cause: "threshold-crossed" | "amount-unreadable" | "tracking-overflow" | "total-overflow";
+  /**
+   * Present on the ONE trip that actually LATCHED this tracker — the
+   * generation number of that latch. This is the caller's instruction about
+   * scoped kills: report exactly the trip that carries it, and no other.
+   *
+   * One call can cross several kill rules at once (a `calls` budget and an
+   * `amount` budget on the same payout), but the lifecycle has room for ONE
+   * kill: the latch is anchored to ONE commit epoch. A second POST /kill
+   * would open a second epoch that nothing anchors, and the owner's restore
+   * of the anchored kill would then release the latch while the other kill
+   * was still in flight — budgets re-armed with the agent still stopped, and
+   * no ceremony for that second kill. The co-crossing rules are audited by
+   * the caller and covered by the same scoped kill: the agent is stopped
+   * either way, and the owner's restore re-arms every budget together.
+   */
+  latchGeneration?: number;
 }
 
 /**
@@ -69,6 +92,13 @@ export interface LatchedLimitTrip {
   reason: string;
   at: number;
   confirmed: boolean;
+  /**
+   * Which latch this is: 1 for the tracker's first, incremented by every
+   * later one. A delivery confirmation names the generation it belongs to,
+   * so a late answer for an ALREADY RELEASED kill cannot confirm the latch
+   * that came after it (`confirmKillDelivered`).
+   */
+  generation: number;
   /**
    * The lowest control-plane kill epoch whose answer can speak about THIS
    * trip's scoped kill. Any answer below it is a snapshot of a world where
@@ -147,6 +177,8 @@ export class LimitTracker {
   private readonly now: () => number;
   private readonly maxWindowEvents: number;
   private latch: LatchState = { phase: "armed" };
+  /** how many latches this tracker has opened — the current one's identity */
+  private latchGenerations = 0;
   /** newest control-plane kill epoch this tracker has been shown */
   private lastObservedEpoch?: number;
 
@@ -273,9 +305,17 @@ export class LimitTracker {
    * trip's floor, which would describe a world older than the one we
    * already observed. The reporter retries; a kill is idempotent, so a
    * later attempt confirms with a real anchor.
+   *
+   * `generation` BINDS the answer to the latch it was sent for (the trip's
+   * `latchGeneration`). A report can land late — after its own kill was
+   * restored and a NEW trip latched — and that stale answer must not
+   * confirm, and so anchor, a latch it knows nothing about. Callers that
+   * cannot name a generation get the unbound behaviour, which the floor
+   * check still guards.
    */
-  confirmKillDelivered(epoch: number): void {
+  confirmKillDelivered(epoch: number, generation?: number): void {
     if (this.latch.phase !== "unconfirmed") return;
+    if (generation !== undefined && generation !== this.latch.record.generation) return;
     if (!Number.isSafeInteger(epoch) || epoch < 1) return;
     const floor = this.latch.record.epochFloor;
     if (floor !== undefined && epoch < floor) return;
@@ -380,21 +420,32 @@ export class LimitTracker {
     return trips;
   }
 
-  /** Record a trip; kill-action trips latch as UNCONFIRMED. */
+  /**
+   * Record a trip; the FIRST kill-action trip while armed latches as
+   * UNCONFIRMED and is stamped with the new latch generation. Every other
+   * trip of that observation is returned unstamped — the caller reports one
+   * scoped kill, for the stamped trip, and audits the rest (see
+   * LimitTrip.latchGeneration).
+   */
   private trip(
     trips: LimitTrip[],
     trip: LimitTrip,
     call: ToolCall,
     epochAtCall?: number,
   ): void {
-    trips.push(trip);
-    if (trip.rule.action !== "kill" || this.latch.phase !== "armed") return;
+    if (trip.rule.action !== "kill" || this.latch.phase !== "armed") {
+      trips.push(trip);
+      return;
+    }
+    const generation = (this.latchGenerations += 1);
+    trips.push({ ...trip, latchGeneration: generation });
     const record: LatchedLimitTrip = {
       ruleId: trip.rule.id,
       agentId: call.agentId,
       reason: limitTripReason(trip, call.agentId),
       at: this.now(),
       confirmed: false,
+      generation,
       // PROVISIONAL floor from THIS call's own reading: the kill we are
       // about to fire must bump past the epoch this call saw. It is only a
       // lower bound — the shared epoch line means another agent's kill can

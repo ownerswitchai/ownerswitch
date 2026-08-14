@@ -13,9 +13,13 @@
  * (@ownerswitchai/gateway `LimitTracker`), per agent, since the control
  * plane never sees allow-lane calls. Stated honestly:
  *  - counters live in gateway memory and reset when that process restarts;
- *    the tripped-kill LATCH is the one thing that survives (via the trip
- *    store), because the latch is enforcement — the counters that led to
- *    it are bookkeeping;
+ *    what survives is the KILL — the control plane's persisted scoped kill
+ *    of the agent, on a separate uid the agent cannot reach. The kill is
+ *    the enforcement; the counters that led to it are bookkeeping;
+ *  - one crossing observation produces ONE kill, even when several kill
+ *    rules cross together (a `calls` budget and an `amount` budget on the
+ *    same payout): the agent is stopped once, the co-crossing rules are
+ *    audited, and the owner's single 2GO restore re-arms every budget;
  *  - each gateway process counts alone: two gateways running under the
  *    same agentId hold two separate budgets. Deploy one gateway per agent
  *    when a budget must be a single number;

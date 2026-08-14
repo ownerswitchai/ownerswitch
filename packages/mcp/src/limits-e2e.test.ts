@@ -71,22 +71,22 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       // skew window, so the reporter runs on the same injected clock
       now: c.now,
       log: () => {},
-      // the REAL chain the CLI runs: response → parser → exact commit epoch
-      // → tracker. Nothing here stands in for production code.
-      onDelivered: (trip, confirmation) => {
-        if (trip.tier !== "kill" || trip.source !== "limit") return;
-        const parsed = parseLimitKillConfirmation(confirmation.body, AGENT_ID);
-        expect(parsed).not.toBeNull();
-        if (parsed !== null) tracker.confirmKillDelivered(parsed.epoch);
-      },
     });
 
-    // 1. the budget trips on the crossing call
-    const trips = tracker.observeCall({ agentId: AGENT_ID, tool: "stripe.payout" });
+    // 1. the budget trips on the crossing call, anchored — as the proxy does
+    // it — to the kill epoch THIS call saw before dispatch
+    const epochAtCall = (
+      (await (await fetch(`${url}/status`)).json()) as { epoch: number }
+    ).epoch;
+    const trips = tracker.observeCall(
+      { agentId: AGENT_ID, tool: "stripe.payout" },
+      { epoch: epochAtCall },
+    );
     expect(trips).toHaveLength(1);
     expect(tracker.killTripped?.confirmed).toBe(false);
 
-    // 2. synchronous delivery — the same shape the CLI's reportKill uses
+    // 2. synchronous delivery — the same shape the CLI's reportKill uses,
+    // including the per-report confirmation bound to THIS latch generation
     const trip: LimitTrip = trips[0];
     reporter.report({
       tier: "kill",
@@ -95,6 +95,13 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       source: "limit",
       agentId: AGENT_ID,
       reason: limitTripReason(trip, AGENT_ID),
+      // the REAL chain the CLI runs: response → parser → exact commit epoch
+      // → tracker. Nothing here stands in for production code.
+      onDelivered: (confirmation) => {
+        const parsed = parseLimitKillConfirmation(confirmation.body, AGENT_ID);
+        expect(parsed).not.toBeNull();
+        if (parsed !== null) tracker.confirmKillDelivered(parsed.epoch, trip.latchGeneration);
+      },
       // the PRODUCTION predicate, not a test stand-in: this run proves the
       // real control plane's answer satisfies what the CLI demands
       confirmDelivery: (body) => isLimitKillConfirmation(body, AGENT_ID),

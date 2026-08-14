@@ -643,13 +643,17 @@ describe("cumulative limits", () => {
     return {
       kills,
       alerts,
-      /** the CLI's step: the control plane's own commit epoch confirms */
-      confirm: () => tracker.confirmKillDelivered(commitEpoch),
+      /**
+       * The CLI's step: the control plane's own commit epoch confirms, bound
+       * to the latch generation the kill was sent for (a late answer for an
+       * already-restored kill must not anchor the next latch).
+       */
+      confirm: () => tracker.confirmKillDelivered(commitEpoch, kills.at(-1)?.latchGeneration),
       limits: {
         tracker,
         reportKill: (trip: LimitTrip): void => {
           kills.push(trip);
-          if (autoConfirm) tracker.confirmKillDelivered(commitEpoch);
+          if (autoConfirm) tracker.confirmKillDelivered(commitEpoch, trip.latchGeneration);
         },
         reportAlert: (trip: LimitTrip): void => {
           alerts.push(trip);
@@ -805,6 +809,108 @@ describe("cumulative limits", () => {
     const retrip = await refusalOf(t.client.callTool({ name: "read_file", arguments: { path: "/f" } }));
     expect(retrip.code).toBe(OwnerSwitchErrorCode.LimitTripped);
     expect(r.kills).toHaveLength(2);
+    await t.close();
+  });
+
+  it("one call crossing TWO kill rules fires ONE scoped kill — the owner's single restore covers both", async () => {
+    // The v8 finding: a payout can cross a `calls` budget and an `amount`
+    // budget in the SAME observation. A second POST /kill would bump the
+    // control plane's epoch again while the latch is anchored to the FIRST
+    // commit epoch — the second kill would then be unanchored, and the
+    // owner's restore of the first would release the latch and re-arm every
+    // budget while that second kill was still in flight. So exactly one kill
+    // goes out per latch; the co-crossing rule is audited and covered by it.
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cp = createFakeControlPlane();
+    const r = recordingLimits(
+      [
+        { id: "call-budget", tool: "read_*", metric: "calls", max: 1, action: "kill" },
+        {
+          id: "spend-budget",
+          tool: "read_*",
+          metric: "amount",
+          amountPath: "cents",
+          max: 100,
+          action: "kill",
+        },
+      ],
+      { commitEpoch: cp.state.epoch + 1, autoConfirm: false },
+    );
+    const t = await startProxy(cp, undefined, r.limits);
+
+    // under both budgets: dispatched
+    await t.client.callTool({ name: "read_file", arguments: { path: "/a", cents: 50 } });
+    expect(t.upstream.calls).toHaveLength(1);
+
+    // this one crosses BOTH: calls 2 > 1 and cents 110 > 100
+    const crossing = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/b", cents: 60 } }),
+    );
+    expect(crossing.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(crossing.message).toContain("call-budget");
+    expect(t.upstream.calls).toHaveLength(1); // the crossing call never ran
+
+    // ONE kill, deterministically the first (latched) trip
+    expect(r.kills).toHaveLength(1);
+    expect(r.kills[0].rule.id).toBe("call-budget");
+    expect(r.kills[0].latchGeneration).toBe(1);
+    // ...and the co-crossing rule is not silently dropped — it is audited
+    expect(audit.mock.calls.flat().join("\n")).toContain("spend-budget");
+
+    // while that single kill is in flight: zero downstream dispatch
+    const during = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/c", cents: 1 } }),
+    );
+    expect(during.message).toContain("in flight");
+    expect(t.upstream.calls).toHaveLength(1);
+
+    // the control plane commits OUR one kill and answers it: E+1 anchors
+    cp.state.epoch += 1;
+    cp.state.killedAgents = ["test-agent"];
+    r.confirm();
+    expect(r.kills).toHaveLength(1); // still exactly one, after confirmation
+    const killed = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/d", cents: 1 } }),
+    );
+    expect(killed.code).toBe(OwnerSwitchErrorCode.Lockdown);
+
+    // the owner's single 2GO restore: because only ONE kill was ever sent,
+    // this absence cannot leave another kill of this agent behind
+    cp.state.killedAgents = [];
+    const revived = await t.client.callTool({ name: "read_file", arguments: { path: "/e", cents: 50 } });
+    expect(text(revived)).toContain("upstream ran read_file");
+
+    // BOTH budgets re-armed together — and the next double crossing is
+    // again exactly one kill, one generation later
+    const retrip = await refusalOf(
+      t.client.callTool({ name: "read_file", arguments: { path: "/f", cents: 60 } }),
+    );
+    expect(retrip.code).toBe(OwnerSwitchErrorCode.LimitTripped);
+    expect(r.kills).toHaveLength(2);
+    expect(r.kills[1].latchGeneration).toBe(2);
+    audit.mockRestore();
+    await t.close();
+  });
+
+  it("an error budget crossing alongside another kill rule reports one kill too", async () => {
+    // the same rule on the error path: a failed execution can cross an
+    // `errors` budget while a second kill rule crosses on the same failure
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = recordingLimits([
+      { id: "error-budget", tool: "read_*", metric: "errors", max: 0, action: "kill" },
+      { id: "error-budget-2", tool: "*", metric: "errors", max: 0, action: "kill" },
+    ]);
+    const t = await startProxy(createFakeControlPlane(), undefined, r.limits);
+
+    const failed = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(failed.isError).toBe(true); // the agent still hears its failure
+    expect(r.kills).toHaveLength(1);
+    expect(r.kills[0].rule.id).toBe("error-budget");
+    expect(audit.mock.calls.flat().join("\n")).toContain("error-budget-2");
+    audit.mockRestore();
     await t.close();
   });
 

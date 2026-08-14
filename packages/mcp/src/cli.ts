@@ -229,15 +229,6 @@ async function runGateway(argv: string[]): Promise<void> {
         controlPlaneUrl,
         deviceId: device.id,
         secret: device.secret,
-        // delivery confirmation advances the trip lifecycle: the kill landed
-        onDelivered: (trip, confirmation) => {
-          if (trip.tier !== "kill" || trip.source !== "limit") return;
-          // The control plane's OWN commit epoch anchors the latch: the
-          // epoch line is shared, so only this number distinguishes our
-          // kill's world from a neighbouring kill's.
-          const confirmed = parseLimitKillConfirmation(confirmation.body, effectiveAgentId);
-          if (confirmed !== null) limitTracker?.confirmKillDelivered(confirmed.epoch);
-        },
       })
     : undefined;
   const limits =
@@ -245,6 +236,12 @@ async function runGateway(argv: string[]): Promise<void> {
       ? {
           tracker: limitTracker,
           reportKill: async (trip: LimitTrip): Promise<void> => {
+            // The latch this kill belongs to. The proxy calls reportKill only
+            // for the trip that latched, and binding the confirmation to that
+            // generation keeps a late-landing answer — one whose kill has
+            // since been restored — from confirming, and so anchoring, the
+            // NEXT latch.
+            const generation = trip.latchGeneration;
             limitReporter.report({
               tier: "kill",
               canaryIds: [],
@@ -252,6 +249,15 @@ async function runGateway(argv: string[]): Promise<void> {
               source: "limit",
               agentId: effectiveAgentId,
               reason: limitTripReason(trip, effectiveAgentId),
+              // delivery confirmation advances THIS trip's lifecycle: the
+              // control plane's OWN commit epoch anchors the latch, because
+              // the epoch line is shared and only that number distinguishes
+              // our kill's world from a neighbouring kill's.
+              onDelivered: (confirmation) => {
+                const confirmed = parseLimitKillConfirmation(confirmation.body, effectiveAgentId);
+                if (confirmed === null) return;
+                limitTracker.confirmKillDelivered(confirmed.epoch, generation);
+              },
               // A 2xx alone must not confirm the latch — the body has to be
               // the control plane's real answer for THIS scoped kill (see
               // limit-kill-confirmation.ts for every rejected shape). A

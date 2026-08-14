@@ -394,6 +394,34 @@ describe("trip reporter", () => {
     expect(h.delivered).toHaveLength(1); // the real echo did
   });
 
+  it("a per-report onDelivered fires for ITS report only, before the reporter-wide hook", async () => {
+    // What the limit latch needs: the reporter-wide hook cannot tell two
+    // kill reports apart, so the confirmation that advances ONE trip's
+    // lifecycle has to travel with that trip.
+    const h = harness(() => okResponse({ killed: false, killedAgent: "agent-7" }));
+    const first: number[] = [];
+    const second: number[] = [];
+    const trip = (reason: string, seen: number[]): Trip => ({
+      tier: "kill",
+      canaryIds: [],
+      how: "",
+      source: "limit",
+      agentId: "agent-7",
+      reason,
+      onDelivered: (confirmation) => seen.push(confirmation.status),
+    });
+    h.reporter.report(trip("budget A", first));
+    h.reporter.report(trip("budget B", second));
+    await settle();
+
+    expect(first).toEqual([200]);
+    expect(second).toEqual([200]);
+    // the reporter-wide hook still sees both, and each per-report hook ran
+    // before its own reporter-wide call
+    expect(h.delivered).toHaveLength(2);
+    expect(h.delivered.map((d) => d.trip.reason)).toEqual(["budget A", "budget B"]);
+  });
+
   it("a degraded-persistence 200 keeps retrying instead of confirming a kill that may not survive", async () => {
     const h = harness((n) =>
       n === 1

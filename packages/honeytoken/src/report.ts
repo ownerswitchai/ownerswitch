@@ -78,6 +78,15 @@ export interface Trip {
    * confirmation looks like (the echoed scope, no degraded persistence).
    */
   confirmDelivery?: (body: unknown) => boolean;
+  /**
+   * Called with THIS report's confirmation when it lands, before the
+   * reporter-wide `onDelivered`. The reporter-wide hook sees every trip and
+   * cannot tell two reports of the same kind apart; this one is bound to the
+   * single report that queued it — which is what a caller needs when the
+   * confirmation advances state belonging to that one trip (a limit latch
+   * generation) rather than to the reporter.
+   */
+  onDelivered?: (confirmation: DeliveryConfirmation) => void;
 }
 
 export interface DeliveryConfirmation {
@@ -269,13 +278,15 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
             landed = true;
             const verb = trip.tier === "kill" ? "KILL CONFIRMED" : "ALERT RECORDED";
             log(`${prefixOf(trip)} ■ ${verb} (${outcome.detail}, attempt ${n}) — ${effectiveReason(trip)}`);
-            opts.onDelivered?.(trip, {
+            const confirmation: DeliveryConfirmation = {
               tier: trip.tier,
               attempts: n,
               status: outcome.status,
               body: outcome.body,
               at: now(),
-            });
+            };
+            trip.onDelivered?.(confirmation);
+            opts.onDelivered?.(trip, confirmation);
             break;
           }
           if (n >= this.retryBudget) {
