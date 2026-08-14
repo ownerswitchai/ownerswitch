@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OwnerSwitch — Workspace console</title>
+<!-- Styles and script are external files, no inline blocks or style=""
+     attributes: the console server sends a strict CSP header
+     (script-src 'self'; style-src 'self'; frame-ancestors 'none') and this
+     page must hold under it without rework — the apps/owner discipline. -->
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+  <div class="stage">
+    <div class="kicker"><b>OwnerSwitch Workspace</b> · console · issue #44</div>
+
+    <div class="frame">
+      <div class="topbar">
+        <div class="brand">OwnerSwitch <small>Workspace</small></div>
+        <span class="killstate unreachable" id="killstate">CONNECTING</span>
+        <span class="epoch" id="epoch">epoch —</span>
+        <div class="spacer"></div>
+        <div class="estop">
+          <span class="label">EMERGENCY<br>every session</span>
+          <button type="button" id="estop" aria-label="Emergency stop — kill every session">STOP</button>
+        </div>
+      </div>
+
+      <!-- fail-closed strip: visible whenever the state is killed OR the
+           control plane cannot be proven live — never an optimistic ARMED -->
+      <div class="banner" id="banner" hidden>
+        <span id="banner-text"></span>
+      </div>
+
+      <div class="cols">
+        <main class="term">
+          <div class="termhead">
+            <span class="prname">Open veto windows</span>
+            <span class="chip" id="pending-chip">—</span>
+          </div>
+          <div class="panel-note" id="pending-note" hidden></div>
+          <div class="windows" id="windows" aria-live="polite"></div>
+        </main>
+
+        <aside class="rail" aria-label="OwnerSwitch controls">
+          <div class="card">
+            <h3>Devices</h3>
+            <div class="panel-note" id="devices-note" hidden></div>
+            <div class="devices" id="devices"></div>
+          </div>
+
+          <div class="card">
+            <h3>Console events <span class="tagnote">this console's own record · UTC</span></h3>
+            <div class="audit" id="journal"></div>
+          </div>
+
+          <div class="card" id="restore-card" hidden>
+            <h3>Restore</h3>
+            <p class="mutednote">Restoring is the 2GO ceremony — an owner
+            session and a fresh passkey assertion. This console is deny-only
+            on purpose; it has no restore button to steal.</p>
+          </div>
+        </aside>
+      </div>
+
+      <div class="statusbar">
+        <span><b>control plane:</b> <span id="sb-plane">—</span></span>
+        <span><b>device lane:</b> <span id="sb-device">—</span></span>
+        <span><b>owner session:</b> <span id="sb-session">—</span></span>
+        <span><b>last poll:</b> <span id="sb-poll">—</span></span>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div class="cell">
+        <h4>Unreachable = killed</h4>
+        <p>If this console cannot positively prove the control plane live and
+        armed, it renders the stopped state. No optimistic defaults, ever.</p>
+      </div>
+      <div class="cell">
+        <h4>Deny-only surface</h4>
+        <p>Everything here stops or reads: E-STOP, VETO, listings. Approving,
+        restoring and merging stay with the owner session and passkey lanes.</p>
+      </div>
+      <div class="cell">
+        <h4>The journal is the console's</h4>
+        <p>What this console observed and did. The control plane's own audit
+        trail has no read endpoint yet — that gap is stated, not papered over.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
