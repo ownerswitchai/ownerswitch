@@ -567,3 +567,61 @@ describe("v29: the two-file crash boundary — boot reconciliation is the repair
     ).toBe(401);
   });
 });
+
+describe("v31: the tombstone stands ALONE — no registry object required", () => {
+  it("MANDATORY REGRESSION: a boot with NO enrollment configuration still refuses the migrated key under a static name", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    // enroll dev_X with key K on a fully configured plane — the standing
+    // file now carries the dev_X/K record
+    const cp = plane({ devicesFile, standingFile });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    const spkiK = (p.cheapLane.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+
+    // the review's exact sequence: a later boot where the enrollment option
+    // is ABSENT entirely (config lost, not corrupt), and the same key K is
+    // re-provisioned as a static device
+    const noRegistry = plane({ standingFile, ownerDeviceKeys: { "owner-phone": spkiK } });
+    expect(noRegistry.enrolledDevices).toBeUndefined();
+    // the standing-history tombstone alone proves K migrated: the static
+    // alias boots REVOKED, durably, in the ONE published snapshot
+    const standing = JSON.parse(readFileSync(standingFile, "utf8")) as {
+      devices: Record<string, { revokedAt: number | null; spki?: string }>;
+    };
+    expect(standing.devices["owner-phone"].revokedAt).not.toBeNull();
+    expect(standing.devices[deviceId].revokedAt).not.toBeNull(); // tombstoned, key preserved
+    expect(standing.devices[deviceId].spki).toBeDefined();
+    const base2 = await start(noRegistry);
+    armWindow(noRegistry, "v-nr");
+    expect(
+      (await signedFetch(base2, p.cheapLane, "owner-phone", "GET", "/veto/v-nr/detail", "")).status,
+    ).toBe(401);
+
+    // and the refusal survives FURTHER registry-less restarts — the
+    // tombstone re-exports itself
+    const again = plane({ standingFile, ownerDeviceKeys: { "owner-phone": spkiK } });
+    const base3 = await start(again);
+    armWindow(again, "v-nr2");
+    expect(
+      (await signedFetch(base3, p.cheapLane, "owner-phone", "GET", "/veto/v-nr2/detail", "")).status,
+    ).toBe(401);
+
+    // an UNRELATED static key on the same registry-less boot is untouched —
+    // the tombstone refuses the MIGRATED key, not the deployment
+    const other = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const otherSpki = (other.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+    const mixed = plane({ standingFile, ownerDeviceKeys: { "owner-tablet": otherSpki } });
+    const base4 = await start(mixed);
+    armWindow(mixed, "v-nr3");
+    expect(
+      (await signedFetch(base4, other, "owner-tablet", "GET", "/veto/v-nr3/detail", "")).status,
+    ).toBe(200);
+  });
+});

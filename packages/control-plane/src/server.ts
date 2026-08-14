@@ -936,6 +936,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
           }
         }
       }
+      // Aliases are reconciled BEFORE the snapshot below is composed, so the
+      // separate escalation reader only ever sees the post-reconciliation
+      // projection — a superseded static name is never published active,
+      // even transiently. (reconcileStaticAliases is defined below; function
+      // declarations hoist through this closure.)
+      reconcileStaticAliases();
       // Persist at EVERY boot, durable-or-refuse:
       //  - absent → the full active snapshot is INITIALIZED before the lane
       //    may operate (implicit "everyone active" would make a wrong path or
@@ -944,7 +950,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       //    explicit act — decision-time lookups never default to trust), AND
       //    the published file is re-issued under the CURRENTLY configured
       //    mode/gid, so a 0600 → 0640+gid transition reconciles here at boot
-      //    instead of leaving a boundary no later save would validate.
+      //    instead of leaving a boundary no later save would validate;
+      //  - and the snapshot already carries the alias reconciliation above
+      //    AND the tombstone rule (persistStanding), in ONE publish.
       const persisted = persistStanding();
       if (!persisted.durable) {
         throw new Error(
@@ -960,20 +968,24 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // after an enrollment the same private key would answer under two names:
   // the old static keys-file id and the new dev_ registry id — and revoking
   // one would leave the other alive. The rule: once a key is enrolled in the
-  // registry, the registry IS its identity. At every boot, any static device
-  // whose canonical SPKI matches ANY registry record (revoked or not — the
-  // authority moved, it did not fork) OR any spki-bearing standing-history
-  // TOMBSTONE (proof the key migrated at some point, valid even while the
-  // registry itself is quarantined or reset and cannot vouch) has its static
-  // standing revoked, persisted with the same durable-or-refuse rule as the
-  // rest of boot standing. The enroll handler performs the same supersession
-  // live at admit time; this reconciles enrollments this process missed —
-  // and, through the tombstones, keeps refusing a migrated key under a
-  // freshly re-provisioned static name on the quarantine-recovery path too.
-  if (enrolledDevices !== undefined && ownerDevices.size > 0) {
+  // registry, the registry IS its identity — and the PROOF of that
+  // migration is carried by the standing-history tombstones on their own,
+  // deliberately WITHOUT needing a live registry object: a boot where the
+  // enrollment option is absent, misconfigured, or quarantined must still
+  // refuse the migrated key under a freshly re-provisioned static name.
+  // Sources for the canonical-SPKI map, in that spirit:
+  //  - ALWAYS: every spki-bearing entry loaded from the standing file
+  //    (unenrolledStanding) — the durable tombstone record;
+  //  - ADDITIONALLY, when the registry can vouch: its live records
+  //    (revoked or not — the authority moved, it did not fork).
+  // Any matching static device is revoked IN MEMORY here; the caller
+  // publishes the result in the boot standing snapshot (durable-or-refuse),
+  // so the escalation reader only ever sees ONE post-reconciliation
+  // projection, never a transiently-active alias. The enroll handler
+  // performs the same supersession live at admit time.
+  function reconcileStaticAliases(): void {
+    if (ownerDevices.size === 0) return;
     const enrolledByCanonSpki = new Map<string, string>();
-    // the spki-bearing standing history: tombstones first, so a usable
-    // registry's live record (below) wins the map entry for the same key
     for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
       if (standing.spki === undefined) continue;
       try {
@@ -985,7 +997,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         // an SPKI the strict parser refuses names no key to collide with
       }
     }
-    if (enrolledDevices.usable) {
+    if (enrolledDevices !== undefined && enrolledDevices.usable) {
       for (const record of enrolledDevices.list()) {
         try {
           enrolledByCanonSpki.set(
@@ -997,6 +1009,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         }
       }
     }
+    if (enrolledByCanonSpki.size === 0) return;
     for (const [staticId, device] of ownerDevices) {
       const enrolledId = enrolledByCanonSpki.get(canonicalSpki(device));
       if (enrolledId === undefined || device.revokedAt !== null) continue;
@@ -1006,18 +1019,13 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
         `[ownerswitch] static owner device "${staticId}" SUPERSEDED at boot: its key is enrolled ` +
           `in the registry as "${enrolledId}" — the static standing is revoked (one key, one identity)`,
       );
-      if (standingStore !== null) {
-        const persisted = persistStanding();
-        if (!persisted.durable) {
-          throw new Error(
-            `[ownerswitch] cannot durably persist the supersession of static device "${staticId}" ` +
-              `(now enrolled as "${enrolledId}"): ${persisted.detail ?? "unknown"} — refusing to ` +
-              "start with the same key trusted under two identities",
-          );
-        }
-      }
     }
   }
+  // Deployments with no standing store (dev) still reconcile against a
+  // usable registry — memory-only, the same deliberately ephemeral trade as
+  // the rest of dev standing. (With a store, the boot block above already
+  // reconciled BEFORE publishing its single snapshot.)
+  if (standingStore === null) reconcileStaticAliases();
   /**
    * The release-time witness check injected into every server-registered
    * window (veto.ts tick()): the acking device must still exist, unrevoked,
