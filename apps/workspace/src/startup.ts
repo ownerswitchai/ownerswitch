@@ -7,13 +7,14 @@ import { isIP } from "node:net";
  */
 
 /**
- * True only for literal loopback: "localhost", "::1", or a VALID dotted-quad
- * in 127.0.0.0/8. The old regex accepted 127.999.999.999 — not an IP
- * literal at all, so the OS would have handed it to a RESOLVER, and a
- * "loopback" bind could land on a routable address.
+ * True only for NUMERIC loopback: "::1" or a VALID dotted-quad in
+ * 127.0.0.0/8. Resolver names are out — "localhost" included: the hosts
+ * file or DNS decides what a name means, and a "loopback" bind must not
+ * depend on that decision (the old regex even accepted 127.999.999.999,
+ * which is not an IP literal at all).
  */
 export function isLoopbackBind(bind: string): boolean {
-  if (bind === "localhost" || bind === "::1") return true;
+  if (bind === "::1") return true;
   return isIP(bind) === 4 && bind.startsWith("127.");
 }
 

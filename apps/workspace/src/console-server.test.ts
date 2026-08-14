@@ -290,6 +290,12 @@ describe("console server", () => {
       expect(calls.map((c) => c.op)).toEqual(["veto"]);
     });
 
+    it("listen() refuses a non-loopback effective address — embedding cannot widen the surface", async () => {
+      const { api } = stubApi();
+      const { listen } = createConsoleServer({ api, publicDir });
+      await expect(listen(0, "0.0.0.0")).rejects.toThrow(/loopback/);
+    });
+
     it("a handler with no allowlisted host refuses everything — fail closed, never a guess", async () => {
       const { api } = stubApi();
       // bypass listen()'s auto-allowlist by giving the server no hosts at all

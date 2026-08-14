@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import { join, resolve, sep } from "node:path";
 import type { ConsoleApi } from "./console-api.js";
 
@@ -289,6 +290,25 @@ export function createConsoleServer(opts: ConsoleServerOptions): {
           const addr = server.address();
           if (addr === null || typeof addr === "string") {
             reject(new Error("console server has no address"));
+            return;
+          }
+          // the EFFECTIVE address must be loopback — not the requested bind
+          // string, the one the kernel actually gave us. This closes the
+          // embedding path too: listen() cannot put this unauthenticated
+          // surface on a routable interface, whoever calls it. A remote
+          // deployment fronts the exported handler with its own TLS+auth
+          // server instead.
+          const effective = addr.address;
+          const effectiveLoopback =
+            effective === "::1" || (isIP(effective) === 4 && effective.startsWith("127."));
+          if (!effectiveLoopback) {
+            server.close();
+            reject(
+              new Error(
+                `refusing to serve on ${effective}: the console binds numeric loopback only — ` +
+                  "front the handler with your own TLS+auth server for anything remote",
+              ),
+            );
             return;
           }
           // the browser reaches a loopback bind under any loopback spelling;

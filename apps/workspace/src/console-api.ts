@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { deviceSignedHeaders } from "./device-sig.js";
+import { validateDeviceId } from "./startup.js";
 
 /**
  * The console server's upstream client: the ONLY code that talks to the
@@ -94,11 +95,15 @@ export function sanitizeControlPlaneUrl(raw: string): string {
     url.hostname.startsWith("[") && url.hostname.endsWith("]")
       ? url.hostname.slice(1, -1)
       : url.hostname;
-  const loopback = host === "localhost" || host === "::1" || (isIP(host) === 4 && host.startsWith("127."));
+  // NUMERIC loopback only — "localhost" is a resolver name (hosts-file or
+  // DNS decides what it means), and a bearer must never ride to whatever
+  // that resolution happens to be today
+  const loopback = host === "::1" || (isIP(host) === 4 && host.startsWith("127."));
   if (url.protocol === "http:") {
     if (!loopback) {
       throw new Error(
-        "http control-plane URLs are allowed only to literal loopback (127.0.0.0/8, ::1, localhost) — use https anywhere else",
+        "http control-plane URLs are allowed only to NUMERIC loopback (127.0.0.0/8 or [::1] — " +
+          '"localhost" is a resolver name, use 127.0.0.1); use https anywhere else',
       );
     }
   } else if (url.protocol !== "https:") {
@@ -113,9 +118,30 @@ function errorText(err: unknown): string {
   return "control plane request failed";
 }
 
-/** a bounded, control-character-free string, or null */
-function safeString(value: unknown, maxChars: number): string | null {
-  return typeof value === "string" && value !== "" && value.length <= maxChars && !CONTROL_CHARS.test(value)
+/**
+ * a bounded, control-character-free string that carries NO configured
+ * credential, or null. The taboo screen is the enforcement behind "the
+ * secret never reaches the browser": an upstream that reflects the bearer
+ * or the device secret inside an otherwise-allowlisted field (a device
+ * name, a reason, a tool label) turns that reading malformed instead of
+ * transiting the console.
+ */
+function safeString(value: unknown, maxChars: number, taboo: readonly string[]): string | null {
+  if (typeof value !== "string" || value === "" || value.length > maxChars || CONTROL_CHARS.test(value)) {
+    return null;
+  }
+  for (const secret of taboo) {
+    if (value.includes(secret)) return null;
+  }
+  return value;
+}
+
+/** ms-since-epoch inside Date's actual range, as a safe integer, or null */
+function safeEpochMs(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= 8_640_000_000_000_000
     ? value
     : null;
 }
@@ -126,25 +152,26 @@ function safeString(value: unknown, maxChars: number): string | null {
  * allowlisted shapes, and the `unhealthy` free text is replaced by a local
  * constant with the same meaning.
  */
-function shapeStatus(body: unknown): Record<string, unknown> | null {
+function shapeStatus(body: unknown, taboo: readonly string[]): Record<string, unknown> | null {
   if (typeof body !== "object" || body === null) return null;
   const b = body as Record<string, unknown>;
   if (b.killed !== true && b.killed !== false) return null;
-  if (typeof b.epoch !== "number" || !Number.isInteger(b.epoch) || b.epoch < 0) return null;
+  if (typeof b.epoch !== "number" || !Number.isSafeInteger(b.epoch) || b.epoch < 0) return null;
   if (!Array.isArray(b.killedAgents)) return null;
   const killedAgents: string[] = [];
   for (const entry of b.killedAgents) {
-    const id = safeString(entry, 128);
+    const id = safeString(entry, 128, taboo);
     if (id === null) return null;
     killedAgents.push(id);
   }
-  const reason = safeString(b.reason, 256);
+  const reason = safeString(b.reason, 256, taboo);
+  const at = safeEpochMs(b.at);
   return {
     killed: b.killed,
     epoch: b.epoch,
     killedAgents,
     ...(reason !== null ? { reason } : {}),
-    ...(typeof b.at === "number" && Number.isFinite(b.at) ? { at: b.at } : {}),
+    ...(at !== null ? { at } : {}),
     ...(b.persistenceDegraded === true ? { persistenceDegraded: true } : {}),
     ...(b.unhealthy !== undefined
       ? { unhealthy: "durable kill state is untrustworthy — owner intervention required" }
@@ -153,38 +180,76 @@ function shapeStatus(body: unknown): Record<string, unknown> | null {
 }
 
 /** one /veto/pending entry, or null when any field fails its allowlist */
-function shapeWindow(entry: unknown): Record<string, unknown> | null {
+function shapeWindow(entry: unknown, taboo: readonly string[]): Record<string, unknown> | null {
   if (typeof entry !== "object" || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  const id = safeString(e.id, 128);
+  const id = safeString(e.id, 128, taboo);
   if (id === null || !SAFE_ID.test(id)) return null;
   if (e.status !== "pending" && e.status !== "extended") return null;
-  const agentId = safeString(e.agentId, 128);
-  const tool = safeString(e.tool, 128);
+  const agentId = safeString(e.agentId, 128, taboo);
+  const tool = safeString(e.tool, 128, taboo);
   if (agentId === null || tool === null) return null;
-  if (typeof e.deadline !== "number" || !Number.isFinite(e.deadline)) return null;
+  // a deadline outside Date's range would RangeError inside the browser's
+  // renderer and freeze a stale panel — malformed here, fail closed there
+  const deadline = safeEpochMs(e.deadline);
+  if (deadline === null) return null;
   if (e.delivered !== true && e.delivered !== false) return null;
-  return { id, status: e.status, agentId, tool, deadline: e.deadline, delivered: e.delivered };
+  return { id, status: e.status, agentId, tool, deadline, delivered: e.delivered };
 }
 
 /** one GET /devices entry (already-redacted upstream), re-allowlisted here */
-function shapeDevice(entry: unknown): Record<string, unknown> | null {
+function shapeDevice(entry: unknown, taboo: readonly string[]): Record<string, unknown> | null {
   if (typeof entry !== "object" || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  const deviceId = safeString(e.deviceId, 128);
+  const deviceId = safeString(e.deviceId, 128, taboo);
   if (deviceId === null) return null;
-  const name = typeof e.name === "string" && e.name.length <= 128 && !CONTROL_CHARS.test(e.name) ? e.name : null;
+  const name =
+    e.name === ""
+      ? ""
+      : safeString(e.name, 128, taboo);
   if (name === null) return null;
-  if (typeof e.enrolledAt !== "number" || !Number.isFinite(e.enrolledAt)) return null;
-  if (e.revokedAt !== null && (typeof e.revokedAt !== "number" || !Number.isFinite(e.revokedAt))) return null;
+  const enrolledAt = safeEpochMs(e.enrolledAt);
+  if (enrolledAt === null) return null;
+  const revokedAt = e.revokedAt === null ? null : safeEpochMs(e.revokedAt);
+  if (e.revokedAt !== null && revokedAt === null) return null;
   if (e.pushRegistered !== true && e.pushRegistered !== false) return null;
   return {
     deviceId,
     name,
-    enrolledAt: e.enrolledAt,
-    revokedAt: e.revokedAt,
+    enrolledAt,
+    revokedAt,
     pushRegistered: e.pushRegistered,
   };
+}
+
+/**
+ * Read a response INCREMENTALLY, aborting the moment the byte cap is
+ * crossed — `res.text()` would buffer (and transparently decompress) the
+ * whole thing first, which turns a gzip bomb into a heap exhaustion before
+ * any length check runs.
+ */
+async function boundedText(res: Response, controller: AbortController): Promise<string> {
+  const body = res.body;
+  if (body === null) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_UPSTREAM_BODY_BYTES) {
+      controller.abort();
+      try {
+        await reader.cancel();
+      } catch {
+        /* the abort already tore the stream down */
+      }
+      throw new Error("oversized control-plane response");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
@@ -192,11 +257,22 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const fetchImpl = opts.fetchImpl ?? fetch;
   const now = opts.now ?? Date.now;
+  // a bad device id must fail HERE, at the shared constructor boundary —
+  // not inside the first signed call, where the signer's throw would read
+  // as an outage and could block even the kill path (audit follow-up #4)
+  if (opts.deviceId !== undefined && opts.deviceId !== "") validateDeviceId(opts.deviceId);
   const deviceConfigured =
     opts.deviceId !== undefined &&
     opts.deviceId !== "" &&
     opts.deviceSecret !== undefined &&
     opts.deviceSecret !== "";
+  // the enforcement behind "no credential reaches the browser": any shaped
+  // string CONTAINING a configured secret poisons its reading (see
+  // safeString). Short values are skipped — a 1-char secret would taboo
+  // half the alphabet, and real credentials are long.
+  const taboo: string[] = [opts.deviceSecret, opts.ownerToken].filter(
+    (s): s is string => typeof s === "string" && s.length >= 8,
+  );
 
   /**
    * One upstream exchange → {upstreamStatus, body} or a thrown error the
@@ -229,8 +305,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
         signal: controller.signal,
         ...(method === "POST" ? { body: rawBody ?? "" } : {}),
       });
-      const text = await res.text();
-      if (text.length > MAX_UPSTREAM_BODY_BYTES) throw new Error("oversized control-plane response");
+      const text = await boundedText(res, controller);
       return { upstreamStatus: res.status, body: JSON.parse(text === "" ? "{}" : text) };
     } finally {
       clearTimeout(timer);
@@ -251,7 +326,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
         if (upstreamStatus !== 200) {
           return { reachable: false, error: `control plane answered HTTP ${upstreamStatus}` };
         }
-        const shaped = shapeStatus(body);
+        const shaped = shapeStatus(body, taboo);
         if (shaped === null) {
           return { reachable: false, error: "control plane answered a malformed status" };
         }
@@ -276,7 +351,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
         }
         const shaped: Array<Record<string, unknown>> = [];
         for (const entry of windows) {
-          const window = shapeWindow(entry);
+          const window = shapeWindow(entry, taboo);
           // one malformed entry poisons the whole reading — hiding just that
           // entry would silently hide a window the owner might need to veto
           if (window === null) return { kind: "unreachable", error: "pending listing malformed" };
@@ -304,8 +379,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
           redirect: "error",
           signal: controller.signal,
         });
-        const text = await res.text();
-        if (text.length > MAX_UPSTREAM_BODY_BYTES) throw new Error("oversized control-plane response");
+        const text = await boundedText(res, controller);
         const body: unknown = JSON.parse(text === "" ? "{}" : text);
         if (res.status !== 200) {
           return { kind: "refused", upstreamStatus: res.status, error: "device listing refused" };
@@ -316,7 +390,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
         }
         const shaped: Array<Record<string, unknown>> = [];
         for (const entry of devices) {
-          const device = shapeDevice(entry);
+          const device = shapeDevice(entry, taboo);
           if (device === null) return { kind: "unreachable", error: "device listing malformed" };
           shaped.push(device);
         }
@@ -335,7 +409,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
         // journal's need when a window leaves the pending list
         const { upstreamStatus, body } = await exchange(`/veto/${encodeURIComponent(id)}`, "GET", null, false);
         if (upstreamStatus !== 200) return { status: null };
-        return { status: safeString((body as { status?: unknown }).status, 32) };
+        return { status: safeString((body as { status?: unknown }).status, 32, taboo) };
       } catch {
         return { status: null };
       }
@@ -353,7 +427,7 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
           ok,
           upstreamStatus,
           body: ok
-            ? { status: safeString((body as { status?: unknown }).status, 32) }
+            ? { status: safeString((body as { status?: unknown }).status, 32, taboo) }
             : { error: "veto refused by the control plane" },
         };
       } catch (err) {
@@ -378,7 +452,9 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
             ? {
                 killed: a.killed === true || a.killed === false ? a.killed : null,
                 epoch:
-                  typeof a.epoch === "number" && Number.isInteger(a.epoch) && a.epoch >= 0 ? a.epoch : null,
+                  typeof a.epoch === "number" && Number.isSafeInteger(a.epoch) && a.epoch >= 0
+                    ? a.epoch
+                    : null,
                 ...(a.persistenceDegraded === true ? { persistenceDegraded: true } : {}),
               }
             : { error: "kill refused by the control plane" },

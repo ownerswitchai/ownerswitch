@@ -35,17 +35,17 @@ const AT = 1_755_000_000_000;
 const CP = "https://cp.invalid";
 
 describe("sanitizeControlPlaneUrl — the one URL parse (audit #6)", () => {
-  it("accepts loopback http and any https, and returns the bare origin", () => {
+  it("accepts numeric-loopback http and any https, and returns the bare origin", () => {
     expect(sanitizeControlPlaneUrl("http://127.0.0.1:4181")).toBe("http://127.0.0.1:4181");
-    expect(sanitizeControlPlaneUrl("http://localhost:4181/")).toBe("http://localhost:4181");
     expect(sanitizeControlPlaneUrl("http://[::1]:4181")).toBe("http://[::1]:4181");
     expect(sanitizeControlPlaneUrl("https://cp.example.com")).toBe("https://cp.example.com");
   });
 
-  it("refuses plaintext http to anything that is not a literal loopback host", () => {
+  it("refuses plaintext http to anything that is not NUMERIC loopback — resolver names included", () => {
     for (const raw of [
       "http://cp.example.com",
       "http://192.168.1.20:4181",
+      "http://localhost:4181", // a resolver name, not a literal
       "http://localhost.evil.example",
       "http://10.0.0.1",
     ]) {
@@ -168,6 +168,43 @@ describe("console-api /status", () => {
     });
     expect((await api.status()).reachable).toBe(false);
   });
+
+  it("the byte cap is STREAMED — an unbounded body is cut off mid-stream, not buffered whole", async () => {
+    // a would-be 1 GiB answer delivered in 64 KiB chunks; the reader must
+    // stop within a chunk or two of the 1 MiB cap instead of draining it
+    const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+    let pulls = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 16_384) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const api = createConsoleApi({
+      controlPlaneUrl: CP,
+      fetchImpl: (() => Promise.resolve(new Response(endless, { status: 200 }))) as typeof fetch,
+    });
+    expect((await api.status()).reachable).toBe(false);
+    expect(pulls).toBeLessThan(32); // ~17 chunks reach 1 MiB; 16384 would mean it drained
+  });
+
+  it("an out-of-Date-range timestamp never reaches the browser's renderer", async () => {
+    const okBase = { killed: true, epoch: 1, killedAgents: [] };
+    const tooFar = createConsoleApi({
+      controlPlaneUrl: CP,
+      fetchImpl: scripted(() => json(200, { ...okBase, at: 1e17 })).fetchImpl,
+    });
+    const reading = await tooFar.status();
+    // `at` fails its bound and is omitted; the reading itself stays usable
+    expect(reading).toEqual({ reachable: true, status: okBase });
+
+    const unsafeEpoch = createConsoleApi({
+      controlPlaneUrl: CP,
+      fetchImpl: scripted(() => json(200, { ...okBase, epoch: 2 ** 53 })).fetchImpl,
+    });
+    expect((await unsafeEpoch.status()).reachable).toBe(false);
+  });
 });
 
 describe("console-api /veto/pending — the device-HMAC lane", () => {
@@ -247,7 +284,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
     for (const entry of [
       { id: "veto_1", status: "released", agentId: "a", tool: "t", deadline: 1, delivered: false },
       { id: "../x", status: "pending", agentId: "a", tool: "t", deadline: 1, delivered: false },
-      { id: "veto_1", status: "pending", agentId: "a b", tool: "t", deadline: 1, delivered: false },
+      { id: "veto_1", status: "pending", agentId: "a\u0000b", tool: "t", deadline: 1, delivered: false },
       { id: "veto_1", status: "pending", agentId: "a", tool: "t", deadline: "soon", delivered: false },
     ]) {
       const api = createConsoleApi({
@@ -367,6 +404,52 @@ describe("console-api credential canaries — no secret in ANY reading (audit #5
     }
   });
 
+  it("a credential reflected inside an ALLOWLISTED 200 field poisons that reading — fail closed", async () => {
+    // window.tool echoes the bearer: the listing must go unreachable
+    const pendingReflect = createConsoleApi({
+      controlPlaneUrl: CP,
+      deviceId: "c",
+      deviceSecret: DEVICE_CANARY,
+      fetchImpl: scripted(() =>
+        json(200, {
+          windows: [
+            { id: "veto_1", status: "pending", agentId: "a", tool: `run ${DEVICE_CANARY}`, deadline: 1, delivered: false },
+          ],
+        }),
+      ).fetchImpl,
+    });
+    const pendingReading = await pendingReflect.pending();
+    expect(pendingReading.kind).toBe("unreachable");
+    expect(JSON.stringify(pendingReading)).not.toContain(DEVICE_CANARY);
+
+    // a device name echoing the owner token: same fate
+    const devicesReflect = createConsoleApi({
+      controlPlaneUrl: CP,
+      ownerToken: TOKEN_CANARY,
+      fetchImpl: scripted(() =>
+        json(200, {
+          devices: [
+            { deviceId: "d1", name: `phone ${TOKEN_CANARY}`, enrolledAt: 1, revokedAt: null, pushRegistered: false },
+          ],
+        }),
+      ).fetchImpl,
+    });
+    const devicesReading = await devicesReflect.devices();
+    expect(devicesReading.kind).toBe("unreachable");
+    expect(JSON.stringify(devicesReading)).not.toContain(TOKEN_CANARY);
+
+    // a kill reason echoing the token: the optional field is dropped
+    const statusReflect = createConsoleApi({
+      controlPlaneUrl: CP,
+      ownerToken: TOKEN_CANARY,
+      fetchImpl: scripted(() =>
+        json(200, { killed: true, epoch: 1, killedAgents: [], reason: `stop ${TOKEN_CANARY}` }),
+      ).fetchImpl,
+    });
+    const statusReading = await statusReflect.status();
+    expect(JSON.stringify(statusReading)).not.toContain(TOKEN_CANARY);
+  });
+
   it("an upstream that reflects the Authorization header never reaches a reading", async () => {
     const reflect = scripted((_url, init) =>
       json(401, { error: `you sent: ${JSON.stringify(init.headers)}` }),
@@ -393,6 +476,12 @@ describe("console-api credential canaries — no secret in ANY reading (audit #5
 });
 
 describe("console-api actions", () => {
+  it("a bad device id fails at CONSTRUCTION, not inside the first signed call", () => {
+    expect(() =>
+      createConsoleApi({ controlPlaneUrl: CP, deviceId: "has.dot", deviceSecret: "s" }),
+    ).toThrow(/OWNERSWITCH_DEVICE_ID/);
+  });
+
   it("veto refuses to pretend without a device credential", async () => {
     const api = createConsoleApi({ controlPlaneUrl: CP });
     const result = await api.veto("veto_a");

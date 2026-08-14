@@ -46,7 +46,8 @@ async function main(): Promise<void> {
   if (!isLoopbackBind(bind)) {
     throw new Error(
       `refusing to bind ${bind}: the console has no caller auth and no TLS, and its verbs reach the ` +
-        "control plane — it binds literal loopback only; put a TLS+auth front in front for remote use",
+        'control plane — it binds NUMERIC loopback only (127.0.0.1 or ::1; "localhost" is a resolver ' +
+        "name). Put a TLS+auth front in front for remote use.",
     );
   }
 
