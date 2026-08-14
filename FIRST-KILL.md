@@ -5,12 +5,15 @@ end you will have watched a policy allow, hold, and deny a real agent's
 calls, vetoed one yourself, stopped everything with one press, seen that a
 restart does **not** undo it, and brought it back with the two-GO ceremony.
 
-**The time claim is measured, not aspirational:** the one full run so far —
-a non-developer, first attempt, fresh macOS machine, cold clone (Node 24,
-pnpm 11), clocked from `git clone` to the post-restore agent run — took
-**12:07**, guided. Fifteen minutes is the honest budget once reading time
-is yours instead of a guide's; when a faster number is proven on this
-document as written, the title will change to it, and not before.
+**The time claim is measured, not aspirational:** the first timed
+non-developer run — first attempt, fresh macOS machine, cold clone
+(Node 24, pnpm 11), clocked from `git clone` to the post-restore agent
+run — took **12:07**, guided. The current revision of this document was
+also executed end to end on a fresh copy (Linux, Node 22, pnpm 9) as
+functional verification of every command — not additional timing data.
+Fifteen minutes is the honest budget once reading time is yours instead
+of a guide's; when a faster timed run is proven on this document as
+written, the title will change to it, and not before.
 
 No AI client, no API key, and no downloads beyond `pnpm install`: the demo
 agent and the tool server it works against live in this repo. That is
@@ -213,19 +216,23 @@ Restoring is meant to be the expensive direction: an owner session, a
 mandatory cooldown, and a single-use ceremony that expires.
 
 GO 1/2 opens the ceremony, and the deliberate **early** GO 2/2 rides in
-the same paste — the two must land inside the 30-second cooldown, so they
-run back to back with no reading time in between. The early try must fail;
-it is the one command that wants the status code, so it drops the `-f`
-that makes the others fail loudly. (`node` pulls the ceremony id out of
-the response — it is already a prerequisite.) Paste the whole block:
+the same paste, chained with `&&` — it fires only if GO 1/2 actually
+succeeded and produced a ceremony id, and the two land inside the
+30-second cooldown because no reading time separates them. The early try
+must fail; it is the one command that wants the status code, so it drops
+the `-f` that makes the others fail loudly. (`node` pulls the ceremony id
+out of the response — it is already a prerequisite.) Paste the block:
 
 ```bash
 OWNER=$OWNERSWITCH_OWNER_TOKEN   # the FRESH token from the restart
-CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).id')
-curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
+CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).id') && test -n "$CER" && curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
 # {"error":"restore rejected"}
 # HTTP 409
 ```
+
+If GO 1/2 fails (bad token, non-JSON answer), the chain stops there — you
+see that error instead of a misleading 409 fired at a ceremony that never
+existed.
 
 That is all you get, whatever went wrong. The body never says which check
 failed (wrong owner, wrong epoch, too early, replayed), because that answer
