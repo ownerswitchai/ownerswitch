@@ -1,19 +1,27 @@
-# Your first kill, in 10 minutes
+# Your first kill, in about 15 minutes
 
 A hands-on walkthrough on a machine that has never seen OwnerSwitch. By the
 end you will have watched a policy allow, hold, and deny a real agent's
 calls, vetoed one yourself, stopped everything with one press, seen that a
 restart does **not** undo it, and brought it back with the two-GO ceremony.
 
+**The time claim is measured, not aspirational:** the one full run so far —
+a non-developer, first attempt, fresh macOS machine, cold clone (Node 24,
+pnpm 11), clocked from `git clone` to the post-restore agent run — took
+**12:07**, guided. Fifteen minutes is the honest budget once reading time
+is yours instead of a guide's; when a faster number is proven on this
+document as written, the title will change to it, and not before.
+
 No AI client, no API key, and no downloads beyond `pnpm install`: the demo
 agent and the tool server it works against live in this repo. That is
 deliberate — the fastest way to trust a stop button is to press it yourself
 before anything valuable is behind it.
 
-**What you need:** Node 22+, pnpm 9 or newer (`corepack enable` gets you
-one), a Unix-like OS (Linux or macOS — the demo sandbox requires
-`O_NOFOLLOW` and refuses to run without it, deliberately), and three
-terminals: the control plane, the agent, and you — the owner.
+**What you need:** Node 22+, pnpm 9–11 (both ends tested; `corepack enable`
+provides one where your Node install ships Corepack), a Unix-like OS
+(Linux or macOS — the demo sandbox requires `O_NOFOLLOW` and refuses to
+run without it, deliberately), and three terminals: the control plane, the
+agent, and you — the owner.
 `jq` is used in a couple of commands for readability; skip it and read the
 JSON yourself if you would rather. The `curl` calls use `-fsS` so an HTTP
 error fails the step loudly instead of printing an error body that scrolls
@@ -149,10 +157,12 @@ and gets **VETOED** — held is a decision point, and the owner just decided.
 
 If you press Enter **without** vetoing, the retry comes back **STILL
 HELD** — in this demo a held call never runs by itself. Silence releases a
-window only after an **enrolled owner device** has confirmed the alert was
-actually seen (production, with the phone app); this walkthrough has none,
-so an undecided window escalates to explicit approval instead of quietly
-releasing. Silence is consent only when the system can prove you saw it.
+window only after an **enrolled owner device** has acknowledged that the
+alert was rendered in front of the owner (production, with the phone app —
+evidence of a render on an enrolled device, which is as close to "seen" as
+software can honestly claim); this walkthrough has no enrolled device, so
+an undecided window escalates to explicit approval instead of quietly
+releasing.
 
 Want a real AI agent behind the same gateway instead? The
 [`packages/mcp` README](packages/mcp/README.md) quickstart connects Claude
@@ -200,16 +210,14 @@ mandatory cooldown, and a single-use ceremony that expires.
 OWNER=$OWNERSWITCH_OWNER_TOKEN   # the FRESH token from the restart
 
 # GO 1/2 — open the ceremony
-CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony \
-  -H "Authorization: Bearer $OWNER" | jq -r .id)
+CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | jq -r .id)
 
 # the cooldown is real; watch it drain
 curl -fsS "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
 # {"state":"go1","cooldownRemainingMs":28417,…}
 
 # GO 2/2 — after it reaches 0
-curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" \
-  -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
+curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
 # {"killed":false}
 ```
 
@@ -217,9 +225,7 @@ Try GO 2/2 early on purpose — this one wants the status code, so drop the
 `-f` that makes the others fail loudly:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" \
-  -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" \
-  -w '\nHTTP %{http_code}\n'
+curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
 # {"error":"restore rejected"}
 # HTTP 409
 ```
@@ -236,7 +242,7 @@ to stop, two GOs to start.**
 
 > In production GO 2/2 additionally requires the owner's **passkey**
 > (WebAuthn) — a stolen session alone cannot restore. The dev control plane
-> runs session-only so this walkthrough fits in ten minutes; the production
+> runs session-only to keep this walkthrough short; the production
 > launcher and its checklist are `packages/mcp/src/control-plane.ts` and
 > `packages/control-plane/STANDING-DEPLOYMENT.md`.
 
