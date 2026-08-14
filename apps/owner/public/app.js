@@ -147,6 +147,23 @@
               .then(function () {
                 setText("enroll-status", "enrolled as " + outcome.deviceId + " — signed requests now use this identity");
                 if (input) input.value = ""; // the secret leaves the DOM
+                // REBIND push under the enrolled identity: the earlier
+                // page-load enrollment registered the subscription under the
+                // deployment-config deviceId; the control plane looks
+                // subscriptions up by deviceId, so re-enroll so wake-ups
+                // reach the registry name too. Best effort — a failure
+                // degrades to SMS/voice/held, never blocks the enrollment.
+                if ("serviceWorker" in navigator) {
+                  navigator.serviceWorker.ready
+                    .then(function (reg) {
+                      return loadRuntime().then(function (rt2) {
+                        return rt2.subscribeAndEnroll(reg);
+                      });
+                    })
+                    .catch(function () {
+                      /* push rebind is best-effort; the ack lane is already live */
+                    });
+                }
               })
               .catch(function () {
                 setText(

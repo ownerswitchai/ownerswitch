@@ -28,7 +28,11 @@ import {
   type DeviceCredential,
   type OwnerSession,
 } from "./auth.js";
-import { canonicalTrustedStandingPath, DeviceStandingFileStore } from "./device-standing.js";
+import {
+  canonicalTrustedStandingPath,
+  DeviceStandingFileStore,
+  type DeviceStanding,
+} from "./device-standing.js";
 import { EnrolledDeviceFileStore, EnrolledDeviceRegistry } from "./enrolled-devices.js";
 import { KillStateFileStore } from "./kill-state.js";
 import { isValidAgentId, KILL_SOURCES, KillSwitch, type KillSource } from "./kill.js";
@@ -37,6 +41,7 @@ import {
   enrolledOwnerDeviceFromSpki,
   verifyOwnerDeviceSignature,
   type EnrolledOwnerDevice,
+  type OwnerDeviceLookup,
 } from "./owner-device.js";
 import { RestoreCeremony } from "./twogo.js";
 import { VetoWindow, type VetoPurpose, type VetoWireStatus } from "./veto.js";
@@ -668,6 +673,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // every future ack into a silent 401.
   const ownerDevices = new Map<string, EnrolledOwnerDevice>();
   for (const [deviceId, spki] of Object.entries(opts.ownerDeviceKeys ?? {})) {
+    // the dev_ namespace belongs to the ceremony registry: a static key
+    // squatting on it could shadow (or be shadowed by) an enrolled identity,
+    // and the two id spaces must never be able to collide
+    if (deviceId.startsWith("dev_")) {
+      throw new Error(
+        `ownerDeviceKeys id "${deviceId}" uses the "dev_" namespace, which is reserved for ` +
+          "ceremony-enrolled devices — rename the static device so the two identity spaces cannot collide",
+      );
+    }
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
   }
   // Durable standing: without it, every boot resurrects revoked phones from
@@ -763,6 +777,45 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // live KillSwitch inside the handler that uses it — never from a request.
   const liveKillSnapshot = () => ({ killed: killSwitch.killed, epoch: killSwitch.epoch });
 
+  // ---- the DYNAMIC owner-device lane (ceremony-enrolled registry) --------
+  // Key material AND standing for ceremony-enrolled (dev_*) devices come
+  // from the durable EnrolledDeviceRegistry: the registry RECORD is the
+  // standing — its generation/revokedAt persist crash-atomically with the
+  // same discipline as everything else in that file — so this population
+  // needs no separate standing-file entry. Standing is read LIVE on every
+  // resolution; only the parsed key object is cached (keyed by the SPKI
+  // bytes, so a changed record can never serve a stale key). Fail
+  // direction: an unusable (corrupt/quarantined) registry resolves
+  // NOTHING — every enrolled-device request 401s while operator-keys-file
+  // devices and every stop path continue untouched.
+  const enrolledKeyCache = new Map<string, { spki: string; device: EnrolledOwnerDevice }>();
+  function resolveOwnerDevice(deviceId: string): EnrolledOwnerDevice | undefined {
+    const provisioned = ownerDevices.get(deviceId);
+    if (provisioned !== undefined) return provisioned;
+    if (enrolledDevices === undefined || !enrolledDevices.usable) return undefined;
+    const record = enrolledDevices.get(deviceId);
+    if (record === null) return undefined;
+    const cached = enrolledKeyCache.get(deviceId);
+    if (cached !== undefined && cached.spki === record.cheapLaneKeySpki) {
+      cached.device.generation = record.generation;
+      cached.device.revokedAt = record.revokedAt;
+      return cached.device;
+    }
+    const device = enrolledOwnerDeviceFromSpki(deviceId, record.cheapLaneKeySpki);
+    device.generation = record.generation;
+    device.revokedAt = record.revokedAt;
+    enrolledKeyCache.set(deviceId, { spki: record.cheapLaneKeySpki, device });
+    return device;
+  }
+  // the verifier takes an OwnerDeviceLookup — this resolver IS one
+  const ownerDeviceResolver: OwnerDeviceLookup = {
+    get: (deviceId: string) => resolveOwnerDevice(deviceId),
+  };
+  const ownerDeviceLaneWired = () => ownerDevices.size > 0 || enrolledDevices !== undefined;
+  /** canonical SPKI DER (base64url) — the ONE key-identity used for alias checks */
+  const canonicalSpki = (device: EnrolledOwnerDevice): string =>
+    (device.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString("base64url");
+
   // QUARANTINE: set whenever the registry on disk may disagree with memory in
   // the PERMISSIVE direction (a revocation that could not be durably
   // persisted). While set, no owner-device evidence is accepted and no
@@ -775,23 +828,88 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // from the keys file must not erase its standing history: a phone that was
   // revoked, removed, and whose key is later re-added boots REVOKED from
   // this record, not fresh.
-  const unenrolledStanding: Record<string, { generation: number; revokedAt: number | null }> = {};
-  /** Persist the CURRENT standing of every enrolled device (+ retained history). */
+  const unenrolledStanding: Record<string, DeviceStanding> = {};
+  /**
+   * Persist the CURRENT standing of every enrolled device (+ retained
+   * history) — schema v2: ceremony-enrolled (dev_*) devices are EXPORTED
+   * into the shared standing file with their cheap-lane SPKI, which is how
+   * the distinct-UID escalation reader authenticates them without touching
+   * the control-plane-private registry. While the registry is quarantined
+   * its entries are OMITTED — the escalation reader then finds no record
+   * and trusts nothing (fail closed), never a stale "active".
+   */
   function persistStanding(): { durable: boolean; detail?: string } {
     if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
-    const devices: Record<string, { generation: number; revokedAt: number | null }> = {
-      ...unenrolledStanding,
-    };
+    const devices: Record<string, DeviceStanding> = {};
+    // History first (see unenrolledStanding). A ceremony (spki-bearing)
+    // entry the registry cannot currently vouch for is exported as a
+    // TOMBSTONE, never as trust and never dropped: revokedAt is forced
+    // non-null (the original instant if one exists, else the 0 sentinel the
+    // corrupt-standing path already uses for policy revocation), while the
+    // SPKI and generation are PRESERVED. Three properties hang on this:
+    //  - the escalation reader refuses the entry (revoked → no push
+    //    enrollment, no active subscription) — fail closed with the CP;
+    //  - the record that this key MIGRATED to the registry survives every
+    //    restart, so the boot alias reconciliation can keep refusing the
+    //    same key under a static name even while the registry is
+    //    quarantined or reset (the "one key, one identity" tombstone);
+    //  - nothing is fabricated permanently: the moment the registry can
+    //    vouch again, its authoritative projection overwrites the tombstone
+    //    below.
+    for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
+      if (standing.spki !== undefined || deviceId.startsWith("dev_")) {
+        devices[deviceId] = { ...standing, revokedAt: standing.revokedAt ?? 0 };
+      } else {
+        devices[deviceId] = standing;
+      }
+    }
     for (const [deviceId, device] of ownerDevices) {
       devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
     }
+    if (enrolledDevices !== undefined && enrolledDevices.usable) {
+      for (const record of enrolledDevices.list()) {
+        devices[record.deviceId] = {
+          generation: record.generation,
+          revokedAt: record.revokedAt,
+          spki: record.cheapLaneKeySpki,
+        };
+      }
+    }
     try {
-      return standingStore.save({ version: 1, devices });
+      return standingStore.save({ version: 2, devices });
     } catch (err) {
       return { durable: false, detail: err instanceof Error ? err.message : String(err) };
     }
   }
-  if (standingStore !== null && ownerDevices.size > 0) {
+  // BOOT STANDING RECONCILIATION — the recovery half of the two-file
+  // revocation story, and one leg of the PINNED CONSISTENCY CONTRACT
+  // (STANDING-DEPLOYMENT.md "Revocation consistency"):
+  //  - a revocation is COMPLETE — both control-plane and escalation
+  //    surfaces severed — only when the revoke request answered 200/503;
+  //    the 200 is issued strictly AFTER both durable writes;
+  //  - a crash between the registry publish and the standing export is a
+  //    revoke that NEVER ACKNOWLEDGED: the caller must treat it as not
+  //    done and retry (idempotent) once the control plane returns;
+  //  - in that interval the ESCALATION process — a separate reader with no
+  //    view of the registry — keeps honoring the LAST COMPLETED export,
+  //    which may still show the device active on its push surfaces. This
+  //    window closes at the next control-plane boot, when the standing
+  //    file is re-derived from live sources and re-published
+  //    durable-or-refuse BEFORE any control-plane surface opens (the
+  //    escalation process runs throughout and converges at its next read
+  //    of the re-published file). Anything stronger — cross-process
+  //    revocation with no post-crash window — needs a shared journal or a
+  //    CP-freshness lease, which this single-host v0 deliberately does not
+  //    claim.
+  //
+  // The block therefore runs whenever the standing file has ANY producer:
+  // static keys-file devices, or an enrollment registry being CONFIGURED at
+  // all — usable or not, populated or not. A quarantined or reset registry
+  // still reconciles: persistStanding() sources spki-bearing entries ONLY
+  // from the usable registry, so unverifiable dev_ entries DROP out of the
+  // export (no record → no trust at the escalation reader — fail closed),
+  // never carry over from history.
+  if (standingStore !== null && (ownerDevices.size > 0 || enrolledDevices !== undefined)) {
     const loaded = standingStore.load();
     if (loaded.outcome === "corrupt") {
       // fail CLOSED: a standing file we cannot trust revokes every device —
@@ -818,6 +936,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
           }
         }
       }
+      // Aliases are reconciled BEFORE the snapshot below is composed, so the
+      // separate escalation reader only ever sees the post-reconciliation
+      // projection — a superseded static name is never published active,
+      // even transiently. (reconcileStaticAliases is defined below; function
+      // declarations hoist through this closure.)
+      reconcileStaticAliases();
       // Persist at EVERY boot, durable-or-refuse:
       //  - absent → the full active snapshot is INITIALIZED before the lane
       //    may operate (implicit "everyone active" would make a wrong path or
@@ -826,7 +950,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       //    explicit act — decision-time lookups never default to trust), AND
       //    the published file is re-issued under the CURRENTLY configured
       //    mode/gid, so a 0600 → 0640+gid transition reconciles here at boot
-      //    instead of leaving a boundary no later save would validate.
+      //    instead of leaving a boundary no later save would validate;
+      //  - and the snapshot already carries the alias reconciliation above
+      //    AND the tombstone rule (persistStanding), in ONE publish.
       const persisted = persistStanding();
       if (!persisted.durable) {
         throw new Error(
@@ -837,6 +963,70 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       }
     }
   }
+  // ---- ALIAS RECONCILIATION (one key, one identity) ----------------------
+  // The phone deliberately enrolls with its EXISTING cheap-lane key, so
+  // after an enrollment the same private key would answer under two names:
+  // the old static keys-file id and the new dev_ registry id — and revoking
+  // one would leave the other alive. The rule: once a key is enrolled in the
+  // registry, the registry IS its identity — and the PROOF of that
+  // migration is carried by the standing-history tombstones on their own,
+  // deliberately WITHOUT needing a live registry object: a boot where the
+  // enrollment option is absent, misconfigured, or quarantined must still
+  // refuse the migrated key under a freshly re-provisioned static name.
+  // Sources for the canonical-SPKI map, in that spirit:
+  //  - ALWAYS: every spki-bearing entry loaded from the standing file
+  //    (unenrolledStanding) — the durable tombstone record;
+  //  - ADDITIONALLY, when the registry can vouch: its live records
+  //    (revoked or not — the authority moved, it did not fork).
+  // Any matching static device is revoked IN MEMORY here; the caller
+  // publishes the result in the boot standing snapshot (durable-or-refuse),
+  // so the escalation reader only ever sees ONE post-reconciliation
+  // projection, never a transiently-active alias. The enroll handler
+  // performs the same supersession live at admit time.
+  function reconcileStaticAliases(): void {
+    if (ownerDevices.size === 0) return;
+    const enrolledByCanonSpki = new Map<string, string>();
+    for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
+      if (standing.spki === undefined) continue;
+      try {
+        enrolledByCanonSpki.set(
+          canonicalSpki(enrolledOwnerDeviceFromSpki(deviceId, standing.spki)),
+          deviceId,
+        );
+      } catch {
+        // an SPKI the strict parser refuses names no key to collide with
+      }
+    }
+    if (enrolledDevices !== undefined && enrolledDevices.usable) {
+      for (const record of enrolledDevices.list()) {
+        try {
+          enrolledByCanonSpki.set(
+            canonicalSpki(enrolledOwnerDeviceFromSpki(record.deviceId, record.cheapLaneKeySpki)),
+            record.deviceId,
+          );
+        } catch {
+          // a record the strict parser refuses resolves no authority anyway
+        }
+      }
+    }
+    if (enrolledByCanonSpki.size === 0) return;
+    for (const [staticId, device] of ownerDevices) {
+      const enrolledId = enrolledByCanonSpki.get(canonicalSpki(device));
+      if (enrolledId === undefined || device.revokedAt !== null) continue;
+      device.revokedAt = now();
+      device.generation += 1;
+      console.error(
+        `[ownerswitch] static owner device "${staticId}" SUPERSEDED at boot: its key was ` +
+          `previously migrated to the enrollment identity namespace as "${enrolledId}" — the ` +
+          "static standing is revoked (one key, one identity)",
+      );
+    }
+  }
+  // Deployments with no standing store (dev) still reconcile against a
+  // usable registry — memory-only, the same deliberately ephemeral trade as
+  // the rest of dev standing. (With a store, the boot block above already
+  // reconciled BEFORE publishing its single snapshot.)
+  if (standingStore === null) reconcileStaticAliases();
   /**
    * The release-time witness check injected into every server-registered
    * window (veto.ts tick()): the acking device must still exist, unrevoked,
@@ -859,7 +1049,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (killSwitch.killed) return false;
     if (standingQuarantined) return false;
     if (deviceId === null || generation === null) return false;
-    const device = ownerDevices.get(deviceId);
+    const device = resolveOwnerDevice(deviceId);
     return device !== undefined && device.revokedAt === null && device.generation === generation;
   }
   // Foreground-detail deliveries: minted by GET /veto/:id/detail, echoed and
@@ -988,12 +1178,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    * request target as sent, so the signature is bound to THIS route and body.
    */
   function validOwnerDeviceIdFrom(req: IncomingMessage, rawBody: string): string | null {
-    if (ownerDevices.size === 0) return null;
+    if (!ownerDeviceLaneWired()) return null;
     const credential = ownerDeviceCredentialFrom(req);
     if (credential === null) return null;
     const method = (req.method ?? "").toUpperCase();
     const pathAndQuery = req.url ?? "";
-    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDevices, {
+    return verifyOwnerDeviceSignature(credential, method, pathAndQuery, rawBody, ownerDeviceResolver, {
       now,
       seenNonces,
     });
@@ -2074,8 +2264,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    */
   async function getVetoDetail(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (ownerDevices.size === 0) {
-      sendJson(res, 501, { error: "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys)" });
+    if (!ownerDeviceLaneWired()) {
+      sendJson(res, 501, {
+        error:
+          "delivery confirmation is not wired: no owner device enrolled (ownerDeviceKeys or the enrollment registry)",
+      });
       return;
     }
     const fetchingDeviceId = validOwnerDeviceIdFrom(req, raw);
@@ -2127,7 +2320,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       deviceId: fetchingDeviceId,
       // the generation this delivery is minted under — a later revocation
       // bumps the device's generation and this delivery dies with it
-      deviceGeneration: ownerDevices.get(fetchingDeviceId)?.generation ?? 0,
+      deviceGeneration: resolveOwnerDevice(fetchingDeviceId)?.generation ?? 0,
       expiresAt: now() + DELIVERY_TTL_MS,
       consumed: false,
     });
@@ -2146,12 +2339,12 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
 
   async function postVetoSeen(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     const raw = await readRawBody(req);
-    if (ownerDevices.size === 0) {
+    if (!ownerDeviceLaneWired()) {
       sendJson(res, 501, {
         error:
           "delivery confirmation is not wired: no owner-app device is enrolled on this control " +
-          "plane, so no device may flip the release-permitting 'delivered' bit — windows walk to " +
-          "held (passkey approval) instead. Enroll an owner device public key (ownerDeviceKeys).",
+          "plane (neither ownerDeviceKeys nor the enrollment registry), so no device may flip the " +
+          "release-permitting 'delivered' bit — windows walk to held (passkey approval) instead.",
       });
       return;
     }
@@ -2214,7 +2407,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     // render is not another's evidence), and a revocation in between bumps
     // the generation so the orphaned delivery can never confirm anything.
     if (delivery.deviceId !== deviceId) return reject("delivery belongs to a different device");
-    const ackingDevice = ownerDevices.get(deviceId);
+    const ackingDevice = resolveOwnerDevice(deviceId);
     if (ackingDevice === undefined || delivery.deviceGeneration !== ackingDevice.generation) {
       ownerDeliveries.delete(deliveryId);
       return reject("delivery was minted under a superseded device generation — fetch a fresh detail");
@@ -2286,7 +2479,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
     const device = ownerDevices.get(id);
     if (device === undefined) {
-      sendJson(res, 404, { error: `no enrolled owner device "${id}"` });
+      // not a static keys-file device — the ceremony-enrolled (registry)
+      // population has its own durable revocation path
+      revokeEnrolledDevice(res, id);
       return;
     }
     if (device.revokedAt !== null) {
@@ -2376,6 +2571,121 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       evidenceCleared,
       durable: persisted.durable,
       ...(persisted.durable ? {} : { durabilityDetail: persisted.detail }),
+    });
+  }
+
+  /**
+   * The ceremony-enrolled (dev_*) arm of POST /devices/:id/revoke. The
+   * REGISTRY is the authoritative standing store for this population, so the
+   * severing is the registry's own durable publish (revokedAt + generation
+   * bump, crash-atomic, quarantine on unproven durability — enrolled-devices
+   * revoke()). The shared standing FILE is then re-exported for the
+   * escalation reader; that export failing is the same emergency as a static
+   * standing-persist failure — the stale file would keep the revoked phone's
+   * push-enrollment lane alive in the OTHER process — and gets the same
+   * answer: quarantine + durable kill.
+   */
+  function revokeEnrolledDevice(res: ServerResponse, id: string): void {
+    if (enrolledDevices === undefined || !enrolledDevices.usable) {
+      // no registry, or a quarantined one — a quarantined registry already
+      // resolves NO dev_ authority (fail closed), and "revoking" against it
+      // would claim a durability nobody proved
+      sendJson(res, 404, {
+        error:
+          enrolledDevices === undefined
+            ? `no enrolled owner device "${id}"`
+            : `cannot revoke "${id}": the enrolled-device registry is quarantined ` +
+              `(${enrolledDevices.corruptDetail ?? "unusable"}) — every dev_ identity is already ` +
+              "refused while quarantined; repair the registry, then retry",
+      });
+      return;
+    }
+    const result = enrolledDevices.revoke(id, now());
+    if (result.outcome === "unknown") {
+      sendJson(res, 404, { error: `no enrolled owner device "${id}"` });
+      return;
+    }
+    if (result.outcome === "publish-failed") {
+      // The durable registry could NOT record the severing. In THIS process
+      // the registry self-quarantined (no dev_ identity resolves), but the
+      // file on disk still holds the device ACTIVE — a restart would
+      // resurrect it. Same emergency, same answer as a static
+      // standing-persist failure: DURABLE KILL so the next boot comes up
+      // killed instead of trusting the stale registry.
+      killSwitch.engage(
+        "api",
+        `enrolled-device registry publish FAILED while revoking "${id}" (${result.detail}) — ` +
+          "fail-closed kill so a restart cannot resurrect the device from the stale registry. " +
+          "Repair the registry path, re-run the revoke, then restore via 2GO.",
+      );
+      approvalChallenges.clear();
+      loginChallenges.clear();
+      restoreChallenges.clear();
+      sendJson(res, 503, {
+        revoked: true,
+        deviceId: id,
+        durable: false,
+        quarantined: true,
+        killed: true,
+        error:
+          `revocation NOT durably recorded (${result.detail}); the enrolled-device registry is ` +
+          "quarantined (no dev_ identity authenticates in this process) and the KILL SWITCH is " +
+          "engaged (durably), so a restart boots killed instead of resurrecting the device. " +
+          "Repair the registry, retry this revoke, then restore via 2GO.",
+      });
+      return;
+    }
+    // durably severed in the registry — now the live-state cleanup this
+    // process owes, mirroring the static path's synchronous section
+    enrolledKeyCache.delete(id);
+    for (const [deliveryId, delivery] of ownerDeliveries) {
+      if (delivery.deviceId === id) ownerDeliveries.delete(deliveryId);
+    }
+    let evidenceCleared = 0;
+    for (const window of vetoWindows.values()) {
+      if (window.revokeDeliveryEvidence(id)) evidenceCleared += 1;
+    }
+    // re-export the shared standing file so the escalation reader sees the
+    // revocation at its very next load
+    const exported = persistStanding();
+    if (standingStore !== null && !exported.durable) {
+      standingQuarantined = true;
+      killSwitch.engage(
+        "api",
+        `device-standing export FAILED after revoking enrolled device "${id}" ` +
+          `(${exported.detail ?? "unknown"}) — the stale standing file would keep the revoked ` +
+          "phone's push-enrollment lane alive in the escalation service; fail-closed kill. " +
+          "Repair the standing path, re-run the revoke, then restore via 2GO.",
+      );
+      approvalChallenges.clear();
+      loginChallenges.clear();
+      restoreChallenges.clear();
+      sendJson(res, 503, {
+        revoked: true,
+        deviceId: id,
+        generation: result.generation,
+        evidenceCleared,
+        alreadyRevoked: result.outcome === "already-revoked",
+        durable: true, // the REGISTRY record is durable; the standing EXPORT is not
+        standingExported: false,
+        quarantined: true,
+        killed: true,
+        error:
+          `revoked durably in the registry, but the shared standing file could not be re-exported ` +
+          `(${exported.detail ?? "unknown"}) — the escalation service would still trust the stale ` +
+          "entry, so the standing lane is quarantined and the KILL SWITCH is engaged (durably). " +
+          "Repair the standing path, retry this revoke, then restore via 2GO.",
+      });
+      return;
+    }
+    standingQuarantined = false;
+    sendJson(res, 200, {
+      revoked: true,
+      deviceId: id,
+      generation: result.generation,
+      evidenceCleared,
+      ...(result.outcome === "already-revoked" ? { alreadyRevoked: true } : {}),
+      durable: true,
     });
   }
 
@@ -2891,6 +3201,62 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       // is gone (mint a new invite)
       const status = !enrolledDevices.usable ? 503 : outcome.inviteSurvives ? 400 : 410;
       return sendJson(res, status, { error: outcome.reason, inviteSurvives: outcome.inviteSurvives });
+    }
+    // ALIAS SUPERSESSION, live: the phone deliberately enrolled its EXISTING
+    // cheap-lane key, so any static keys-file device holding the SAME key is
+    // now a second name for one identity — and revoking one name must kill
+    // the key. The registry is the identity from here on: the static standing
+    // is severed in the same synchronous section as the admit (revoked +
+    // generation bump, deliveries purged, delivered evidence cleared), and
+    // persisted with the static revoke path's exact failure discipline
+    // (quarantine + durable kill — see postDeviceRevoke).
+    let severedAlias: string | null = null;
+    try {
+      const canonNew = canonicalSpki(
+        enrolledOwnerDeviceFromSpki(outcome.device.deviceId, outcome.device.cheapLaneKeySpki),
+      );
+      for (const [staticId, staticDevice] of ownerDevices) {
+        if (staticDevice.revokedAt !== null || canonicalSpki(staticDevice) !== canonNew) continue;
+        severedAlias = staticId;
+        staticDevice.revokedAt = now();
+        staticDevice.generation += 1;
+        for (const [deliveryId, delivery] of ownerDeliveries) {
+          if (delivery.deviceId === staticId) ownerDeliveries.delete(deliveryId);
+        }
+        for (const window of vetoWindows.values()) window.revokeDeliveryEvidence(staticId);
+        console.error(
+          `[ownerswitch] static owner device "${staticId}" SUPERSEDED: its key just enrolled as ` +
+            `"${outcome.device.deviceId}" — the static standing is revoked (one key, one identity)`,
+        );
+      }
+    } catch {
+      // a registry record the strict parser refuses resolves no authority,
+      // so there is no alias to sever
+    }
+    // export standing (the new dev_ entry + any severed alias) for the
+    // escalation reader; a failure after a SEVERING is the stale-permissive
+    // emergency and takes the kill path, a failure with nothing severed only
+    // delays the escalation lane (fail closed: no record → no trust)
+    const exported = persistStanding();
+    if (standingStore !== null && !exported.durable) {
+      if (severedAlias !== null) {
+        standingQuarantined = true;
+        killSwitch.engage(
+          "api",
+          `device-standing persistence FAILED while superseding static device "${severedAlias}" ` +
+            `(now enrolled as "${outcome.device.deviceId}"): ${exported.detail ?? "unknown"} — ` +
+            "fail-closed kill so a restart cannot leave one key trusted under two identities. " +
+            "Repair the standing path, then restore via 2GO.",
+        );
+        approvalChallenges.clear();
+        loginChallenges.clear();
+        restoreChallenges.clear();
+      } else {
+        console.error(
+          `[ownerswitch] standing export after enrollment failed (${exported.detail ?? "unknown"}) — ` +
+            "the escalation service will not trust the new device until the next successful export",
+        );
+      }
     }
     // the pinned EnrollmentResponse (types.ts): {deviceId}, nothing else —
     // both lanes registered PUBLIC keys, nothing on this wire is worth
