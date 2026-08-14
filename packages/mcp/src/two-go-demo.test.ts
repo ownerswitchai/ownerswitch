@@ -132,6 +132,22 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
     expect(run.output).toContain("literal-loopback");
   });
 
+  it("loopback LOOK-ALIKES are refused by the real URL parser — prefix globs and userinfo tricks", async () => {
+    for (const url of [
+      "http://127.evil.example:4600",
+      "http://127.0.0.1@evil.example:4600",
+      "http://[::1]@evil.example:4600",
+      "http://localhost:4600",
+      "http://127.0.0.1:4600/path",
+      "http://127.0.0.1:4600?x=1",
+      "https://127.0.0.1:4600",
+    ]) {
+      const run = await runScript(url);
+      expect(run.code, url).not.toBe(0);
+      expect(run.output, url).toContain("literal-loopback");
+    }
+  });
+
   it("a failed or malformed GO 1/2 issues ZERO restore POSTs", async () => {
     const badGo1: Array<[number, string]> = [
       [401, '{"error":"unauthorized"}'],
@@ -144,6 +160,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
       [200, '{"id":"evil"}'],
       [200, '{"id":"cer_../../etc"}'],
       [200, `{"id":"CER_${randomUUID()}"}`],
+      [200, '{"id":"cer_00000000-0000-0000-0000-000000000000"}'], // not a v4 UUID
     ];
     for (const go1 of badGo1) {
       const stub = await stubPlane({ go1 });
@@ -265,7 +282,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
     expect(run.output).toContain("do not assume killed");
   });
 
-  it("a restore answer without killed:false is a failure, not a shrug", async () => {
+  it("a restore answering killed:true reconciles and fails honestly — /status confirms still killed", async () => {
     const stub = await stubPlane({
       go1: [201, `{"id":"${CANONICAL_ID}"}`],
       restore: [
@@ -273,9 +290,108 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
         [200, '{"killed":true,"epoch":2}'],
       ],
       ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":true,"epoch":2,"killedAgents":[]}'],
     });
     const run = await runScript(stub.url);
     expect(run.code).not.toBe(0);
-    expect(run.output).toContain("killed:false");
+    expect(run.output).toContain("still killed");
+  });
+
+  it("a TRUNCATED final 200 reconciles: ARMED means restored, KILLED means failed — never FAILED-over-ARMED", async () => {
+    const armed = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [200, '{"killed":fa'], // cleanly-delivered truncated body
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":false,"epoch":1,"killedAgents":[]}'],
+    });
+    const runArmed = await runScript(armed.url);
+    expect(runArmed.code).toBe(0);
+    expect(runArmed.output).toContain("LANDED");
+
+    const killed = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [200, '{"killed":fa'],
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":true,"epoch":1,"killedAgents":[]}'],
+    });
+    const runKilled = await runScript(killed.url);
+    expect(runKilled.code).not.toBe(0);
+    expect(runKilled.output).toContain("still killed");
+  });
+
+  it("a final 500 after the cooldown reconciles too — the commit may have happened", async () => {
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [500, '{"error":"boom"}'],
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":false,"epoch":1,"killedAgents":[]}'],
+    });
+    const run = await runScript(stub.url);
+    expect(run.code).toBe(0);
+    expect(run.output).toContain("LANDED");
+  });
+
+  it("reconciliation trusts only a STRICT 200 /status — a 500 killed:false is OUTCOME UNKNOWN", async () => {
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        "drop",
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [500, '{"killed":false,"epoch":1,"killedAgents":[]}'],
+    });
+    const run = await runScript(stub.url);
+    expect(run.code).not.toBe(0);
+    expect(run.output).toContain("RESTORE OUTCOME UNKNOWN");
+  });
+
+  it("a degraded-persistence /status cannot certify a restore — OUTCOME UNKNOWN, fail closed", async () => {
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        "drop",
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":false,"epoch":1,"killedAgents":[],"persistenceDegraded":true}'],
+    });
+    const run = await runScript(stub.url);
+    expect(run.code).not.toBe(0);
+    expect(run.output).toContain("RESTORE OUTCOME UNKNOWN");
+  });
+
+  it("MAX_TIME=0 is CLAMPED, not disabled — a hanging plane is still cut off", async () => {
+    const stub = await stubPlane({ go1: "hang" });
+    const run = await runScript(stub.url, "tok-demo", { OWNERSWITCH_TWO_GO_MAX_TIME_S: "0" });
+    expect(run.code).not.toBe(0);
+    expect(stub.restorePosts()).toBe(0);
+  }, 40_000);
+
+  it("a configured proxy is bypassed — the bearer goes direct to loopback", async () => {
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [200, '{"killed":false}'],
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+    });
+    const run = await runScript(stub.url, "tok-demo", {
+      http_proxy: "http://127.0.0.1:9",
+      https_proxy: "http://127.0.0.1:9",
+      ALL_PROXY: "http://127.0.0.1:9",
+    });
+    expect(run.code).toBe(0);
+    expect(stub.restorePosts()).toBe(2);
   });
 });
