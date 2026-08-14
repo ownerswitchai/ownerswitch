@@ -37,10 +37,24 @@ enforcement boundary after KILL. Every tool call routed through the
 gateway is checked against live kill state at decision time; once KILL
 is engaged, every one of them is denied.
 
-**The limit:** in-flight actions aren't interrupted. And today that's
-the whole guarantee — it covers calls that route through the gateway,
-nothing an agent reaches by other means (see
-[Enforcement boundary](#enforcement-boundary)).
+**Measured, not "fast":** kill-to-deny latency — from `POST /kill`
+returning to the next gateway evaluation denying a previously-allowed
+call — benchmarked at **p50 0.75 ms / p99 2.3 ms** (300 runs, localhost
+loopback, a real fsync'd kill-state write included in every run; network
+between your gateway and control plane adds its own round trip on top).
+Reproduce it yourself: `pnpm bench:kill-latency`
+([examples/kill-latency-benchmark.ts](examples/kill-latency-benchmark.ts)).
+
+**The limit:** in-flight actions aren't interrupted — today. A call the
+gateway already forwarded upstream runs to completion; KILL stops the
+next one. Aborting outstanding upstream calls at the moment the kill
+lands is designed and tracked in
+[#53 (in-flight abort on KILL)](https://github.com/ownerswitchai/ownerswitch/issues/53),
+with the residual it cannot remove stated up front: a request that
+already reached the upstream may have taken effect — abort cancels our
+side of the wire, it is not a rollback. And the guarantee covers calls
+that route through the gateway, nothing an agent reaches by other means
+(see [Enforcement boundary](#enforcement-boundary)).
 
 **Scoped kill — stop one agent, not the fleet.** `POST /kill` with an
 `agentId` stops that agent only: every call carrying its id is denied at
@@ -123,6 +137,36 @@ watched it happen). Containment comes from what you deploy around the
 gateway — credential broker, sandboxed egress, OS-level enforcement —
 ranked honestly in the [threat model](packages/mcp/THREAT-MODEL.md).
 Don't read the quickstart as a containment promise.
+
+## FAQ — the skeptic's questions, answered with links
+
+**What exactly does the button stop?**
+Every tool call routed through the gateway, at decision time, against
+live kill state — measured kill-to-deny at p50 0.75 ms on loopback. See
+[What KILL guarantees](#what-kill-guarantees-and-what-it-doesnt).
+
+**Does it interrupt an operation already in progress?**
+Not today — an already-forwarded call runs to completion; KILL denies
+the next one. In-flight abort is designed in
+[#53](https://github.com/ownerswitchai/ownerswitch/issues/53), and even
+then one residual stays: what already reached the upstream may have
+taken effect. We say so instead of pretending otherwise. See
+[What KILL guarantees](#what-kill-guarantees-and-what-it-doesnt).
+
+**How does OwnerSwitch know what the agent is doing?**
+It doesn't watch the agent — it sits on the agent's tool-call path. The
+gateway IS the agent's MCP server, so every call the agent makes through
+it is inspected before it runs; nothing is inferred from logs after the
+fact. See [How a tool call is decided](#how-a-tool-call-is-decided).
+
+**And if the agent acts outside the gateway?**
+Then OwnerSwitch never saw it — a denial removes permission, not
+capability, and we've watched an agent route around a correct denial
+with its own built-in tool. Containment is a deployment property
+(credential broker, sandbox, OS enforcement), not a library feature; the
+honest ranking is in
+[Enforcement boundary](#enforcement-boundary) and
+[packages/mcp/THREAT-MODEL.md](packages/mcp/THREAT-MODEL.md).
 
 ## Layout
 
