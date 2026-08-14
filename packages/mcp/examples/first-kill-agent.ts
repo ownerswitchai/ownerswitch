@@ -4,13 +4,21 @@
  * tries a scripted set of tool calls and prints, honestly, what the gateway
  * answered. No AI, no API key, no external MCP client install: this is the
  * smallest thing that behaves like an agent on the wire, so you can watch
- * OwnerSwitch allow, hold, deny, and kill it.
+ * OwnerSwitch allow, hold, veto, deny, and kill it.
+ *
+ * The session is ONE gateway connection end to end — that matters: a held
+ * call's veto window lives in this gateway process, so the HELD → owner
+ * veto → VETOED transition is only observable on the SAME connection. After
+ * the held write the agent prints the window id and waits for you to veto
+ * (Enter to continue); then it retries the exact same call and shows the
+ * verdict. Non-interactive runs (no TTY, or --no-wait) skip the pause.
  *
  * Run from packages/mcp (terminal 2, with the dev control plane up in
  * terminal 1):
  *   npx tsx examples/first-kill-agent.ts
  *   npx tsx examples/first-kill-agent.ts --config /path/to/your.config.json
  */
+import { createInterface } from "node:readline/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -27,11 +35,15 @@ if (flag !== -1) {
   }
   config = resolve(value);
 }
+const interactive = process.stdin.isTTY === true && !process.argv.includes("--no-wait");
 
-// the agent speaks to the GATEWAY; the gateway spawns the demo tools server
+// The gateway is spawned as ONE node process (node --import tsx), not
+// through a package-runner chain: the README documents how npx/pnpm
+// indirection leaves orphaned descendants when a client tears the
+// connection down — a demo must be able to PROVE its child exited.
 const transport = new StdioClientTransport({
-  command: "npx",
-  args: ["tsx", resolve(here, "..", "src", "cli.ts"), "--config", config],
+  command: process.execPath,
+  args: ["--import", "tsx", resolve(here, "..", "src", "cli.ts"), "--config", config],
   cwd: resolve(here, ".."),
   stderr: "inherit", // the gateway's startup line prints straight through
 });
@@ -49,8 +61,10 @@ try {
 const tools = await client.listTools();
 console.log(`connected through the gateway — upstream offers: ${tools.tools.map((t) => t.name).join(", ")}\n`);
 
-/** try one call; print the verdict the way an agent would experience it */
-async function attempt(tool: string, args: Record<string, unknown>): Promise<void> {
+type Outcome = { kind: string; message: string };
+
+/** try one call; return + print the verdict the way an agent experiences it */
+async function attempt(tool: string, args: Record<string, unknown>): Promise<Outcome> {
   const label = `${tool}(${JSON.stringify(args)})`;
   try {
     const result = await client.callTool({ name: tool, arguments: args });
@@ -59,36 +73,87 @@ async function attempt(tool: string, args: Record<string, unknown>): Promise<voi
       .map((c) => c.text)
       .join(" ");
     console.log(`  RAN     ${label}\n          -> ${text ?? "(no text)"}`);
+    return { kind: "RAN", message: text ?? "" };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const kind = /-32052/.test(message)
-      ? "HELD    " // veto window open — the owner has minutes to stop it
+      ? "HELD"
       : /-32053/.test(message)
-        ? "VETOED  "
+        ? "VETOED"
         : /-32050/.test(message)
-          ? "DENIED  "
+          ? "DENIED"
           : /-32051/.test(message)
             ? "NEEDS-OK"
             : /-32054/.test(message)
-              ? "KILLED  "
-              : "ERROR   ";
-    console.log(`  ${kind}${label}\n          -> ${message.split("\n")[0]}`);
+              ? "KILLED"
+              : "ERROR";
+    console.log(`  ${kind.padEnd(8)}${label}\n          -> ${message.split("\n")[0]}`);
+    return { kind, message };
   }
 }
 
 console.log("the demo agent tries its day's work:\n");
 await attempt("list_files", {});
 await attempt("read_file", { name: "welcome.txt" });
-await attempt("write_file", { name: "hello.txt", content: "hi from the demo agent" });
+const write = await attempt("write_file", { name: "hello.txt", content: "hi from the demo agent" });
 await attempt("move_file", { from: "welcome.txt", to: "renamed.txt" });
 
+// THE OWNER'S TURN — on the same live session, because the veto window
+// belongs to THIS gateway process: veto it now, and the retry below shows
+// the held call staying blocked.
+if (write.kind === "HELD") {
+  const windowId = /veto window \(id "([^"]+)"\)/.exec(write.message)?.[1];
+  if (windowId !== undefined && interactive) {
+    console.log(
+      `\nthe write is HELD in veto window "${windowId}". Be the owner — in another terminal:\n\n` +
+        `  curl -fsS -X POST http://127.0.0.1:4600/veto/${windowId} \\\n` +
+        `    -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" \\\n` +
+        `    -H 'content-type: application/json' -d '{"decision":"veto"}'\n`,
+    );
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    await rl.question("press Enter after the veto (or Enter to just retry): ");
+    rl.close();
+    console.log("\nthe agent retries the exact same write:\n");
+    await attempt("write_file", { name: "hello.txt", content: "hi from the demo agent" });
+  } else if (windowId !== undefined) {
+    console.log(
+      `\n(non-interactive run: veto window "${windowId}" is open — veto it and retry on the same\n` +
+        "session to see VETOED; the interactive run walks this step)",
+    );
+  }
+}
+
 console.log(
-  "\nwhat you just saw: reads/lists RAN (allow), write_file was HELD or VETOED\n" +
-    "(the owner decides), move_file was DENIED by policy — or, after the kill,\n" +
-    "EVERYTHING came back KILLED. The gateway told the agent exactly why, every time.",
+  "\nwhat you just saw: reads/lists RAN (allow), write_file was HELD and — once you\n" +
+    "vetoed — stayed VETOED on retry, move_file was DENIED by policy; after a kill,\n" +
+    "EVERYTHING comes back KILLED. The gateway told the agent exactly why, every time.",
 );
 
+// PROVEN shutdown, not a blind exit: close the session, then verify the
+// gateway child actually exited (it has no package-runner chain to orphan).
+const pid = transport.pid;
 await client.close();
-// the npx→tsx chain under the gateway can outlive the closed transport (the
-// same indirection the README warns about) — a demo must not leave orphans
-process.exit(0);
+if (pid !== null) {
+  const gone = () => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  const deadline = Date.now() + 3_000;
+  while (!gone() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (!gone()) {
+    console.error(`gateway child ${pid} survived close() — killing it (this would be a bug, tell us)`);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* raced its exit */
+    }
+    process.exitCode = 1;
+  }
+}
+process.stdin.unref?.();

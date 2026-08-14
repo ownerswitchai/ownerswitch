@@ -6,38 +6,36 @@
  * package on first run, which on a fresh machine can blow straight through
  * the gateway's (and doctor's) MCP-handshake timeout.
  *
- * This is a DEMO: the sandbox containment below keeps the demo agent inside
- * its directory, but nothing here is part of the OwnerSwitch enforcement
- * boundary — the gateway in front of it is the product.
+ * The sandbox rules live in demo-sandbox.ts (imported below, and covered by
+ * regression tests): real-directory 0700 root, single-basename names,
+ * O_NOFOLLOW opens — a planted symlink refuses instead of reaching outside
+ * the directory. This keeps the demo honest about staying in its sandbox;
+ * the OwnerSwitch enforcement boundary is still the gateway in front.
  *
  * Run by the gateway (see examples/first-kill.config.json), or by hand:
  *   npx tsx examples/demo-tools-server.ts
  */
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { readdirSync, renameSync } from "node:fs";
+import { resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ensureSandboxRoot,
+  readSandboxFile,
+  seedSandboxFile,
+  validateName,
+  writeSandboxFile,
+} from "./demo-sandbox.js";
 
-const DEMO_DIR = resolve(process.env.OWNERSWITCH_DEMO_DIR ?? "/tmp/ownerswitch-demo");
-mkdirSync(DEMO_DIR, { recursive: true });
+// sandbox dir: argv wins (the gateway strips OWNERSWITCH_* from the
+// upstream's env on purpose, so an env override would never arrive through
+// it), then env for direct runs, then the tutorial default
+const DEMO_DIR = ensureSandboxRoot(
+  process.argv[2] ?? process.env.OWNERSWITCH_DEMO_DIR ?? "/tmp/ownerswitch-demo",
+);
 // seed one file so the demo agent's first read has something real to read
-try {
-  writeFileSync(resolve(DEMO_DIR, "welcome.txt"), "OwnerSwitch demo sandbox — feel free to delete.\n", {
-    flag: "wx",
-  });
-} catch {
-  /* already seeded */
-}
-
-/** every path stays inside the sandbox — a demo should not write your $HOME */
-function inSandbox(name: string): string {
-  const full = resolve(DEMO_DIR, name);
-  if (full !== DEMO_DIR && !full.startsWith(DEMO_DIR + sep)) {
-    throw new Error(`path escapes the demo sandbox: ${name}`);
-  }
-  return full;
-}
+seedSandboxFile(DEMO_DIR, "welcome.txt", "OwnerSwitch demo sandbox — feel free to delete.\n");
 
 const asText = (text: string) => ({ content: [{ type: "text" as const, text }] });
 
@@ -100,13 +98,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return asText(names.length === 0 ? "(empty)" : names.join("\n"));
     }
     case "read_file":
-      return asText(readFileSync(inSandbox(args.name), "utf8"));
+      return asText(readSandboxFile(DEMO_DIR, args.name));
     case "write_file": {
-      writeFileSync(inSandbox(args.name), args.content, "utf8");
-      return asText(`wrote ${args.name} (${Buffer.byteLength(args.content, "utf8")} bytes)`);
+      const bytes = writeSandboxFile(DEMO_DIR, args.name, args.content);
+      return asText(`wrote ${args.name} (${bytes} bytes)`);
     }
     case "move_file": {
-      renameSync(inSandbox(args.from), inSandbox(args.to));
+      // rename moves the directory ENTRY (a planted symlink moves as a
+      // link, its target untouched); both names pass the basename rule
+      renameSync(resolve(DEMO_DIR, validateName(args.from)), resolve(DEMO_DIR, validateName(args.to)));
       return asText(`moved ${args.from} -> ${args.to}`);
     }
     default:

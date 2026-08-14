@@ -61,26 +61,38 @@ This is a real MCP client. It spawns the **gateway**, which spawns the demo
 ```
 
 The policy that decided all of that is
-`examples/first-kill.config.json` — five lines of rules, fail-closed
+`examples/first-kill.config.json` — a handful of rules, fail-closed
 default.
 
 ## [4:00] Be the owner: veto the held write
 
-Copy the `veto_…` id from the agent's output:
+After the HELD line the agent **pauses and waits for you** — a veto window
+lives in the gateway process that opened it, so the held → vetoed
+transition plays out on this same, still-open session. It prints the exact
+command; run it in another terminal:
 
 ```bash
-curl -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 \
-  -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN"
+curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 \
+  -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" \
+  -H 'content-type: application/json' -d '{"decision":"veto"}'
 # → {"status":"vetoed"}
 ```
 
-Run the agent again: the write now comes back **VETOED** — held is a
-decision point, and the owner just decided.
+(`-fsS` makes a failed call FAIL loudly instead of printing an error page
+that looks like progress.) Press Enter back in the agent's terminal: it
+retries the exact same write and gets **VETOED** — held is a decision
+point, and the owner just decided:
+
+```
+  VETOED  write_file({"name":"hello.txt", …})
+          -> MCP error -32053: … the owner vetoed this action … Do not retry …
+```
 
 ## [5:00] The kill switch
 
 ```bash
-curl -X POST http://127.0.0.1:4600/kill -d '{"reason":"first kill tutorial"}'
+curl -fsS -X POST http://127.0.0.1:4600/kill \
+  -H 'content-type: application/json' -d '{"reason":"first kill tutorial"}'
 # → {"killed":true,"epoch":1}
 ```
 
@@ -120,17 +132,17 @@ a mandatory 30-second cooldown — the anti-panic, anti-social-engineering
 pause:
 
 ```bash
-curl -X POST http://127.0.0.1:4600/restore/ceremony \
+curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony \
   -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN"
 # → {"id":"cer_…","state":"go1","cooldownRemainingMs":30000,…}
 ```
 
 Wait out the cooldown (check progress with
-`curl http://127.0.0.1:4600/restore/ceremony/cer_… -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN"`),
+`curl -fsS http://127.0.0.1:4600/restore/ceremony/cer_… -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN"`),
 then GO 2/2, quoting the ceremony id:
 
 ```bash
-curl -X POST http://127.0.0.1:4600/restore \
+curl -fsS -X POST http://127.0.0.1:4600/restore \
   -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"ceremonyId":"cer_…"}'
@@ -138,8 +150,9 @@ curl -X POST http://127.0.0.1:4600/restore \
 ```
 
 Run the agent one last time: `RAN … RAN … HELD … DENIED` — back to work,
-under the same policy. Kill → restart-proof → deliberate two-step restore:
-that is the whole product in one loop.
+under the same policy (just press Enter through the veto pause this time).
+Kill → restart-proof → deliberate two-step restore: that is the whole
+product in one loop.
 
 > In production GO 2/2 additionally requires the owner's **passkey**
 > (WebAuthn) — a stolen session alone cannot restore. The dev control plane
