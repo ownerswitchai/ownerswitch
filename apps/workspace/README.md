@@ -51,11 +51,28 @@ Two layers, all new files, zero external runtime dependencies:
 ## Honest limits
 
 - **Deny-only console, unauthenticated to its (loopback) callers.** The
-  console server binds `127.0.0.1` and refuses a non-loopback bind unless
-  `OWNERSWITCH_CONSOLE_ALLOW_NONLOCAL=1` is set explicitly. Anything that can
-  reach it can stop things (veto, kill) and read what an enrolled surface
-  could read (pending summaries, device labels). Stops being cheap is the
-  doctrine; the reads are a real, stated widening — bind it loopback.
+  console server binds **literal loopback only** — the old
+  `ALLOW_NONLOCAL` escape hatch is gone: with no caller auth and no TLS a
+  LAN bind was an unauthenticated kill/veto proxy (post-merge audit).
+  Remote access needs a real TLS+auth front in front of it. Anything that
+  can reach loopback can stop things (veto, kill) and read what an
+  enrolled surface could read (pending summaries, device labels).
+- **A browser→console boundary guards every request** (post-merge audit):
+  the Host header must be the console's own origin (DNS rebinding arrives
+  under a foreign Host and is refused before any credential-backed
+  upstream call), a present `Origin`/`Sec-Fetch-Site` must be same-origin,
+  and mutations additionally require the `x-workspace-console: 1` header
+  with an `application/json` content-type — an HTML form can produce
+  neither, and a cross-origin fetch that tries preflights into a refusal.
+  Scripting the API by hand means sending those two headers.
+- **Nothing upstream-authored reaches the browser unshaped**: every /api
+  response is rebuilt through a per-field allowlist (status, windows,
+  devices, action answers), and error strings are stable local constants —
+  never `Error.message`, never an upstream body's text, so no reflected
+  header or echoed credential can transit the console. The control-plane
+  URL itself is validated to a bare origin (no userinfo/path/query;
+  plaintext http to literal loopback only) and only that origin is ever
+  dialed or printed.
 - **The journal is the console's own record**, labelled as such: what this
   console observed and did (state transitions, windows appearing/closing,
   vetoes, kills, poll failures). The control plane's authoritative audit

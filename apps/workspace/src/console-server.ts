@@ -18,6 +18,13 @@ export interface ConsoleServerOptions {
   api: ConsoleApi;
   /** directory holding index.html and friends (flat, no subdirectories) */
   publicDir: string;
+  /**
+   * Exact `host[:port]` values this server answers to. listen() adds the
+   * loopback spellings of its own bind+port automatically; set this only
+   * when driving the handler without listen() (tests, embedding). With no
+   * entry at all every request is refused — fail closed, never a guess.
+   */
+  allowedHosts?: readonly string[];
 }
 
 export interface ListeningConsole {
@@ -91,11 +98,61 @@ function readRawBody(req: IncomingMessage): Promise<string | null> {
   });
 }
 
+/** The custom header every /api mutation must carry (audit #1): a plain
+ * form POST cannot set it, and a cross-origin fetch that tries triggers a
+ * CORS preflight this server never approves — so its presence proves the
+ * request came from a same-origin script, not a foreign page. */
+export const CONSOLE_CSRF_HEADER = "x-workspace-console";
+
 export function createConsoleServer(opts: ConsoleServerOptions): {
   handler: (req: IncomingMessage, res: ServerResponse) => void;
   listen(port: number, bind: string): Promise<ListeningConsole>;
 } {
   const publicRoot = resolve(opts.publicDir);
+  const allowedHosts = new Set<string>((opts.allowedHosts ?? []).map((h) => h.toLowerCase()));
+
+  /**
+   * THE BROWSER→CONSOLE BOUNDARY (post-merge audit #1). Applied before any
+   * routing. Returns the refusal to send, or null to proceed.
+   *
+   * - Host allowlist: DNS rebinding lands with a foreign Host header —
+   *   refuse it before any credential-backed upstream call can be made on
+   *   the attacker's behalf. An empty allowlist refuses everything.
+   * - Origin, when a browser sent one, must be exactly this console's own
+   *   http origin ("null" included in the refusal).
+   * - Sec-Fetch-Site, when present, must be same-origin or none (address
+   *   bar / bookmarks) — a cross-site fetch says cross-site and is refused.
+   * - Mutations additionally need the CONSOLE_CSRF_HEADER and, when a
+   *   content-type is present, application/json — an HTML form can produce
+   *   neither (its POSTs are urlencoded/multipart/text with no custom
+   *   headers), so form-based CSRF dies here even on old browsers that
+   *   send no Fetch-Metadata.
+   */
+  function boundaryRefusal(req: IncomingMessage, isApi: boolean): { status: number; error: string } | null {
+    const host = (req.headers.host ?? "").toLowerCase();
+    if (!allowedHosts.has(host)) {
+      return { status: 403, error: "unrecognized Host — the console answers only its own origin" };
+    }
+    if (!isApi) return null;
+    const origin = req.headers.origin;
+    if (origin !== undefined && origin.toLowerCase() !== `http://${host}`) {
+      return { status: 403, error: "cross-origin request refused" };
+    }
+    const site = req.headers["sec-fetch-site"];
+    if (site !== undefined && site !== "same-origin" && site !== "none") {
+      return { status: 403, error: "cross-site request refused" };
+    }
+    if (req.method === "POST") {
+      if (req.headers[CONSOLE_CSRF_HEADER] !== "1") {
+        return { status: 403, error: `mutations require the ${CONSOLE_CSRF_HEADER}: 1 header` };
+      }
+      const contentType = req.headers["content-type"];
+      if (contentType !== undefined && !/^application\/json\b/i.test(contentType)) {
+        return { status: 415, error: "mutations accept application/json only" };
+      }
+    }
+    return null;
+  }
 
   async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -132,6 +189,12 @@ export function createConsoleServer(opts: ConsoleServerOptions): {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", "http://console.invalid");
     const path = url.pathname;
+
+    const refusal = boundaryRefusal(req, path.startsWith("/api/"));
+    if (refusal !== null) {
+      sendJson(res, refusal.status, { error: refusal.error });
+      return;
+    }
 
     if (!path.startsWith("/api/")) {
       await serveStatic(req, res, path);
@@ -227,6 +290,12 @@ export function createConsoleServer(opts: ConsoleServerOptions): {
           if (addr === null || typeof addr === "string") {
             reject(new Error("console server has no address"));
             return;
+          }
+          // the browser reaches a loopback bind under any loopback spelling;
+          // everything else (a rebound DNS name above all) stays refused
+          const boundHost = bind.includes(":") ? `[${bind}]` : bind;
+          for (const host of [`127.0.0.1:${addr.port}`, `localhost:${addr.port}`, `[::1]:${addr.port}`, `${boundHost}:${addr.port}`]) {
+            allowedHosts.add(host.toLowerCase());
           }
           resolvePromise({
             server,

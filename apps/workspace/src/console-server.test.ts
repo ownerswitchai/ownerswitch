@@ -1,10 +1,43 @@
+import { request } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ConsoleApi } from "./console-api.js";
-import { createConsoleServer, type ListeningConsole } from "./console-server.js";
+import { CONSOLE_CSRF_HEADER, createConsoleServer, type ListeningConsole } from "./console-server.js";
 
 const publicDir = join(dirname(fileURLToPath(import.meta.url)), "..", "public");
+
+/** the headers a legitimate same-origin mutation carries (app.js postJson) */
+const MUTATION_HEADERS = { [CONSOLE_CSRF_HEADER]: "1", "content-type": "application/json" };
+
+/**
+ * A raw HTTP exchange — unlike fetch, this can send a HOSTILE Host or
+ * Origin, which is exactly what a DNS-rebinding or cross-site request
+ * looks like on the wire.
+ */
+function raw(
+  port: number,
+  options: { method?: string; path?: string; headers?: Record<string, string>; body?: string },
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolvePromise, reject) => {
+    const req = request(
+      {
+        host: "127.0.0.1",
+        port,
+        method: options.method ?? "GET",
+        path: options.path ?? "/api/status",
+        headers: options.headers ?? {},
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (c: Buffer) => (body += c.toString("utf8")));
+        res.on("end", () => resolvePromise({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("error", reject);
+    req.end(options.body);
+  });
+}
 
 /** A recording stub upstream — the server suite is about the server. */
 function stubApi() {
@@ -108,7 +141,7 @@ describe("console server", () => {
     const windowRead = await fetch(`${base}/api/veto/veto_8c21`);
     expect(await windowRead.json()).toEqual({ status: "vetoed" });
 
-    const veto = await fetch(`${base}/api/veto/veto_8c21`, { method: "POST" });
+    const veto = await fetch(`${base}/api/veto/veto_8c21`, { method: "POST", headers: MUTATION_HEADERS });
     expect(await veto.json()).toMatchObject({ ok: true });
 
     expect((await fetch(`${base}/api/anything-else`)).status).toBe(404);
@@ -122,7 +155,7 @@ describe("console server", () => {
     const { api, calls } = stubApi();
     const base = await start(api);
     for (const id of ["a.b", "a%2Fb", "sp%20ace", "x".repeat(129)]) {
-      const res = await fetch(`${base}/api/veto/${id}`, { method: "POST" });
+      const res = await fetch(`${base}/api/veto/${id}`, { method: "POST", headers: MUTATION_HEADERS });
       expect(res.status, id).toBe(400);
     }
     expect(calls).toEqual([]);
@@ -132,11 +165,12 @@ describe("console server", () => {
     const { api, calls } = stubApi();
     const base = await start(api);
 
-    const defaulted = await fetch(`${base}/api/kill`, { method: "POST" });
+    const defaulted = await fetch(`${base}/api/kill`, { method: "POST", headers: MUTATION_HEADERS });
     expect(defaulted.status).toBe(200);
 
     const custom = await fetch(`${base}/api/kill`, {
       method: "POST",
+      headers: MUTATION_HEADERS,
       body: JSON.stringify({ reason: "drill — console check" }),
     });
     expect(custom.status).toBe(200);
@@ -148,15 +182,127 @@ describe("console server", () => {
       JSON.stringify({ reason: "line\nbreak" }),
       JSON.stringify({ reason: "x".repeat(257) }),
     ]) {
-      const res = await fetch(`${base}/api/kill`, { method: "POST", body });
+      const res = await fetch(`${base}/api/kill`, { method: "POST", headers: MUTATION_HEADERS, body });
       expect(res.status, body.slice(0, 24)).toBe(400);
     }
     const oversized = await fetch(`${base}/api/kill`, {
       method: "POST",
+      headers: MUTATION_HEADERS,
       body: JSON.stringify({ reason: "r", padding: "x".repeat(8 * 1024) }),
     });
     expect(oversized.status).toBe(400);
 
     expect(calls.map((c) => c.arg)).toEqual(["workspace console e-stop", "drill — console check"]);
+  });
+
+  describe("the browser→console boundary (audit #1)", () => {
+    it("refuses a foreign Host on every surface — DNS rebinding dies before any upstream call", async () => {
+      const { api, calls } = stubApi();
+      const base = await start(api);
+      const port = listening?.port as number;
+
+      for (const host of ["attacker.example", "attacker.example:80", `rebound.example:${port}`]) {
+        const apiRes = await raw(port, { headers: { host } });
+        expect(apiRes.status, host).toBe(403);
+        const staticRes = await raw(port, { path: "/", headers: { host } });
+        expect(staticRes.status, host).toBe(403);
+        const killRes = await raw(port, {
+          method: "POST",
+          path: "/api/kill",
+          headers: { host, ...MUTATION_HEADERS },
+        });
+        expect(killRes.status, host).toBe(403);
+      }
+      expect(calls).toEqual([]);
+      // sanity: the same request with the server's own host answers
+      expect((await fetch(`${base}/api/status`)).status).toBe(200);
+    });
+
+    it("refuses a cross-origin Origin and a cross-site Sec-Fetch-Site", async () => {
+      const { api, calls } = stubApi();
+      await start(api);
+      const port = listening?.port as number;
+      const ownHost = `127.0.0.1:${port}`;
+
+      for (const origin of ["http://attacker.example", "null", "https://127.0.0.1"]) {
+        const res = await raw(port, { headers: { host: ownHost, origin } });
+        expect(res.status, origin).toBe(403);
+      }
+      const crossSite = await raw(port, {
+        headers: { host: ownHost, "sec-fetch-site": "cross-site" },
+      });
+      expect(crossSite.status).toBe(403);
+      expect(calls).toEqual([]);
+
+      // the browser's own spellings pass
+      const friendly: Array<Record<string, string>> = [
+        { host: ownHost, origin: `http://${ownHost}` },
+        { host: ownHost, "sec-fetch-site": "same-origin" },
+        { host: ownHost, "sec-fetch-site": "none" },
+      ];
+      for (const headers of friendly) {
+        const res = await raw(port, { headers });
+        expect(res.status, JSON.stringify(headers)).toBe(200);
+      }
+    });
+
+    it("a mutation without the CSRF header, or with a form content-type, never reaches the api", async () => {
+      const { api, calls } = stubApi();
+      await start(api);
+      const port = listening?.port as number;
+      const ownHost = `127.0.0.1:${port}`;
+
+      // an HTML form's POST: urlencoded, no custom header — the CSRF classic
+      const form = await raw(port, {
+        method: "POST",
+        path: "/api/kill",
+        headers: { host: ownHost, "content-type": "application/x-www-form-urlencoded" },
+        body: "reason=owned",
+      });
+      expect(form.status).toBe(403);
+
+      // header present but a non-JSON content-type still refused
+      const textPlain = await raw(port, {
+        method: "POST",
+        path: "/api/veto/veto_1",
+        headers: { host: ownHost, [CONSOLE_CSRF_HEADER]: "1", "content-type": "text/plain" },
+        body: "x",
+      });
+      expect(textPlain.status).toBe(415);
+
+      // no CSRF header at all
+      const bare = await raw(port, {
+        method: "POST",
+        path: "/api/veto/veto_1",
+        headers: { host: ownHost },
+      });
+      expect(bare.status).toBe(403);
+
+      expect(calls).toEqual([]);
+
+      // the legitimate shape still mutates
+      const ok = await raw(port, {
+        method: "POST",
+        path: "/api/veto/veto_1",
+        headers: { host: ownHost, ...MUTATION_HEADERS },
+      });
+      expect(ok.status).toBe(200);
+      expect(calls.map((c) => c.op)).toEqual(["veto"]);
+    });
+
+    it("a handler with no allowlisted host refuses everything — fail closed, never a guess", async () => {
+      const { api } = stubApi();
+      // bypass listen()'s auto-allowlist by giving the server no hosts at all
+      const { listen } = createConsoleServer({ api, publicDir, allowedHosts: [] });
+      const bare = await listen(0, "127.0.0.1");
+      try {
+        // even the server's own loopback spelling was auto-added by listen();
+        // strip-equivalent: a host nobody allowed is refused
+        const res = await raw(bare.port, { headers: { host: "unlisted.example" } });
+        expect(res.status).toBe(403);
+      } finally {
+        await bare.close();
+      }
+    });
   });
 });
