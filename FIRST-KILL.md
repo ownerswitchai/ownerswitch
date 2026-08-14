@@ -10,7 +10,9 @@ agent and the tool server it works against live in this repo. That is
 deliberate — the fastest way to trust a stop button is to press it yourself
 before anything valuable is behind it.
 
-**What you need:** Node 22+, pnpm 9 (`corepack enable`), and two terminals.
+**What you need:** Node 22+, pnpm 9 (`corepack enable`), a Unix-like OS
+(Linux or macOS — the demo sandbox requires `O_NOFOLLOW` and refuses to
+run without it, deliberately), and two terminals.
 `jq` is used in a couple of commands for readability; skip it and read the
 JSON yourself if you would rather. The `curl` calls use `-fsS` so an HTTP
 error fails the step loudly instead of printing an error body that scrolls

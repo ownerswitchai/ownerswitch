@@ -111,27 +111,52 @@ function assertRootBoundary(root: string): void {
 }
 
 /**
+ * The parent-trust rule, re-checked per operation: the directory HOLDING
+ * the root's entry must be ours (or root's), and must grant NO group or
+ * world write — either bit lets another party rename or replace the root
+ * entry between a check and an open — unless the sticky bit restores the
+ * only-the-owner-renames property (the /tmp model).
+ */
+function assertParentTrusted(root: string): void {
+  const parent = dirname(root);
+  const ps = lstatSync(parent);
+  const trusted =
+    ps.isDirectory() &&
+    (ps.uid === ourUid() || ps.uid === 0) &&
+    ((ps.mode & 0o022) === 0 || (ps.mode & 0o1000) !== 0);
+  if (!trusted) {
+    throw new Error(
+      `demo sandbox parent "${parent}" is not a trusted directory (foreign-owned, or group-/` +
+        "world-writable without the sticky bit) — its entries can be swapped out from under " +
+        "the sandbox; put the demo directory somewhere private (e.g. under your home)",
+    );
+  }
+}
+
+/**
  * Ensure the sandbox root exists and satisfies the WHOLE boundary above.
  * Returns the CANONICAL path — every later operation resolves from it.
  */
 export function ensureSandboxRoot(dir: string): string {
   requireNoFollow(constants.O_NOFOLLOW);
-  mkdirSync(resolve(dir), { recursive: true, mode: 0o700 });
-  const root = realpathSync(resolve(dir));
-  assertRootBoundary(root);
-  const parent = dirname(root);
-  const ps = lstatSync(parent);
-  const parentTrusted =
-    ps.isDirectory() &&
-    (ps.uid === ourUid() || ps.uid === 0) &&
-    ((ps.mode & 0o002) === 0 || (ps.mode & 0o1000) !== 0);
-  if (!parentTrusted) {
+  const lexical = resolve(dir);
+  mkdirSync(lexical, { recursive: true, mode: 0o700 });
+  // THE LEAF ITSELF MUST NOT BE A SYMLINK — checked on the LEXICAL path,
+  // BEFORE realpath erases the evidence: a recursive mkdir "succeeds"
+  // silently on a symlink that points at an existing directory, and a
+  // planted `~/.ownerswitch/demo -> ~/.ssh` would then pass every later
+  // check (the target IS a real, owner-owned 0700 directory) and hand the
+  // auto-allowed read_file the user's key material.
+  if (lstatSync(lexical).isSymbolicLink()) {
     throw new Error(
-      `demo sandbox parent "${parent}" is not a trusted directory (foreign-owned, or ` +
-        "world-writable without the sticky bit) — its entries can be swapped out from under " +
-        "the sandbox; put the demo directory somewhere private (e.g. under your home)",
+      `demo sandbox root "${lexical}" is a symlink — refusing to follow it (a planted link ` +
+        "would silently redirect the sandbox into a real directory such as ~/.ssh); remove " +
+        "the link and re-run",
     );
   }
+  const root = realpathSync(lexical);
+  assertRootBoundary(root);
+  assertParentTrusted(root);
   return root;
 }
 
@@ -141,7 +166,11 @@ export function ensureSandboxRoot(dir: string): string {
  */
 function safeOpen(root: string, name: string, flags: number): number {
   const O_NOFOLLOW = requireNoFollow(constants.O_NOFOLLOW);
-  assertRootBoundary(root); // re-verified per operation — a swapped root refuses
+  // BOTH halves of the boundary re-verified per operation: the root's own
+  // state AND the parent that holds its entry — a parent whose permissions
+  // widened since startup refuses instead of becoming a swap window
+  assertRootBoundary(root);
+  assertParentTrusted(root);
   const fd = openSync(
     resolve(root, validateName(name)),
     flags | O_NOFOLLOW | constants.O_NONBLOCK,
@@ -204,6 +233,7 @@ export function writeSandboxFile(root: string, name: string, content: string): n
 export function seedSandboxFile(root: string, name: string, content: string): void {
   const O_NOFOLLOW = requireNoFollow(constants.O_NOFOLLOW);
   assertRootBoundary(root);
+  assertParentTrusted(root);
   const path = resolve(root, validateName(name));
   let fd: number;
   try {
