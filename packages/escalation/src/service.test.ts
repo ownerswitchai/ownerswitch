@@ -487,3 +487,116 @@ describe("escalation service against a live control plane", () => {
     expect(push.sent).toHaveLength(0);
   });
 });
+
+describe("ceremony-enrolled (dev_) devices on the push-enrollment surface", () => {
+  const servers: Server[] = [];
+  afterEach(() => {
+    for (const s of servers.splice(0)) s.close();
+  });
+
+  it("a dev_ device authenticates from the standing file's exported SPKI — and its revocation severs it here without any notification", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-dev-"));
+    const stateFile = join(dir, "state.json");
+    const standingFile = join(dir, "standing.json");
+    // what the CONTROL PLANE exports at enrollment: the dev_ entry with the
+    // cheap-lane public key (standing schema v2, written by the same store
+    // class both processes share)
+    const key = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const spki = (key.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString("base64url");
+    const store = new DeviceStandingFileStore(standingFile);
+    expect(store.save({ version: 2, devices: { dev_abc: { generation: 1, revokedAt: null, spki } } }).durable).toBe(true);
+
+    const service = createEscalationService({
+      config: {
+        ...baseConfig("http://127.0.0.1:1", stateFile),
+        ownerDeviceKeys: {}, // NO keys file — the standing export is the ONLY credential source
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
+      channels: { push: fakePush().channel },
+      now: c.now,
+      log: () => {},
+    });
+    const url = await listen(service.webhookHandler, servers);
+    const subscription = {
+      endpoint: "https://push.example/send/dev",
+      keys: { p256dh: "BPub", auth: "QXV0aA" },
+    };
+    const body = JSON.stringify({ subscription });
+    const enroll = (deviceId: string, nonce: string) => {
+      const at = c.now();
+      const preimage = ownerDeviceSigPreimage({
+        deviceId,
+        method: "POST",
+        pathAndQuery: "/push/subscription",
+        bodyHash: new Uint8Array(createHash("sha256").update(body).digest()),
+        timestamp: at,
+        nonce,
+      });
+      return fetch(`${url}/push/subscription`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-device-id": deviceId,
+          "x-device-timestamp": String(at),
+          "x-device-nonce": nonce,
+          "x-device-signature": ecSign("sha256", preimage, { key: key.privateKey, dsaEncoding: "ieee-p1363" }).toString("base64url"),
+        },
+        body,
+      });
+    };
+
+    // the dev_ identity enrolls — no OWNERSWITCH_OWNER_DEVICE_KEYS_FILE anywhere
+    expect((await enroll("dev_abc", "n-dev-1")).status).toBe(200);
+    expect(service.subscription()).toEqual(subscription);
+    // an id the standing file does not carry resolves nothing
+    expect((await enroll("dev_other", "n-dev-x")).status).toBe(401);
+
+    // the control plane revokes and re-exports; THIS process reads the flip
+    // at its very next decision — subscription inactive, re-enrollment refused
+    expect(store.save({ version: 2, devices: { dev_abc: { generation: 2, revokedAt: c.now(), spki } } }).durable).toBe(true);
+    expect(service.subscription()).toBeNull();
+    expect((await enroll("dev_abc", "n-dev-2")).status).toBe(401);
+  });
+
+  it("no keys file and no SPKI-carrying standing entries → push enrollment is honestly 501", async () => {
+    const c = clock();
+    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-esc-501-"));
+    const standingFile = join(dir, "standing.json");
+    // a standing file with only STATIC entries (no exported keys) wires nothing here
+    new DeviceStandingFileStore(standingFile).save({
+      version: 2,
+      devices: { "owner-phone": { generation: 1, revokedAt: null } },
+    });
+    const service = createEscalationService({
+      config: {
+        ...baseConfig("http://127.0.0.1:1", join(dir, "state.json")),
+        ownerDeviceKeys: {},
+        ownerDeviceStandingFile: standingFile,
+        unsafeAllowUntrustedStandingPathForTests: true,
+      },
+      channels: { push: fakePush().channel },
+      now: c.now,
+      log: () => {},
+    });
+    const url = await listen(service.webhookHandler, servers);
+    const res = await fetch(`${url}/push/subscription`, { method: "POST", body: "{}" });
+    expect(res.status).toBe(501);
+  });
+
+  it("a static key squatting on the dev_ namespace refuses the boot", () => {
+    const key = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const pem = key.publicKey.export({ format: "pem", type: "spki" }).toString();
+    expect(() =>
+      createEscalationService({
+        config: {
+          ...baseConfig("http://127.0.0.1:1", join(mkdtempSync(join(tmpdir(), "ownerswitch-esc-ns-")), "state.json")),
+          ownerDeviceKeys: { dev_squatter: pem },
+        },
+        channels: {},
+        log: () => {},
+      }),
+    ).toThrow(/reserved for/);
+  });
+});

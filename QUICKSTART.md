@@ -22,15 +22,16 @@ Then, in two terminals:
 # terminal 1 — the control plane holds kill state; leave it running
 pnpm --filter @ownerswitchai/mcp dev:control-plane
 
-# terminal 2 — preflight before an agent is anywhere near it
+# terminal 2 — preflight, then the in-repo demo agent behind the gateway
 cd packages/mcp
-npx tsx src/cli.ts doctor --config ~/ownerswitch.mcp.json
+npx tsx src/cli.ts doctor --config examples/first-kill.config.json
+npx tsx examples/first-kill-agent.ts
 ```
 
 **→ [FIRST-KILL.md](FIRST-KILL.md) walks the whole path in about 10
-minutes**, including the config file `doctor` is looking for, and ends with
-you stopping a live agent and bringing it back through the two-GO ceremony.
-No agent is needed for the first eight minutes of it.
+minutes** and ends with you stopping that agent and bringing it back through
+the two-GO ceremony. No AI client and no API key: the demo agent and its
+tool server live in this repo, so nothing downloads.
 
 Reference documentation for every configuration field, error code and lane:
 [`packages/mcp/README.md`](packages/mcp/README.md). What the gateway does and

@@ -56,6 +56,9 @@ export interface UpstreamProbeOptions {
  * never answers. Naming the variables that ARE set here but not passed
  * through turns a 15-second silence into one line to copy.
  */
+/** Commands whose FIRST run may download the server before it can speak. */
+const PACKAGE_RUNNERS = new Set(["npx", "pnpx", "bunx", "pnpm", "yarn", "deno"]);
+
 const ENV_THE_CHILD_DOES_NOT_INHERIT = [
   "HTTPS_PROXY",
   "https_proxy",
@@ -437,12 +440,20 @@ export async function checkUpstreamHandshake(
         name: "upstream command",
         status: "fail",
         detail: `"${spec.command}" did not answer the MCP initialize handshake within ${timeoutMs}ms${stderrTail()}`,
+        // Both diagnoses, because both are common and they look identical
+        // from here: the child got a stripped environment, or a package
+        // runner is still downloading the server it was asked to run.
         fix:
           `${envHint}.\n` +
           `    Then check the command itself launches a stdio MCP server — try it by hand: ` +
           `${spec.command} ${spec.args.join(" ")}\n` +
-          `    A first "npx -y <package>" run also downloads before it speaks; --upstream-timeout <ms> ` +
-          `raises the ${timeoutMs}ms budget if that is all it is`,
+          (PACKAGE_RUNNERS.has(spec.command)
+            ? `    A package runner's FIRST run may DOWNLOAD the server, which alone can blow this ` +
+              `timeout on a fresh machine: run it once by hand until it starts and re-run doctor, ` +
+              `raise the ${timeoutMs}ms budget with --upstream-timeout <ms>, or use the in-repo demo ` +
+              `upstream (examples/demo-tools-server.ts), which downloads nothing`
+            : `    If the command is simply slow to boot, --upstream-timeout <ms> raises the ` +
+              `${timeoutMs}ms budget`),
       };
     }
     const code = (err as NodeJS.ErrnoException).code;

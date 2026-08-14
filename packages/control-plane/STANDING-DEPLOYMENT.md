@@ -76,6 +76,35 @@ host. All six checks, in order:
    revoked at next boot; escalation: every device untrusted at next
    request). Restore the group afterwards and re-run check 2.
 
+## Revocation consistency (the pinned two-process contract)
+
+An owner-device revocation touches TWO durable files (the enrolled-device
+registry and the shared standing export) read by TWO processes (control
+plane, escalation). The contract, exactly:
+
+- **A revoke is COMPLETE only when the request answered.** `200` means both
+  durable writes landed — control-plane auth AND the escalation reader's
+  view are severed. `503` means the severing is in force but degraded
+  (quarantine + durable kill; see below). **No response means NOT DONE**: a
+  crash mid-sequence surfaces as a dead connection, and the caller must
+  retry the (idempotent) revoke once the control plane returns.
+- **Between a mid-revoke crash and the next CP boot**, the escalation
+  process keeps honoring the LAST COMPLETED export — a device whose revoke
+  never acknowledged may still enroll push subscriptions and receive
+  alerts on that surface during this window. The control plane is down for
+  the whole window (it crashed), so no new windows, deliveries, or acks
+  exist meanwhile.
+- **The next CP boot repairs structurally**: the standing file is
+  re-derived from live sources and re-published durable-or-refuse before
+  any control-plane surface opens; the escalation converges at its next
+  read. Ceremony entries the registry cannot vouch for (quarantined/reset
+  registry) are exported as revoked-shaped TOMBSTONES — key preserved,
+  trust refused — never as active, and never dropped, so an alias of a
+  migrated key stays refused across restarts.
+- This is the single-host v0 contract. Cross-process revocation with NO
+  post-crash window would require a shared journal or a CP-freshness lease
+  for the escalation reader; v0 deliberately does not claim it.
+
 ## Failure semantics worth knowing on-call
 
 - A revoke whose persist fails answers **503** and engages the DURABLE kill

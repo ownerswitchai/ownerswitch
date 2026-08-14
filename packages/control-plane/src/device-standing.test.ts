@@ -47,17 +47,51 @@ describe("DeviceStandingFileStore — durable revocation standing", () => {
   it("rejects shapes it would not have written: extra keys, bad generations, colon device ids", () => {
     const file = join(tmp(), "standing.json");
     const bad = [
-      '{"version":2,"devices":{}}',
+      '{"version":3,"devices":{}}',
       '{"version":1,"devices":{},"extra":1}',
       '{"version":1,"devices":{"d":{"generation":0,"revokedAt":null}}}',
       '{"version":1,"devices":{"d":{"generation":1,"revokedAt":null,"x":1}}}',
       '{"version":1,"devices":{"a:b":{"generation":1,"revokedAt":null}}}',
+      // spki is a VERSION-2 field — a v1 file carrying one was not written by us
+      '{"version":1,"devices":{"dev_a":{"generation":1,"revokedAt":null,"spki":"QQ"}}}',
+      // v2 spki must be non-empty canonical-base64url-charset text
+      '{"version":2,"devices":{"dev_a":{"generation":1,"revokedAt":null,"spki":""}}}',
+      '{"version":2,"devices":{"dev_a":{"generation":1,"revokedAt":null,"spki":"not base64url!"}}}',
+      // prototype-machinery device ids are hostile by definition (v2 carries keys)
+      '{"version":2,"devices":{"__proto__":{"generation":1,"revokedAt":null}}}',
+      '{"version":1,"devices":{"constructor":{"generation":1,"revokedAt":null}}}',
       "not json",
     ];
     for (const content of bad) {
       writeFileSync(file, content);
       expect(new DeviceStandingFileStore(file).load().outcome).toBe("corrupt");
     }
+  });
+
+  it("SCHEMA V2: enrolled entries round-trip their exported SPKI; static entries stay bare", () => {
+    const store = new DeviceStandingFileStore(join(tmp(), "standing.json"));
+    const saved = store.save({
+      version: 2,
+      devices: {
+        "owner-phone": { generation: 2, revokedAt: 1_234 },
+        dev_abc: { generation: 1, revokedAt: null, spki: "MFkwEwYHKoZIzj0CAQ" },
+      },
+    });
+    expect(saved.durable).toBe(true);
+    const loaded = store.load();
+    expect(loaded.outcome).toBe("loaded");
+    if (loaded.outcome !== "loaded") return;
+    expect(loaded.state.version).toBe(2);
+    expect(loaded.state.devices["owner-phone"]).toEqual({ generation: 2, revokedAt: 1_234 });
+    expect(loaded.state.devices.dev_abc).toEqual({
+      generation: 1,
+      revokedAt: null,
+      spki: "MFkwEwYHKoZIzj0CAQ",
+    });
+    // a plain v2 file with no spki entries is fine too (post-migration static-only)
+    const bare = new DeviceStandingFileStore(join(tmp(), "standing.json"));
+    bare.save({ version: 2, devices: {} });
+    expect(bare.load().outcome).toBe("loaded");
   });
 
   it("publishes 0600 by default and 0640 in the group-readable (distinct-UID) model", () => {

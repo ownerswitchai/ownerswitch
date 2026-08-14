@@ -51,9 +51,12 @@
  * concurrent writers is an unsupported deployment, the same invariant as
  * the kill-state and standing stores.
  *
- * Scope: nothing reads this registry for request authentication yet —
- * auth wiring, remote revocation, and reconciliation with the operator
- * keys file are the HTTP slice, behind the same review gate.
+ * Scope: this registry IS in the production auth path — the control
+ * plane resolves dev_* signing identities from it live (server.ts
+ * resolveOwnerDevice) and revokes through revoke() below, with the same
+ * durable-or-quarantine rules as the admit path. The remaining ceremony
+ * slices (device-minted invites over HTTP, lost-201 reconciliation) are
+ * still behind the review gate.
  */
 import { randomBytes } from "node:crypto";
 import {
@@ -966,6 +969,65 @@ export class EnrolledDeviceRegistry {
   get(deviceId: string): PersistedEnrolledDevice | null {
     const devices = this.#usableState().devices;
     return Object.hasOwn(devices, deviceId) ? cloneDevice(devices[deviceId]) : null;
+  }
+
+  /**
+   * REVOKE an enrolled device — the durable severing of a dev_* identity,
+   * with the admit path's exact publish discipline turned around:
+   *  - the revocation (revokedAt + generation bump) is published durably
+   *    FIRST; memory changes only after the publish proves durable, so a
+   *    crash between the two leaves the SAFE state on disk (revoked);
+   *  - a FAILED publish quarantines the registry: unlike the admit path
+   *    (where refusing the new device is safe), here the stale file still
+   *    holds the device ACTIVE, so serving from memory-only revocation
+   *    would let a restart resurrect it — the caller must treat this as
+   *    the same emergency as a standing-persist failure (durable kill);
+   *  - an UNPROVEN publish (visible, durability unverifiable) quarantines
+   *    for the same reason as everywhere else;
+   *  - idempotent: re-revoking an already-revoked device is a successful
+   *    no-op (relays may blind-retry).
+   */
+  revoke(
+    deviceId: string,
+    revokedAt: number,
+  ):
+    | { outcome: "revoked" | "already-revoked"; generation: number }
+    | { outcome: "unknown" }
+    | { outcome: "publish-failed"; detail: string } {
+    const state = this.#usableState();
+    if (!Object.hasOwn(state.devices, deviceId)) return { outcome: "unknown" };
+    const device = state.devices[deviceId];
+    if (device.revokedAt !== null) {
+      return { outcome: "already-revoked", generation: device.generation };
+    }
+    const revoked: PersistedEnrolledDevice = {
+      ...cloneDevice(device),
+      revokedAt,
+      generation: device.generation + 1,
+    };
+    const next: PersistedEnrolledDevices = {
+      ...state,
+      devices: nullProtoDevices(
+        Object.entries(state.devices).map(([id, d]) =>
+          id === deviceId ? ([id, revoked] as const) : ([id, d] as const),
+        ),
+      ),
+    };
+    let saved: SaveResult;
+    try {
+      saved = this.#store.save(next);
+    } catch (err) {
+      const detail = `revocation publish FAILED (${message(err)})`;
+      this.#quarantine(detail);
+      return { outcome: "publish-failed", detail };
+    }
+    if (!saved.durable) {
+      const detail = `revocation publish durability UNPROVEN: ${saved.detail}`;
+      this.#quarantine(detail);
+      return { outcome: "publish-failed", detail };
+    }
+    this.#state = next;
+    return { outcome: "revoked", generation: revoked.generation };
   }
 
   list(): PersistedEnrolledDevice[] {

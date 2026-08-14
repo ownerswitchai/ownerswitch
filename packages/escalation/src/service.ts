@@ -70,9 +70,17 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   const log = opts.log ?? ((line: string) => console.error(`[ownerswitch-escalation] ${line}`));
 
   // Enrolled owner-app device public keys — the credential push enrollment is
-  // gated on. Built once; a bad key would have failed the config load.
+  // gated on. Built once; a bad key would have failed the config load. The
+  // dev_ namespace is the ceremony registry's (same rule as the control
+  // plane): a static key squatting on it could shadow an enrolled identity.
   const ownerDevices = new Map<string, EnrolledOwnerDevice>();
   for (const [deviceId, spki] of Object.entries(cfg.ownerDeviceKeys ?? {})) {
+    if (deviceId.startsWith("dev_")) {
+      throw new Error(
+        `owner device key id "${deviceId}" uses the "dev_" namespace reserved for ` +
+          "ceremony-enrolled devices — rename it so the two identity spaces cannot collide",
+      );
+    }
     ownerDevices.set(deviceId, enrolledOwnerDeviceFromSpki(deviceId, spki));
   }
 
@@ -126,8 +134,56 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     if (standingStore === null) return true;
     const loaded = standingStore.load();
     if (loaded.outcome !== "loaded") return false; // absent or corrupt: no trust without a registry
-    const standing = loaded.state.devices[deviceId];
-    return standing !== undefined && standing.revokedAt === null;
+    if (!Object.hasOwn(loaded.state.devices, deviceId)) return false;
+    return loaded.state.devices[deviceId].revokedAt === null;
+  }
+
+  // CEREMONY-ENROLLED (dev_*) devices: the control plane exports their
+  // cheap-lane PUBLIC key into the shared standing file (schema v2, `spki`
+  // per entry) precisely so THIS distinct-UID process can authenticate them
+  // without ever touching the control-plane-private registry. Resolution
+  // order mirrors the control plane's: the static keys file first, then a
+  // fresh standing-file read — generation/revokedAt always come from the
+  // load, only the PARSED key is cached (keyed by the SPKI string, so a
+  // changed entry can never serve a stale key). Every SPKI goes through the
+  // same strict parser as the keys file (enrolledOwnerDeviceFromSpki); an
+  // entry it refuses resolves nothing. Fail direction everywhere: no store,
+  // no file, corrupt file, unknown id, bad SPKI → undefined → 401.
+  const enrolledKeyCache = new Map<string, { spki: string; device: EnrolledOwnerDevice }>();
+  function resolveOwnerDevice(deviceId: string): EnrolledOwnerDevice | undefined {
+    const provisioned = ownerDevices.get(deviceId);
+    if (provisioned !== undefined) return provisioned;
+    if (standingStore === null) return undefined;
+    const loaded = standingStore.load();
+    if (loaded.outcome !== "loaded") return undefined;
+    if (!Object.hasOwn(loaded.state.devices, deviceId)) return undefined;
+    const entry = loaded.state.devices[deviceId];
+    if (entry.spki === undefined) return undefined; // static entry: its key lives in the keys file
+    const cached = enrolledKeyCache.get(deviceId);
+    if (cached !== undefined && cached.spki === entry.spki) {
+      cached.device.generation = entry.generation;
+      cached.device.revokedAt = entry.revokedAt;
+      return cached.device;
+    }
+    let device: EnrolledOwnerDevice;
+    try {
+      device = enrolledOwnerDeviceFromSpki(deviceId, entry.spki);
+    } catch {
+      return undefined; // an SPKI the strict parser refuses is no identity
+    }
+    device.generation = entry.generation;
+    device.revokedAt = entry.revokedAt;
+    enrolledKeyCache.set(deviceId, { spki: entry.spki, device });
+    return device;
+  }
+  const ownerDeviceResolver = { get: (deviceId: string) => resolveOwnerDevice(deviceId) };
+  /** true when ANY owner-device credential source is wired (keys file, or standing entries with keys). */
+  function ownerDeviceLaneWired(): boolean {
+    if (ownerDevices.size > 0) return true;
+    if (standingStore === null) return false;
+    const loaded = standingStore.load();
+    if (loaded.outcome !== "loaded") return false;
+    return Object.values(loaded.state.devices).some((entry) => entry.spki !== undefined);
   }
 
   /* ---------------- push subscription store (0600, atomic) ------------- */
@@ -385,15 +441,16 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
     // produce) closes that. Absent an enrolled owner device, enrollment is
     // simply unavailable (501).
     if (method === "POST" && path === "/push/subscription") {
-      if (ownerDevices.size === 0) {
+      if (!ownerDeviceLaneWired()) {
         send(
           res,
           501,
           "application/json",
           JSON.stringify({
             error:
-              "push enrollment is not available: no owner-app device is enrolled " +
-              "(OWNERSWITCH_OWNER_DEVICE_KEYS_FILE)",
+              "push enrollment is not available: no owner-app device credential source is wired " +
+              "(neither OWNERSWITCH_OWNER_DEVICE_KEYS_FILE nor ceremony-enrolled entries in the " +
+              "shared standing file)",
           }),
         );
         return;
@@ -403,7 +460,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
         (req.method ?? "").toUpperCase(),
         req.url ?? "",
         rawBody,
-        ownerDevices,
+        ownerDeviceResolver,
         { now, seenNonces },
       );
       if (enrolledBy === null) {

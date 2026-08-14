@@ -45,6 +45,17 @@ export interface OwnerDeviceCredential {
   signature: string;
 }
 
+/**
+ * What the signature verifier actually needs from a device source: one
+ * lookup. Both a plain Map of keys-file devices and the control plane's
+ * registry-backed resolver satisfy it — the EXPLICIT interface replaces the
+ * earlier ReadonlyMap cast, so a resolver is a first-class citizen, not a
+ * type-system trick.
+ */
+export interface OwnerDeviceLookup {
+  get(deviceId: string): EnrolledOwnerDevice | undefined;
+}
+
 export interface OwnerDeviceVerifyOptions {
   now?: () => number;
   /** accepted clock skew, which is also the replay window; default 60 s */
@@ -228,7 +239,7 @@ export function verifyOwnerDeviceSignature(
   method: string,
   pathAndQuery: string,
   rawBody: string,
-  devices: ReadonlyMap<string, EnrolledOwnerDevice>,
+  devices: OwnerDeviceLookup,
   opts: OwnerDeviceVerifyOptions = {},
 ): string | null {
   const now = opts.now ?? Date.now;
