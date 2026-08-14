@@ -117,7 +117,11 @@ describe("workspace console against a REAL control plane", () => {
     expect(listed.windows[0]?.msRemaining).toBeGreaterThan(0);
 
     // one click stops it — and only the server's explicit word says "stopped"
-    const vetoRes = await fetch(`${base}/api/veto/${windowId}`, { method: "POST" });
+    // (the CSRF header is what app.js sends; the boundary refuses it bare)
+    const vetoRes = await fetch(`${base}/api/veto/${windowId}`, {
+      method: "POST",
+      headers: { "x-workspace-console": "1" },
+    });
     const vetoResult = await vetoRes.json();
     expect(vetoResultAction(windowId, windowId, vetoResult)).toBe("stopped");
 
@@ -128,13 +132,16 @@ describe("workspace console against a REAL control plane", () => {
     expect(finalStatus).toEqual({ status: "vetoed" });
 
     // re-vetoing a vetoed window stays a successful no-op (blind-retry safe)
-    const again = await (await fetch(`${base}/api/veto/${windowId}`, { method: "POST" })).json();
+    const again = await (
+      await fetch(`${base}/api/veto/${windowId}`, { method: "POST", headers: { "x-workspace-console": "1" } })
+    ).json();
     expect(vetoResultAction(windowId, windowId, again)).toBe("stopped");
 
     // the E-STOP: kill through the console, with its reason attributed
     const killResult = await (
       await fetch(`${base}/api/kill`, {
         method: "POST",
+        headers: { "content-type": "application/json", "x-workspace-console": "1" },
         body: JSON.stringify({ reason: "workspace console e-stop" }),
       })
     ).json();

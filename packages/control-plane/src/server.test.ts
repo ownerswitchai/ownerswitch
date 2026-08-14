@@ -1170,6 +1170,46 @@ describe("control-plane HTTP API", () => {
     expect(await status.json()).toEqual({ status: "vetoed" });
   });
 
+  it("re-veto by an owner session is IDEMPOTENT — 200, first attribution kept (matches the device path)", async () => {
+    const c = clock();
+    const cp = ephemeral({ now: c.now });
+    const url = await start(cp);
+
+    const window = new VetoWindow({ agentId: "agent-1", tool: "bash" }, 0, { now: c.now });
+    cp.vetoWindows.set("v-1", window);
+
+    const first = createOwnerSession("owner-one", { now: c.now });
+    const stop = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(first.token),
+      body: JSON.stringify({}),
+    });
+    expect(stop.status).toBe(200);
+
+    // the same owner's double-click, and even a different owner's later
+    // stop, CONFIRM the stop that already happened — never a 409 that reads
+    // as failure of a veto that in fact landed (a live walkthrough hit this)
+    const again = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(first.token),
+      body: JSON.stringify({}),
+    });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toEqual({ status: "vetoed" });
+
+    const second = createOwnerSession("owner-two", { now: c.now });
+    const confirm = await fetch(`${url}/veto/v-1`, {
+      method: "POST",
+      headers: bearer(second.token),
+      body: JSON.stringify({}),
+    });
+    expect(confirm.status).toBe(200);
+    expect(await confirm.json()).toEqual({ status: "vetoed" });
+
+    // attribution is the FIRST stop's — a confirming re-veto rewrites nothing
+    expect(window.vetoedBy).toBe("owner-one");
+  });
+
   it("POST /veto/:id on a released window -> 409 (authenticated)", async () => {
     const c = clock();
     const cp = ephemeral({ now: c.now });

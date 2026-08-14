@@ -95,14 +95,17 @@ export function vetoPending(
   vetoStatus = "pending",
 ): OwnerSwitchRefusal {
   const opening = justOpened
-    ? `A veto window (id "${vetoWindowId}") is now open — the owner has a few minutes to stop it.`
+    ? `A veto window (id "${vetoWindowId}") is now open — the owner can stop it before it ever runs.`
     : `Its veto window (id "${vetoWindowId}", status "${vetoStatus}") is still open.`;
   return new OwnerSwitchRefusal(
     OwnerSwitchErrorCode.VetoPending,
     `OwnerSwitch held "${tool}" for owner review: ${verdict.reason}. The call has NOT run. ` +
       `${opening} Tell the user the action is pending owner review, and call the same tool ` +
-      `again later: a released window lets it run, a vetoed one stays blocked. Do not assume ` +
-      `it succeeded.`,
+      `again later to learn the verdict: it may proceed only after the owner's review ` +
+      `releases it (delivery acknowledged by the owner's enrolled device, then silence ` +
+      `through the deadline — and even then every live check still applies); a vetoed call ` +
+      `stays blocked, and an unreachable owner escalates to explicit approval instead of a ` +
+      `release. Do not assume it succeeded.`,
     {
       decision: "veto",
       tool,

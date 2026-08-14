@@ -48,7 +48,10 @@
     return fetch(path, {
       method: "POST",
       cache: "no-store",
-      headers: { "content-type": "application/json" },
+      // x-workspace-console is the server's CSRF gate: a foreign page's form
+      // POST cannot set it, and a cross-origin fetch that tries preflights
+      // into a refusal — only this same-origin script can mutate
+      headers: { "content-type": "application/json", "x-workspace-console": "1" },
       body: JSON.stringify(body || {}),
     })
       .then(function (res) {

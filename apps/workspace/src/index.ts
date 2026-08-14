@@ -5,7 +5,7 @@
  * imported directly by the tests); this package entry exports the console
  * server pieces for embedding and for the test suite.
  */
-export { createConsoleApi } from "./console-api.js";
+export { createConsoleApi, sanitizeControlPlaneUrl } from "./console-api.js";
 export type {
   ActionResult,
   ConsoleApi,
@@ -13,7 +13,8 @@ export type {
   StatusReading,
   UpstreamOptions,
 } from "./console-api.js";
-export { createConsoleServer } from "./console-server.js";
+export { CONSOLE_CSRF_HEADER, createConsoleServer } from "./console-server.js";
+export { isLoopbackBind, validateDeviceId } from "./startup.js";
 export type { ConsoleServerOptions, ListeningConsole } from "./console-server.js";
 export { deviceSignedHeaders, newNonce, signDeviceRequest } from "./device-sig.js";
 export type { DeviceSigFields } from "./device-sig.js";
