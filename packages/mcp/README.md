@@ -37,12 +37,13 @@ is policy and audit, not a cage.
 Goal: your first *blocked* tool call, with the connection and the policy
 both verified *before* you ever prompt an agent.
 
-> No MCP client installed, or on a slow network? The root
-> **[FIRST-KILL.md](../../FIRST-KILL.md)** walks the same loop — through the
-> kill and the 2GO restore — with a demo agent and tool server that live in
-> this repo (`examples/`), so nothing downloads and no AI client is needed.
-> Its config, `examples/first-kill.config.json`, also works verbatim for
-> every step below if you'd rather skip the filesystem-server download.
+> Prefer a guided walkthrough that ends with you pressing the stop button?
+> **[FIRST-KILL.md](../../FIRST-KILL.md)** — kill, persistence across a
+> restart, and the 2GO restore, in about 10 minutes, with a demo agent and
+> tool server that live in this repo (`examples/`) so nothing downloads and
+> no AI client is needed. Its config, `examples/first-kill.config.json`,
+> also works verbatim for every step below if you'd rather skip the
+> filesystem-server download.
 
 **Honest timing.** We clocked a first, unassisted run of this quickstart
 with a stopwatch at **~20 minutes**, not 5. Almost all of it was two
@@ -235,22 +236,36 @@ of by an agent burning its quota on it. Both take the same `--config <file>`
 npx tsx src/cli.ts doctor --config ~/ownerswitch.mcp.json
 ```
 
-Five one-line checks, printed as `✔` (pass), `⚠` (action required), or `✘`
+Six one-line checks, printed as `✔` (pass), `⚠` (action required), or `✘`
 (failed) — every non-`✔` line names what to do about it:
 
 | check | what it does |
 | --- | --- |
 | node version | `process.version` is 22 or newer |
 | config | the file parses and every field validates (same loader the gateway uses) |
-| control plane | `GET /status` responds within `timeoutMs` — and if it responds `killed:true`, that is a `⚠`, **not** a pass: the plane is reachable but every call will be refused (`-32054`) until an owner runs the 2GO restore ceremony, and the fix line says exactly that |
+| startup gates | the gateway's **pure configuration gates** — every pre-serve check that depends only on config and environment — run here instead: an unacknowledged kill-action budget, a half-configured or unreadable honeytoken registry, a partial GitHub connector triple, incoherent executor routes, a gateway credential passed through argv. These parse fine and then refuse to start — and a gateway that refuses to start is invisible to an MCP client, which reports only a closed connection. Both paths call the same `startup-gates.ts`, so a new gate cannot be added to one and forgotten in the other. A gate failure **stops the run**: nothing downstream is probed, and in particular the upstream is never spawned — one of these gates fires precisely because `upstream.args` carries a credential, and spawning anyway would perform the `/proc`-and-`ps` leak it just diagnosed |
+| control plane | `GET /status` responds within `timeoutMs` — and if it responds `killed:true`, that is a `⚠`, **not** a pass: the plane is reachable but every call will be refused (`-32054`) until an owner runs the 2GO restore ceremony. The fix line prints the ceremony commands themselves, because a premature restore answers a deliberately uniform `409 {"error":"restore rejected"}` that never says which check failed |
 | device credentials | a signed, deliberately-malformed `POST /veto` gets `400` (signature accepted) rather than `401` (rejected) — this proves `device.id`/`device.secret` are right *without* opening a real veto window |
-| upstream command | launches your `upstream.command` exactly as the gateway will and completes a **real MCP initialize handshake**, then shuts it down through the SDK's close path (stdin end → wait for the child to exit, escalating only if it lingers) — a binary that starts but crashes on boot, or was never an MCP server, fails here instead of surfacing later as the client's opaque connection timeout |
+| upstream command | launches your `upstream.command` exactly as the gateway will — the same `upstreamLaunchSpec`, so the child's environment is the gateway's, credential strip included; a preflight must never hand the untrusted child more than the gateway would — and completes a **real MCP initialize handshake**, then shuts it down through the SDK's close path (stdin end → wait for the child to exit, escalating only if it lingers) — a binary that starts but crashes on boot, or was never an MCP server, fails here instead of surfacing later as the client's opaque connection timeout |
 
 A failing check skips whatever depends on it (a bad config skips
-control-plane/device/upstream; an unreachable control plane skips the
-device-credentials check) rather than printing a confusing cascade. Exits 0
-only when every line is `✔` — a `⚠` exits 1 too, because you must not
-connect an agent over it.
+startup-gates/control-plane/device/upstream; an unreachable control plane
+skips the device-credentials check) rather than printing a confusing
+cascade. Exits 0 only when every line is `✔` — a `⚠` exits 1 too, because
+you must not connect an agent over it.
+
+**When the upstream check times out, suspect the environment first.** The
+upstream child does not inherit your shell: the MCP SDK spawns it with an
+allowlist of roughly `HOME/LOGNAME/PATH/SHELL/TERM/USER`, and the gateway
+does the same (plus stripping every OwnerSwitch credential by name and
+value). Behind a proxy or a custom CA, the exact command that works when you
+type it hangs when the gateway spawns it, because `HTTPS_PROXY` and
+`NODE_EXTRA_CA_CERTS` did not come along — a failure whose evidence points
+the wrong way, since running it by hand "proves" the config is fine. The fix
+line names which of those variables you have set but have not declared in
+`upstream.env`. A cold `npx -y <package>` download can also outlast the
+15-second handshake budget; `--upstream-timeout <ms>` (or
+`OWNERSWITCH_UPSTREAM_TIMEOUT_MS`) raises it.
 
 ### `ownerswitch-mcp verify`
 

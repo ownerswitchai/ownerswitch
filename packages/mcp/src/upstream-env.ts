@@ -1,4 +1,55 @@
-import { ConfigError } from "./config.js";
+import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ConfigError, type UpstreamConfig } from "./config.js";
+
+/**
+ * Un-prefixed alias names a gateway credential might ride into the upstream
+ * child under, stripped from its environment by NAME regardless of value.
+ * OWNERSWITCH_* names are always stripped separately.
+ */
+export const KNOWN_CREDENTIAL_ENV_NAMES = [
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "DEVICE_SECRET",
+  "CANARY_KEY",
+] as const;
+
+/** Everything needed to spawn the upstream child — see upstreamLaunchSpec. */
+export interface UpstreamLaunchSpec {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd?: string;
+}
+
+/**
+ * THE way the upstream child is launched — one function, so there is one
+ * answer to "what environment does the upstream get?".
+ *
+ * `doctor` used to build the child's environment itself, and the copy it
+ * built was the unfiltered one: base + upstream.env, no credential strip.
+ * That made the preflight tool a wider leak than the thing it checks — a
+ * device secret parked in `upstream.env` under an innocent name reached the
+ * untrusted child on every `doctor` run, while the gateway stripped it. A
+ * preflight must never be the most dangerous way to run a config, so the
+ * spec is built here and both callers take it whole.
+ */
+export function upstreamLaunchSpec(
+  upstream: UpstreamConfig,
+  secretValues: ReadonlyArray<string | undefined>,
+  base: Record<string, string> = getDefaultEnvironment(),
+): UpstreamLaunchSpec {
+  return {
+    command: upstream.command,
+    args: upstream.args ?? [],
+    env: upstreamEnvironment({
+      base,
+      configured: upstream.env,
+      secretValues,
+      secretNames: KNOWN_CREDENTIAL_ENV_NAMES,
+    }),
+    ...(upstream.cwd !== undefined ? { cwd: upstream.cwd } : {}),
+  };
+}
 
 /**
  * The environment handed to the spawned upstream MCP server — built

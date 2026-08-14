@@ -13,10 +13,11 @@ discipline on your side, not a guarantee OwnerSwitch enforces.
 
 *One press to stop. Two GOs to start.*
 
-**New here? [First Kill in 10 minutes](FIRST-KILL.md)** — install, put a
-demo agent behind the gateway, veto it, kill it, prove the kill survives a
-restart, and restore with the 2GO ceremony. Every command pre-run on a
-fresh clone; no AI client or API key needed.
+**→ [Your first kill, in 10 minutes](FIRST-KILL.md)** — clone to a stopped
+agent and back again, on a machine that has never seen OwnerSwitch: a demo
+agent (in this repo — no AI client, no API key, no downloads) behind the
+gateway, an owner veto, the kill, proof it survives a restart, and the 2GO
+restore. Every command pre-run on a fresh clone.
 
 ## How a tool call is decided
 
@@ -188,11 +189,14 @@ packages/restricted-runtime — locked-down launch profile for the gateway proce
 ## Dev
 
 ```bash
-pnpm install
-pnpm build
+pnpm install       # installs AND builds the workspace (root `prepare`)
 pnpm typecheck
 pnpm test
 ```
+
+The packages import each other's build output, so an installed-but-unbuilt
+tree fails with `ERR_MODULE_NOT_FOUND … /dist/index.js`. `pnpm install`
+builds; if you ever see that error anyway, `pnpm build` is the fix.
 
 ## Status
 
