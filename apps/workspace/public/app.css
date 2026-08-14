@@ -1,0 +1,214 @@
+/* Workspace console — the mock's single-world terminal control room
+   (deliberately one look on any host theme; the page paints its own dark
+   ground). External file so the strict CSP holds with no inline style. */
+
+:root {
+  --ground: #101418;
+  --panel: #161c23;
+  --panel-2: #1c242d;
+  --line: #26303b;
+  --ink: #d9e1e8;
+  --muted: #8a97a3;
+  --faint: #5c6873;
+  --stop: #e5484d;
+  --stop-deep: #a92f34;
+  --collar: #f2c53e;
+  --ok: #4fae62;
+  --warn: #f2b23e;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, Menlo, monospace;
+  --ui: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { margin: 0; box-sizing: border-box; }
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 28px 20px 48px;
+}
+.stage { max-width: 1100px; margin: 0 auto; }
+.stage > .kicker {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+}
+.stage > .kicker b { color: var(--muted); font-weight: 600; }
+
+.frame {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 14px; }
+.brand small { color: var(--faint); font-weight: 500; }
+.killstate {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.killstate::before { content: "● "; }
+.killstate.armed {
+  border-color: rgba(79, 174, 98, 0.4);
+  color: var(--ok);
+  background: rgba(79, 174, 98, 0.08);
+}
+.killstate.killed,
+.killstate.unreachable {
+  border-color: rgba(229, 72, 77, 0.45);
+  color: var(--stop);
+  background: rgba(229, 72, 77, 0.08);
+}
+.spacer { flex: 1; }
+.epoch { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+/* the E-STOP: mushroom head in a hazard collar */
+.estop { display: flex; align-items: center; gap: 10px; }
+.estop .label {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em;
+  color: var(--muted); text-align: right; line-height: 1.5;
+}
+.estop button {
+  width: 54px; height: 54px; border-radius: 50%;
+  border: 4px solid var(--collar);
+  background: radial-gradient(circle at 34% 28%, #ff8489, var(--stop) 55%, var(--stop-deep) 95%);
+  box-shadow: 0 4px 0 #8a6d15, 0 6px 14px rgba(0, 0, 0, 0.5), inset 0 -4px 8px rgba(0, 0, 0, 0.35);
+  color: #fff; font-family: var(--ui); font-weight: 800; font-size: 10.5px; letter-spacing: 0.08em;
+  cursor: pointer;
+}
+.estop button:active { transform: translateY(2px); box-shadow: 0 2px 0 #8a6d15, 0 3px 8px rgba(0, 0, 0, 0.5); }
+.estop button:disabled { filter: grayscale(0.4) brightness(0.8); cursor: wait; }
+button:focus-visible { outline: 2px solid var(--warn); outline-offset: 2px; }
+
+/* ---------- fail-closed banner ---------- */
+.banner {
+  padding: 8px 16px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--stop);
+  background: rgba(229, 72, 77, 0.1);
+  border-bottom: 1px solid rgba(229, 72, 77, 0.35);
+}
+.banner.warn { color: var(--warn); background: rgba(242, 178, 62, 0.08); border-bottom-color: rgba(242, 178, 62, 0.3); }
+
+/* ---------- columns ---------- */
+.cols { display: grid; grid-template-columns: 1fr 320px; min-height: 480px; }
+
+.term { display: flex; flex-direction: column; background: #0c1014; min-width: 0; }
+.termhead {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  background: var(--panel);
+}
+.prname { color: var(--ink); font-weight: 600; }
+.chip {
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+  font-size: 10px; color: var(--muted);
+}
+.chip.v { color: var(--ok); border-color: rgba(79, 174, 98, 0.35); }
+.chip.w { color: var(--warn); border-color: rgba(242, 178, 62, 0.4); }
+.chip.s { color: var(--stop); border-color: rgba(229, 72, 77, 0.4); }
+
+.panel-note {
+  padding: 10px 14px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--warn);
+  border-bottom: 1px solid var(--line);
+}
+.windows { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+
+/* one open veto window */
+.vetocard { border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); padding: 11px 12px; }
+.vetocard h3 {
+  font-size: 12.5px; font-weight: 650; margin-bottom: 6px;
+  display: flex; align-items: center; gap: 7px;
+}
+.vetocard h3 .tag {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; color: var(--warn);
+  border: 1px solid rgba(242, 178, 62, 0.4); border-radius: 999px; padding: 1px 7px;
+}
+.vetoline { font-family: var(--mono); font-size: 11.5px; color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
+.vetoline b { color: var(--ink); font-weight: 600; }
+.countwrap { display: flex; align-items: center; gap: 10px; margin: 9px 0 10px; }
+.count { font-family: var(--mono); font-size: 22px; font-weight: 600; color: var(--warn); font-variant-numeric: tabular-nums; }
+.bar { flex: 1; height: 5px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--warn); border-radius: 999px; }
+.vetobtn {
+  width: 100%; padding: 9px; font-weight: 700; font-size: 13px; letter-spacing: 0.08em;
+  color: #fff; background: linear-gradient(180deg, var(--stop), var(--stop-deep));
+  border: 1px solid #8f2b2f; border-radius: 7px; cursor: pointer;
+  font-family: var(--ui);
+}
+.vetobtn:disabled { filter: grayscale(0.55) brightness(0.75); cursor: default; }
+.vetosub { font-size: 11px; color: var(--faint); margin-top: 7px; line-height: 1.5; }
+.empty {
+  font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+  padding: 14px; text-align: center;
+}
+
+/* ---------- right rail ---------- */
+.rail { border-left: 1px solid var(--line); background: var(--panel); padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+.card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); padding: 11px 12px; }
+.card h3 { font-size: 12.5px; font-weight: 650; margin-bottom: 6px; display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+.card h3 .tagnote { font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; color: var(--faint); font-weight: 500; }
+.mutednote { font-size: 11px; color: var(--faint); line-height: 1.5; }
+
+.devices { font-family: var(--mono); font-size: 11px; line-height: 1.9; color: var(--muted); }
+.devices .row { display: flex; gap: 7px; align-items: baseline; }
+.devices .dot { color: var(--ok); }
+.devices .dot.off { color: var(--faint); }
+.devices .name { color: var(--ink); overflow-wrap: anywhere; }
+.devices .name.revoked { text-decoration: line-through; color: var(--faint); }
+.devices .meta { color: var(--faint); font-size: 10px; margin-left: auto; white-space: nowrap; }
+
+.audit { font-family: var(--mono); font-size: 11px; line-height: 1.9; color: var(--muted); max-height: 340px; overflow-y: auto; }
+.audit .row { display: flex; gap: 7px; align-items: baseline; }
+.audit .t { color: var(--faint); flex: none; }
+.audit .x { overflow-wrap: anywhere; }
+.audit .x.ok { color: var(--ok); }
+.audit .x.warn { color: var(--warn); }
+.audit .x.stop { color: var(--stop); }
+.audit .n { color: var(--faint); flex: none; }
+
+/* ---------- status bar ---------- */
+.statusbar {
+  display: flex; gap: 18px; align-items: center;
+  padding: 7px 14px; border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  overflow-x: auto; white-space: nowrap;
+}
+.statusbar b { color: var(--muted); font-weight: 600; }
+.statusbar .live { color: var(--ok); }
+.statusbar .down { color: var(--stop); }
+
+/* ---------- legend ---------- */
+.legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 18px; }
+.legend .cell { border-top: 2px solid var(--line); padding-top: 9px; }
+.legend h4 { font-size: 12.5px; font-weight: 650; margin-bottom: 3px; }
+.legend p { font-size: 12px; color: var(--muted); line-height: 1.55; }
+.legend .cell:first-child { border-top-color: var(--stop); }
+
+@media (max-width: 860px) {
+  .cols { grid-template-columns: 1fr; }
+  .rail { border-left: none; border-top: 1px solid var(--line); }
+  .legend { grid-template-columns: 1fr; }
+}

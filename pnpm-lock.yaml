@@ -34,6 +34,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/escalation
 
+  apps/workspace:
+    devDependencies:
+      '@ownerswitchai/control-plane':
+        specifier: workspace:*
+        version: link:../../packages/control-plane
+
   packages/button:
     dependencies:
       '@ownerswitchai/control-plane':
