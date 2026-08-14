@@ -101,6 +101,7 @@ await attempt("move_file", { from: "welcome.txt", to: "renamed.txt" });
 // THE OWNER'S TURN — on the same live session, because the veto window
 // belongs to THIS gateway process: veto it now, and the retry below shows
 // the held call staying blocked.
+let retry: Outcome | null = null;
 if (write.kind === "HELD") {
   const windowId = /veto window \(id "([^"]+)"\)/.exec(write.message)?.[1];
   if (windowId !== undefined && interactive) {
@@ -114,7 +115,7 @@ if (write.kind === "HELD") {
     await rl.question("press Enter after the veto (or Enter to just retry): ");
     rl.close();
     console.log("\nthe agent retries the exact same write:\n");
-    await attempt("write_file", { name: "hello.txt", content: "hi from the demo agent" });
+    retry = await attempt("write_file", { name: "hello.txt", content: "hi from the demo agent" });
   } else if (windowId !== undefined) {
     console.log(
       `\n(non-interactive run: veto window "${windowId}" is open — veto it and retry on the same\n` +
@@ -123,10 +124,21 @@ if (write.kind === "HELD") {
   }
 }
 
+// the closing summary tells the truth about THIS run, not the ideal one
+const writeStory =
+  retry?.kind === "VETOED"
+    ? "write_file was HELD and — once you vetoed — stayed VETOED on retry"
+    : retry?.kind === "HELD"
+      ? "write_file was HELD, and without a veto the retry is STILL HELD (the window is yours to decide)"
+      : retry?.kind === "RAN"
+        ? "write_file was HELD and, released, RAN on retry"
+        : write.kind === "KILLED"
+          ? "every call was KILLED"
+          : "write_file was HELD (veto it and retry on a live session to see VETOED)";
 console.log(
-  "\nwhat you just saw: reads/lists RAN (allow), write_file was HELD and — once you\n" +
-    "vetoed — stayed VETOED on retry, move_file was DENIED by policy; after a kill,\n" +
-    "EVERYTHING comes back KILLED. The gateway told the agent exactly why, every time.",
+  `\nwhat you just saw: reads/lists RAN (allow), ${writeStory}, move_file was DENIED\n` +
+    "by policy; after a kill, EVERYTHING comes back KILLED. The gateway told the agent\n" +
+    "exactly why, every time.",
 );
 
 // PROVEN shutdown, not a blind exit: close the session, then verify the
