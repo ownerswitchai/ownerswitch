@@ -303,7 +303,15 @@ export async function checkUpstreamHandshake(
         name: "upstream command",
         status: "fail",
         detail: `"${upstream.command}" did not answer the MCP initialize handshake within ${timeoutMs}ms${stderrTail()}`,
-        fix: `check that upstream.command/args launch a stdio MCP server; try it by hand: ${upstream.command} ${(upstream.args ?? []).join(" ")}`,
+        fix:
+          `check that upstream.command/args launch a stdio MCP server; try it by hand: ` +
+          `${upstream.command} ${(upstream.args ?? []).join(" ")}` +
+          (upstream.command === "npx" || upstream.command === "pnpx" || upstream.command === "bunx"
+            ? " — note: a package runner's FIRST run may download the server, which alone can " +
+              "blow this timeout on a fresh machine; run it once by hand until it starts, then " +
+              "re-run doctor (or use the in-repo demo upstream, examples/demo-tools-server.ts, " +
+              "which downloads nothing)"
+            : ""),
       };
     }
     const code = (err as NodeJS.ErrnoException).code;

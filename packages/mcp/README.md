@@ -37,6 +37,13 @@ is policy and audit, not a cage.
 Goal: your first *blocked* tool call, with the connection and the policy
 both verified *before* you ever prompt an agent.
 
+> No MCP client installed, or on a slow network? The root
+> **[FIRST-KILL.md](../../FIRST-KILL.md)** walks the same loop — through the
+> kill and the 2GO restore — with a demo agent and tool server that live in
+> this repo (`examples/`), so nothing downloads and no AI client is needed.
+> Its config, `examples/first-kill.config.json`, also works verbatim for
+> every step below if you'd rather skip the filesystem-server download.
+
 **Honest timing.** We clocked a first, unassisted run of this quickstart
 with a stopwatch at **~20 minutes**, not 5. Almost all of it was two
 infrastructure surprises — the `claude` CLI wasn't installed, and the
@@ -209,10 +216,12 @@ curl -X POST http://127.0.0.1:4600/kill -d '{"reason":"owner pressed stop"}'
 Now *everything* — even reads — comes back `-32054`. Restarting the control
 plane does NOT undo it: kill state persists to a file
 (`ownerswitch-kill-state.json` by default) and a restart comes back killed —
-only the 2GO restore ceremony clears it. To hard-reset a dev instance
-instead, stop it and delete the kill-state file. Stop the control plane
-entirely and it's the same story: **no control plane, no tool calls.** Fail
-closed is not a mode; it's the default.
+only the 2GO restore ceremony clears it. The ceremony is two curl calls with
+a mandatory cooldown between them; **[FIRST-KILL.md](../../FIRST-KILL.md)
+§[7:00]** walks it. To hard-reset a dev instance instead, stop it and delete
+the kill-state file. Stop the control plane entirely and it's the same
+story: **no control plane, no tool calls.** Fail closed is not a mode; it's
+the default.
 
 ## Preflight: `doctor` and `verify`
 

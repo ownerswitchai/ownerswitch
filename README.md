@@ -13,6 +13,11 @@ discipline on your side, not a guarantee OwnerSwitch enforces.
 
 *One press to stop. Two GOs to start.*
 
+**New here? [First Kill in 10 minutes](FIRST-KILL.md)** — install, put a
+demo agent behind the gateway, veto it, kill it, prove the kill survives a
+restart, and restore with the 2GO ceremony. Every command pre-run on a
+fresh clone; no AI client or API key needed.
+
 ## How a tool call is decided
 
 | Decision | Meaning |
@@ -123,19 +128,24 @@ Don't read the quickstart as a containment promise.
 
 ```
 apps/web              — ownerswitch.ai landing (static)
-packages/shared       — policy model types
-packages/gateway      — the decision engine (start here)
-packages/mcp          — MCP gateway: OwnerSwitch in front of any MCP server
+apps/owner            — the owner's phone app: veto, delivery ack, device enrollment
+packages/shared       — policy model types + wire contracts
+packages/gateway      — the decision engine + limit budgets (start here)
+packages/mcp          — MCP gateway: OwnerSwitch in front of any MCP server (+ doctor/verify)
 packages/sdk          — agent-side client (stub)
 packages/button       — physical kill button daemon (keyboard, HTTP, or serial e-stop)
 packages/honeytoken   — decoy credentials that trip an automatic kill on touch
-packages/control-plane— policies, kill state, audit (stub)
+packages/control-plane— kill state, veto windows, 2GO restore, device standing, audit
+packages/escalation   — the alert ladder: push, SMS, voice, email — until the owner answers
+packages/executor     — the executing merge broker (grant-gated GitHub merges)
+packages/restricted-runtime — locked-down launch profile for the gateway process
 ```
 
 ## Dev
 
 ```bash
 pnpm install
+pnpm build
 pnpm typecheck
 pnpm test
 ```
