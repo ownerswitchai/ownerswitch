@@ -1,6 +1,9 @@
 /**
- * Every check the gateway makes BEFORE it serves a single call — in one
- * place, so `doctor` can run exactly what `runGateway` runs.
+ * The gateway's pure configuration gates — every check it makes before
+ * serving that depends only on config and environment — in one place, so
+ * `doctor` runs exactly what `runGateway` runs. (Failures that need a live
+ * socket or a spawned child are not gates; doctor's own later checks cover
+ * those.)
  *
  * Why this module exists at all: these gates throw at startup, and under an
  * MCP client a gateway that throws at startup is invisible. The client
@@ -45,6 +48,12 @@ export interface StartupGateDeps {
 export interface StartupGateResult {
   connector?: GitHubConnectorEnv;
   honeytokenRegistry?: HoneytokenRegistry;
+  /**
+   * Every credential VALUE this gateway holds. The child's environment is
+   * filtered against exactly this list (upstreamLaunchSpec), so whoever
+   * spawns the upstream — the gateway or `doctor` — strips the same set.
+   */
+  secretValues: ReadonlyArray<string | undefined>;
 }
 
 /**
@@ -130,16 +139,21 @@ export function runStartupGates(
 
   // 5. No gateway credential may ride into the upstream child through argv
   //    — visible via /proc/<pid>/cmdline and `ps aux`, so this is a refusal
-  //    to start, not a filter. Same value set the environment filter uses.
-  assertUpstreamArgsCredentialFree(config.upstream.args, [
+  //    to start, not a filter. The SAME value set filters the child's
+  //    environment, so argv and env cannot disagree about what a credential
+  //    is. The GitHub App private key rides along: tokens minted from it
+  //    exist only after startup, but the key itself can be pasted anywhere.
+  const secretValues = [
     config.device.secret,
     env.OWNERSWITCH_GITHUB_TOKEN,
     githubAppKeyPem,
     env.OWNERSWITCH_CANARY_KEY,
     env.OWNERSWITCH_DEVICE_SECRET,
-  ]);
+  ];
+  assertUpstreamArgsCredentialFree(config.upstream.args, secretValues);
 
   return {
+    secretValues,
     ...(connector !== undefined ? { connector } : {}),
     ...(honeytokenRegistry !== undefined ? { honeytokenRegistry } : {}),
   };

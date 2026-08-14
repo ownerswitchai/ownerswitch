@@ -157,7 +157,7 @@ describe("checkDeviceCredentials", () => {
 describe("checkUpstreamHandshake", () => {
   it("passes only after a completed MCP initialize handshake, then shuts down cleanly", async () => {
     const check = await checkUpstreamHandshake(
-      { command: "fake-upstream", args: [] },
+      { command: "fake-upstream", args: [], env: {} },
       { transportFactory: workingUpstreamFactory },
     );
     expect(check.status).toBe("pass");
@@ -166,7 +166,7 @@ describe("checkUpstreamHandshake", () => {
 
   it("fails on timeout for a process that starts but never speaks MCP", async () => {
     const check = await checkUpstreamHandshake(
-      { command: "not-an-mcp-server", args: [] },
+      { command: "not-an-mcp-server", args: [], env: {} },
       { transportFactory: silentUpstreamFactory, timeoutMs: 50 },
     );
     expect(check.status).toBe("fail");
@@ -179,7 +179,7 @@ describe("checkUpstreamHandshake", () => {
     // fine in their shell, so the config "must" be right. The difference is
     // the environment, and only doctor is in a position to say so.
     const check = await checkUpstreamHandshake(
-      { command: "npx", args: ["-y", "some-server"] },
+      { command: "npx", args: ["-y", "some-server"], env: { HOME: "/root" } },
       {
         transportFactory: silentUpstreamFactory,
         timeoutMs: 20,
@@ -198,7 +198,7 @@ describe("checkUpstreamHandshake", () => {
 
   it("does not blame the environment for vars the config already declares", async () => {
     const check = await checkUpstreamHandshake(
-      { command: "npx", args: [], env: { HTTPS_PROXY: "http://proxy:8080" } },
+      { command: "npx", args: [], env: { HTTPS_PROXY: "http://proxy:8080", HOME: "/root" } },
       {
         transportFactory: silentUpstreamFactory,
         timeoutMs: 20,
@@ -211,7 +211,7 @@ describe("checkUpstreamHandshake", () => {
 
   it("fails with ENOENT guidance when the command isn't found", async () => {
     const check = await checkUpstreamHandshake(
-      { command: "not-a-real-cmd", args: [] },
+      { command: "not-a-real-cmd", args: [], env: {} },
       { transportFactory: enoentUpstreamFactory },
     );
     expect(check.status).toBe("fail");
@@ -224,7 +224,7 @@ describe("checkStartupGates — the gate doctor could not see", () => {
     checkStartupGates(
       loadConfig(["--config", "/etc/ownerswitch.json"], {}, fileWith({ ...VALID_CONFIG, ...extra })),
       env,
-    );
+    ).check;
 
   it("catches a kill-action budget with no risk acknowledgment — the gateway would refuse to start", () => {
     // Before this check existed, doctor printed "All checks passed" for this
@@ -278,10 +278,60 @@ describe("--upstream-timeout", () => {
   });
 
   it("undeclaredUpstreamEnv reports only what is set AND not declared", () => {
-    expect(
-      undeclaredUpstreamEnv({ command: "x" }, { HTTP_PROXY: "p", PATH: "/bin", NO_PROXY: "" }),
-    ).toEqual(["HTTP_PROXY"]);
-    expect(undeclaredUpstreamEnv({ command: "x", env: { HTTP_PROXY: "p" } }, { HTTP_PROXY: "p" })).toEqual([]);
+    expect(undeclaredUpstreamEnv({}, { HTTP_PROXY: "p", PATH: "/bin", NO_PROXY: "" })).toEqual([
+      "HTTP_PROXY",
+    ]);
+    expect(undeclaredUpstreamEnv({ HTTP_PROXY: "p" }, { HTTP_PROXY: "p" })).toEqual([]);
+  });
+});
+
+describe("the preflight is not a wider hole than the thing it checks", () => {
+  it("spawns the upstream with the GATEWAY's environment — credentials stripped, proxy kept", async () => {
+    // doctor used to build the child's env itself, unfiltered: a device
+    // secret parked in upstream.env under an innocent name reached the
+    // untrusted child on every preflight run, while the gateway stripped it.
+    let spawned: { command: string; args: string[]; env: Record<string, string> } | undefined;
+    await runDoctor(["--config", "/etc/ownerswitch.json"], {}, {
+      readFile: fileWith({
+        ...VALID_CONFIG,
+        upstream: {
+          command: "npx",
+          args: ["-y", "some-server"],
+          env: { LEAK: VALID_CONFIG.device.secret, HTTPS_PROXY: "http://proxy:8080" },
+        },
+      }),
+      fetchImpl: jsonResponse({ killed: false }),
+      upstreamProbe: {
+        transportFactory: (spec) => {
+          spawned = spec as typeof spawned;
+          return workingUpstreamFactory();
+        },
+      },
+    });
+    expect(spawned?.env.LEAK).toBeUndefined(); // the secret never reaches the child
+    expect(spawned?.env.HTTPS_PROXY).toBe("http://proxy:8080"); // ...and the useful var does
+  });
+
+  it("does NOT spawn the upstream after a failed startup gate", async () => {
+    // The sharpest case: the gate refuses BECAUSE the credential is in
+    // upstream.args. Probing anyway would perform the /proc-and-ps leak it
+    // just diagnosed.
+    const transportFactory = vi.fn(workingUpstreamFactory);
+    const fetchImpl = vi.fn(jsonResponse({ killed: false }));
+    const checks = await runDoctor(["--config", "/etc/ownerswitch.json"], {}, {
+      readFile: fileWith({
+        ...VALID_CONFIG,
+        upstream: { command: "npx", args: ["--token", VALID_CONFIG.device.secret] },
+      }),
+      fetchImpl,
+      upstreamProbe: { transportFactory },
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(checks.find((c) => c.name === "startup gates")?.status).toBe("fail");
+    for (const name of ["control plane", "device credentials", "upstream command"]) {
+      expect(checks.find((c) => c.name === name)?.detail, name).toContain("skipped");
+    }
   });
 });
 

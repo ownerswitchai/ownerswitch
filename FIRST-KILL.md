@@ -10,7 +10,9 @@ stop button is to press it yourself before anything valuable is behind it.
 
 **What you need:** Node 22+, pnpm 9 (`corepack enable`), and a terminal.
 `jq` is used in a couple of commands for readability; skip it and read the
-JSON yourself if you would rather.
+JSON yourself if you would rather. The `curl` calls use `-fsS` so an HTTP
+error fails the step loudly instead of printing an error body that scrolls
+past looking like success — the one place that is dropped is called out.
 
 **Timings below are real**, measured on a warm machine with a fast link.
 The two things that move them most are npm downloads and how long you spend
@@ -176,7 +178,7 @@ with the id of the window you now own.
 The single most important command in this document:
 
 ```bash
-curl -sX POST http://127.0.0.1:4600/kill -d '{"reason":"first kill"}'
+curl -fsS -X POST http://127.0.0.1:4600/kill -d '{"reason":"first kill"}'
 ```
 
 Ask the agent to do *anything* now — even a read. Every call comes back
@@ -189,7 +191,7 @@ people assume and rarely check:
 # 1. it is not a mood: kill state persists to disk
 #    stop the control plane in terminal 1 (Ctrl-C), start it again
 pnpm --filter @ownerswitchai/mcp dev:control-plane
-curl -s http://127.0.0.1:4600/status      # still {"killed":true,…}
+curl -fsS http://127.0.0.1:4600/status    # still {"killed":true,…}
 
 # 2. no control plane, no tool calls: stop it entirely and ask the agent
 #    again — every call is refused, because unreachable reads as killed
@@ -206,21 +208,31 @@ mandatory cooldown, and a single-use ceremony that expires.
 OWNER=<the owner token from terminal 1>   # a fresh one if 15 min have passed
 
 # GO 1/2 — open the ceremony
-CER=$(curl -sX POST http://127.0.0.1:4600/restore/ceremony \
+CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony \
   -H "Authorization: Bearer $OWNER" | jq -r .id)
 
 # the cooldown is real; watch it drain
-curl -s "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
+curl -fsS "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
 # {"state":"go1","cooldownRemainingMs":28417,…}
 
 # GO 2/2 — after it reaches 0
-curl -sX POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" \
+curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" \
   -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
 # {"killed":false}
 ```
 
-Try GO 2/2 early on purpose. You get `409 {"error":"restore rejected"}` — and
-that is all you get, whatever went wrong. The body never says which check
+Try GO 2/2 early on purpose — this one wants the status code, so drop the
+`-f` that makes the others fail loudly:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" \
+  -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" \
+  -w '\nHTTP %{http_code}\n'
+# {"error":"restore rejected"}
+# HTTP 409
+```
+
+That is all you get, whatever went wrong. The body never says which check
 failed (wrong owner, wrong epoch, too early, replayed), because that answer
 would be a map for someone who is not you. `cooldownRemainingMs` above is the
 number to read; it is yours to ask for, and asking requires your token.
@@ -233,9 +245,9 @@ is about — **one press to stop, two GOs to start.**
 A fleet does not need a fleet-wide stop for one misbehaving member:
 
 ```bash
-curl -sX POST http://127.0.0.1:4600/kill \
+curl -fsS -X POST http://127.0.0.1:4600/kill \
   -H 'content-type: application/json' -d '{"agentId":"mcp-gateway","reason":"just this one"}'
-curl -s http://127.0.0.1:4600/status   # {"killed":false,"killedAgents":["mcp-gateway"],…}
+curl -fsS http://127.0.0.1:4600/status  # {"killed":false,"killedAgents":["mcp-gateway"],…}
 ```
 
 Everything carrying that agent id is denied; every other agent keeps
