@@ -22,8 +22,8 @@ provides one where your Node install ships Corepack), a Unix-like OS
 (Linux or macOS — the demo sandbox requires `O_NOFOLLOW` and refuses to
 run without it, deliberately), and three terminals: the control plane, the
 agent, and you — the owner.
-`jq` is used in a couple of commands for readability; skip it and read the
-JSON yourself if you would rather. The `curl` calls use `-fsS` so an HTTP
+`jq` is used once, to pull the restore ceremony's id into a variable;
+without it, copy the id by hand — that step shows how. The `curl` calls use `-fsS` so an HTTP
 error fails the step loudly instead of printing an error body that scrolls
 past looking like success — the one place that is dropped is called out.
 
@@ -71,7 +71,7 @@ In **terminal 2**. The demo's config ships in the repo —
 `packages/mcp/examples/first-kill.config.json`: reads and listings run,
 writes are held for your review, renames never run, and anything the policy
 has not heard of needs you (fail closed). Its upstream is the in-repo demo
-tool server, so nothing downloads.
+tool server, so nothing beyond `pnpm install` downloads.
 
 ```bash
 cd packages/mcp
@@ -142,10 +142,12 @@ After the HELD line the agent **pauses and waits for you** — a veto window
 lives in the gateway process that opened it, so the held → vetoed
 transition plays out on this same, still-open session. It prints the exact
 command; run it in **terminal 3** — which needs `OWNERSWITCH_OWNER_TOKEN`
-exported too (every new terminal does). It is one line on purpose:
-multi-line pastes with `\` get mangled by some terminals.
+exported too (every new terminal does; without it the curl answers 401).
+The curl is one line on purpose: multi-line pastes with `\` get mangled by
+some terminals.
 
 ```bash
+export OWNERSWITCH_OWNER_TOKEN=<the owner token from terminal 1>
 curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'
 # → {"status":"vetoed"}
 ```
@@ -158,11 +160,11 @@ and gets **VETOED** — held is a decision point, and the owner just decided.
 If you press Enter **without** vetoing, the retry comes back **STILL
 HELD** — in this demo a held call never runs by itself. Silence releases a
 window only after an **enrolled owner device** has acknowledged that the
-alert was rendered in front of the owner (production, with the phone app —
-evidence of a render on an enrolled device, which is as close to "seen" as
-software can honestly claim); this walkthrough has no enrolled device, so
-an undecided window escalates to explicit approval instead of quietly
-releasing.
+alert was rendered in a visible, focused foreground detail view on that
+device (production, with the phone app) — device-render evidence, not
+proof that a human was present or read it; this walkthrough has no
+enrolled device, so an undecided window escalates to explicit approval
+instead of quietly releasing.
 
 Want a real AI agent behind the same gateway instead? The
 [`packages/mcp` README](packages/mcp/README.md) quickstart connects Claude
@@ -209,20 +211,15 @@ mandatory cooldown, and a single-use ceremony that expires.
 ```bash
 OWNER=$OWNERSWITCH_OWNER_TOKEN   # the FRESH token from the restart
 
-# GO 1/2 — open the ceremony
+# GO 1/2 — open the ceremony (jq pulls the ceremony id into a variable)
 CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | jq -r .id)
-
-# the cooldown is real; watch it drain
-curl -fsS "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
-# {"state":"go1","cooldownRemainingMs":28417,…}
-
-# GO 2/2 — after it reaches 0
-curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
-# {"killed":false}
+# no jq? run the curl by itself, copy the "id" out of the JSON, and set it:
+# CER=cer_...
 ```
 
-Try GO 2/2 early on purpose — this one wants the status code, so drop the
-`-f` that makes the others fail loudly:
+Now try GO 2/2 **immediately, on purpose** — the cooldown has not drained,
+so this must fail. It is the one command that wants the status code, so it
+drops the `-f` that makes the others fail loudly:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
@@ -232,8 +229,18 @@ curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER"
 
 That is all you get, whatever went wrong. The body never says which check
 failed (wrong owner, wrong epoch, too early, replayed), because that answer
-would be a map for someone who is not you. `cooldownRemainingMs` above is
+would be a map for someone who is not you. `cooldownRemainingMs` below is
 the number to read; it is yours to ask for, and asking requires your token.
+
+```bash
+# the cooldown is real; watch it drain
+curl -fsS "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
+# {"state":"go1","cooldownRemainingMs":28417,…}
+
+# GO 2/2 — after it reaches 0
+curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
+# {"killed":false}
+```
 
 Run the demo agent one last time: `RAN … RAN … HELD … DENIED` — back to
 work, under the same policy (just press Enter through the veto pause this

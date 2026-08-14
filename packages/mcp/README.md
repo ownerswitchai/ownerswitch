@@ -40,7 +40,7 @@ both verified *before* you ever prompt an agent.
 > Prefer a guided walkthrough that ends with you pressing the stop button?
 > **[FIRST-KILL.md](../../FIRST-KILL.md)** — kill, persistence across a
 > restart, and the 2GO restore, in about 15 minutes, with a demo agent and
-> tool server that live in this repo (`examples/`) so nothing downloads and
+> tool server that live in this repo (`examples/`) so nothing beyond `pnpm install` downloads and
 > no AI client is needed. Its config, `examples/first-kill.config.json`,
 > also works verbatim for every step below if you'd rather skip the
 > filesystem-server download.

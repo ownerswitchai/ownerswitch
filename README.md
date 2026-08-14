@@ -15,7 +15,7 @@ discipline on your side, not a guarantee OwnerSwitch enforces.
 
 **→ [Your first kill, in about 15 minutes](FIRST-KILL.md)** — clone to a stopped
 agent and back again, on a machine that has never seen OwnerSwitch: a demo
-agent (in this repo — no AI client, no API key, no downloads) behind the
+agent (in this repo — no AI client, no API key, no downloads beyond `pnpm install`) behind the
 gateway, an owner veto, the kill, proof it survives a restart, and the 2GO
 restore. Every command pre-run on a fresh clone.
 
