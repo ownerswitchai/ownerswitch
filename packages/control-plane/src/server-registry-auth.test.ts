@@ -441,3 +441,92 @@ describe("v28: dev_ revocation, alias supersession, standing export", () => {
     expect(window.vetoedBy).toBe(`owner-device:${deviceId}`);
   });
 });
+
+describe("v29: the two-file crash boundary — boot reconciliation is the repair", () => {
+  const standingOf = (standingFile: string) =>
+    JSON.parse(readFileSync(standingFile, "utf8")) as {
+      version: number;
+      devices: Record<string, { generation: number; revokedAt: number | null; spki?: string }>;
+    };
+
+  it("CRASH between the registry publish and the standing export: the stale-active file is the hazard, and the next boot repairs it", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    const cp = plane({ devicesFile, standingFile });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    expect(standingOf(standingFile).devices[deviceId].revokedAt).toBeNull();
+
+    // THE CRASH CUT: the registry's durable severing lands, and the process
+    // dies before the standing export (and before any kill) — exactly the
+    // sequence the review pinned. Calling the registry directly IS that cut:
+    // no handler cleanup, no persistStanding, ever.
+    const result = cp.enrolledDevices?.revoke(deviceId, Date.now());
+    expect(result).toEqual({ outcome: "revoked", generation: 2 });
+    // the hazard, stated: the standing file STILL says active — the
+    // escalation reader would keep trusting this identity right now
+    expect(standingOf(standingFile).devices[deviceId].revokedAt).toBeNull();
+
+    // RESTART: boot re-derives the standing file from the registry and
+    // republishes durable-or-refuse — the stale projection is gone before
+    // any surface opens
+    const restarted = plane({ devicesFile, standingFile });
+    const after = standingOf(standingFile);
+    expect(after.devices[deviceId].revokedAt).not.toBeNull();
+    expect(after.devices[deviceId].generation).toBe(2);
+    // and the identity is dead on the control plane too
+    const base2 = await start(restarted);
+    armWindow(restarted, "v-crash");
+    expect(
+      (await signedFetch(base2, p.cheapLane, deviceId, "GET", "/veto/v-crash/detail", "")).status,
+    ).toBe(401);
+  });
+
+  it("a QUARANTINED registry never re-exports its devices from history — the stale entries DROP, with or without static keys", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    const cp = plane({ devicesFile, standingFile });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    expect(standingOf(standingFile).devices[deviceId].spki).toBeDefined();
+
+    // the registry file is destroyed; the standing file still carries the
+    // dev_ entry ACTIVE with its key — the exact stale-permissive shape
+    writeFileSync(devicesFile, "{ not the registry", { mode: 0o600 });
+
+    // registry-only restart: the boot block still runs (a registry is
+    // CONFIGURED, even though unusable) and the unverifiable entry drops
+    const registryOnly = plane({ devicesFile, standingFile });
+    expect(registryOnly.enrolledDevices?.usable).toBe(false);
+    expect(standingOf(standingFile).devices[deviceId]).toBeUndefined();
+
+    // the escalation reader now finds NO record: no trust, fail closed —
+    // instead of authenticating the stale "active" projection
+    // (re-create the stale state and repeat with a static key present)
+    const other = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const otherSpki = (other.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+      "base64url",
+    );
+    writeFileSync(
+      standingFile,
+      JSON.stringify({
+        version: 2,
+        devices: { [deviceId]: { generation: 1, revokedAt: null, spki: otherSpki } },
+      }),
+      { mode: 0o600 },
+    );
+    const withStatic = plane({
+      devicesFile,
+      standingFile,
+      ownerDeviceKeys: { "owner-phone": otherSpki },
+    });
+    expect(withStatic.enrolledDevices?.usable).toBe(false);
+    const after = standingOf(standingFile);
+    expect(after.devices[deviceId]).toBeUndefined();
+    expect(after.devices["owner-phone"]).toBeDefined();
+  });
+});

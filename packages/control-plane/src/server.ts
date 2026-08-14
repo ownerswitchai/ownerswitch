@@ -828,7 +828,7 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // from the keys file must not erase its standing history: a phone that was
   // revoked, removed, and whose key is later re-added boots REVOKED from
   // this record, not fresh.
-  const unenrolledStanding: Record<string, { generation: number; revokedAt: number | null }> = {};
+  const unenrolledStanding: Record<string, DeviceStanding> = {};
   /**
    * Persist the CURRENT standing of every enrolled device (+ retained
    * history) — schema v2: ceremony-enrolled (dev_*) devices are EXPORTED
@@ -840,9 +840,19 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
    */
   function persistStanding(): { durable: boolean; detail?: string } {
     if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
-    const devices: Record<string, DeviceStanding> = {
-      ...unenrolledStanding,
-    };
+    const devices: Record<string, DeviceStanding> = {};
+    // Static history first (see unenrolledStanding) — but NEVER a ceremony
+    // (dev_*/spki-bearing) entry: for those the REGISTRY is the only source
+    // of truth, and echoing one from loaded history would re-publish a
+    // projection nobody can verify right now. While the registry is
+    // quarantined its devices simply drop out of the export, and the
+    // escalation reader — no record, no trust — fails closed with the
+    // control plane instead of trusting a stale "active". A recovered
+    // registry re-exports them at its next boot or write.
+    for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
+      if (standing.spki !== undefined || deviceId.startsWith("dev_")) continue;
+      devices[deviceId] = standing;
+    }
     for (const [deviceId, device] of ownerDevices) {
       devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
     }
@@ -861,13 +871,26 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       return { durable: false, detail: err instanceof Error ? err.message : String(err) };
     }
   }
-  // Boot standing reconciliation runs whenever there is ANY device whose
-  // standing the shared file must carry: static keys-file devices, and/or
-  // ceremony-enrolled registry devices (whose entries — WITH their SPKI —
-  // the escalation reader authenticates from).
-  const enrolledPopulated = () =>
-    enrolledDevices !== undefined && enrolledDevices.usable && enrolledDevices.list().length > 0;
-  if (standingStore !== null && (ownerDevices.size > 0 || enrolledPopulated())) {
+  // BOOT STANDING RECONCILIATION — the recovery half of the two-file
+  // revocation story. The registry publish and the standing export are two
+  // separate durable writes; a crash between them leaves the standing file
+  // holding a projection the registry has already superseded (a revoked
+  // dev_ device still "active" to the escalation reader). The repair is
+  // structural, not detective: at EVERY boot the standing file is
+  // re-derived from the live sources and re-published durable-or-refuse,
+  // so the authoritative registry projection overwrites whatever the crash
+  // left — and until this process is back up to do that, the escalation
+  // surface can at worst serve the file the LAST completed export wrote,
+  // while the control plane (the only revoker) is down anyway.
+  //
+  // The block therefore runs whenever the standing file has ANY producer:
+  // static keys-file devices, or an enrollment registry being CONFIGURED at
+  // all — usable or not, populated or not. A quarantined or reset registry
+  // still reconciles: persistStanding() sources spki-bearing entries ONLY
+  // from the usable registry, so unverifiable dev_ entries DROP out of the
+  // export (no record → no trust at the escalation reader — fail closed),
+  // never carry over from history.
+  if (standingStore !== null && (ownerDevices.size > 0 || enrolledDevices !== undefined)) {
     const loaded = standingStore.load();
     if (loaded.outcome === "corrupt") {
       // fail CLOSED: a standing file we cannot trust revokes every device —
