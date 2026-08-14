@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -37,7 +37,7 @@ const quiet = <T>(build: () => T): T => {
 
 describe("first-kill lifecycle E2E — one gateway session end to end", () => {
   it("HELD -> owner veto -> the SAME session's identical retry is VETOED, and the upstream wrote nothing", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "ownerswitch-first-kill-"));
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "ownerswitch-first-kill-")));
     dirs.push(dir);
     const sandbox = join(dir, "sandbox");
 
