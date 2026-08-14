@@ -153,10 +153,15 @@ The curl is one line on purpose: multi-line pastes with `\` get mangled by
 some terminals.
 
 ```bash
-export OWNERSWITCH_OWNER_TOKEN='the-token-terminal-1-printed'   # ← paste the real line from terminal 1
+export OWNERSWITCH_OWNER_TOKEN='the-token-terminal-1-printed'
 curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'
-# → {"status":"vetoed"}
 ```
+
+(The first line is a placeholder — paste the real export line terminal 1
+printed. The fences in this document carry commands only, no `#` comments:
+a default macOS zsh runs pasted `#` lines as commands, and a trailing
+comment on an assignment un-sets the variable it just set.) The veto
+answers `{"status":"vetoed"}`.
 
 Press Enter back in the agent's terminal: it retries the exact same write
 and gets **VETOED** — held is a decision point, and the owner just decided.
@@ -191,23 +196,31 @@ tool is blocked" — stopped.
 Two things worth doing while it is down, because they are the properties
 people assume and rarely check:
 
-```bash
-# 1. it is not a mood: kill state persists to disk
-#    stop the control plane in terminal 1 (Ctrl-C), start it again
-pnpm --filter @ownerswitchai/mcp dev:control-plane
-curl -fsS http://127.0.0.1:4600/status    # still {"killed":true,…}
+**1. It is not a mood: kill state persists to disk.** Stop the control
+plane in terminal 1 (Ctrl-C) and start it again:
 
-# 2. no control plane, no tool calls: stop it entirely and run the agent
-#    again — every call is refused, because unreachable reads as killed
+```bash
+pnpm --filter @ownerswitchai/mcp dev:control-plane
 ```
+
+It boots straight into `kill state : KILLED`. Confirm from terminal 3 —
+the status still says `{"killed":true,…}`:
+
+```bash
+curl -fsS http://127.0.0.1:4600/status
+```
+
+**2. No control plane, no tool calls.** Stop it entirely and run the
+agent again — every call is refused, because unreachable reads as killed.
+(Start it back up before continuing.)
 
 Restarting is not a restore. There is exactly one way back — and the
 restart just **invalidated your owner token**: terminal 1 printed a fresh
-ready-to-paste export line. Copy that new line into terminal 3 before the
-next step:
+ready-to-paste export line. Copy that new line (this is its shape) into
+terminal 3 before the next step:
 
 ```bash
-export OWNERSWITCH_OWNER_TOKEN='the-NEW-token-terminal-1-printed'   # ← paste the real line
+export OWNERSWITCH_OWNER_TOKEN='the-NEW-token-terminal-1-printed'
 ```
 
 ## 7. Be the owner: the two GOs (≈2 min)
@@ -215,41 +228,37 @@ export OWNERSWITCH_OWNER_TOKEN='the-NEW-token-terminal-1-printed'   # ← paste 
 Restoring is meant to be the expensive direction: an owner session, a
 mandatory cooldown, and a single-use ceremony that expires.
 
-GO 1/2 opens the ceremony, and the deliberate **early** GO 2/2 rides in
-the same paste, chained with `&&` — it fires only if GO 1/2 actually
-succeeded and produced a ceremony id, and the two land inside the
-30-second cooldown because no reading time separates them. The early try
-must fail; it is the one command that wants the status code, so it drops
-the `-f` that makes the others fail loudly. (`node` pulls the ceremony id
-out of the response — it is already a prerequisite.) Paste the block:
+This step runs as a **script** — not because the commands are secret (it
+is four curls, [readable in one screen](packages/mcp/examples/two-go-demo.sh)),
+but because the demonstration is correctness-sensitive in ways a paste
+block cannot honestly promise: the deliberate early GO 2/2 must land
+inside the 30-second cooldown, the ceremony id must validate against its
+canonical grammar before anything is posted at it, and the early answer
+must really be the 409 — the script asserts each of these and stops
+loudly on anything else (the test suite drives it through the failure
+matrix, including that a failed GO 1/2 issues ZERO restore calls). Run it
+in **terminal 3**, with `bash` spelled out so your interactive shell
+never interprets its insides:
 
 ```bash
-OWNER=$OWNERSWITCH_OWNER_TOKEN   # the FRESH token from the restart
-CER=$(curl -fsS -X POST http://127.0.0.1:4600/restore/ceremony -H "Authorization: Bearer $OWNER" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).id') && test -n "$CER" && curl -sS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}" -w '\nHTTP %{http_code}\n'
-# {"error":"restore rejected"}
-# HTTP 409
+bash examples/two-go-demo.sh
 ```
 
-If GO 1/2 fails (bad token, non-JSON answer), the chain stops there — you
-see that error instead of a misleading 409 fired at a ceremony that never
-existed.
+What you will watch, in order — every request under your owner token:
 
-That is all you get, whatever went wrong. The body never says which check
-failed (wrong owner, wrong epoch, too early, replayed), because that answer
-would be a map for someone who is not you. `cooldownRemainingMs` below is
-the number to read; it is yours to ask for, and asking requires your token.
-And the failed early try spent nothing: the SAME ceremony completes the
-restore below (the control-plane suite pins exactly this sequence).
-
-```bash
-# the cooldown is real; watch it drain
-curl -fsS "http://127.0.0.1:4600/restore/ceremony/$CER" -H "Authorization: Bearer $OWNER"
-# {"state":"go1","cooldownRemainingMs":28417,…}
-
-# GO 2/2 — after it reaches 0
-curl -fsS -X POST http://127.0.0.1:4600/restore -H "Authorization: Bearer $OWNER" -H 'content-type: application/json' -d "{\"ceremonyId\":\"$CER\"}"
-# {"killed":false}
-```
+1. **GO 1/2** opens the ceremony (`POST /restore/ceremony`) and validates
+   the returned `cer_…` id.
+2. **GO 2/2 early, on purpose** (`POST /restore`) — refused:
+   `HTTP 409 {"error":"restore rejected"}`. That is all anyone gets,
+   whatever went wrong: the body never says which check failed (wrong
+   owner, wrong epoch, too early, replayed), because that answer would be
+   a map for someone who is not you.
+3. **The cooldown drains** — the script polls
+   `GET /restore/ceremony/<id>` until `cooldownRemainingMs` reaches 0.
+   The failed early try spent nothing.
+4. **GO 2/2** — the SAME ceremony restores: `{"killed":false}` (the
+   control-plane suite pins exactly this early-409-then-same-ceremony
+   sequence).
 
 Run the demo agent one last time: `RAN … RAN … HELD … DENIED` — back to
 work, under the same policy (just press Enter through the veto pause this
@@ -268,8 +277,10 @@ A fleet does not need a fleet-wide stop for one misbehaving member:
 
 ```bash
 curl -fsS -X POST http://127.0.0.1:4600/kill -H 'content-type: application/json' -d '{"agentId":"mcp-gateway","reason":"just this one"}'
-curl -fsS http://127.0.0.1:4600/status  # {"killed":false,"killedAgents":["mcp-gateway"],…}
+curl -fsS http://127.0.0.1:4600/status
 ```
+
+The status answers `{"killed":false,"killedAgents":["mcp-gateway"],…}`.
 
 Everything carrying that agent id is denied; every other agent keeps
 running. Restoring is the same ceremony, scoped: pass `{"agentId":

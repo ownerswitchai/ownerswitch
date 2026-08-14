@@ -10,8 +10,9 @@ import { describe, expect, it } from "vitest";
  * future reflow of the document from quietly undoing that.
  */
 describe("FIRST-KILL.md paste safety", () => {
+  const doc = readFileSync(resolve(__dirname, "..", "..", "..", "FIRST-KILL.md"), "utf8");
+
   it("no code fence contains a backslash line continuation", () => {
-    const doc = readFileSync(resolve(__dirname, "..", "..", "..", "FIRST-KILL.md"), "utf8");
     const offenders: string[] = [];
     let inFence = false;
     doc.split("\n").forEach((line, i) => {
@@ -20,6 +21,25 @@ describe("FIRST-KILL.md paste safety", () => {
         return;
       }
       if (inFence && line.trimEnd().endsWith("\\")) {
+        offenders.push(`FIRST-KILL.md:${i + 1}: ${line.trim()}`);
+      }
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  it("no bash fence contains a # anywhere — zsh runs pasted comments as commands", () => {
+    // A default macOS zsh has no INTERACTIVE_COMMENTS: a pasted line
+    // starting with "#" errors, and a TRAILING comment on an assignment
+    // makes the assignment a command-scoped prefix — the variable ends up
+    // unset. Fences are commands only; narration lives in prose.
+    const offenders: string[] = [];
+    let inBashFence = false;
+    doc.split("\n").forEach((line, i) => {
+      if (line.startsWith("```")) {
+        inBashFence = !inBashFence && line.trimEnd() === "```bash";
+        return;
+      }
+      if (inBashFence && line.includes("#")) {
         offenders.push(`FIRST-KILL.md:${i + 1}: ${line.trim()}`);
       }
     });
