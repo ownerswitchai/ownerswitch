@@ -1016,8 +1016,9 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       device.revokedAt = now();
       device.generation += 1;
       console.error(
-        `[ownerswitch] static owner device "${staticId}" SUPERSEDED at boot: its key is enrolled ` +
-          `in the registry as "${enrolledId}" — the static standing is revoked (one key, one identity)`,
+        `[ownerswitch] static owner device "${staticId}" SUPERSEDED at boot: its key was ` +
+          `previously migrated to the enrollment identity namespace as "${enrolledId}" — the ` +
+          "static standing is revoked (one key, one identity)",
       );
     }
   }
