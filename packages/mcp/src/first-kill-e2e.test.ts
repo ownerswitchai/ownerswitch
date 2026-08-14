@@ -76,6 +76,8 @@ describe("first-kill lifecycle E2E — one gateway session end to end", () => {
           rules: [
             { id: "writes", tool: "write_file", decision: "veto", description: "the owner can veto writes" },
             { id: "reads", tool: "read_*", decision: "allow", description: "reads are safe" },
+            { id: "lists", tool: "list_*", decision: "allow", description: "listing is safe" },
+            { id: "moves", tool: "move_file", decision: "allow", description: "allowed here to exercise the wrapper" },
           ],
           defaultDecision: "approve",
         },
@@ -131,6 +133,18 @@ describe("first-kill lifecycle E2E — one gateway session end to end", () => {
 
     // 4. the upstream executed NOTHING: zero writes reached the sandbox
     expect(existsSync(join(sandbox, "hello.txt"))).toBe(false);
+
+    // 4b. list and move run through the gateway VIA THE SANDBOX WRAPPERS —
+    //     the boundary-checked paths, not direct readdir/rename
+    const listed = await client.callTool({ name: "list_files", arguments: {} });
+    const listedText = (listed.content as Array<{ type: string; text?: string }>)
+      .filter((c) => c.type === "text")
+      .map((c) => c.text)
+      .join(" ");
+    expect(listedText).toContain("welcome.txt");
+    await client.callTool({ name: "move_file", arguments: { from: "welcome.txt", to: "renamed.txt" } });
+    expect(existsSync(join(sandbox, "renamed.txt"))).toBe(true);
+    expect(existsSync(join(sandbox, "welcome.txt"))).toBe(false);
 
     // 5. proven shutdown: the gateway child is GONE after close()
     await client.close();

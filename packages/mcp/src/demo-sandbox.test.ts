@@ -128,19 +128,42 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
     expect(readFileSync(join(fakeSsh, "id_ed25519"), "utf8")).toBe("PRIVATE KEY MATERIAL");
   });
 
-  it("a DANGLING root symlink refuses; a symlinked PARENT canonicalizes and is judged by its real target", () => {
+  it("a DANGLING root symlink refuses; a symlink ANYWHERE in the chain refuses — no canonicalize-and-trust-the-target", () => {
     const real = fresh();
     const linkParent = fresh();
     const rootLink = join(linkParent, "sandbox-link");
     symlinkSync(join(real, "nonexistent-dir"), rootLink);
     expect(() => ensureSandboxRoot(rootLink)).toThrow();
-    // parent-as-symlink: resolves to a TRUSTED real dir → accepted, and the
-    // returned root is the canonical path (operations never re-walk the link)
+    // an INTERMEDIATE symlink is namespace laundering even when its target
+    // is a perfectly trusted directory: realpath would authenticate the
+    // target's world, not the directory the entry actually sits in
     const trustedReal = fresh();
     const parentLink = join(fresh(), "via-link");
     symlinkSync(trustedReal, parentLink);
-    const root = ensureSandboxRoot(join(parentLink, "sandbox"));
-    expect(root).toBe(join(lstatSync(trustedReal).isDirectory() ? trustedReal : "", "sandbox"));
+    expect(() => ensureSandboxRoot(join(parentLink, "sandbox"))).toThrow(/component .* is a symlink/);
+  });
+
+  it("the review's via-home LAUNDERING refuses: an attacker-chain symlink into the victim's own trusted tree", () => {
+    // /shared/attacker/via-home -> $HOME-like trusted dir; configured
+    // sandbox via-home/.ssh — the resolved target's owner/mode all pass,
+    // so only the component-wise no-symlink rule can see the redirect
+    const attacker = join(fresh(), "attacker");
+    mkdirSync(attacker);
+    const victimHome = fresh();
+    const dotSsh = join(victimHome, ".ssh");
+    mkdirSync(dotSsh, { mode: 0o700 });
+    chmodSync(dotSsh, 0o700);
+    writeFileSync(join(dotSsh, "id_ed25519"), "PRIVATE KEY MATERIAL", { mode: 0o600 });
+    symlinkSync(victimHome, join(attacker, "via-home"));
+    expect(() => ensureSandboxRoot(join(attacker, "via-home", ".ssh"))).toThrow(
+      /component .* is a symlink/,
+    );
+    expect(readFileSync(join(dotSsh, "id_ed25519"), "utf8")).toBe("PRIVATE KEY MATERIAL");
+  });
+
+  it("a MISSING intermediate refuses — only the final leaf is created, never a recursive chain", () => {
+    const base = fresh();
+    expect(() => ensureSandboxRoot(join(base, "not-yet", "sandbox"))).toThrow(/does not exist/);
   });
 
   it("a GROUP-writable non-sticky parent refuses too — group members can swap entries just as well", () => {
@@ -179,7 +202,11 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
     mkdirSync(trustedTarget);
     chmodSync(trustedTarget, 0o700); // its parent (mkdtemp) is trusted too
     symlinkSync(trustedTarget, join(attackerDir, "demo")); // the swapped-in link
-    expect(() => ensureSandboxRoot(join(attackerDir, "demo"))).toThrow(/not a trusted directory/);
+    // refused either as the planted symlink itself or on the untrusted
+    // parent — both fire before anything trusts the link's target
+    expect(() => ensureSandboxRoot(join(attackerDir, "demo"))).toThrow(
+      /not a trusted directory|is a symlink/,
+    );
   });
 
   it("list_files and move_file honor the SAME per-operation boundary — a widened parent refuses both", () => {
