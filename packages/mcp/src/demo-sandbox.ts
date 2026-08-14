@@ -60,7 +60,7 @@ import {
   writeSync,
   type Stats,
 } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 /**
  * O_NOFOLLOW is the promise — a platform without it refuses, never
