@@ -15,6 +15,7 @@
  * Run by the gateway (see examples/first-kill.config.json), or by hand:
  *   npx tsx examples/demo-tools-server.ts
  */
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -31,18 +32,20 @@ import {
 
 // sandbox dir: argv wins (the gateway strips OWNERSWITCH_* from the
 // upstream's env on purpose, so an env override would never arrive through
-// it), then env for direct runs, then a PRIVATE default — under the user's
-// home rather than a predictable world-writable /tmp name, so a shared
-// machine's other users cannot pre-seed it (HOME survives the gateway's
-// upstream-env allowlist; the uid-suffixed tmp fallback still passes the
-// sandbox's owner/mode/parent checks)
-const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+// it), then env for direct runs. The DEFAULT is an mkdtemp directory: born
+// 0700 with an unpredictable name by an atomic kernel operation inside the
+// sticky temp dir — there is no pre-existing root to have planted in, no
+// predictable name to race, and replacing its entry requires this uid.
+// (realpath immediately: mkdtemp's result may traverse platform links like
+// macOS /var, and the sandbox demands a symlink-free lexical chain.)
+// Explicit paths go through the full chain/parent/root verification and
+// are the operator's own trust decision. Each server start is a FRESH
+// sandbox; the demo re-seeds it, nothing in the tutorial relies on
+// persistence between runs.
 const DEMO_DIR = ensureSandboxRoot(
   process.argv[2] ??
     process.env.OWNERSWITCH_DEMO_DIR ??
-    (process.env.HOME !== undefined && process.env.HOME !== ""
-      ? join(process.env.HOME, ".ownerswitch", "demo")
-      : join(tmpdir(), `ownerswitch-demo-${uid}`)),
+    realpathSync(mkdtempSync(join(tmpdir(), "ownerswitch-demo-"))),
 );
 // seed one file so the demo agent's first read has something real to read
 seedSandboxFile(DEMO_DIR, "welcome.txt", "OwnerSwitch demo sandbox — feel free to delete.\n");

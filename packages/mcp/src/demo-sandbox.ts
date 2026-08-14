@@ -60,7 +60,7 @@ import {
   writeSync,
   type Stats,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 
 /**
  * O_NOFOLLOW is the promise — a platform without it refuses, never
@@ -140,46 +140,72 @@ function assertParentTrusted(root: string): void {
 }
 
 /**
+ * Every EXISTING component of the lexical path must be a real directory —
+ * a symlink ANYWHERE in the chain is namespace laundering: realpath would
+ * resolve it to some (possibly trusted-looking) target and every later
+ * check would authenticate the target's world instead of the attacker's
+ * directory the entry actually sits in. Only the final leaf may be absent
+ * (it is the one thing ensureSandboxRoot creates, non-recursively). This
+ * also means recursive mkdir never runs across an unverified chain.
+ */
+function assertChainSymlinkFree(lexical: string): void {
+  const parts = lexical.split(sep).filter((p) => p !== "");
+  let current: string = sep;
+  for (const part of parts) {
+    current = join(current, part);
+    let stat: Stats;
+    try {
+      stat = lstatSync(current);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" && current === lexical) return;
+      throw new Error(
+        `demo sandbox path component "${current}" does not exist — only the final directory is ` +
+          "created here; create (and own) the parent chain yourself, or use the default sandbox",
+      );
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(
+        `demo sandbox path component "${current}" is a symlink — an explicit sandbox path must ` +
+          "not traverse symlinks anywhere (a resolved link would launder the namespace into a " +
+          "different directory's trust); use the default sandbox, or a fully real path",
+      );
+    }
+  }
+}
+
+/**
  * Ensure the sandbox root exists and satisfies the WHOLE boundary above.
  * Returns the CANONICAL path — every later operation resolves from it.
  *
- * ORDER MATTERS, and it is the LEXICAL parent that gets authenticated
- * first: canonicalize dirname(lexical), require it trusted, and only then
- * look at the leaf — then require that the canonical root actually lives
- * in that already-verified parent. The previous order (leaf lstat, then
- * realpath, then a parent check) authenticated the TARGET's parent: under
- * a writable lexical parent, a swap-to-symlink between the lstat and the
- * realpath would have sent the check to ~/.ssh's (perfectly trusted)
- * parent while the swap happened in the attacker's directory. With the
- * parent verified first, a writable parent refuses before the leaf is
- * ever trusted — there is no window left in which a swap wins.
+ * The rule that closes the laundering class outright: the lexical chain
+ * must be symlink-free (checked component-by-component, above), the
+ * parent must already EXIST and be trusted, the leaf is created
+ * NON-recursively, and afterwards `realpath(lexical)` must equal the
+ * lexical path itself — on a symlink-free chain the two can only differ
+ * if something was swapped mid-sequence, and that difference refuses.
+ * Nothing here ever follows a link, so there is no target whose trust
+ * could be mistaken for the chain's.
  */
 export function ensureSandboxRoot(dir: string): string {
   requireNoFollow(constants.O_NOFOLLOW);
   const lexical = resolve(dir);
-  mkdirSync(lexical, { recursive: true, mode: 0o700 });
-  // 1. authenticate the LEXICAL parent (canonicalized) — the directory the
-  //    root's entry actually sits in, where any swap would have to happen
-  const canonParent = realpathSync(dirname(lexical));
-  assertTrustedParentDir(canonParent);
-  // 2. the leaf, addressed THROUGH the verified parent, must be a real
-  //    directory — a planted `demo -> ~/.ssh` refuses whatever it points at
-  const leafInParent = join(canonParent, basename(lexical));
-  if (lstatSync(leafInParent).isSymbolicLink()) {
+  assertChainSymlinkFree(lexical);
+  assertTrustedParentDir(dirname(lexical));
+  try {
+    mkdirSync(lexical, { mode: 0o700 }); // NON-recursive: only under the verified parent
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  if (lstatSync(lexical).isSymbolicLink()) {
     throw new Error(
-      `demo sandbox root "${leafInParent}" is a symlink — refusing to follow it (a planted ` +
-        "link would silently redirect the sandbox into a real directory such as ~/.ssh); " +
-        "remove the link and re-run",
+      `demo sandbox root "${lexical}" is a symlink — refusing to follow it; remove the link and re-run`,
     );
   }
-  // 3. canonicalize and require the result to live EXACTLY in the parent
-  //    verified above — a root whose canonical home is anywhere else was
-  //    redirected, whoever raced whom
-  const root = realpathSync(leafInParent);
-  if (dirname(root) !== canonParent) {
+  const root = realpathSync(lexical);
+  if (root !== lexical) {
     throw new Error(
-      `demo sandbox root "${leafInParent}" resolves outside its verified parent ` +
-        `("${root}") — refusing the redirect`,
+      `demo sandbox root "${lexical}" canonicalizes to "${root}" — a symlink-free chain can only ` +
+        "diverge from itself if a component was swapped; refusing the redirect",
     );
   }
   assertRootBoundary(root);
