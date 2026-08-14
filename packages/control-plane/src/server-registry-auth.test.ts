@@ -484,7 +484,7 @@ describe("v29: the two-file crash boundary — boot reconciliation is the repair
     ).toBe(401);
   });
 
-  it("a QUARANTINED registry never re-exports its devices from history — the stale entries DROP, with or without static keys", async () => {
+  it("a QUARANTINED registry TOMBSTONES its devices in the export — refused everywhere, never trusted, never lost", async () => {
     const dir = freshDir();
     const devicesFile = join(dir, "devices.json");
     const standingFile = join(dir, "standing.json");
@@ -492,41 +492,78 @@ describe("v29: the two-file crash boundary — boot reconciliation is the repair
     const base = await start(cp);
     const p = phone();
     const deviceId = await enrollPhone(cp, base, p);
-    expect(standingOf(standingFile).devices[deviceId].spki).toBeDefined();
+    const active = standingOf(standingFile).devices[deviceId];
+    expect(active.revokedAt).toBeNull();
+    const registryBytes = readFileSync(devicesFile);
 
     // the registry file is destroyed; the standing file still carries the
     // dev_ entry ACTIVE with its key — the exact stale-permissive shape
     writeFileSync(devicesFile, "{ not the registry", { mode: 0o600 });
 
     // registry-only restart: the boot block still runs (a registry is
-    // CONFIGURED, even though unusable) and the unverifiable entry drops
-    const registryOnly = plane({ devicesFile, standingFile });
-    expect(registryOnly.enrolledDevices?.usable).toBe(false);
-    expect(standingOf(standingFile).devices[deviceId]).toBeUndefined();
+    // CONFIGURED, even though unusable) and the unverifiable entry becomes a
+    // TOMBSTONE — refused by the escalation reader (revoked), key preserved
+    const quarantined = plane({ devicesFile, standingFile });
+    expect(quarantined.enrolledDevices?.usable).toBe(false);
+    const tombstoned = standingOf(standingFile).devices[deviceId];
+    expect(tombstoned.revokedAt).not.toBeNull();
+    expect(tombstoned.spki).toBe(active.spki);
+    expect(tombstoned.generation).toBe(active.generation);
 
-    // the escalation reader now finds NO record: no trust, fail closed —
-    // instead of authenticating the stale "active" projection
-    // (re-create the stale state and repeat with a static key present)
-    const other = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-    const otherSpki = (other.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
+    // and the tombstone is a POLICY refusal, not fabricated history: the
+    // repaired registry's authoritative projection restores the truth
+    writeFileSync(devicesFile, registryBytes, { mode: 0o600 });
+    const recovered = plane({ devicesFile, standingFile });
+    expect(recovered.enrolledDevices?.usable).toBe(true);
+    expect(standingOf(standingFile).devices[deviceId].revokedAt).toBeNull();
+    const base2 = await start(recovered);
+    armWindow(recovered, "v-rec");
+    expect(
+      (await signedFetch(base2, p.cheapLane, deviceId, "GET", "/veto/v-rec/detail", "")).status,
+    ).toBe(200);
+  });
+
+  it("MANDATORY REGRESSION: the migrated key under a fresh static name is refused even while the registry cannot vouch", async () => {
+    const dir = freshDir();
+    const devicesFile = join(dir, "devices.json");
+    const standingFile = join(dir, "standing.json");
+    const cp = plane({ devicesFile, standingFile });
+    const base = await start(cp);
+    const p = phone();
+    const deviceId = await enrollPhone(cp, base, p);
+    const spkiK = (p.cheapLane.publicKey.export({ type: "spki", format: "der" }) as Buffer).toString(
       "base64url",
     );
-    writeFileSync(
-      standingFile,
-      JSON.stringify({
-        version: 2,
-        devices: { [deviceId]: { generation: 1, revokedAt: null, spki: otherSpki } },
-      }),
-      { mode: 0o600 },
-    );
-    const withStatic = plane({
+
+    // registry corrupted, then the operator re-provisions THE SAME key K as
+    // a static device — the v29 review's exact fail-open sequence
+    writeFileSync(devicesFile, "{ not the registry", { mode: 0o600 });
+    const rebooted = plane({
       devicesFile,
       standingFile,
-      ownerDeviceKeys: { "owner-phone": otherSpki },
+      ownerDeviceKeys: { "owner-phone": spkiK },
     });
-    expect(withStatic.enrolledDevices?.usable).toBe(false);
-    const after = standingOf(standingFile);
-    expect(after.devices[deviceId]).toBeUndefined();
-    expect(after.devices["owner-phone"]).toBeDefined();
+    expect(rebooted.enrolledDevices?.usable).toBe(false);
+    // the standing-history TOMBSTONE proves K migrated to the registry, so
+    // the static alias boots REVOKED — durably, for the escalation reader too
+    const standing = standingOf(standingFile);
+    expect(standing.devices["owner-phone"].revokedAt).not.toBeNull();
+    expect(standing.devices[deviceId].revokedAt).not.toBeNull();
+    const base2 = await start(rebooted);
+    armWindow(rebooted, "v-ts");
+    expect(
+      (await signedFetch(base2, p.cheapLane, "owner-phone", "GET", "/veto/v-ts/detail", "")).status,
+    ).toBe(401);
+    expect(
+      (await signedFetch(base2, p.cheapLane, deviceId, "GET", "/veto/v-ts/detail", "")).status,
+    ).toBe(401);
+
+    // and the refusal SURVIVES further restarts — the tombstone re-exports
+    const again = plane({ devicesFile, standingFile, ownerDeviceKeys: { "owner-phone": spkiK } });
+    const base3 = await start(again);
+    armWindow(again, "v-ts2");
+    expect(
+      (await signedFetch(base3, p.cheapLane, "owner-phone", "GET", "/veto/v-ts2/detail", "")).status,
+    ).toBe(401);
   });
 });

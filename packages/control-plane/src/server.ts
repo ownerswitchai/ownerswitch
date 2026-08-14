@@ -841,17 +841,27 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   function persistStanding(): { durable: boolean; detail?: string } {
     if (standingStore === null) return { durable: false, detail: "no standing registry configured (dev)" };
     const devices: Record<string, DeviceStanding> = {};
-    // Static history first (see unenrolledStanding) — but NEVER a ceremony
-    // (dev_*/spki-bearing) entry: for those the REGISTRY is the only source
-    // of truth, and echoing one from loaded history would re-publish a
-    // projection nobody can verify right now. While the registry is
-    // quarantined its devices simply drop out of the export, and the
-    // escalation reader — no record, no trust — fails closed with the
-    // control plane instead of trusting a stale "active". A recovered
-    // registry re-exports them at its next boot or write.
+    // History first (see unenrolledStanding). A ceremony (spki-bearing)
+    // entry the registry cannot currently vouch for is exported as a
+    // TOMBSTONE, never as trust and never dropped: revokedAt is forced
+    // non-null (the original instant if one exists, else the 0 sentinel the
+    // corrupt-standing path already uses for policy revocation), while the
+    // SPKI and generation are PRESERVED. Three properties hang on this:
+    //  - the escalation reader refuses the entry (revoked → no push
+    //    enrollment, no active subscription) — fail closed with the CP;
+    //  - the record that this key MIGRATED to the registry survives every
+    //    restart, so the boot alias reconciliation can keep refusing the
+    //    same key under a static name even while the registry is
+    //    quarantined or reset (the "one key, one identity" tombstone);
+    //  - nothing is fabricated permanently: the moment the registry can
+    //    vouch again, its authoritative projection overwrites the tombstone
+    //    below.
     for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
-      if (standing.spki !== undefined || deviceId.startsWith("dev_")) continue;
-      devices[deviceId] = standing;
+      if (standing.spki !== undefined || deviceId.startsWith("dev_")) {
+        devices[deviceId] = { ...standing, revokedAt: standing.revokedAt ?? 0 };
+      } else {
+        devices[deviceId] = standing;
+      }
     }
     for (const [deviceId, device] of ownerDevices) {
       devices[deviceId] = { generation: device.generation, revokedAt: device.revokedAt };
@@ -872,16 +882,25 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     }
   }
   // BOOT STANDING RECONCILIATION — the recovery half of the two-file
-  // revocation story. The registry publish and the standing export are two
-  // separate durable writes; a crash between them leaves the standing file
-  // holding a projection the registry has already superseded (a revoked
-  // dev_ device still "active" to the escalation reader). The repair is
-  // structural, not detective: at EVERY boot the standing file is
-  // re-derived from the live sources and re-published durable-or-refuse,
-  // so the authoritative registry projection overwrites whatever the crash
-  // left — and until this process is back up to do that, the escalation
-  // surface can at worst serve the file the LAST completed export wrote,
-  // while the control plane (the only revoker) is down anyway.
+  // revocation story, and one leg of the PINNED CONSISTENCY CONTRACT
+  // (STANDING-DEPLOYMENT.md "Revocation consistency"):
+  //  - a revocation is COMPLETE — both control-plane and escalation
+  //    surfaces severed — only when the revoke request answered 200/503;
+  //    the 200 is issued strictly AFTER both durable writes;
+  //  - a crash between the registry publish and the standing export is a
+  //    revoke that NEVER ACKNOWLEDGED: the caller must treat it as not
+  //    done and retry (idempotent) once the control plane returns;
+  //  - in that interval the ESCALATION process — a separate reader with no
+  //    view of the registry — keeps honoring the LAST COMPLETED export,
+  //    which may still show the device active on its push surfaces. This
+  //    window closes at the next control-plane boot, when the standing
+  //    file is re-derived from live sources and re-published
+  //    durable-or-refuse BEFORE any control-plane surface opens (the
+  //    escalation process runs throughout and converges at its next read
+  //    of the re-published file). Anything stronger — cross-process
+  //    revocation with no post-crash window — needs a shared journal or a
+  //    CP-freshness lease, which this single-host v0 deliberately does not
+  //    claim.
   //
   // The block therefore runs whenever the standing file has ANY producer:
   // static keys-file devices, or an enrollment registry being CONFIGURED at
@@ -943,20 +962,39 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
   // one would leave the other alive. The rule: once a key is enrolled in the
   // registry, the registry IS its identity. At every boot, any static device
   // whose canonical SPKI matches ANY registry record (revoked or not — the
-  // authority moved, it did not fork) has its static standing revoked, and
-  // the revocation is persisted with the same durable-or-refuse rule as the
+  // authority moved, it did not fork) OR any spki-bearing standing-history
+  // TOMBSTONE (proof the key migrated at some point, valid even while the
+  // registry itself is quarantined or reset and cannot vouch) has its static
+  // standing revoked, persisted with the same durable-or-refuse rule as the
   // rest of boot standing. The enroll handler performs the same supersession
-  // live at admit time; this reconciles enrollments this process missed.
-  if (enrolledDevices !== undefined && enrolledDevices.usable && ownerDevices.size > 0) {
+  // live at admit time; this reconciles enrollments this process missed —
+  // and, through the tombstones, keeps refusing a migrated key under a
+  // freshly re-provisioned static name on the quarantine-recovery path too.
+  if (enrolledDevices !== undefined && ownerDevices.size > 0) {
     const enrolledByCanonSpki = new Map<string, string>();
-    for (const record of enrolledDevices.list()) {
+    // the spki-bearing standing history: tombstones first, so a usable
+    // registry's live record (below) wins the map entry for the same key
+    for (const [deviceId, standing] of Object.entries(unenrolledStanding)) {
+      if (standing.spki === undefined) continue;
       try {
         enrolledByCanonSpki.set(
-          canonicalSpki(enrolledOwnerDeviceFromSpki(record.deviceId, record.cheapLaneKeySpki)),
-          record.deviceId,
+          canonicalSpki(enrolledOwnerDeviceFromSpki(deviceId, standing.spki)),
+          deviceId,
         );
       } catch {
-        // a record the strict parser refuses resolves no authority anyway
+        // an SPKI the strict parser refuses names no key to collide with
+      }
+    }
+    if (enrolledDevices.usable) {
+      for (const record of enrolledDevices.list()) {
+        try {
+          enrolledByCanonSpki.set(
+            canonicalSpki(enrolledOwnerDeviceFromSpki(record.deviceId, record.cheapLaneKeySpki)),
+            record.deviceId,
+          );
+        } catch {
+          // a record the strict parser refuses resolves no authority anyway
+        }
       }
     }
     for (const [staticId, device] of ownerDevices) {
