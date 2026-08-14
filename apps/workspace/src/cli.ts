@@ -62,8 +62,9 @@ async function main(): Promise<void> {
   const listening = await listen(port, bind);
 
   const lanes = api.lanes();
-  // names only — no secret value is ever printed
-  console.log(`workspace console: http://${bind}:${listening.port}`);
+  // names only — no secret value is ever printed (IPv6 hosts bracketed)
+  const printableBind = bind.includes(":") ? `[${bind}]` : bind;
+  console.log(`workspace console: http://${printableBind}:${listening.port}`);
   console.log(`control plane:     ${controlPlaneUrl}`);
   console.log(`device lane:       ${lanes.device ? `configured (${deviceId})` : "absent — pending list and VETO disabled"}`);
   console.log(`owner session:     ${lanes.ownerSession ? "configured" : "absent — devices panel disabled"}`);

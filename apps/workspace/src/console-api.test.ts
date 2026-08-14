@@ -247,7 +247,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
     const api = createConsoleApi({
       controlPlaneUrl: CP,
       deviceId: "c",
-      deviceSecret: "s",
+      deviceSecret: "stub-secret",
       fetchImpl: scripted(() =>
         json(200, {
           windows: [
@@ -290,7 +290,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
       const api = createConsoleApi({
         controlPlaneUrl: CP,
         deviceId: "c",
-        deviceSecret: "s",
+        deviceSecret: "stub-secret",
         fetchImpl: scripted(() => json(200, { windows: [entry] })).fetchImpl,
       });
       expect((await api.pending()).kind, JSON.stringify(entry)).toBe("unreachable");
@@ -301,7 +301,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
     const refused = createConsoleApi({
       controlPlaneUrl: CP,
       deviceId: "c",
-      deviceSecret: "wrong",
+      deviceSecret: "wrong-secret",
       fetchImpl: scripted(() => json(401, { error: "unauthorized: Bearer tok-canary-123" })).fetchImpl,
     });
     const reading = await refused.pending();
@@ -311,7 +311,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
     const hollow = createConsoleApi({
       controlPlaneUrl: CP,
       deviceId: "c",
-      deviceSecret: "s",
+      deviceSecret: "stub-secret",
       fetchImpl: scripted(() => json(200, {})).fetchImpl,
     });
     expect((await hollow.pending()).kind).toBe("unreachable");
@@ -342,7 +342,7 @@ describe("console-api /devices — the owner-session lane", () => {
         ],
       }),
     );
-    const api = createConsoleApi({ controlPlaneUrl: CP, ownerToken: "tok-1", fetchImpl });
+    const api = createConsoleApi({ controlPlaneUrl: CP, ownerToken: "tok-0000001", fetchImpl });
     const reading = await api.devices();
     expect(reading).toEqual({
       kind: "ok",
@@ -352,12 +352,12 @@ describe("console-api /devices — the owner-session lane", () => {
     });
     expect(JSON.stringify(reading)).not.toContain("never-forwarded");
     const headers = captured[0]?.init.headers as Record<string, string>;
-    expect(headers.authorization).toBe("Bearer tok-1");
+    expect(headers.authorization).toBe("Bearer tok-0000001");
     expect(captured[0]?.init.redirect).toBe("error");
 
     const expired = createConsoleApi({
       controlPlaneUrl: CP,
-      ownerToken: "tok-2",
+      ownerToken: "tok-0000002",
       fetchImpl: scripted(() => json(401, { error: "unauthorized" })).fetchImpl,
     });
     expect(await expired.devices()).toEqual({
@@ -368,7 +368,7 @@ describe("console-api /devices — the owner-session lane", () => {
 
     const malformed = createConsoleApi({
       controlPlaneUrl: CP,
-      ownerToken: "tok-3",
+      ownerToken: "tok-0000003",
       fetchImpl: scripted(() => json(200, { devices: [{ deviceId: "d", name: 42 }] })).fetchImpl,
     });
     expect((await malformed.devices()).kind).toBe("unreachable");
@@ -478,8 +478,17 @@ describe("console-api credential canaries — no secret in ANY reading (audit #5
 describe("console-api actions", () => {
   it("a bad device id fails at CONSTRUCTION, not inside the first signed call", () => {
     expect(() =>
-      createConsoleApi({ controlPlaneUrl: CP, deviceId: "has.dot", deviceSecret: "s" }),
+      createConsoleApi({ controlPlaneUrl: CP, deviceId: "has.dot", deviceSecret: "stub-secret" }),
     ).toThrow(/OWNERSWITCH_DEVICE_ID/);
+  });
+
+  it("a credential too short to taboo-screen is refused at construction — it must not exist at all", () => {
+    expect(() => createConsoleApi({ controlPlaneUrl: CP, deviceId: "c", deviceSecret: "s" })).toThrow(
+      /OWNERSWITCH_DEVICE_SECRET.*8/,
+    );
+    expect(() => createConsoleApi({ controlPlaneUrl: CP, ownerToken: "tok-1" })).toThrow(
+      /OWNERSWITCH_OWNER_TOKEN.*8/,
+    );
   });
 
   it("veto refuses to pretend without a device credential", async () => {
@@ -511,7 +520,7 @@ describe("console-api actions", () => {
     const api = createConsoleApi({
       controlPlaneUrl: CP,
       deviceId: "c",
-      deviceSecret: "s",
+      deviceSecret: "stub-secret",
       fetchImpl: scripted(() => json(409, { error: "too late to veto — window w9 details" })).fetchImpl,
     });
     expect(await api.veto("veto_x")).toEqual({
@@ -594,8 +603,8 @@ describe("console-api actions", () => {
       createConsoleApi({
         controlPlaneUrl: CP,
         deviceId: "c",
-        deviceSecret: "s",
-        ownerToken: "t",
+        deviceSecret: "stub-secret",
+        ownerToken: "tok-lanes-1",
       }).lanes(),
     ).toEqual({ device: true, ownerSession: true });
   });

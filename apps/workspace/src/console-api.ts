@@ -232,24 +232,29 @@ async function boundedText(res: Response, controller: AbortController): Promise<
   const body = res.body;
   if (body === null) return "";
   const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
+  // ONE preallocated buffer is the actual memory bound — a chunk ARRAY
+  // would let a million one-byte chunks cost far more than the cap in
+  // per-chunk overhead before the size counter ever tripped
+  const buf = Buffer.allocUnsafe(MAX_UPSTREAM_BODY_BYTES + 1);
   let size = 0;
+  const overflow = async (): Promise<never> => {
+    controller.abort();
+    try {
+      await reader.cancel();
+    } catch {
+      /* the abort already tore the stream down */
+    }
+    throw new Error("oversized control-plane response");
+  };
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (value.byteLength > buf.length - size) return overflow();
+    buf.set(value, size);
     size += value.byteLength;
-    if (size > MAX_UPSTREAM_BODY_BYTES) {
-      controller.abort();
-      try {
-        await reader.cancel();
-      } catch {
-        /* the abort already tore the stream down */
-      }
-      throw new Error("oversized control-plane response");
-    }
-    chunks.push(value);
+    if (size > MAX_UPSTREAM_BODY_BYTES) return overflow();
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return buf.subarray(0, size).toString("utf8");
 }
 
 export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
@@ -261,17 +266,27 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
   // not inside the first signed call, where the signer's throw would read
   // as an outage and could block even the kill path (audit follow-up #4)
   if (opts.deviceId !== undefined && opts.deviceId !== "") validateDeviceId(opts.deviceId);
+  // credentials shorter than the taboo screen can safely match are refused
+  // OUTRIGHT — a 3-char secret cannot be screened out of reflected fields
+  // without tabooing half the alphabet, so it must not exist at all (and a
+  // short credential is a misconfiguration in its own right)
+  if (opts.deviceSecret !== undefined && opts.deviceSecret !== "" && opts.deviceSecret.length < 8) {
+    throw new Error("OWNERSWITCH_DEVICE_SECRET must be at least 8 characters");
+  }
+  if (opts.ownerToken !== undefined && opts.ownerToken !== "" && opts.ownerToken.length < 8) {
+    throw new Error("OWNERSWITCH_OWNER_TOKEN must be at least 8 characters");
+  }
   const deviceConfigured =
     opts.deviceId !== undefined &&
     opts.deviceId !== "" &&
     opts.deviceSecret !== undefined &&
     opts.deviceSecret !== "";
   // the enforcement behind "no credential reaches the browser": any shaped
-  // string CONTAINING a configured secret poisons its reading (see
-  // safeString). Short values are skipped — a 1-char secret would taboo
-  // half the alphabet, and real credentials are long.
+  // string CONTAINING a configured credential poisons its reading (see
+  // safeString) — EVERY configured credential, the length floor above
+  // guarantees they are all screenable
   const taboo: string[] = [opts.deviceSecret, opts.ownerToken].filter(
-    (s): s is string => typeof s === "string" && s.length >= 8,
+    (s): s is string => typeof s === "string" && s !== "",
   );
 
   /**

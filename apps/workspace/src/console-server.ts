@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP } from "node:net";
 import { join, resolve, sep } from "node:path";
 import type { ConsoleApi } from "./console-api.js";
+import { isLoopbackBind } from "./startup.js";
 
 /**
  * The console server: serves the static console (strict CSP, no inline
@@ -283,6 +284,19 @@ export function createConsoleServer(opts: ConsoleServerOptions): {
   return {
     handler,
     listen(port: number, bind: string): Promise<ListeningConsole> {
+      // the REQUESTED bind is judged BEFORE any socket opens: a resolver
+      // name that happens to point at loopback today must not slip a raw,
+      // attacker-influenceable name into the Host allowlist, and 0.0.0.0
+      // must not be reachable even for the instant before a post-bind
+      // check could close it
+      if (!isLoopbackBind(bind)) {
+        return Promise.reject(
+          new Error(
+            `refusing to bind ${bind}: the console binds numeric loopback only (127.0.0.0/8 or ::1) — ` +
+              "front the handler with your own TLS+auth server for anything remote",
+          ),
+        );
+      }
       const server = createServer(handler);
       return new Promise((resolvePromise, reject) => {
         server.once("error", reject);
