@@ -8,7 +8,7 @@ import {
   seedSandboxFile,
   validateName,
   writeSandboxFile,
-} from "../examples/demo-sandbox.js";
+} from "./demo-sandbox.js";
 
 /**
  * The demo sandbox's containment REGRESSIONS (the review's exact attacks):

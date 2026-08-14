@@ -6,7 +6,7 @@
  * stderr. The upstream server is spawned as a child with its stderr
  * inherited, so its logs surface in the client's logs too.
  */
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "node:path";
 import {
@@ -29,76 +29,42 @@ import {
   type LimitTrip,
 } from "@ownerswitchai/gateway";
 import type { LimitRule } from "@ownerswitchai/shared";
-import {
-  createTripReporter,
-  createTripwire,
-  loadRegistry,
-  readRegistryFile,
-  type Tripwire,
-} from "@ownerswitchai/honeytoken";
-import { assertKillLimitRiskAccepted, ConfigError, loadConfig } from "./config.js";
+import { createTripReporter, createTripwire, type Tripwire } from "@ownerswitchai/honeytoken";
+import { ConfigError, loadConfig } from "./config.js";
 import { doctorMain } from "./doctor.js";
 import {
   isLimitKillConfirmation,
   parseLimitKillConfirmation,
 } from "./limit-kill-confirmation.js";
-import { resolveGitHubConnectorEnv } from "./github-app-env.js";
 import { createOwnerSwitchProxy, PROXY_NAME } from "./proxy.js";
-import { assertUpstreamArgsCredentialFree, upstreamEnvironment } from "./upstream-env.js";
+import { runStartupGates } from "./startup-gates.js";
+import { upstreamLaunchSpec } from "./upstream-env.js";
 import { createVetoClient } from "./veto-client.js";
 import { verifyMain } from "./verify.js";
-
-/**
- * Un-prefixed alias names a gateway credential might ride into the upstream
- * child under, stripped from its environment by NAME regardless of value
- * (see upstream-env.ts). OWNERSWITCH_* names are always stripped separately.
- */
-const KNOWN_CREDENTIAL_ENV_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "DEVICE_SECRET", "CANARY_KEY"];
-
-/**
- * Arm the honeytoken tripwire when a registry is configured. Opt-in, and
- * explicit: the canary key is DEDICATED (never the device secret), and the
- * deployment id must match the one the registry was minted for — loadRegistry
- * rejects a tampered or foreign registry loudly. Returns undefined when no
- * registry is configured (the gateway runs without honeytoken scanning).
- */
-function armTripwire(controlPlaneUrl: string, device: { id: string; secret: string }): Tripwire | undefined {
-  const registryPath = process.env.OWNERSWITCH_HONEYTOKEN_REGISTRY;
-  if (registryPath === undefined) return undefined;
-
-  const canaryKey = process.env.OWNERSWITCH_CANARY_KEY;
-  const deploymentId = process.env.OWNERSWITCH_DEPLOYMENT_ID;
-  if (!canaryKey || !deploymentId) {
-    throw new ConfigError(
-      "OWNERSWITCH_HONEYTOKEN_REGISTRY is set but OWNERSWITCH_CANARY_KEY and/or " +
-        "OWNERSWITCH_DEPLOYMENT_ID are missing — the registry cannot be verified without them",
-    );
-  }
-  let serialized: string;
-  try {
-    // readRegistryFile refuses to follow a symlink at registryPath and caps
-    // the file size before the bytes are read into memory — a locally
-    // replaced huge or symlinked file is rejected here, before parsing.
-    serialized = readRegistryFile(registryPath);
-  } catch (err) {
-    throw new ConfigError(
-      `cannot read honeytoken registry "${registryPath}": ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  let registry;
-  try {
-    registry = loadRegistry(serialized, { canaryKey, deploymentId });
-  } catch (err) {
-    throw new ConfigError(`honeytoken registry rejected: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return createTripwire({ controlPlaneUrl, deviceId: device.id, secret: device.secret, registry });
-}
 
 async function runGateway(argv: string[]): Promise<void> {
   const config = loadConfig(argv, process.env);
   const { controlPlaneUrl, device, timeoutMs = 1500 } = config;
 
-  const tripwire = armTripwire(controlPlaneUrl, device);
+  // EVERY pre-serve gate, in one call — the same one `doctor` makes, so a
+  // green doctor can no longer be followed by a gateway that refuses to
+  // start (which an MCP client shows only as a dead connection). New gates
+  // belong in startup-gates.ts, never inline here.
+  const gates = runStartupGates(config, process.env);
+
+  // Arm the honeytoken tripwire when the gates loaded a registry. Opt-in and
+  // explicit: the canary key is DEDICATED (never the device secret) and the
+  // registry must have been minted for THIS deployment id. No registry
+  // configured → the gateway runs without honeytoken scanning.
+  const tripwire: Tripwire | undefined =
+    gates.honeytokenRegistry !== undefined
+      ? createTripwire({
+          controlPlaneUrl,
+          deviceId: device.id,
+          secret: device.secret,
+          registry: gates.honeytokenRegistry,
+        })
+      : undefined;
   const controlPlane = createControlPlaneClient({ baseUrl: controlPlaneUrl, timeoutMs });
 
   // Executor routing, when configured: routed tools are performed by the
@@ -141,7 +107,7 @@ async function runGateway(argv: string[]): Promise<void> {
   // agent sees.
   const routes = config.executorRoutes;
   const githubToken = process.env.OWNERSWITCH_GITHUB_TOKEN;
-  const connectorEnv = resolveGitHubConnectorEnv(process.env);
+  const connectorEnv = gates.connector;
   const ledger = createSecretLedger();
   let githubClient: GitHubMergeClient | undefined;
   let githubAppKeyPem: string | undefined;
@@ -221,9 +187,6 @@ async function runGateway(argv: string[]): Promise<void> {
   // background; delivery confirmation advances the tracker's lifecycle.
   const effectiveAgentId = config.agentId ?? PROXY_NAME;
   const armLimits = config.limits !== undefined && config.limits.length > 0;
-  // Kill-action budgets demand the explicit process-local-risk flag —
-  // rationale and contract in config.ts assertKillLimitRiskAccepted.
-  assertKillLimitRiskAccepted(config.limits, process.env);
   const limitTracker = armLimits ? new LimitTracker(config.limits as LimitRule[]) : undefined;
   const limitReporter = armLimits
     ? createTripReporter({
@@ -327,41 +290,18 @@ async function runGateway(argv: string[]): Promise<void> {
     });
   };
 
-  // Every gateway credential this process holds, in one place: reused for
-  // both the environment filter (by value AND by known alias name) and the
-  // args check below (by value — a credential in argv is a hard refusal,
-  // not a filter, since argv is visible to any process that can read it).
-  // The GitHub App PRIVATE KEY rides along: installation tokens minted from
-  // it exist only after startup and can't be inherited, but the key itself
-  // pasted into an env var or an argument absolutely can be.
-  const gatewaySecretValues = [
-    config.device.secret,
-    githubToken,
-    githubAppKeyPem,
-    process.env.OWNERSWITCH_CANARY_KEY,
-    process.env.OWNERSWITCH_DEVICE_SECRET,
-  ];
-  // Command-line arguments are a worse leak surface than an environment
-  // variable (visible via /proc/<pid>/cmdline, `ps aux`, …) — refuse to
-  // start rather than filter, naming the offending argument, never its value.
-  assertUpstreamArgsCredentialFree(config.upstream.args, gatewaySecretValues);
-
+  // The upstream child's launch spec — command, args, cwd, and an
+  // environment built explicitly with every gateway/executor/connector
+  // credential stripped by name (OWNERSWITCH_* and known aliases) and by
+  // value. The child is the agent's side of the boundary: it must never
+  // inherit the credential the executor exists to keep away from it. The
+  // gates checked argv against the same value set (a credential there is a
+  // refusal to start, not something to filter), and `doctor` spawns its
+  // probe from this same function, so a preflight can never hand the child
+  // more than the gateway would.
   await proxy.connectUpstream(
     new StdioClientTransport({
-      command: config.upstream.command,
-      args: config.upstream.args ?? [],
-      // The child's environment is EXACTLY upstreamEnvironment()'s output:
-      // built explicitly, every gateway/executor/connector credential
-      // stripped by name (OWNERSWITCH_* and known aliases) and by value.
-      // The upstream child is the agent's side of the boundary — it must
-      // never inherit the credential the executor exists to keep away from it.
-      env: upstreamEnvironment({
-        base: getDefaultEnvironment(),
-        configured: config.upstream.env,
-        secretValues: gatewaySecretValues,
-        secretNames: KNOWN_CREDENTIAL_ENV_NAMES,
-      }),
-      cwd: config.upstream.cwd,
+      ...upstreamLaunchSpec(config.upstream, gates.secretValues),
       stderr: "inherit",
     }),
   );

@@ -26,7 +26,7 @@ import {
   seedSandboxFile,
   validateName,
   writeSandboxFile,
-} from "./demo-sandbox.js";
+} from "../src/demo-sandbox.js";
 
 // sandbox dir: argv wins (the gateway strips OWNERSWITCH_* from the
 // upstream's env on purpose, so an env override would never arrive through

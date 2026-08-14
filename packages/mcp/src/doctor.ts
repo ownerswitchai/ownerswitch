@@ -7,10 +7,16 @@
  */
 import { randomBytes } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { signDeviceRequest } from "@ownerswitchai/control-plane";
-import { ConfigError, loadConfig, type OwnerSwitchMcpConfig, type UpstreamConfig } from "./config.js";
+import { ConfigError, loadConfig, type OwnerSwitchMcpConfig } from "./config.js";
+import {
+  runStartupGates,
+  type StartupGateDeps,
+  type StartupGateResult,
+} from "./startup-gates.js";
+import { upstreamLaunchSpec, type UpstreamLaunchSpec } from "./upstream-env.js";
 import type { DeviceIdentity } from "./veto-client.js";
 
 /**
@@ -31,8 +37,55 @@ export interface DoctorCheck {
 export interface UpstreamProbeOptions {
   /** give up on the MCP initialize handshake after this long; default 15s */
   timeoutMs?: number;
-  /** injectable for tests — defaults to a real stdio transport for the upstream command */
-  transportFactory?: (upstream: UpstreamConfig) => Transport;
+  /** injectable for tests — defaults to a real stdio transport for the spec */
+  transportFactory?: (spec: UpstreamLaunchSpec) => Transport;
+  /** the ambient environment to diagnose a stripped-env failure against */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Environment variables that commonly decide whether a command can reach
+ * the network or a registry AT ALL, and that the upstream child does NOT
+ * inherit: the MCP SDK spawns it with `getDefaultEnvironment()`, an
+ * allowlist of roughly HOME/LOGNAME/PATH/SHELL/TERM/USER. Everything else
+ * must be declared in `upstream.env`.
+ *
+ * This is the single most confusing failure in the whole setup, because the
+ * evidence points the wrong way: the identical command run by hand works,
+ * so the config "must" be right — and the only symptom is a handshake that
+ * never answers. Naming the variables that ARE set here but not passed
+ * through turns a 15-second silence into one line to copy.
+ */
+const ENV_THE_CHILD_DOES_NOT_INHERIT = [
+  "HTTPS_PROXY",
+  "https_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "NPM_CONFIG_REGISTRY",
+  "npm_config_registry",
+  "NODE_OPTIONS",
+  "NVM_BIN",
+] as const;
+
+/**
+ * Ambient vars the child will NOT have — computed against the environment
+ * the child ACTUALLY gets, not against what the config declares. Those
+ * differ in the case that matters most: a variable declared in
+ * `upstream.env` but stripped as a credential is missing from the child,
+ * and saying "you declared it" would send the reader looking in the wrong
+ * place.
+ */
+export function undeclaredUpstreamEnv(
+  childEnv: Record<string, string>,
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  return ENV_THE_CHILD_DOES_NOT_INHERIT.filter(
+    (name) => env[name] !== undefined && env[name] !== "" && childEnv[name] === undefined,
+  );
 }
 
 export interface DoctorDeps {
@@ -40,6 +93,7 @@ export interface DoctorDeps {
   readFile?: (path: string) => string;
   nodeVersion?: string;
   upstreamProbe?: UpstreamProbeOptions;
+  startupGates?: StartupGateDeps;
 }
 
 const MIN_NODE_MAJOR = 22;
@@ -94,6 +148,67 @@ export function checkConfig(
   }
 }
 
+/**
+ * The gateway's SHARED, PURE configuration gates — everything it validates
+ * before serving that is a function of config and environment alone — run
+ * here instead of at launch. (Runtime construction and connection failures
+ * are not gates and cannot be checked this way; the control-plane, device
+ * and upstream checks below cover what can.) Without this, a config that
+ * parses but trips a startup gate
+ * produced the worst outcome doctor can produce: "All checks passed",
+ * followed by an MCP client reporting nothing but a closed connection —
+ * because the gateway's refusal went to a stderr the client swallows.
+ *
+ * Pure validation only (startup-gates.ts): no sockets, no spawns, no writes.
+ */
+export function checkStartupGates(
+  config: OwnerSwitchMcpConfig,
+  env: Record<string, string | undefined>,
+  deps: StartupGateDeps = {},
+): { check: DoctorCheck; gates?: StartupGateResult } {
+  let gates: StartupGateResult;
+  try {
+    gates = runStartupGates(config, env, deps);
+  } catch (err) {
+    return {
+      check: {
+        name: "startup gates",
+        status: "fail",
+        detail: err instanceof ConfigError || err instanceof Error ? err.message : String(err),
+        // The detail IS the instruction — these messages name the flag, file
+        // or variable to fix. What people need told is that this is not a
+        // doctor-only complaint: the gateway refuses to start on it, and an
+        // MCP client will show that only as a dead connection.
+        fix: "the gateway REFUSES TO START until this is resolved — an MCP client would show it only as a closed connection or a timeout",
+      },
+    };
+  }
+  {
+    const { connector, honeytokenRegistry } = gates;
+    const armed = [
+      config.limits !== undefined && config.limits.length > 0
+        ? `${config.limits.length} limit rule(s)`
+        : undefined,
+      honeytokenRegistry !== undefined ? "honeytoken registry" : undefined,
+      connector !== undefined ? `github connector (${connector.mode})` : undefined,
+      config.executorRoutes !== undefined && Object.keys(config.executorRoutes).length > 0
+        ? `${Object.keys(config.executorRoutes).length} executor route(s)`
+        : undefined,
+    ].filter((s): s is string => s !== undefined);
+    return {
+      gates,
+      check: {
+        name: "startup gates",
+        status: "pass",
+        detail:
+          armed.length === 0
+            ? "nothing beyond policy is armed — the gateway will start"
+            : `the gateway will start with ${armed.join(", ")}`,
+      },
+    };
+  }
+}
+
 export async function checkControlPlane(
   baseUrl: string,
   timeoutMs: number,
@@ -130,11 +245,21 @@ export async function checkControlPlane(
           name: "control plane",
           status: "action",
           detail: `reachable at ${baseUrl} — but the kill switch is ENGAGED${reason}; every tool call is refused (-32054)`,
+          // The commands, not a pointer to them: a restore rejection answers
+          // a deliberately uniform 409 ("restore rejected") that never says
+          // WHICH check failed, so someone guessing at the ceremony gets no
+          // feedback to guess with. The one honest way through is to run it
+          // in the right order and read the ceremony's own state.
           fix:
-            "restore it with the 2GO ceremony before connecting an agent: POST /restore/ceremony " +
-            "(owner token), wait out the ~30s cooldown, then POST /restore with the minted ceremony id — " +
-            "see the README's verify section for the exact curl commands. Restarting the control plane " +
-            "does NOT restore it; kill state persists to disk.",
+            "restore it with the 2GO ceremony before connecting an agent (OWNER=your owner token):\n" +
+            `      CER=$(curl -fsS -X POST ${baseUrl}/restore/ceremony -H "Authorization: Bearer $OWNER" | jq -r .id)\n` +
+            `      curl -fsS ${baseUrl}/restore/ceremony/$CER -H "Authorization: Bearer $OWNER"   # cooldownRemainingMs\n` +
+            "      # wait out the ~30s cooldown, then:\n" +
+            `      curl -fsS -X POST ${baseUrl}/restore -H "Authorization: Bearer $OWNER" ` +
+            '-H "content-type: application/json" -d "{\\"ceremonyId\\":\\"$CER\\"}"\n' +
+            "    A restore attempted early answers 409 {\"error\":\"restore rejected\"} — the body never says " +
+            "which check failed, by design; the ceremony's own cooldownRemainingMs above is the thing to read. " +
+            "Restarting the control plane does NOT restore it; kill state persists to disk.",
         },
       };
     }
@@ -242,21 +367,30 @@ class HandshakeTimeout extends Error {}
  * report as an opaque connection timeout.
  */
 export async function checkUpstreamHandshake(
-  upstream: UpstreamConfig,
+  spec: UpstreamLaunchSpec,
   options: UpstreamProbeOptions = {},
 ): Promise<DoctorCheck> {
   const timeoutMs = options.timeoutMs ?? 15_000;
   const stderrChunks: string[] = [];
+  // The child's environment is an ALLOWLIST, not an inheritance — and it is
+  // the SAME environment the gateway builds, credential strip included,
+  // because both come from upstreamLaunchSpec. Anything ambient and
+  // load-bearing that the child will not get is the first thing to suspect
+  // when a command that works by hand goes silent here.
+  const missingEnv = undeclaredUpstreamEnv(spec.env, options.env ?? process.env);
+  const envHint =
+    missingEnv.length === 0
+      ? "the upstream child runs with a STRIPPED environment (roughly HOME/PATH/SHELL/TERM/USER — " +
+        "not your shell's); anything else it needs must be declared in upstream.env"
+      : `the upstream child runs with a STRIPPED environment, so these are set in YOUR shell but NOT ` +
+        `passed to it: ${missingEnv.join(", ")}. If the same command works by hand, that difference is ` +
+        `the likely cause — declare what it needs in upstream.env`;
   const transportFactory =
     options.transportFactory ??
-    ((u: UpstreamConfig): Transport => {
-      const transport = new StdioClientTransport({
-        command: u.command,
-        args: u.args ?? [],
-        env: { ...getDefaultEnvironment(), ...(u.env ?? {}) },
-        cwd: u.cwd,
-        stderr: "pipe",
-      });
+    ((s: UpstreamLaunchSpec): Transport => {
+      // EXACTLY what the gateway spawns (upstreamLaunchSpec), differing only
+      // in stderr handling: the probe captures the tail to quote it back.
+      const transport = new StdioClientTransport({ ...s, stderr: "pipe" });
       transport.stderr?.on("data", (chunk: Buffer) => {
         stderrChunks.push(chunk.toString("utf8"));
         while (stderrChunks.length > 8) stderrChunks.shift();
@@ -271,7 +405,7 @@ export async function checkUpstreamHandshake(
 
   let transport: Transport;
   try {
-    transport = transportFactory(upstream);
+    transport = transportFactory(spec);
   } catch (err) {
     return {
       name: "upstream command",
@@ -294,7 +428,7 @@ export async function checkUpstreamHandshake(
     return {
       name: "upstream command",
       status: "pass",
-      detail: `"${upstream.command}" answered the MCP initialize handshake and shut down cleanly`,
+      detail: `"${spec.command}" answered the MCP initialize handshake and shut down cleanly`,
     };
   } catch (err) {
     await client.close().catch(() => {});
@@ -302,24 +436,22 @@ export async function checkUpstreamHandshake(
       return {
         name: "upstream command",
         status: "fail",
-        detail: `"${upstream.command}" did not answer the MCP initialize handshake within ${timeoutMs}ms${stderrTail()}`,
+        detail: `"${spec.command}" did not answer the MCP initialize handshake within ${timeoutMs}ms${stderrTail()}`,
         fix:
-          `check that upstream.command/args launch a stdio MCP server; try it by hand: ` +
-          `${upstream.command} ${(upstream.args ?? []).join(" ")}` +
-          (upstream.command === "npx" || upstream.command === "pnpx" || upstream.command === "bunx"
-            ? " — note: a package runner's FIRST run may download the server, which alone can " +
-              "blow this timeout on a fresh machine; run it once by hand until it starts, then " +
-              "re-run doctor (or use the in-repo demo upstream, examples/demo-tools-server.ts, " +
-              "which downloads nothing)"
-            : ""),
+          `${envHint}.\n` +
+          `    Then check the command itself launches a stdio MCP server — try it by hand: ` +
+          `${spec.command} ${spec.args.join(" ")}\n` +
+          `    A first "npx -y <package>" run also downloads before it speaks; --upstream-timeout <ms> ` +
+          `raises the ${timeoutMs}ms budget if that is all it is (or use the in-repo demo upstream, ` +
+          `examples/demo-tools-server.ts, which downloads nothing)`,
       };
     }
     const code = (err as NodeJS.ErrnoException).code;
     const detail =
       code === "ENOENT"
-        ? `"${upstream.command}" was not found on PATH`
+        ? `"${spec.command}" was not found on PATH`
         : code === "EACCES"
-          ? `"${upstream.command}" is not executable (permission denied)`
+          ? `"${spec.command}" is not executable (permission denied)`
           : `${err instanceof Error ? err.message : String(err)}${stderrTail()}`;
     return {
       name: "upstream command",
@@ -342,9 +474,27 @@ export async function runDoctor(
   const { check: configCheck, config } = checkConfig(argv, env, deps.readFile);
   checks.push(configCheck);
   if (config === undefined) {
+    checks.push(skipped("startup gates", "config did not load"));
     checks.push(skipped("control plane", "config did not load"));
     checks.push(skipped("device credentials", "config did not load"));
     checks.push(skipped("upstream command", "config did not load"));
+    return checks;
+  }
+
+  // Second, before anything touches the network OR SPAWNS ANYTHING: would
+  // the gateway even start with this config and environment? A green run
+  // that ends in a refusing gateway is the failure mode doctor exists to
+  // remove — and a gate failure must stop the run, not annotate it. One of
+  // these gates refuses BECAUSE upstream.args carries a credential; probing
+  // the upstream anyway would perform the very /proc-and-ps leak the gate
+  // just diagnosed. Nothing downstream runs.
+  const { check: gatesCheck, gates } = checkStartupGates(config, env, deps.startupGates);
+  checks.push(gatesCheck);
+  if (gates === undefined) {
+    const why = "the gateway would refuse to start — resolve the startup gate above";
+    checks.push(skipped("control plane", why));
+    checks.push(skipped("device credentials", why));
+    checks.push(skipped("upstream command", why));
     return checks;
   }
 
@@ -356,8 +506,34 @@ export async function runDoctor(
       ? await checkDeviceCredentials(config.controlPlaneUrl, config.device, timeoutMs, deps.fetchImpl)
       : skipped("device credentials", "control plane unreachable"),
   );
-  checks.push(await checkUpstreamHandshake(config.upstream, deps.upstreamProbe));
+  checks.push(
+    // the gateway's own launch spec, credential strip included — a preflight
+    // must never hand the child more than the gateway would
+    await checkUpstreamHandshake(upstreamLaunchSpec(config.upstream, gates.secretValues), {
+      env,
+      ...upstreamTimeoutFrom(argv, env),
+      ...deps.upstreamProbe,
+    }),
+  );
   return checks;
+}
+
+/**
+ * `--upstream-timeout <ms>` (or OWNERSWITCH_UPSTREAM_TIMEOUT_MS) — raises
+ * the handshake budget for an upstream whose FIRST run is slow: `npx -y
+ * <package>` downloads before it speaks, and on a cold cache or a slow link
+ * that can outlast the default. A garbage value is ignored rather than
+ * fatal: this is a preflight tool, and refusing to run over a malformed
+ * flag would be the least helpful thing it could do.
+ */
+export function upstreamTimeoutFrom(
+  argv: string[],
+  env: Record<string, string | undefined>,
+): { timeoutMs?: number } {
+  const flagAt = argv.indexOf("--upstream-timeout");
+  const raw = flagAt >= 0 ? argv[flagAt + 1] : env.OWNERSWITCH_UPSTREAM_TIMEOUT_MS;
+  const ms = Number(raw);
+  return raw !== undefined && Number.isSafeInteger(ms) && ms > 0 ? { timeoutMs: ms } : {};
 }
 
 export function formatDoctorReport(checks: DoctorCheck[]): string {
