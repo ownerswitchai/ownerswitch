@@ -205,7 +205,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
     });
     const run = await runScript(stub.url);
     expect(run.code).not.toBe(0);
-    expect(run.output).toContain("ARMED");
+    expect(run.output).toContain("LANDED");
   });
 
   it("the happy path keeps the exact wire contract: same ceremony, Bearer, json, two restore POSTs", async () => {
@@ -219,6 +219,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
         [200, '{"state":"go1","cooldownRemainingMs":2000}'],
         [200, '{"state":"ready","cooldownRemainingMs":0}'],
       ],
+      status: [200, '{"killed":false,"epoch":1,"killedAgents":[]}'],
     });
     const run = await runScript(stub.url);
     expect(run.output).toContain("HTTP 409");
@@ -377,6 +378,66 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
     expect(stub.restorePosts()).toBe(0);
   }, 40_000);
 
+  it("a CLEAN killed:false does NOT skip the durability gate — a degraded /status is OUTCOME UNKNOWN", async () => {
+    // the review's mandated regression: restore 200 killed:false, but the
+    // next /status carries persistenceDegraded/unhealthy — never "restored"
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [200, '{"killed":false}'],
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [
+        200,
+        '{"killed":false,"epoch":1,"killedAgents":[],"persistenceDegraded":true,"unhealthy":"stale state"}',
+      ],
+    });
+    const run = await runScript(stub.url);
+    expect(run.code).not.toBe(0);
+    expect(run.output).toContain("RESTORE OUTCOME UNKNOWN");
+    expect(run.output).not.toContain("restored — one press");
+    // and the gate actually ran: a /status GET followed the final restore
+    expect(stub.requests.some((r) => r.method === "GET" && r.url === "/status")).toBe(true);
+  });
+
+  it("killed:false with scoped kills remaining is NOT called fully armed", async () => {
+    const stub = await stubPlane({
+      go1: [201, `{"id":"${CANONICAL_ID}"}`],
+      restore: [
+        [409, '{"error":"restore rejected"}'],
+        [200, '{"killed":false}'],
+      ],
+      ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":false,"epoch":4,"killedAgents":["mcp-gateway"]}'],
+    });
+    const run = await runScript(stub.url);
+    expect(run.code).toBe(0);
+    expect(run.output).toContain("scoped kills remain");
+    expect(run.output).not.toContain("restored — one press");
+  });
+
+  it("the strict arbiter rejects a merely-PRESENT degraded flag and malformed killedAgents entries", async () => {
+    for (const statusBody of [
+      '{"killed":false,"epoch":1,"killedAgents":[],"persistenceDegraded":false}',
+      '{"killed":false,"epoch":1,"killedAgents":[42]}',
+      '{"killed":false,"epoch":1,"killedAgents":[""]}',
+    ]) {
+      const stub = await stubPlane({
+        go1: [201, `{"id":"${CANONICAL_ID}"}`],
+        restore: [
+          [409, '{"error":"restore rejected"}'],
+          "drop",
+        ],
+        ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+        status: [200, statusBody],
+      });
+      const run = await runScript(stub.url);
+      expect(run.code, statusBody).not.toBe(0);
+      expect(run.output, statusBody).toContain("RESTORE OUTCOME UNKNOWN");
+    }
+  });
+
   it("a configured proxy is bypassed — the bearer goes direct to loopback", async () => {
     const stub = await stubPlane({
       go1: [201, `{"id":"${CANONICAL_ID}"}`],
@@ -385,6 +446,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
         [200, '{"killed":false}'],
       ],
       ceremonyRead: [[200, '{"state":"ready","cooldownRemainingMs":0}']],
+      status: [200, '{"killed":false,"epoch":1,"killedAgents":[]}'],
     });
     const run = await runScript(stub.url, "tok-demo", {
       http_proxy: "http://127.0.0.1:9",

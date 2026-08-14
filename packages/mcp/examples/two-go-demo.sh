@@ -86,8 +86,14 @@ SEND() {
 
 # The truth of last resort: a fresh /status read, trusted ONLY when it is
 # an exact HTTP 200 whose body parses with a boolean killed, a safe epoch,
-# a killedAgents array, and NO degraded-persistence flags. Prints
-# ARMED / KILLED / UNKNOWN.
+# a WELL-FORMED killedAgents list (every element a bounded string), and no
+# degraded-persistence field PRESENT at all — the flag's existence, not
+# its value, is the signal that durable state cannot be trusted. Prints:
+#   ARMED   — killed:false AND no scoped kills remain
+#   SCOPED  — killed:false but killedAgents is non-empty (a global restore
+#             deliberately leaves scoped kills in force)
+#   KILLED  — killed:true
+#   UNKNOWN — anything else
 status_reading() {
   local status body
   if ! status=$(curl -q -sS --noproxy '*' --connect-timeout 5 --max-time "$MAX_TIME" \
@@ -106,12 +112,19 @@ status_reading() {
       let s;
       try { s = JSON.parse(d); } catch { process.stdout.write("UNKNOWN"); return; }
       if (typeof s !== "object" || s === null) { process.stdout.write("UNKNOWN"); return; }
-      if (s.persistenceDegraded === true || s.unhealthy !== undefined) { process.stdout.write("UNKNOWN"); return; }
-      if (typeof s.epoch !== "number" || !Number.isSafeInteger(s.epoch) || s.epoch < 0 || !Array.isArray(s.killedAgents)) {
+      if ("persistenceDegraded" in s || "unhealthy" in s) { process.stdout.write("UNKNOWN"); return; }
+      if (typeof s.epoch !== "number" || !Number.isSafeInteger(s.epoch) || s.epoch < 0) {
         process.stdout.write("UNKNOWN");
         return;
       }
-      process.stdout.write(s.killed === true ? "KILLED" : s.killed === false ? "ARMED" : "UNKNOWN");
+      const agents = s.killedAgents;
+      if (!Array.isArray(agents) || !agents.every((a) => typeof a === "string" && a.length > 0 && a.length <= 128)) {
+        process.stdout.write("UNKNOWN");
+        return;
+      }
+      if (s.killed === true) { process.stdout.write("KILLED"); return; }
+      if (s.killed !== false) { process.stdout.write("UNKNOWN"); return; }
+      process.stdout.write(agents.length === 0 ? "ARMED" : "SCOPED");
     });
   '
 }
@@ -137,16 +150,18 @@ echo "GO 2/2 EARLY, on purpose — the cooldown must refuse this (POST /restore)
 if ! SEND POST "$CP/restore" "{\"ceremonyId\":\"$CER\"}"; then
   echo "    the early GO 2/2's answer was lost mid-flight; reconciling with /status..."
   case "$(status_reading)" in
-    ARMED) fail "the EARLY restore appears to have LANDED (system is ARMED) — the cooldown did not refuse; report this" ;;
+    ARMED|SCOPED) fail "the EARLY restore appears to have LANDED — the cooldown did not refuse; report this" ;;
     KILLED) fail "the early GO 2/2 could not be sent (network/timeout); still killed — retry the script" ;;
     *) echo "two-go-demo: RESTORE OUTCOME UNKNOWN — do not assume killed; read /status yourself" >&2; exit 1 ;;
   esac
 fi
 echo "    HTTP $HTTP_STATUS $HTTP_BODY"
 if [ "$HTTP_STATUS" != "409" ]; then
-  if [ "$(status_reading)" = "ARMED" ]; then
-    fail "the early GO 2/2 answered HTTP $HTTP_STATUS and the system is now ARMED — the cooldown did not refuse; report this"
-  fi
+  case "$(status_reading)" in
+    ARMED|SCOPED)
+      fail "the early GO 2/2 answered HTTP $HTTP_STATUS and the restore LANDED — the cooldown did not refuse; report this"
+      ;;
+  esac
   fail "the early GO 2/2 answered HTTP $HTTP_STATUS instead of 409 — the cooldown did not refuse; report this"
 fi
 echo "    (the body never says WHICH check failed — that answer would be a map"
@@ -189,24 +204,34 @@ if SEND POST "$CP/restore" "{\"ceremonyId\":\"$CER\"}"; then
 else
   echo "    the real GO 2/2's answer was lost mid-flight"
 fi
-if [ "$FINAL_CLEAN" != "1" ]; then
-  # ANYTHING short of a clean 200 killed:false — truncated body, garbled
-  # JSON, unexpected status, dead socket — goes through reconciliation:
-  # the commit may have happened and only the answer died. Never a blind
-  # retry; /status is the arbiter, and only its strict reading counts.
+# THE POSTCONDITION IS ALWAYS THE ARBITER. A clean 200 killed:false only
+# proves the RESPONSE arrived — the restore may have flipped the in-memory
+# switch and then failed to persist, and only the next /status says so
+# (persistenceDegraded/unhealthy). An unclear answer additionally means
+# the commit itself is in question. Either way: one fresh, strictly
+# validated /status read decides what may be claimed. Never a blind retry.
+if [ "$FINAL_CLEAN" = "1" ]; then
+  echo "    confirming with a fresh /status read (durability and scope)..."
+else
   echo "    not a clean killed:false answer; reconciling with /status..."
-  case "$(status_reading)" in
-    ARMED)
-      echo "    /status says the system is ARMED — the restore LANDED and its response was lost."
-      ;;
-    KILLED)
-      fail "the real GO 2/2 did not restore — /status confirms the system is still killed"
-      ;;
-    *)
-      echo "two-go-demo: RESTORE OUTCOME UNKNOWN — do not assume killed; read /status yourself" >&2
-      exit 1
-      ;;
-  esac
 fi
-
-echo "restored — one press to stop, two GOs to start."
+case "$(status_reading)" in
+  ARMED)
+    if [ "$FINAL_CLEAN" != "1" ]; then
+      echo "    /status says the system is ARMED — the restore LANDED and its response was lost."
+    fi
+    echo "restored — one press to stop, two GOs to start."
+    ;;
+  SCOPED)
+    echo "    the GLOBAL restore landed, but scoped kills remain (killedAgents is not"
+    echo "    empty) — those agents stay denied until their own scoped ceremony."
+    echo "global restore complete — scoped kills remain."
+    ;;
+  KILLED)
+    fail "the restore did not take — /status confirms the system is still killed"
+    ;;
+  *)
+    echo "two-go-demo: RESTORE OUTCOME UNKNOWN — the restore may have landed, but /status cannot certify a healthy durable state; do not assume killed OR restored" >&2
+    exit 1
+    ;;
+esac

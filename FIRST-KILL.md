@@ -262,6 +262,12 @@ What you will watch, in order — every request under your owner token:
 4. **GO 2/2** — the SAME ceremony restores: `{"killed":false}` (the
    control-plane suite pins exactly this early-409-then-same-ceremony
    sequence).
+5. **A fresh `/status` read is the postcondition** — the restore's own
+   answer only proves the response arrived. The script certifies
+   "restored" strictly: a healthy store (no degraded-persistence flags)
+   and an empty `killedAgents` list; scoped kills left in force are
+   reported as exactly that, and an uncertifiable state is
+   "RESTORE OUTCOME UNKNOWN", never a guess.
 
 Run the demo agent one last time: `RAN … RAN … HELD … DENIED` — back to
 work, under the same policy (just press Enter through the veto pause this
