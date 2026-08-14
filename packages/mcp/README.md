@@ -194,15 +194,14 @@ Reads and listings just work. The `write_file` call comes back with:
 ```
 MCP error -32052: OwnerSwitch held "write_file" for owner review: the owner can
 veto writes. The call has NOT run. A veto window (id "veto_ab12cd34ef56") is now
-open — the owner has a few minutes to stop it. …
+open — the owner is being alerted and can stop it. …
 ```
 
 **[5:00] Be the owner.** Terminal 1 printed the exact commands, e.g.:
 
 ```bash
-# one tap: stop it
-curl -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 \
-  -H 'Authorization: Bearer <owner token>'
+# one tap: stop it (one line — multi-line pastes get mangled by some terminals)
+curl -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 -H 'Authorization: Bearer <owner token>'
 ```
 
 Ask the agent to try again → `MCP error -32053: … the owner vetoed this
@@ -384,7 +383,7 @@ that key grants could be forged.
 | --- | --- | --- |
 | `-32050` `PolicyDenied` | a rule says this never runs | no |
 | `-32051` `ApprovalRequired` | needs the owner's explicit approval (2GO); also a veto window whose owner was unreachable (escalated, fail closed) | after approval |
-| `-32052` `VetoPending` | held in an open veto window | yes, in a few minutes |
+| `-32052` `VetoPending` | held in an open veto window | yes — retry to learn the verdict: released runs (requires the owner's enrolled device to have confirmed delivery, then silence), vetoed stays blocked, unreachable owner escalates to `-32051` |
 | `-32053` `OwnerVetoed` | the owner stopped this exact action | no |
 | `-32054` `Lockdown` | kill switch engaged, or control plane unreachable | once restored |
 | `-32055` `HoneytokenTripped` | a decoy credential surfaced in the call — the kill is already firing | no |

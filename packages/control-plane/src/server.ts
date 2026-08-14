@@ -2032,6 +2032,15 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
       }
       return;
     }
+    // IDEMPOTENT, matching the device path (postDeviceVeto): a second "stop"
+    // — a double-click, a second tab, a blind retry of a reply that never
+    // rendered — confirms the stop that already happened, and keeps the
+    // FIRST attribution. The first live walkthrough read the old 409 here
+    // as a scary failure of a veto that had in fact landed.
+    if (window.state === "vetoed") {
+      sendJson(res, 200, { status: "vetoed" });
+      return;
+    }
     // Too late to veto once the grant is COMMITTED for dispatch: the merge
     // is in flight and cannot be recalled. Reported honestly rather than
     // accepting a veto that does nothing. This branch and the commit handler

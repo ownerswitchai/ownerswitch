@@ -10,9 +10,10 @@ agent and the tool server it works against live in this repo. That is
 deliberate — the fastest way to trust a stop button is to press it yourself
 before anything valuable is behind it.
 
-**What you need:** Node 22+, pnpm 9 (`corepack enable`), a Unix-like OS
-(Linux or macOS — the demo sandbox requires `O_NOFOLLOW` and refuses to
-run without it, deliberately), and two terminals.
+**What you need:** Node 22+, pnpm 9 or newer (`corepack enable` gets you
+one), a Unix-like OS (Linux or macOS — the demo sandbox requires
+`O_NOFOLLOW` and refuses to run without it, deliberately), and three
+terminals: the control plane, the agent, and you — the owner.
 `jq` is used in a couple of commands for readability; skip it and read the
 JSON yourself if you would rather. The `curl` calls use `-fsS` so an HTTP
 error fails the step loudly instead of printing an error body that scrolls
@@ -132,17 +133,26 @@ This is a real MCP client. It spawns the **gateway**, which spawns the demo
 After the HELD line the agent **pauses and waits for you** — a veto window
 lives in the gateway process that opened it, so the held → vetoed
 transition plays out on this same, still-open session. It prints the exact
-command; run it in another terminal:
+command; run it in **terminal 3** — which needs `OWNERSWITCH_OWNER_TOKEN`
+exported too (every new terminal does). It is one line on purpose:
+multi-line pastes with `\` get mangled by some terminals.
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 \
-  -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" \
-  -H 'content-type: application/json' -d '{"decision":"veto"}'
+curl -fsS -X POST http://127.0.0.1:4600/veto/veto_ab12cd34ef56 -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'
 # → {"status":"vetoed"}
 ```
 
 Press Enter back in the agent's terminal: it retries the exact same write
 and gets **VETOED** — held is a decision point, and the owner just decided.
+(Ran it twice by accident? The second veto answers the same `{"status":
+"vetoed"}` — confirming a stop is never an error.)
+
+If you press Enter **without** vetoing, the retry comes back **STILL
+HELD** — in this demo a held call never runs by itself. Silence releases a
+window only after an **enrolled owner device** has confirmed the alert was
+actually seen (production, with the phone app); this walkthrough has none,
+so an undecided window escalates to explicit approval instead of quietly
+releasing. Silence is consent only when the system can prove you saw it.
 
 Want a real AI agent behind the same gateway instead? The
 [`packages/mcp` README](packages/mcp/README.md) quickstart connects Claude
@@ -153,8 +163,7 @@ Code (or any MCP client) to it in two commands.
 The single most important command in this document:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:4600/kill \
-  -H 'content-type: application/json' -d '{"reason":"first kill"}'
+curl -fsS -X POST http://127.0.0.1:4600/kill -H 'content-type: application/json' -d '{"reason":"first kill"}'
 ```
 
 Run the demo agent again — **everything**, even the reads that were
@@ -174,8 +183,13 @@ curl -fsS http://127.0.0.1:4600/status    # still {"killed":true,…}
 #    again — every call is refused, because unreachable reads as killed
 ```
 
-Restarting is not a restore. There is exactly one way back. (The restart
-printed a fresh owner token — re-export it before the next step.)
+Restarting is not a restore. There is exactly one way back — and the
+restart just **invalidated your owner token**: it printed a fresh one in
+terminal 1. Re-export it in terminal 3 before the next step:
+
+```bash
+export OWNERSWITCH_OWNER_TOKEN=<the NEW token from terminal 1>
+```
 
 ## 7. Be the owner: the two GOs (≈2 min)
 
@@ -231,8 +245,7 @@ to stop, two GOs to start.**
 A fleet does not need a fleet-wide stop for one misbehaving member:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:4600/kill \
-  -H 'content-type: application/json' -d '{"agentId":"mcp-gateway","reason":"just this one"}'
+curl -fsS -X POST http://127.0.0.1:4600/kill -H 'content-type: application/json' -d '{"agentId":"mcp-gateway","reason":"just this one"}'
 curl -fsS http://127.0.0.1:4600/status  # {"killed":false,"killedAgents":["mcp-gateway"],…}
 ```
 

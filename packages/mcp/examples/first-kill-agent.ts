@@ -106,10 +106,11 @@ if (write.kind === "HELD") {
   const windowId = /veto window \(id "([^"]+)"\)/.exec(write.message)?.[1];
   if (windowId !== undefined && interactive) {
     console.log(
-      `\nthe write is HELD in veto window "${windowId}". Be the owner — in another terminal:\n\n` +
-        `  curl -fsS -X POST http://127.0.0.1:4600/veto/${windowId} \\\n` +
-        `    -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" \\\n` +
-        `    -H 'content-type: application/json' -d '{"decision":"veto"}'\n`,
+      `\nthe write is HELD in veto window "${windowId}". Be the owner — in another terminal.\n` +
+        `(That terminal needs OWNERSWITCH_OWNER_TOKEN exported — every NEW terminal does; the\n` +
+        `control plane's terminal shows the current token. The command is one line on purpose:\n` +
+        `multi-line pastes get mangled by some terminals.)\n\n` +
+        `  curl -fsS -X POST http://127.0.0.1:4600/veto/${windowId} -H "Authorization: Bearer $OWNERSWITCH_OWNER_TOKEN" -H 'content-type: application/json' -d '{"decision":"veto"}'\n`,
     );
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     await rl.question("press Enter after the veto (or Enter to just retry): ");
@@ -129,7 +130,7 @@ const writeStory =
   retry?.kind === "VETOED"
     ? "write_file was HELD and — once you vetoed — stayed VETOED on retry"
     : retry?.kind === "HELD"
-      ? "write_file was HELD, and without a veto the retry is STILL HELD (the window is yours to decide)"
+      ? "write_file was HELD, and without a veto the retry is STILL HELD (the window is yours to decide — in this demo a held call never runs by itself)"
       : retry?.kind === "RAN"
         ? "write_file was HELD and, released, RAN on retry"
         : write.kind === "KILLED"

@@ -86,8 +86,7 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`  kill everything   curl -X POST ${base}/kill -d '{"reason":"owner pressed stop"}'`);
   console.log(`  check kill state  curl ${base}/status`);
   console.log(`  watch a window    curl ${base}/veto/<id>`);
-  console.log(`  veto a window     curl -X POST ${base}/veto/<id> \\`);
-  console.log(`                      -H 'Authorization: Bearer ${owner.token}'`);
+  console.log(`  veto a window     curl -X POST ${base}/veto/<id> -H 'Authorization: Bearer ${owner.token}'`);
   console.log(``);
   console.log(`Sessions and veto windows reset on restart; the kill does NOT — restarting`);
   console.log(`is not a restore. To hard-reset a dev instance, stop it and delete the`);
