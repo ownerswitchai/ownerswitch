@@ -1,0 +1,17 @@
+{
+  "controlPlaneUrl": "http://127.0.0.1:4600",
+  "device": { "id": "mcp-gateway", "secret": "dev-device-secret" },
+  "upstream": {
+    "command": "npx",
+    "args": ["tsx", "examples/demo-tools-server.ts"]
+  },
+  "policy": {
+    "rules": [
+      { "id": "reads", "tool": "read_*", "decision": "allow", "description": "reading is safe" },
+      { "id": "lists", "tool": "list_*", "decision": "allow", "description": "listing is safe" },
+      { "id": "writes", "tool": "write_file", "decision": "veto", "description": "the owner can veto writes" },
+      { "id": "moves", "tool": "move_file", "decision": "deny", "description": "renames never run" }
+    ],
+    "defaultDecision": "approve"
+  }
+}
