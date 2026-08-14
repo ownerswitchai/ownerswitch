@@ -217,7 +217,8 @@ agent again — every call is refused, because unreachable reads as killed.
 Restarting is not a restore. There is exactly one way back — and the
 restart just **invalidated your owner token**: terminal 1 printed a fresh
 ready-to-paste export line. Copy that new line (this is its shape) into
-terminal 3 before the next step:
+**terminal 2** — the next step runs there, because that terminal is
+already inside `packages/mcp`:
 
 ```bash
 export OWNERSWITCH_OWNER_TOKEN='the-NEW-token-terminal-1-printed'
@@ -237,8 +238,10 @@ canonical grammar before anything is posted at it, and the early answer
 must really be the 409 — the script asserts each of these and stops
 loudly on anything else (the test suite drives it through the failure
 matrix, including that a failed GO 1/2 issues ZERO restore calls). Run it
-in **terminal 3**, with `bash` spelled out so your interactive shell
-never interprets its insides:
+in **terminal 2** — that terminal is already inside `packages/mcp`, where
+`examples/` lives, and it now holds the fresh token you just exported.
+`bash` is spelled out so your interactive shell never interprets the
+script's insides:
 
 ```bash
 bash examples/two-go-demo.sh
