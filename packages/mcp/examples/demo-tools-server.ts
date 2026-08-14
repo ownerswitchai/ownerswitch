@@ -42,7 +42,8 @@ import {
 // trusted, no symlink anywhere) and are the operator's own trust
 // decision. Each server start is a FRESH sandbox; the demo re-seeds it,
 // nothing in the tutorial relies on persistence between runs, and the
-// abandoned directories are ordinary temp entries the OS reaper collects.
+// abandoned directories are ordinary temp entries, eligible for the
+// platform's temp cleanup (whose timing is the OS's, not guaranteed here).
 const DEMO_DIR = ensureSandboxRoot(
   process.argv[2] ??
     process.env.OWNERSWITCH_DEMO_DIR ??
