@@ -53,12 +53,14 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   writeSync,
   type Stats,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 /**
  * O_NOFOLLOW is the promise — a platform without it refuses, never
@@ -111,14 +113,13 @@ function assertRootBoundary(root: string): void {
 }
 
 /**
- * The parent-trust rule, re-checked per operation: the directory HOLDING
- * the root's entry must be ours (or root's), and must grant NO group or
- * world write — either bit lets another party rename or replace the root
- * entry between a check and an open — unless the sticky bit restores the
- * only-the-owner-renames property (the /tmp model).
+ * The parent-trust rule, applied to a NAMED parent directory: it must be
+ * ours (or root's), and must grant NO group or world write — either bit
+ * lets another party rename or replace the root entry between a check and
+ * an open — unless the sticky bit restores the only-the-owner-renames
+ * property (the /tmp model).
  */
-function assertParentTrusted(root: string): void {
-  const parent = dirname(root);
+function assertTrustedParentDir(parent: string): void {
   const ps = lstatSync(parent);
   const trusted =
     ps.isDirectory() &&
@@ -133,30 +134,55 @@ function assertParentTrusted(root: string): void {
   }
 }
 
+/** the per-operation form: verify the parent that holds the root's entry */
+function assertParentTrusted(root: string): void {
+  assertTrustedParentDir(dirname(root));
+}
+
 /**
  * Ensure the sandbox root exists and satisfies the WHOLE boundary above.
  * Returns the CANONICAL path — every later operation resolves from it.
+ *
+ * ORDER MATTERS, and it is the LEXICAL parent that gets authenticated
+ * first: canonicalize dirname(lexical), require it trusted, and only then
+ * look at the leaf — then require that the canonical root actually lives
+ * in that already-verified parent. The previous order (leaf lstat, then
+ * realpath, then a parent check) authenticated the TARGET's parent: under
+ * a writable lexical parent, a swap-to-symlink between the lstat and the
+ * realpath would have sent the check to ~/.ssh's (perfectly trusted)
+ * parent while the swap happened in the attacker's directory. With the
+ * parent verified first, a writable parent refuses before the leaf is
+ * ever trusted — there is no window left in which a swap wins.
  */
 export function ensureSandboxRoot(dir: string): string {
   requireNoFollow(constants.O_NOFOLLOW);
   const lexical = resolve(dir);
   mkdirSync(lexical, { recursive: true, mode: 0o700 });
-  // THE LEAF ITSELF MUST NOT BE A SYMLINK — checked on the LEXICAL path,
-  // BEFORE realpath erases the evidence: a recursive mkdir "succeeds"
-  // silently on a symlink that points at an existing directory, and a
-  // planted `~/.ownerswitch/demo -> ~/.ssh` would then pass every later
-  // check (the target IS a real, owner-owned 0700 directory) and hand the
-  // auto-allowed read_file the user's key material.
-  if (lstatSync(lexical).isSymbolicLink()) {
+  // 1. authenticate the LEXICAL parent (canonicalized) — the directory the
+  //    root's entry actually sits in, where any swap would have to happen
+  const canonParent = realpathSync(dirname(lexical));
+  assertTrustedParentDir(canonParent);
+  // 2. the leaf, addressed THROUGH the verified parent, must be a real
+  //    directory — a planted `demo -> ~/.ssh` refuses whatever it points at
+  const leafInParent = join(canonParent, basename(lexical));
+  if (lstatSync(leafInParent).isSymbolicLink()) {
     throw new Error(
-      `demo sandbox root "${lexical}" is a symlink — refusing to follow it (a planted link ` +
-        "would silently redirect the sandbox into a real directory such as ~/.ssh); remove " +
-        "the link and re-run",
+      `demo sandbox root "${leafInParent}" is a symlink — refusing to follow it (a planted ` +
+        "link would silently redirect the sandbox into a real directory such as ~/.ssh); " +
+        "remove the link and re-run",
     );
   }
-  const root = realpathSync(lexical);
+  // 3. canonicalize and require the result to live EXACTLY in the parent
+  //    verified above — a root whose canonical home is anywhere else was
+  //    redirected, whoever raced whom
+  const root = realpathSync(leafInParent);
+  if (dirname(root) !== canonParent) {
+    throw new Error(
+      `demo sandbox root "${leafInParent}" resolves outside its verified parent ` +
+        `("${root}") — refusing the redirect`,
+    );
+  }
   assertRootBoundary(root);
-  assertParentTrusted(root);
   return root;
 }
 
@@ -222,6 +248,42 @@ export function writeSandboxFile(root: string, name: string, content: string): n
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * List the sandbox — the SAME per-operation boundary as read/write/seed,
+ * so the auto-allowed list_files cannot follow a swapped root where the
+ * read would already refuse. The directory itself is additionally opened
+ * O_DIRECTORY|O_NOFOLLOW and fd-verified (a real, owner-only directory of
+ * ours) before its entries are read.
+ */
+export function listSandboxFiles(root: string): string[] {
+  const O_NOFOLLOW = requireNoFollow(constants.O_NOFOLLOW);
+  assertRootBoundary(root);
+  assertParentTrusted(root);
+  const fd = openSync(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | O_NOFOLLOW);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isDirectory() || stat.uid !== ourUid() || (stat.mode & 0o077) !== 0) {
+      throw new Error(`refusing to list "${root}": not an owner-only directory of this user`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return readdirSync(root);
+}
+
+/**
+ * Rename within the sandbox — boundary-checked like every other
+ * operation; both names pass the basename rule, and rename moves the
+ * directory ENTRY (a planted symlink moves as a link, its target
+ * untouched).
+ */
+export function moveSandboxFile(root: string, from: string, to: string): void {
+  requireNoFollow(constants.O_NOFOLLOW);
+  assertRootBoundary(root);
+  assertParentTrusted(root);
+  renameSync(resolve(root, validateName(from)), resolve(root, validateName(to)));
 }
 
 /**

@@ -15,17 +15,17 @@
  * Run by the gateway (see examples/first-kill.config.json), or by hand:
  *   npx tsx examples/demo-tools-server.ts
  */
-import { readdirSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   ensureSandboxRoot,
+  listSandboxFiles,
+  moveSandboxFile,
   readSandboxFile,
   seedSandboxFile,
-  validateName,
   writeSandboxFile,
 } from "../src/demo-sandbox.js";
 
@@ -104,7 +104,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, string>;
   switch (req.params.name) {
     case "list_files": {
-      const names = readdirSync(DEMO_DIR);
+      const names = listSandboxFiles(DEMO_DIR);
       return asText(names.length === 0 ? "(empty)" : names.join("\n"));
     }
     case "read_file":
@@ -114,9 +114,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return asText(`wrote ${args.name} (${bytes} bytes)`);
     }
     case "move_file": {
-      // rename moves the directory ENTRY (a planted symlink moves as a
-      // link, its target untouched); both names pass the basename rule
-      renameSync(resolve(DEMO_DIR, validateName(args.from)), resolve(DEMO_DIR, validateName(args.to)));
+      moveSandboxFile(DEMO_DIR, args.from, args.to);
       return asText(`moved ${args.from} -> ${args.to}`);
     }
     default:

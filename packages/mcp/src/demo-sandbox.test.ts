@@ -15,6 +15,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureSandboxRoot,
+  listSandboxFiles,
+  moveSandboxFile,
   readSandboxFile,
   requireNoFollow,
   seedSandboxFile,
@@ -163,6 +165,46 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
     writeSandboxFile(root, "note.txt", "hi");
     chmodSync(parent, 0o777); // the namespace becomes swappable AFTER startup
     expect(() => readSandboxFile(root, "note.txt")).toThrow(/not a trusted directory/);
+  });
+
+  it("INIT authenticates the LEXICAL parent — a writable parent refuses even when a planted link's TARGET parent would be trusted", () => {
+    // the review's TOCTOU shape, made static: the swap window only exists
+    // in a writable lexical parent, so that parent must refuse BEFORE any
+    // leaf is looked at — checking the (trusted) parent of the link's
+    // target instead is exactly the bypass
+    const attackerDir = join(fresh(), "attacker");
+    mkdirSync(attackerDir);
+    chmodSync(attackerDir, 0o777); // the swap arena: writable, not sticky
+    const trustedTarget = join(fresh(), "victim-0700");
+    mkdirSync(trustedTarget);
+    chmodSync(trustedTarget, 0o700); // its parent (mkdtemp) is trusted too
+    symlinkSync(trustedTarget, join(attackerDir, "demo")); // the swapped-in link
+    expect(() => ensureSandboxRoot(join(attackerDir, "demo"))).toThrow(/not a trusted directory/);
+  });
+
+  it("list_files and move_file honor the SAME per-operation boundary — a widened parent refuses both", () => {
+    const grand = fresh();
+    const parent = join(grand, "was-safe");
+    mkdirSync(parent);
+    chmodSync(parent, 0o700);
+    const root = ensureSandboxRoot(join(parent, "sandbox"));
+    writeSandboxFile(root, "a.txt", "hi");
+    expect(listSandboxFiles(root)).toContain("a.txt");
+    moveSandboxFile(root, "a.txt", "b.txt");
+    expect(listSandboxFiles(root)).toContain("b.txt");
+    chmodSync(parent, 0o777); // the root entry becomes swappable
+    expect(() => listSandboxFiles(root)).toThrow(/not a trusted directory/);
+    expect(() => moveSandboxFile(root, "b.txt", "c.txt")).toThrow(/not a trusted directory/);
+    // and a root SWAPPED to a symlink refuses the list outright (restore
+    // the parent so only the root's own state is what refuses)
+    chmodSync(parent, 0o700);
+    rmSync(root, { recursive: true, force: true });
+    const elsewhere = join(fresh(), "elsewhere");
+    mkdirSync(elsewhere);
+    chmodSync(elsewhere, 0o700);
+    writeFileSync(join(elsewhere, "outside.txt"), "outside", { mode: 0o600 });
+    symlinkSync(elsewhere, root);
+    expect(() => listSandboxFiles(root)).toThrow();
   });
 
   it("the SEED reports a planted entry LOUDLY, is a no-op on a benign file, and surfaces non-EEXIST errors", () => {
