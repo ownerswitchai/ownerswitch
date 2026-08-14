@@ -18,9 +18,11 @@ import {
 } from "@ownerswitchai/executor";
 import {
   evaluateRemote,
+  isLatchingTrip,
   limitTripReason,
   type ControlPlaneClient,
   type KillState,
+  type LatchingLimitTrip,
   type LimitTracker,
   type LimitTrip,
 } from "@ownerswitchai/gateway";
@@ -146,14 +148,15 @@ export interface LimitEnforcement {
    * even hears "no". On failure the tracker stays latched (unconfirmed) and
    * the implementation keeps retrying in the background.
    *
-   * Called at most ONCE per latch generation, always with the trip the
-   * tracker latched (`trip.latchGeneration` is set). Co-crossing kill rules
-   * are audited, not re-killed — a second kill would open a control-plane
-   * epoch the latch cannot anchor to. The implementation should bind the
-   * delivery confirmation it feeds back to `confirmKillDelivered` to that
-   * same generation, so a late answer cannot confirm a later latch.
+   * Called at most ONCE per latch generation, and the parameter type says
+   * so: only the trip the tracker LATCHED carries `latchGeneration`, so
+   * "report every kill-action trip" does not type-check. Co-crossing kill
+   * rules are audited, not re-killed — a second kill would open a
+   * control-plane epoch the latch cannot anchor to. The implementation binds
+   * the delivery confirmation it feeds back to `confirmKillDelivered` to
+   * that same generation, so a late answer cannot confirm a later latch.
    */
-  reportKill(trip: LimitTrip): void | Promise<void>;
+  reportKill(trip: LatchingLimitTrip): void | Promise<void>;
   /** fire-and-forget alert report for a tripped alert-action rule — best effort */
   reportAlert(trip: LimitTrip): void;
 }
@@ -514,7 +517,7 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
     // agent was still in flight. They are audited here and covered by the same
     // scoped kill: the agent stops either way, and one 2GO restore re-arms all
     // of them together.
-    const latchedTrip = killTrips.find((t) => t.latchGeneration !== undefined);
+    const latchedTrip = killTrips.find(isLatchingTrip);
     for (const trip of killTrips) {
       if (trip === latchedTrip) continue;
       console.error(
@@ -561,12 +564,21 @@ export function createOwnerSwitchProxy(options: ProxyOptions): OwnerSwitchProxy 
       });
       for (const trip of observed) {
         if (trip.rule.action !== "kill") {
-          limits.reportAlert(trip);
+          try {
+            // best effort, and ISOLATED: an alert lane that throws must
+            // never keep the scoped kill below it from being queued
+            limits.reportAlert(trip);
+          } catch (err) {
+            console.error(
+              `[ownerswitch-mcp] limit alert report failed (rule "${trip.rule.id}"): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
           continue;
         }
         // Same single-kill rule as the call path: only the trip the tracker
         // LATCHED is reported, so one observation never opens two epochs.
-        if (trip.latchGeneration === undefined) {
+        if (!isLatchingTrip(trip)) {
           console.error(
             `[ownerswitch-mcp] limit "${trip.rule.id}" also crossed on this failure ` +
               `(${limitTripReason(trip, agentId)}) — covered by the scoped kill ` +

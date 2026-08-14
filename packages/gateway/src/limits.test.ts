@@ -238,7 +238,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     tracker.observeKillState([], { epoch: 4 }); // the world before the trip
     tracker.observeCall(call("x"));
 
-    tracker.confirmKillDelivered(5); // our kill's own commit epoch
+    tracker.confirmKillDelivered(5, 1); // our kill's own commit epoch
     expect(tracker.killTripped?.confirmed).toBe(true);
     expect(tracker.killTripped?.ruleId).toBe("hard"); // still refusing, honestly
 
@@ -259,7 +259,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 7 }); // the world before the trip
     tracker.observeCall(call("x")); // trips; the kill will make epoch 8
-    tracker.confirmKillDelivered(8); // our kill's own response → confirmed
+    tracker.confirmKillDelivered(8, 1); // our kill's own response → confirmed
     expect(tracker.killTripped?.confirmed).toBe(true);
 
     tracker.observeKillState([], { epoch: 7 }); // the stale answer, arriving late
@@ -278,7 +278,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     // control plane's own commit epoch (E+2) can tell the two apart.
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"), { epoch: 10 }); // baseline 10 → provisional floor 11
-    tracker.confirmKillDelivered(12); // OUR kill actually committed at 12
+    tracker.confirmKillDelivered(12, 1); // OUR kill actually committed at 12
     expect(tracker.killTripped?.confirmed).toBe(true);
 
     // the neighbour's-epoch snapshot, arriving late, does NOT release us
@@ -302,7 +302,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     expect(tracker.killTripped?.ruleId).toBe("hard");
 
     // our own kill response is what confirms
-    tracker.confirmKillDelivered(6);
+    tracker.confirmKillDelivered(6, 1);
     expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([], { epoch: 6 });
     expect(tracker.killTripped).toBeUndefined();
@@ -311,7 +311,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
   it("floors only ever rise: an out-of-order answer cannot widen the release window", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"), { epoch: 3 }); // floor 4
-    tracker.confirmKillDelivered(4); // our commit epoch anchors at 4
+    tracker.confirmKillDelivered(4, 1); // our commit epoch anchors at 4
     tracker.observeKillState(["a1"], { epoch: 9 }); // still killed at 9 → floor 9
     expect(tracker.killTripped?.confirmed).toBe(true);
     for (const stale of [4, 5, 8]) {
@@ -328,7 +328,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"), { epoch: 2 }); // trip: floor 3
     tracker.observeCall(call("y"), { epoch: 7 }); // a concurrent call, already over max
-    tracker.confirmKillDelivered(3);
+    tracker.confirmKillDelivered(3, 1);
     tracker.observeKillState([], { epoch: 3 }); // our commit epoch: genuine restore
     expect(tracker.killTripped).toBeUndefined();
   });
@@ -336,7 +336,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
   it("an epoch-less answer holds a confirmed latch rather than guessing", () => {
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x")); // no epoch ever observed → no floor
-    tracker.confirmKillDelivered(4); // our commit epoch anchors it exactly
+    tracker.confirmKillDelivered(4, 1); // our commit epoch anchors it exactly
     tracker.observeKillState([]); // no epoch on the answer: cannot order it
     expect(tracker.killTripped?.ruleId).toBe("hard");
     tracker.observeKillState([], { epoch: 4 }); // our world: the real restore
@@ -348,7 +348,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     tracker.observeKillState([], { epoch: 1 });
     tracker.observeCall(call("x"));
     // our kill's own response confirms (the only path that can)
-    tracker.confirmKillDelivered(2);
+    tracker.confirmKillDelivered(2, 1);
     expect(tracker.killTripped?.confirmed).toBe(true);
     // a DEGRADED absence cannot release: the kill it describes may not
     // survive a restart, so it proves nothing durable in either direction
@@ -362,7 +362,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeKillState([], { epoch: 2 });
     tracker.observeCall(call("x")); // floor = 3 (the kill will bump 2 → 3)
-    tracker.confirmKillDelivered(3); // POST /kill confirmed, commit epoch 3
+    tracker.confirmKillDelivered(3, 1); // POST /kill confirmed, commit epoch 3
     expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([], { epoch: 2 }); // a stale pre-kill answer: holds
     expect(tracker.killTripped?.ruleId).toBe("hard");
@@ -381,7 +381,7 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     tracker.observeKillState([], { epoch: 11 }); // that kill's restore
     expect(tracker.killTripped?.ruleId).toBe("hard"); // we are STILL latched
 
-    tracker.confirmKillDelivered(12); // now OUR kill's response arrives
+    tracker.confirmKillDelivered(12, 1); // now OUR kill's response arrives
     expect(tracker.killTripped?.confirmed).toBe(true);
     tracker.observeKillState([], { epoch: 11 }); // the older world: inadmissible
     expect(tracker.killTripped?.ruleId).toBe("hard");
@@ -402,15 +402,15 @@ describe("the kill-trip lifecycle: tripped-unconfirmed → confirmed → release
     for (const bad of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
       const tracker = new LimitTracker([KILL_RULE]);
       tracker.observeCall(call("x"), { epoch: 2 });
-      tracker.confirmKillDelivered(bad);
+      tracker.confirmKillDelivered(bad, 1);
       expect(tracker.killTripped?.confirmed, `epoch ${bad}`).toBe(false);
     }
     // below the trip's own floor: an older world than we already saw
     const tracker = new LimitTracker([KILL_RULE]);
     tracker.observeCall(call("x"), { epoch: 9 }); // floor 10
-    tracker.confirmKillDelivered(9);
+    tracker.confirmKillDelivered(9, 1);
     expect(tracker.killTripped?.confirmed).toBe(false);
-    tracker.confirmKillDelivered(10); // the real one
+    tracker.confirmKillDelivered(10, 1); // the real one
     expect(tracker.killTripped?.confirmed).toBe(true);
   });
 

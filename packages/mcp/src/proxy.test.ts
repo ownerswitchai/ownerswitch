@@ -10,7 +10,12 @@ import {
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { verifyDeviceSignature, type VetoStatus } from "@ownerswitchai/control-plane";
-import { createControlPlaneClient, LimitTracker, type LimitTrip } from "@ownerswitchai/gateway";
+import {
+  createControlPlaneClient,
+  LimitTracker,
+  type LatchingLimitTrip,
+  type LimitTrip,
+} from "@ownerswitchai/gateway";
 import {
   createTripwire,
   generateHoneytoken,
@@ -637,7 +642,7 @@ describe("cumulative limits", () => {
     opts: { commitEpoch?: number; autoConfirm?: boolean } = {},
   ) => {
     const { commitEpoch = 1, autoConfirm = true } = opts;
-    const kills: LimitTrip[] = [];
+    const kills: LatchingLimitTrip[] = [];
     const alerts: LimitTrip[] = [];
     const tracker = new LimitTracker(rules);
     return {
@@ -648,10 +653,10 @@ describe("cumulative limits", () => {
        * to the latch generation the kill was sent for (a late answer for an
        * already-restored kill must not anchor the next latch).
        */
-      confirm: () => tracker.confirmKillDelivered(commitEpoch, kills.at(-1)?.latchGeneration),
+      confirm: () => tracker.confirmKillDelivered(commitEpoch, kills[kills.length - 1].latchGeneration),
       limits: {
         tracker,
-        reportKill: (trip: LimitTrip): void => {
+        reportKill: (trip: LatchingLimitTrip): void => {
           kills.push(trip);
           if (autoConfirm) tracker.confirmKillDelivered(commitEpoch, trip.latchGeneration);
         },
@@ -910,6 +915,36 @@ describe("cumulative limits", () => {
     expect(r.kills).toHaveLength(1);
     expect(r.kills[0].rule.id).toBe("error-budget");
     expect(audit.mock.calls.flat().join("\n")).toContain("error-budget-2");
+    audit.mockRestore();
+    await t.close();
+  });
+
+  it("a throwing alert lane cannot swallow the kill report queued behind it", async () => {
+    // best-effort visibility must never stand between a crossed kill budget
+    // and its scoped kill — on the error path as on the call path
+    const audit = vi.spyOn(console, "error").mockImplementation(() => {});
+    const kills: LatchingLimitTrip[] = [];
+    const limits = {
+      tracker: new LimitTracker([
+        { id: "noisy-watch", tool: "*", metric: "errors", max: 0, action: "alert" } as LimitRule,
+        { id: "error-budget", tool: "*", metric: "errors", max: 0, action: "kill" } as LimitRule,
+      ]),
+      reportKill: (trip: LatchingLimitTrip): void => {
+        kills.push(trip);
+      },
+      reportAlert: (): void => {
+        throw new Error("alert lane is broken");
+      },
+    };
+    const t = await startProxy(createFakeControlPlane(), undefined, limits);
+
+    const failed = (await t.client.callTool({
+      name: "read_file",
+      arguments: { path: "/fails" },
+    })) as CallToolResult;
+    expect(failed.isError).toBe(true);
+    expect(kills).toHaveLength(1); // the kill still went out
+    expect(kills[0].rule.id).toBe("error-budget");
     audit.mockRestore();
     await t.close();
   });

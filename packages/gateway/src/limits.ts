@@ -80,6 +80,19 @@ export interface LimitTrip {
 }
 
 /**
+ * A trip that MAY be reported as a scoped kill: the one the tracker latched.
+ * Kill-report plumbing takes this type, not `LimitTrip`, so "report every
+ * kill-action trip you see" — the shape that fires several kills for one
+ * observation — cannot be written by accident.
+ */
+export type LatchingLimitTrip = LimitTrip & { latchGeneration: number };
+
+/** Narrows an observation's trips to the single one that latched. */
+export function isLatchingTrip(trip: LimitTrip): trip is LatchingLimitTrip {
+  return trip.latchGeneration !== undefined;
+}
+
+/**
  * The latched record of a kill-action trip: what the refusals cite and what
  * the kill report carries. `confirmed` flips ONLY when our own kill request
  * comes back validated from the control plane — never from `/status` (see
@@ -307,15 +320,15 @@ export class LimitTracker {
    * later attempt confirms with a real anchor.
    *
    * `generation` BINDS the answer to the latch it was sent for (the trip's
-   * `latchGeneration`). A report can land late — after its own kill was
-   * restored and a NEW trip latched — and that stale answer must not
-   * confirm, and so anchor, a latch it knows nothing about. Callers that
-   * cannot name a generation get the unbound behaviour, which the floor
-   * check still guards.
+   * `latchGeneration`), and is REQUIRED: a report can land late — after its
+   * own kill was restored and a NEW trip latched — and that stale answer
+   * must not confirm, and so anchor, a latch it knows nothing about. No
+   * unbound form exists, so no future integration can reach confirmation
+   * without naming which latch it is confirming.
    */
-  confirmKillDelivered(epoch: number, generation?: number): void {
+  confirmKillDelivered(epoch: number, generation: number): void {
     if (this.latch.phase !== "unconfirmed") return;
-    if (generation !== undefined && generation !== this.latch.record.generation) return;
+    if (generation !== this.latch.record.generation) return;
     if (!Number.isSafeInteger(epoch) || epoch < 1) return;
     const floor = this.latch.record.epochFloor;
     if (floor !== undefined && epoch < floor) return;

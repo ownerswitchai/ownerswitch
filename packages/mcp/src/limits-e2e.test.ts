@@ -13,7 +13,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createControlPlane, createOwnerSession } from "@ownerswitchai/control-plane";
-import { LimitTracker, limitTripReason, type LimitTrip } from "@ownerswitchai/gateway";
+import {
+  isLatchingTrip,
+  LimitTracker,
+  limitTripReason,
+  type LatchingLimitTrip,
+} from "@ownerswitchai/gateway";
 import { createTripReporter } from "@ownerswitchai/honeytoken";
 import type { LimitRule } from "@ownerswitchai/shared";
 import {
@@ -52,7 +57,13 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       acceptSessionOnlyApprovalRisk: true,
     });
     silenceDevWarning.mockRestore();
-    server = createServer(cp.handler);
+    // count POST /kill AT THE SOCKET: the single-kill rule is a claim about
+    // what crosses the wire, so it is counted where the wire is
+    let killPosts = 0;
+    server = createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/kill") killPosts += 1;
+      cp.handler(req, res);
+    });
     const url = await new Promise<string>((resolveUrl) => {
       server!.listen(0, "127.0.0.1", () => {
         const addr = server!.address();
@@ -61,8 +72,13 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       });
     });
 
-    const rule: LimitRule = { id: "e2e-budget", tool: "*", metric: "calls", max: 0, action: "kill" };
-    const tracker = new LimitTracker([rule]);
+    // TWO kill rules that cross on the SAME call: the payout spends its
+    // call budget and its spend budget at once. Exactly one kill may go out.
+    const rules: LimitRule[] = [
+      { id: "e2e-budget", tool: "*", metric: "calls", max: 0, action: "kill" },
+      { id: "e2e-spend", tool: "*", metric: "amount", amountPath: "cents", max: 0, action: "kill" },
+    ];
+    const tracker = new LimitTracker(rules);
     const reporter = createTripReporter({
       controlPlaneUrl: url,
       deviceId: "gw-e2e",
@@ -79,15 +95,19 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
       (await (await fetch(`${url}/status`)).json()) as { epoch: number }
     ).epoch;
     const trips = tracker.observeCall(
-      { agentId: AGENT_ID, tool: "stripe.payout" },
+      { agentId: AGENT_ID, tool: "stripe.payout", args: { cents: 4_200 } },
       { epoch: epochAtCall },
     );
-    expect(trips).toHaveLength(1);
+    expect(trips.map((t) => t.rule.id)).toEqual(["e2e-budget", "e2e-spend"]); // both crossed
     expect(tracker.killTripped?.confirmed).toBe(false);
 
     // 2. synchronous delivery — the same shape the CLI's reportKill uses,
-    // including the per-report confirmation bound to THIS latch generation
-    const trip: LimitTrip = trips[0];
+    // including the per-report confirmation bound to THIS latch generation.
+    // Only the LATCHED trip may be reported; the co-crossing rule rides on
+    // the same kill (the proxy audits it), so the wire sees exactly one.
+    const latched = trips.filter(isLatchingTrip);
+    expect(latched).toHaveLength(1);
+    const trip: LatchingLimitTrip = latched[0];
     reporter.report({
       tier: "kill",
       canaryIds: [],
@@ -109,6 +129,8 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     const { delivered } = await reporter.flush({ maxAttempts: 4 });
     expect(delivered).toBe(true);
     expect(tracker.killTripped?.confirmed).toBe(true); // onDelivered advanced the lifecycle
+    // the wire claim, counted: two crossing kill rules, ONE POST /kill
+    expect(killPosts).toBe(1);
 
     // 3. the DURABLE authority holds the scoped kill, attributed to "limit"
     const status = (await (await fetch(`${url}/status`)).json()) as {
@@ -191,7 +213,16 @@ describe("limits end to end: trip → signed scoped kill → killedAgents → 2G
     expect(after.killedAgents).toEqual([]);
     tracker.observeKillState(after.killedAgents, { epoch: after.epoch });
     expect(tracker.killTripped).toBeUndefined();
-    expect(tracker.observeCall({ agentId: AGENT_ID, tool: "stripe.payout" })).toHaveLength(1); // fresh crossing
+    // ONE owner ceremony re-armed BOTH budgets — the whole point of one kill
+    // per crossing observation. The next payout crosses both again, and
+    // again exactly one of the two carries the kill.
+    const fresh = tracker.observeCall({
+      agentId: AGENT_ID,
+      tool: "stripe.payout",
+      args: { cents: 1 },
+    });
+    expect(fresh.map((t) => t.rule.id)).toEqual(["e2e-budget", "e2e-spend"]);
+    expect(fresh.filter(isLatchingTrip)).toHaveLength(1);
 
     reporter.stop();
   });

@@ -25,6 +25,7 @@ import {
   createControlPlaneClient,
   limitTripReason,
   LimitTracker,
+  type LatchingLimitTrip,
   type LimitTrip,
 } from "@ownerswitchai/gateway";
 import type { LimitRule } from "@ownerswitchai/shared";
@@ -235,12 +236,12 @@ async function runGateway(argv: string[]): Promise<void> {
     limitTracker !== undefined && limitReporter !== undefined
       ? {
           tracker: limitTracker,
-          reportKill: async (trip: LimitTrip): Promise<void> => {
-            // The latch this kill belongs to. The proxy calls reportKill only
-            // for the trip that latched, and binding the confirmation to that
-            // generation keeps a late-landing answer — one whose kill has
-            // since been restored — from confirming, and so anchoring, the
-            // NEXT latch.
+          reportKill: async (trip: LatchingLimitTrip): Promise<void> => {
+            // The latch this kill belongs to — carried by the type, since
+            // only a latched trip may be reported. Binding the confirmation
+            // to that generation keeps a late-landing answer (one whose kill
+            // has since been restored) from confirming, and so anchoring,
+            // the NEXT latch.
             const generation = trip.latchGeneration;
             limitReporter.report({
               tier: "kill",
