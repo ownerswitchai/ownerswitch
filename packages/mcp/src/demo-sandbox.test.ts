@@ -111,7 +111,22 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
     expect(() => ensureSandboxRoot(join(parent, "sandbox2"))).not.toThrow();
   });
 
-  it("a symlinked sandbox ROOT is refused; a symlinked PARENT canonicalizes and is judged by its real target", () => {
+  it("a ROOT symlink to an EXISTING owner-owned 0700 directory refuses — the ~/.ssh redirect", () => {
+    // the review's exact attack: the target passes every post-realpath
+    // check (real dir, ours, 0700), so only the pre-realpath lstat of the
+    // LEXICAL leaf can see the redirect
+    const fakeSsh = join(fresh(), "ssh");
+    mkdirSync(fakeSsh, { mode: 0o700 });
+    chmodSync(fakeSsh, 0o700);
+    writeFileSync(join(fakeSsh, "id_ed25519"), "PRIVATE KEY MATERIAL", { mode: 0o600 });
+    const rootLink = join(fresh(), "demo");
+    symlinkSync(fakeSsh, rootLink);
+    expect(() => ensureSandboxRoot(rootLink)).toThrow(/symlink/);
+    // and nothing was seeded into the redirect target
+    expect(readFileSync(join(fakeSsh, "id_ed25519"), "utf8")).toBe("PRIVATE KEY MATERIAL");
+  });
+
+  it("a DANGLING root symlink refuses; a symlinked PARENT canonicalizes and is judged by its real target", () => {
     const real = fresh();
     const linkParent = fresh();
     const rootLink = join(linkParent, "sandbox-link");
@@ -124,6 +139,30 @@ describe("demo sandbox — symlinks AND hard links refuse, roots are verified, s
     symlinkSync(trustedReal, parentLink);
     const root = ensureSandboxRoot(join(parentLink, "sandbox"));
     expect(root).toBe(join(lstatSync(trustedReal).isDirectory() ? trustedReal : "", "sandbox"));
+  });
+
+  it("a GROUP-writable non-sticky parent refuses too — group members can swap entries just as well", () => {
+    const grand = fresh();
+    const parent = join(grand, "group-parent");
+    mkdirSync(parent);
+    chmodSync(parent, 0o775); // group-write, NOT sticky
+    expect(() => ensureSandboxRoot(join(parent, "sandbox"))).toThrow(/not a trusted directory/);
+    chmodSync(parent, 0o770);
+    expect(() => ensureSandboxRoot(join(parent, "sandbox"))).toThrow(/not a trusted directory/);
+    // no group/world write at all → trusted (the typical 0755 $HOME shape)
+    chmodSync(parent, 0o755);
+    expect(() => ensureSandboxRoot(join(parent, "sandbox"))).not.toThrow();
+  });
+
+  it("the parent boundary is re-verified PER OPERATION — a widened parent refuses later reads", () => {
+    const grand = fresh();
+    const parent = join(grand, "was-safe");
+    mkdirSync(parent);
+    chmodSync(parent, 0o700);
+    const root = ensureSandboxRoot(join(parent, "sandbox"));
+    writeSandboxFile(root, "note.txt", "hi");
+    chmodSync(parent, 0o777); // the namespace becomes swappable AFTER startup
+    expect(() => readSandboxFile(root, "note.txt")).toThrow(/not a trusted directory/);
   });
 
   it("the SEED reports a planted entry LOUDLY, is a no-op on a benign file, and surfaces non-EEXIST errors", () => {
