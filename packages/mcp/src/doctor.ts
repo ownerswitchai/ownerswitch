@@ -320,7 +320,10 @@ export async function checkDeviceCredentials(
         "x-device-id": device.id,
         "x-device-timestamp": String(timestamp),
         "x-device-nonce": nonce,
-        "x-device-signature": signDeviceRequest({ deviceId: device.id, timestamp, nonce }, body, device.secret),
+        "x-device-signature": signDeviceRequest({ deviceId: device.id, timestamp, nonce }, body, device.secret, {
+          method: "POST",
+          pathAndQuery: "/veto",
+        }),
       },
       body,
       signal: controller.signal,

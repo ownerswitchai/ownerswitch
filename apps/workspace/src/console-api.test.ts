@@ -238,6 +238,7 @@ describe("console-api /veto/pending — the device-HMAC lane", () => {
         },
         "",
         "fleet-secret",
+        { method: "GET", pathAndQuery: "/veto/pending" },
         { now: () => AT, seenNonces: new Map() },
       ),
     ).toBe(true);
@@ -554,6 +555,7 @@ describe("console-api actions", () => {
         },
         body,
         "fleet-secret",
+        { method: "POST", pathAndQuery: "/kill" },
         { now: () => AT, seenNonces: new Map() },
       ),
     ).toBe(true);

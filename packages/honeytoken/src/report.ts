@@ -169,7 +169,10 @@ export function createTripReporter(opts: TripReporterOptions): TripReporter {
       // an agentId makes the kill SCOPED — stop this one agent, not the fleet
       ...(trip.agentId !== undefined ? { agentId: trip.agentId } : {}),
     });
-    const signature = signDeviceRequest({ deviceId: opts.deviceId, timestamp, nonce }, body, opts.secret);
+    const signature = signDeviceRequest({ deviceId: opts.deviceId, timestamp, nonce }, body, opts.secret, {
+      method: "POST",
+      pathAndQuery: url.pathname + url.search,
+    });
     log(`[${source}] → POST ${url} (${trip.tier}, attempt ${n}, device ${opts.deviceId})`);
     // Bounds a request that never SETTLES, not just one that errors fast —
     // cancelWait (the backoff-wait canceller) has no reach into an in-flight

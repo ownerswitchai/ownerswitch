@@ -2,6 +2,7 @@ import { verifyDeviceSignature } from "@ownerswitchai/control-plane";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createButtonDaemon, type KillConfirmation } from "./daemon.js";
 
+const KILL_CTX = { method: "POST", pathAndQuery: "/kill" };
 const SECRET = "button-test-secret";
 
 const okResponse = () =>
@@ -117,14 +118,14 @@ describe("button daemon", () => {
     const at = () => credential.timestamp;
 
     expect(
-      verifyDeviceSignature(credential, body, SECRET, { now: at, seenNonces: new Map() }),
+      verifyDeviceSignature(credential, body, SECRET, KILL_CTX, { now: at, seenNonces: new Map() }),
     ).toBe(true);
     // …and only over the exact bytes it sent, with the exact secret:
     expect(
-      verifyDeviceSignature(credential, body + " ", SECRET, { now: at, seenNonces: new Map() }),
+      verifyDeviceSignature(credential, body + " ", SECRET, KILL_CTX, { now: at, seenNonces: new Map() }),
     ).toBe(false);
     expect(
-      verifyDeviceSignature(credential, body, "wrong-secret", { now: at, seenNonces: new Map() }),
+      verifyDeviceSignature(credential, body, "wrong-secret", KILL_CTX, { now: at, seenNonces: new Map() }),
     ).toBe(false);
   });
 

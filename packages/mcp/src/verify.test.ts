@@ -41,7 +41,13 @@ function createFakeControlPlane() {
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-  const validDevice = (init: RequestInit | undefined, rawBody: string): boolean => {
+  // fleet-hmac v2: the stub verifies the exact method+path it received, the
+  // way the real control plane does
+  const validDevice = (
+    init: RequestInit | undefined,
+    rawBody: string,
+    context: { method: string; pathAndQuery: string },
+  ): boolean => {
     const h = new Headers(init?.headers);
     return verifyDeviceSignature(
       {
@@ -52,6 +58,7 @@ function createFakeControlPlane() {
       },
       rawBody,
       DEVICE.secret,
+      context,
     );
   };
 
@@ -66,7 +73,9 @@ function createFakeControlPlane() {
     if (method === "GET" && url.pathname === "/status") return json({ killed });
 
     if (method === "POST" && url.pathname === "/kill") {
-      if (!validDevice(init, rawBody)) return json({ error: "unauthorized" }, 401);
+      if (!validDevice(init, rawBody, { method, pathAndQuery: "/kill" })) {
+        return json({ error: "unauthorized" }, 401);
+      }
       killed = true;
       killCalls.push(JSON.parse(rawBody));
       return json({ killed: true });
@@ -80,7 +89,9 @@ function createFakeControlPlane() {
     }
 
     if (method === "POST" && url.pathname === "/veto") {
-      if (!validDevice(init, rawBody)) return json({ error: "unauthorized" }, 401);
+      if (!validDevice(init, rawBody, { method, pathAndQuery: "/veto" })) {
+        return json({ error: "unauthorized" }, 401);
+      }
       const id = `veto_fake_${windows.size + 1}`;
       windows.set(id, { status: "pending" });
       return json({ id, status: "pending" }, 201);

@@ -287,7 +287,12 @@ describe("escalation service against a live control plane", () => {
         "x-device-id": "owner-app",
         "x-device-timestamp": String(at),
         "x-device-nonce": "fleet-1",
-        "x-device-signature": signDeviceRequest({ deviceId: "owner-app", timestamp: at, nonce: "fleet-1" }, body, DEVICE_SECRET),
+        "x-device-signature": signDeviceRequest(
+          { deviceId: "owner-app", timestamp: at, nonce: "fleet-1" },
+          body,
+          DEVICE_SECRET,
+          { method: "POST", pathAndQuery },
+        ),
       },
       body,
     });

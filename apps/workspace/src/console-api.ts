@@ -310,7 +310,10 @@ export function createConsoleApi(opts: UpstreamOptions): ConsoleApi {
       if (signed && deviceConfigured) {
         Object.assign(
           headers,
-          deviceSignedHeaders(opts.deviceId as string, opts.deviceSecret as string, rawBody ?? "", now()),
+          deviceSignedHeaders(opts.deviceId as string, opts.deviceSecret as string, rawBody ?? "", now(), {
+            method,
+            pathAndQuery: path,
+          }),
         );
       }
       const res = await fetchImpl(base + path, {

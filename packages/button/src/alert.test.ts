@@ -49,6 +49,7 @@ describe("createFaultReporter", () => {
         },
         body,
         "device-secret",
+        { method: "POST", pathAndQuery: "/alert" },
         { now: () => Number(headers["x-device-timestamp"]), seenNonces: new Map() },
       ),
     ).toBe(true);

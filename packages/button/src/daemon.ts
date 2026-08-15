@@ -158,6 +158,7 @@ export function createButtonDaemon(opts: ButtonDaemonOptions): ButtonDaemon {
       { deviceId: opts.deviceId, timestamp, nonce },
       body,
       opts.secret,
+      { method: "POST", pathAndQuery: killUrl.pathname + killUrl.search },
     );
     log(`[button] → POST ${killUrl} (attempt ${attempt}, device ${opts.deviceId})`);
     const controller = new AbortController();

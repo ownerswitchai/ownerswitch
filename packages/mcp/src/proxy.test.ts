@@ -300,7 +300,7 @@ describe("veto", () => {
     };
     expect(credential.deviceId).toBe("gw-test");
     expect(
-      verifyDeviceSignature(credential, reg.rawBody, DEVICE_SECRET, { seenNonces: new Map() }),
+      verifyDeviceSignature(credential, reg.rawBody, DEVICE_SECRET, { method: "POST", pathAndQuery: "/veto" }, { seenNonces: new Map() }),
     ).toBe(true);
     await t.close();
   });
@@ -612,6 +612,7 @@ describe("honeytoken tripwire", () => {
         },
         post.body,
         DEVICE_SECRET,
+        { method: "POST", pathAndQuery: "/kill" },
         { now: () => Number(post.headers["x-device-timestamp"]), seenNonces: new Map() },
       ),
     ).toBe(true);

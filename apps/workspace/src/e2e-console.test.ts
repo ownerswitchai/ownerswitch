@@ -70,7 +70,10 @@ describe("workspace console against a REAL control plane", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...deviceSignedHeaders("workspace-console", DEVICE_SECRET, body, Date.now()),
+        ...deviceSignedHeaders("workspace-console", DEVICE_SECRET, body, Date.now(), {
+          method: "POST",
+          pathAndQuery: "/veto",
+        }),
       },
       body,
     });
@@ -190,7 +193,10 @@ describe("workspace console against a REAL control plane", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...deviceSignedHeaders("workspace-console", DEVICE_SECRET, body, Date.now()),
+        ...deviceSignedHeaders("workspace-console", DEVICE_SECRET, body, Date.now(), {
+          method: "POST",
+          pathAndQuery: "/kill",
+        }),
       },
       body,
     });

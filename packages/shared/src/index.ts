@@ -88,6 +88,8 @@ export {
   utf8,
 } from "./owner-device-sig.js";
 export type { OwnerDeviceSigFields } from "./owner-device-sig.js";
+export { FLEET_HMAC_LABEL, fleetHmacPreimage } from "./fleet-hmac.js";
+export type { FleetHmacFields } from "./fleet-hmac.js";
 export { ENROLL_POP_LABEL, ownerEnrollPopPreimage } from "./enroll-pop.js";
 export type { EnrollPopFields } from "./enroll-pop.js";
 export { enrollmentInviteFromWire } from "./enrollment-invite.js";

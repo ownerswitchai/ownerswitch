@@ -415,6 +415,7 @@ describe("assertion-gated approval over HTTP", () => {
           { deviceId: "btn", timestamp, nonce },
           body,
           "dev-secret",
+          { method: "POST", pathAndQuery: "/kill" },
         ),
       };
     };

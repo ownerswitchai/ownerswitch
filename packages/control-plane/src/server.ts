@@ -1197,7 +1197,11 @@ export function createControlPlane(opts: ControlPlaneOptions = {}): ControlPlane
     if (secret === undefined) return null;
     const credential = deviceCredentialFrom(req);
     if (credential === null) return null;
-    return verifyDeviceSignature(credential, rawBody, secret, { now, seenNonces })
+    // the verifier binds the request IT received (fleet-hmac v2): the exact
+    // method and origin-form target of THIS request go into the transcript,
+    // so a MAC captured for one route cannot open another
+    const context = { method: (req.method ?? "").toUpperCase(), pathAndQuery: req.url ?? "" };
+    return verifyDeviceSignature(credential, rawBody, secret, context, { now, seenNonces })
       ? credential.deviceId
       : null;
   }

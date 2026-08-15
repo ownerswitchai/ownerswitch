@@ -85,6 +85,7 @@ export function createFaultReporter(opts: FaultReporterOptions): FaultReporter {
               { deviceId: opts.deviceId, timestamp, nonce },
               body,
               opts.secret,
+              { method: "POST", pathAndQuery: alertUrl.pathname + alertUrl.search },
             ),
           },
           body,

@@ -395,11 +395,17 @@ app's two credentials:
 can send in one tap — without waking WebAuthn UI, without a live
 session — under the device's cheap-lane key (non-extractable private
 key, §2). The app shares the button's *header discipline* — a
-single-use nonce, a timestamp, a signature — but its signed preimage
-is deliberately richer, because the button's dot-joined
-`deviceId.timestamp.nonce.body` shape does not bind an empty-body
-`GET /veto/:id` to that id at all. The app's preimage is the
-concatenation of length-prefixed fields (4-byte big-endian byte
+single-use nonce, a timestamp, a signature — and, since the fleet lane
+moved to **fleet-hmac v2**, the same transcript SHAPE: the fleet's
+original dot-joined `deviceId.timestamp.nonce.body` payload bound
+neither method nor path, so a captured MAC could be redirected on its
+first use; both lanes now sign length-prefixed fields under their own
+domain labels (`@ownerswitchai/shared`: `fleetHmacPreimage` and
+`ownerDeviceSigPreimage`). What still separates them is the KEY and the
+authority: the fleet lane is a shared HMAC secret that may only STOP,
+the app's lane is an asymmetric key no server-side secret can forge and
+the only one that may mark an alert delivered. The app's preimage is
+the concatenation of length-prefixed fields (4-byte big-endian byte
 counts, injective by construction): the UTF-8 label
 `ownerswitch/device-sig/v1`, the `deviceId`, the upper-case HTTP
 method, the request path **and query exactly as sent** (byte-exact,

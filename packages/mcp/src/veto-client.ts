@@ -118,6 +118,7 @@ export function createVetoClient(options: VetoClientOptions): VetoClient {
           { deviceId: device.id, timestamp, nonce },
           body,
           device.secret,
+          { method: "POST", pathAndQuery: "/veto" },
         ),
       },
       body,

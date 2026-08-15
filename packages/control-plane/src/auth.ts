@@ -1,4 +1,5 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { fleetHmacPreimage } from "@ownerswitchai/shared";
 
 /**
  * Authentication for the control plane's HTTP surface.
@@ -18,8 +19,21 @@ export interface DeviceCredential {
   timestamp: number;
   /** unique per request; replays of a seen nonce are rejected */
   nonce: string;
-  /** hex HMAC-SHA256 over `${deviceId}.${timestamp}.${nonce}.${rawBody}` */
+  /** hex HMAC-SHA256 over the fleet-hmac v2 preimage (@ownerswitchai/shared) */
   signature: string;
+}
+
+/**
+ * The REQUEST the signature binds (PR #62 audit #7): the verifier derives
+ * these from the request it actually received, the signer states what it is
+ * about to send — so a captured MAC cannot be redirected to another verb,
+ * endpoint or window id even on its first use.
+ */
+export interface DeviceRequestContext {
+  /** HTTP method; compared UPPER-cased inside the preimage */
+  method: string;
+  /** origin-form request target, byte-exact as sent (path + query) */
+  pathAndQuery: string;
 }
 
 export interface DeviceVerifyOptions {
@@ -38,20 +52,42 @@ export interface DeviceVerifyOptions {
 // shared store before this runs as more than one process.
 const defaultSeenNonces = new Map<string, number>();
 
-const signedPayload = (c: Pick<DeviceCredential, "deviceId" | "timestamp" | "nonce">, rawBody: string) =>
-  `${c.deviceId}.${c.timestamp}.${c.nonce}.${rawBody}`;
-
-// The payload is dot-joined, so deviceId and nonce must not contain "." and
-// the timestamp must be an integer — otherwise one signed string could parse
-// as two different credentials (e.g. nonce "5.x" re-read as timestamp suffix
-// ".5" plus nonce "x"), and a captured signature would burn two nonces.
+// deviceId and nonce stay dot-free and non-empty: the nonce store keys on
+// `${deviceId}:${nonce}` and older tooling may still log the v1 dotted
+// shape; the preimage itself is length-prefixed, so this is a grammar
+// choice, not an ambiguity requirement any more.
 const unambiguousField = (value: string): boolean => value !== "" && !value.includes(".");
+
+/**
+ * The v2 preimage HMAC input, or null when the fields cannot form a
+ * canonical transcript (bad path, unsafe timestamp) — the verifier maps
+ * null to "invalid" instead of throwing on attacker-shaped input.
+ */
+function preimageOf(
+  fields: Pick<DeviceCredential, "deviceId" | "timestamp" | "nonce">,
+  rawBody: string,
+  context: DeviceRequestContext,
+): Uint8Array | null {
+  try {
+    return fleetHmacPreimage({
+      deviceId: fields.deviceId,
+      method: context.method,
+      pathAndQuery: context.pathAndQuery,
+      bodyHash: createHash("sha256").update(rawBody, "utf8").digest(),
+      timestamp: fields.timestamp,
+      nonce: fields.nonce,
+    });
+  } catch {
+    return null;
+  }
+}
 
 /** Compute the signature a device must send; also documents the exact format. */
 export function signDeviceRequest(
   fields: Pick<DeviceCredential, "deviceId" | "timestamp" | "nonce">,
   rawBody: string,
   secret: string,
+  context: DeviceRequestContext,
 ): string {
   if (!unambiguousField(fields.deviceId) || !unambiguousField(fields.nonce)) {
     throw new Error('deviceId and nonce must be non-empty and contain no "."');
@@ -59,13 +95,18 @@ export function signDeviceRequest(
   if (!Number.isInteger(fields.timestamp)) {
     throw new Error("timestamp must be an integer (ms since epoch)");
   }
-  return createHmac("sha256", secret).update(signedPayload(fields, rawBody)).digest("hex");
+  const preimage = preimageOf(fields, rawBody, context);
+  if (preimage === null) {
+    throw new Error("cannot sign: method/pathAndQuery do not form a canonical fleet-hmac transcript");
+  }
+  return createHmac("sha256", secret).update(preimage).digest("hex");
 }
 
 export function verifyDeviceSignature(
   credential: DeviceCredential,
   rawBody: string,
   secret: string,
+  context: DeviceRequestContext,
   opts: DeviceVerifyOptions = {},
 ): boolean {
   const now = opts.now ?? Date.now;
@@ -83,7 +124,11 @@ export function verifyDeviceSignature(
   if (!Number.isInteger(timestamp)) return false;
   if (Math.abs(now() - timestamp) > maxSkewMs) return false;
 
-  const expected = createHmac("sha256", secret).update(signedPayload(credential, rawBody)).digest();
+  // the verifier binds the request IT received — a MAC minted for another
+  // method/path/body computes a different preimage and simply fails here
+  const preimage = preimageOf(credential, rawBody, context);
+  if (preimage === null) return false;
+  const expected = createHmac("sha256", secret).update(preimage).digest();
   // Buffer.from(hex) stops at the first invalid character, so garbage input
   // lands in the length check instead of throwing inside timingSafeEqual.
   const provided = Buffer.from(signature, "hex");

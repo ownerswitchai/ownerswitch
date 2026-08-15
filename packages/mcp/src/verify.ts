@@ -111,14 +111,19 @@ async function deviceSignedPost(
 ): Promise<Response> {
   const timestamp = now();
   const nonce = randomBytes(12).toString("hex");
-  return fetchImpl(new URL(path, baseUrl), {
+  const url = new URL(path, baseUrl);
+  return fetchImpl(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "x-device-id": device.id,
       "x-device-timestamp": String(timestamp),
       "x-device-nonce": nonce,
-      "x-device-signature": signDeviceRequest({ deviceId: device.id, timestamp, nonce }, body, device.secret),
+      // sign what the WIRE will carry — the serializer's own target
+      "x-device-signature": signDeviceRequest({ deviceId: device.id, timestamp, nonce }, body, device.secret, {
+        method: "POST",
+        pathAndQuery: url.pathname + url.search,
+      }),
     },
     body,
   });

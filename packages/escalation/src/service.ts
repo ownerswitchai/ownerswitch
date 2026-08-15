@@ -301,7 +301,11 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
   async function deviceRequest(path: string, method: "GET" | "POST", body = ""): Promise<Response> {
     const timestamp = now();
     const nonce = randomBytes(12).toString("hex");
-    return doFetch(new URL(path, cfg.controlPlaneUrl), {
+    const url = new URL(path, cfg.controlPlaneUrl);
+    // sign what the WIRE will carry: the URL serializer's own origin-form
+    // target, not the path string we happened to pass in
+    const pathAndQuery = url.pathname + url.search;
+    return doFetch(url, {
       method,
       cache: "no-store",
       headers: {
@@ -314,6 +318,7 @@ export function createEscalationService(opts: EscalationServiceOptions): Escalat
           { deviceId: cfg.device.id, timestamp, nonce },
           body,
           cfg.device.secret,
+          { method, pathAndQuery },
         ),
       },
       ...(method === "POST" ? { body } : {}),

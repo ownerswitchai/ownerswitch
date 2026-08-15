@@ -37,8 +37,20 @@ const ownerKeypair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const OWNER_DEVICE_SPKI = ownerKeypair.publicKey.export({ format: "pem", type: "spki" }).toString();
 const OWNER_DEVICE_KEYS: Record<string, string> = { "owner-app": OWNER_DEVICE_SPKI };
 
-/** Headers for a device-signed request over `body`, signed "now". */
-const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random().toString(36).slice(2)}`) => ({
+/** fleet-hmac v2 request contexts for the routes these tests sign */
+const KILL_CTX = { method: "POST", pathAndQuery: "/kill" };
+const ALERT_CTX = { method: "POST", pathAndQuery: "/alert" };
+const VETO_CTX = { method: "POST", pathAndQuery: "/veto" };
+const PENDING_CTX = { method: "GET", pathAndQuery: "/veto/pending" };
+
+/** Headers for a device-signed request over `body`, signed "now", bound to
+ *  the exact method+path it will be sent to (fleet-hmac v2). */
+const deviceHeaders = (
+  body: string,
+  at: number,
+  ctx: { method: string; pathAndQuery: string },
+  nonce = `n-${at}-${Math.random().toString(36).slice(2)}`,
+) => ({
   "content-type": "application/json",
   "x-device-id": "btn-1",
   "x-device-timestamp": String(at),
@@ -47,6 +59,7 @@ const deviceHeaders = (body: string, at: number, nonce = `n-${at}-${Math.random(
     { deviceId: "btn-1", timestamp: at, nonce },
     body,
     DEVICE_SECRET,
+    ctx,
   ),
 });
 
@@ -226,7 +239,7 @@ describe("control-plane HTTP API", () => {
     const body = JSON.stringify({ source: "button", reason: "red button pressed" });
     const res = await fetch(`${url}/kill`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), KILL_CTX),
       body,
     });
     expect(res.status).toBe(200);
@@ -269,7 +282,7 @@ describe("control-plane HTTP API", () => {
     const body = JSON.stringify({ source: "button" });
     const res = await fetch(`${url}/kill`, {
       method: "POST",
-      headers: { ...deviceHeaders(body, c.now()), "x-device-signature": "deadbeef" },
+      headers: { ...deviceHeaders(body, c.now(), KILL_CTX), "x-device-signature": "deadbeef" },
       body,
     });
     expect(res.status).toBe(200);
@@ -302,7 +315,7 @@ describe("control-plane HTTP API", () => {
     const url = await startAs(cp, "203.0.113.7");
 
     const body = JSON.stringify({ source: "button" });
-    const headers = deviceHeaders(body, c.now());
+    const headers = deviceHeaders(body, c.now(), KILL_CTX);
     const res = await fetch(`${url}/kill`, { method: "POST", headers, body });
     expect(res.status).toBe(200);
     expect(cp.killSwitch.killed).toBe(true);
@@ -342,7 +355,7 @@ describe("control-plane HTTP API", () => {
     const body = JSON.stringify({ source: "honeytoken", reason: "read of /decoys/.env.backup" });
     const res = await fetch(`${url}/alert`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), ALERT_CTX),
       body,
     });
     expect(res.status).toBe(200);
@@ -1325,7 +1338,7 @@ describe("control-plane HTTP API", () => {
     const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
     const res = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), VETO_CTX),
       body,
     });
     expect(res.status).toBe(201);
@@ -1343,7 +1356,7 @@ describe("control-plane HTTP API", () => {
     });
     const res = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), VETO_CTX),
       body,
     });
     expect(res.status).toBe(201);
@@ -1385,7 +1398,7 @@ describe("control-plane HTTP API", () => {
       call: { agentId: "mcp-proxy", tool: "github.merge_pr", args: mergeArgs },
       purpose: { connector: "github", operation: "merge_pull_request", policyVersion: "sha256:pv" },
     });
-    const res = await fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+    const res = await fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now(), VETO_CTX), body });
     expect(res.status).toBe(201);
     const { id } = (await res.json()) as { id: string };
     expect(cp.vetoWindows.get(id)?.purpose).toEqual({
@@ -1420,7 +1433,7 @@ describe("control-plane HTTP API", () => {
 
     const send = async (payload: unknown): Promise<Response> => {
       const body = JSON.stringify(payload);
-      return fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now()), body });
+      return fetch(`${url}/veto`, { method: "POST", headers: deviceHeaders(body, c.now(), VETO_CTX), body });
     };
     const call = { agentId: "a", tool: "t", args: { owner: "o", repo: "r", pullNumber: 7 } };
 
@@ -1460,7 +1473,7 @@ describe("control-plane HTTP API", () => {
 
     const forged = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: { ...deviceHeaders(body, c.now()), "x-device-signature": "deadbeef" },
+      headers: { ...deviceHeaders(body, c.now(), VETO_CTX), "x-device-signature": "deadbeef" },
       body,
     });
     expect(forged.status).toBe(401);
@@ -1475,7 +1488,7 @@ describe("control-plane HTTP API", () => {
     const body = JSON.stringify({ call: { agentId: "mcp-proxy", tool: "write_file" } });
     const res = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), VETO_CTX),
       body,
     });
     expect(res.status).toBe(401);
@@ -1491,7 +1504,7 @@ describe("control-plane HTTP API", () => {
       const body = JSON.stringify(bad);
       const res = await fetch(`${url}/veto`, {
         method: "POST",
-        headers: deviceHeaders(body, c.now()),
+        headers: deviceHeaders(body, c.now(), VETO_CTX),
         body,
       });
       expect(res.status).toBe(400);
@@ -1875,7 +1888,7 @@ describe("MergeGrant issuance on ACTIVE owner approval", () => {
     cp.vetoWindows.set("v-1", approvedWindow(c, 0)); // approved at epoch 0
 
     const killBody = JSON.stringify({ source: "button" });
-    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now()), body: killBody });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now(), KILL_CTX), body: killBody });
 
     const body = (await (await fetch(`${url}/veto/v-1`)).json()) as { status: string; grant?: unknown };
     expect(body.status).toBe("spent");
@@ -1900,7 +1913,7 @@ describe("MergeGrant issuance on ACTIVE owner approval", () => {
     // engage the kill, then an owner approval must be REFUSED (409) — no
     // approval may be minted while killed
     const killBody = JSON.stringify({ source: "button" });
-    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now()), body: killBody });
+    await fetch(`${url}/kill`, { method: "POST", headers: deviceHeaders(killBody, c.now(), KILL_CTX), body: killBody });
     const session = createOwnerSession("adam", { now: c.now });
     const whileKilled = await fetch(`${url}/veto/v-1`, {
       method: "POST",
@@ -2127,7 +2140,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     // credential) is rejected: it may stop, never confirm-delivered
     const viaFleet = await fetch(`${url}/veto/v-1/seen`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: deviceHeaders("", c.now(), { method: "POST", pathAndQuery: "/veto/v-1/seen" }),
       body: "",
     });
     expect(viaFleet.status).toBe(401);
@@ -2463,7 +2476,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const body = JSON.stringify({ reason: "phone stolen" });
     const res = await fetch(`${url}/devices/owner-app/revoke`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), { method: "POST", pathAndQuery: "/devices/owner-app/revoke" }),
       body,
     });
     expect(res.status).toBe(200);
@@ -2525,14 +2538,14 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
       cp,
       "POST",
       path,
-      { ...deviceHeaders(body, c.now()), "x-device-signature": "not-a-real-signature" },
+      { ...deviceHeaders(body, c.now(), { method: "POST", pathAndQuery: "/devices/owner-app/revoke" }), "x-device-signature": "not-a-real-signature" },
       body,
     );
     expect(wrong.status).toBe(401);
     expect(cp.ownerDevices.get("owner-app")?.revokedAt).toBeNull(); // nothing severed yet
 
     // a VALID fleet signature from the same remote address -> 200
-    const ok = await callFromRemote(cp, "POST", path, deviceHeaders(body, c.now()), body);
+    const ok = await callFromRemote(cp, "POST", path, deviceHeaders(body, c.now(), { method: "POST", pathAndQuery: "/devices/owner-app/revoke" }), body);
     expect(ok.status).toBe(200);
     expect(ok.body.revoked).toBe(true);
     expect(cp.ownerDevices.get("owner-app")?.revokedAt).not.toBeNull();
@@ -2813,7 +2826,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
     const reg = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(registerBody, c.now()),
+      headers: deviceHeaders(registerBody, c.now(), VETO_CTX),
       body: registerBody,
     });
     const { id } = (await reg.json()) as { id: string };
@@ -2906,7 +2919,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
     const reg = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(registerBody, c.now()),
+      headers: deviceHeaders(registerBody, c.now(), VETO_CTX),
       body: registerBody,
     });
     expect(reg.status).toBe(201);
@@ -3019,7 +3032,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const registerBody = JSON.stringify({ call: { agentId: "agent-1", tool: "bash" } });
     const reg = await fetch(`${url2}/veto`, {
       method: "POST",
-      headers: deviceHeaders(registerBody, c.now()),
+      headers: deviceHeaders(registerBody, c.now(), VETO_CTX),
       body: registerBody,
     });
     const { id } = (await reg.json()) as { id: string };
@@ -3039,7 +3052,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const body = JSON.stringify({ decision: "veto", attribution: "channel:sms-reply" });
     const res = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: deviceHeaders(body, c.now()),
+      headers: deviceHeaders(body, c.now(), { method: "POST", pathAndQuery: "/veto/v-1" }),
       body,
     });
     expect(res.status).toBe(200);
@@ -3050,7 +3063,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const retryBody = JSON.stringify({ attribution: "channel:sms-reply" });
     const retry = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: deviceHeaders(retryBody, c.now()),
+      headers: deviceHeaders(retryBody, c.now(), { method: "POST", pathAndQuery: "/veto/v-1" }),
       body: retryBody,
     });
     expect(retry.status).toBe(200);
@@ -3094,7 +3107,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
     const res = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: deviceHeaders("", c.now(), { method: "POST", pathAndQuery: "/veto/v-1" }),
       body: "",
     });
     expect(res.status).toBe(200);
@@ -3110,7 +3123,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const approve = JSON.stringify({ decision: "approve" });
     const res = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: deviceHeaders(approve, c.now()),
+      headers: deviceHeaders(approve, c.now(), { method: "POST", pathAndQuery: "/veto/v-1" }),
       body: approve,
     });
     expect(res.status).toBe(403);
@@ -3121,7 +3134,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const forged = JSON.stringify({ attribution: "owner:adam" }); // not a channel:* label
     const bad = await fetch(`${url}/veto/v-1`, {
       method: "POST",
-      headers: deviceHeaders(forged, c.now()),
+      headers: deviceHeaders(forged, c.now(), { method: "POST", pathAndQuery: "/veto/v-1" }),
       body: forged,
     });
     expect(bad.status).toBe(400);
@@ -3140,7 +3153,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
 
     expect((await fetch(`${url}/veto/pending`)).status).toBe(401);
 
-    const res = await fetch(`${url}/veto/pending`, { headers: deviceHeaders("", c.now()) });
+    const res = await fetch(`${url}/veto/pending`, { headers: deviceHeaders("", c.now(), PENDING_CTX) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { windows: Array<Record<string, unknown>> };
     expect(body.windows).toHaveLength(2);
@@ -3171,7 +3184,7 @@ describe("the escalation surface — seen acks, device veto relay, pending listi
     const open = (await (await fetch(`${url}/veto/v-1`)).json()) as Record<string, unknown>;
     expect(open).toEqual({ status: "pending" }); // no clock leak to id holders
 
-    const signed = await fetch(`${url}/veto/v-1`, { headers: deviceHeaders("", c.now()) });
+    const signed = await fetch(`${url}/veto/v-1`, { headers: deviceHeaders("", c.now(), { method: "GET", pathAndQuery: "/veto/v-1" }) });
     expect(await signed.json()).toEqual({
       status: "pending",
       deadline: window.deadlineAt,
@@ -3267,7 +3280,7 @@ describe("2GO licensing — the ONE paid gate; every stop path stays free", () =
     cp.vetoWindows.set("v-free", window);
     const veto = await fetch(`${url}/veto/v-free`, {
       method: "POST",
-      headers: deviceHeaders("", c.now()),
+      headers: deviceHeaders("", c.now(), { method: "POST", pathAndQuery: "/veto/v-free" }),
       body: "",
     });
     expect(veto.status).toBe(200);
@@ -3500,7 +3513,7 @@ describe("scoped (per-agent) kills over HTTP", () => {
     const registerBody = JSON.stringify({ call: { agentId: "agent-7", tool: "stripe.payout" } });
     const register = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(registerBody, c.now()),
+      headers: deviceHeaders(registerBody, c.now(), VETO_CTX),
       body: registerBody,
     });
     expect(register.status).toBe(409);
@@ -3540,7 +3553,7 @@ describe("scoped (per-agent) kills over HTTP", () => {
     const otherBody = JSON.stringify({ call: { agentId: "agent-8", tool: "stripe.payout" } });
     const other = await fetch(`${url}/veto`, {
       method: "POST",
-      headers: deviceHeaders(otherBody, c.now()),
+      headers: deviceHeaders(otherBody, c.now(), VETO_CTX),
       body: otherBody,
     });
     expect(other.status).toBe(201);
@@ -3586,7 +3599,7 @@ describe("scoped (per-agent) kills over HTTP", () => {
       const body = JSON.stringify({ call: { agentId: bad, tool: "stripe.payout" } });
       const res = await fetch(`${url}/veto`, {
         method: "POST",
-        headers: deviceHeaders(body, c.now()),
+        headers: deviceHeaders(body, c.now(), VETO_CTX),
         body,
       });
       expect(res.status).toBe(400);

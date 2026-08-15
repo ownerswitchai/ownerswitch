@@ -8,6 +8,7 @@ import {
   type Trip,
 } from "./report.js";
 
+const KILL_CTX = { method: "POST", pathAndQuery: "/kill" };
 const SECRET = "honeytoken-test-secret";
 
 const KILL_TRIP: Trip = {
@@ -106,8 +107,12 @@ describe("trip reporter", () => {
       signature: headers["x-device-signature"],
     };
     const at = () => credential.timestamp;
-    expect(verifyDeviceSignature(credential, body, SECRET, { now: at, seenNonces: new Map() })).toBe(true);
-    expect(verifyDeviceSignature(credential, body + " ", SECRET, { now: at, seenNonces: new Map() })).toBe(false);
+    expect(
+      verifyDeviceSignature(credential, body, SECRET, KILL_CTX, { now: at, seenNonces: new Map() }),
+    ).toBe(true);
+    expect(
+      verifyDeviceSignature(credential, body + " ", SECRET, KILL_CTX, { now: at, seenNonces: new Map() }),
+    ).toBe(false);
   });
 
   it("a failed POST retries on the 200/400/800/2000ms schedule and never gives up in the background", async () => {
@@ -362,6 +367,7 @@ describe("trip reporter", () => {
         },
         kills[0].body,
         SECRET,
+        KILL_CTX,
       ),
     ).toBe(true);
     expect(h.logs.some((l) => l.includes("[limit]"))).toBe(true);
