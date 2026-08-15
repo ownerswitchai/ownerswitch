@@ -114,3 +114,18 @@ export interface JournalSeed {
 }
 
 export function killStateTransitionEvents(prev: KillView | null, next: KillView | null): JournalSeed[];
+
+export const STATUS_FRESH_TTL_MS: number;
+
+export function isStatusStale(lastFreshAt: number | null, nowMs: number, ttlMs?: number): boolean;
+
+export function staleKillView(prev: Pick<KillView, "epoch"> | KillView | null): KillView;
+
+export function reduceKillView(prev: KillView | null, next: KillView): KillView;
+
+export interface KillConfirmation {
+  kind: "confirmed" | "confirmed-degraded" | "unconfirmed";
+  text: string;
+}
+
+export function killConfirmation(result: unknown): KillConfirmation;

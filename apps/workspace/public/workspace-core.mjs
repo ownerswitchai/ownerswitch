@@ -317,6 +317,106 @@ export function createJournal(limit = 250) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* kill-state freshness and ordering (post-merge audit #2)             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How long the last accepted status reading may stand before the console
+ * refuses to keep showing it. Four poll periods: enough to ride out one
+ * slow answer, short enough that a suspended tab or hung fetch cannot
+ * leave yesterday's ARMED on screen.
+ */
+export const STATUS_FRESH_TTL_MS = 8_000;
+
+export function isStatusStale(lastFreshAt, nowMs, ttlMs = STATUS_FRESH_TTL_MS) {
+  return typeof lastFreshAt !== "number" || !(nowMs - lastFreshAt <= ttlMs);
+}
+
+/** The view a stale (expired-TTL) status renders as — treated as killed. */
+export function staleKillView(prev) {
+  return {
+    state: "unreachable",
+    badge: "UNREACHABLE",
+    treatAsKilled: true,
+    epoch: prev !== null && typeof prev === "object" && typeof prev.epoch === "number" ? prev.epoch : null,
+    scopedKills: [],
+    warnings: [],
+    detail: "status reading is STALE — no fresh answer inside the freshness window; treated as killed (fail closed)",
+  };
+}
+
+/**
+ * The MONOTONIC reducer between the accepted view and a candidate: the kill
+ * epoch never decreases on a real control plane (restarts reload it from
+ * disk), so a candidate whose epoch regresses is a stale or forged answer —
+ * refused as unreachable, never allowed to downgrade what the console
+ * already accepted. Everything else passes through. (Response ORDERING is
+ * additionally handled by the caller's serial polling + generation guard;
+ * this reducer is the belt to that suspenders.)
+ */
+export function reduceKillView(prev, next) {
+  if (
+    prev !== null &&
+    typeof prev === "object" &&
+    typeof prev.epoch === "number" &&
+    next !== null &&
+    typeof next === "object" &&
+    typeof next.epoch === "number" &&
+    next.epoch < prev.epoch
+  ) {
+    return {
+      state: "unreachable",
+      badge: "UNREACHABLE",
+      treatAsKilled: true,
+      epoch: prev.epoch,
+      scopedKills: [],
+      warnings: [],
+      detail: `status regressed to epoch ${next.epoch} behind accepted epoch ${prev.epoch} — stale or forged; treated as killed (fail closed)`,
+    };
+  }
+  return next;
+}
+
+/* ------------------------------------------------------------------ */
+/* kill confirmation (post-merge audit #4)                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What an /api/kill answer may be CALLED. "confirmed" needs the exact
+ * shape — ok:true with killed:true and a usable epoch; a {} body, a
+ * killed:false, or a malformed epoch is "unconfirmed" however the HTTP
+ * status looked. A confirmed kill whose answer carries
+ * persistenceDegraded is stated as exactly that: engaged now, but a
+ * restart may not preserve it.
+ */
+export function killConfirmation(result) {
+  const unconfirmed = (why) => ({ kind: "unconfirmed", text: `kill NOT confirmed — ${why} — check the control plane directly` });
+  if (typeof result !== "object" || result === null) return unconfirmed("no answer");
+  if (result.ok !== true) {
+    const why =
+      typeof result.error === "string"
+        ? result.error
+        : typeof result.body === "object" && result.body !== null && typeof result.body.error === "string"
+          ? result.body.error
+          : "the console server did not report success";
+    return unconfirmed(why);
+  }
+  const body = result.body;
+  if (typeof body !== "object" || body === null) return unconfirmed("the answer carried no body");
+  if (body.killed !== true) return unconfirmed("the answer did not say killed:true");
+  if (typeof body.epoch !== "number" || !Number.isInteger(body.epoch) || body.epoch < 0) {
+    return unconfirmed("the answer carried no usable epoch");
+  }
+  if (body.persistenceDegraded === true) {
+    return {
+      kind: "confirmed-degraded",
+      text: `kill engaged (epoch ${body.epoch}) — but persistence is DEGRADED: a restart may not preserve it`,
+    };
+  }
+  return { kind: "confirmed", text: `kill engaged — control plane confirmed (epoch ${body.epoch})` };
+}
+
 /**
  * The journal entries a kill-state transition earns. Pure over (prev, next)
  * classifications; prev === null (first reading) journals the initial state.

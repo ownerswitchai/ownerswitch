@@ -12,7 +12,11 @@ import {
   formatClock,
   formatCountdown,
   isSafeId,
+  isStatusStale,
+  killConfirmation,
   killStateTransitionEvents,
+  reduceKillView,
+  staleKillView,
   pendingModel,
   validatePendingWindow,
   vetoResultAction,
@@ -350,5 +354,87 @@ describe("killStateTransitionEvents", () => {
     expect(killStateTransitionEvents(killed, armed)[0]).toMatchObject({ tone: "ok" });
     expect(killStateTransitionEvents(armed, unreachable)[0]).toMatchObject({ tone: "warn" });
     expect(killStateTransitionEvents(null, null)).toEqual([]);
+  });
+});
+
+describe("reduceKillView — the monotonic epoch reducer (audit #2)", () => {
+  const view = (state: "armed" | "killed" | "unreachable", epoch: number | null) =>
+    ({
+      state,
+      badge: state.toUpperCase(),
+      treatAsKilled: state !== "armed",
+      epoch,
+      scopedKills: [],
+      warnings: [],
+      detail: "x",
+    }) as Parameters<typeof reduceKillView>[1];
+
+  it("refuses an epoch regression as unreachable — a stale ARMED cannot downgrade a newer KILLED", () => {
+    const prev = view("killed", 3);
+    const next = view("armed", 2);
+    const reduced = reduceKillView(prev, next);
+    expect(reduced.state).toBe("unreachable");
+    expect(reduced.treatAsKilled).toBe(true);
+    expect(reduced.epoch).toBe(3);
+    expect(reduced.detail).toContain("regressed");
+  });
+
+  it("passes equal and advancing epochs, first readings, and epoch-less views through", () => {
+    expect(reduceKillView(view("killed", 3), view("armed", 3)).state).toBe("armed");
+    expect(reduceKillView(view("killed", 3), view("armed", 4)).state).toBe("armed");
+    expect(reduceKillView(null, view("armed", 0)).state).toBe("armed");
+    expect(reduceKillView(view("unreachable", null), view("armed", 0)).state).toBe("armed");
+    expect(reduceKillView(view("armed", 2), view("unreachable", null)).state).toBe("unreachable");
+  });
+});
+
+describe("status freshness (audit #2)", () => {
+  it("no reading yet, or one older than the TTL, is stale", () => {
+    expect(isStatusStale(null, 1_000)).toBe(true);
+    expect(isStatusStale(0, 9_000)).toBe(true);
+    expect(isStatusStale(5_000, 12_000)).toBe(false);
+    expect(isStatusStale(5_000, 13_001)).toBe(true);
+  });
+
+  it("the stale view is treated as killed and keeps the last accepted epoch", () => {
+    const stale = staleKillView({ epoch: 7 });
+    expect(stale.treatAsKilled).toBe(true);
+    expect(stale.state).toBe("unreachable");
+    expect(stale.epoch).toBe(7);
+    expect(staleKillView(null).epoch).toBeNull();
+  });
+});
+
+describe("killConfirmation — confirmed is a schema, not an HTTP 200 (audit #4)", () => {
+  it("confirms only killed:true with a usable epoch", () => {
+    expect(killConfirmation({ ok: true, upstreamStatus: 200, body: { killed: true, epoch: 1 } })).toEqual({
+      kind: "confirmed",
+      text: "kill engaged — control plane confirmed (epoch 1)",
+    });
+  });
+
+  it("a {} body, killed:false, a bad epoch, or a refusal is unconfirmed", () => {
+    for (const result of [
+      null,
+      {},
+      { ok: true, upstreamStatus: 200, body: {} },
+      { ok: true, upstreamStatus: 200, body: { killed: false, epoch: 1 } },
+      { ok: true, upstreamStatus: 200, body: { killed: true } },
+      { ok: true, upstreamStatus: 200, body: { killed: true, epoch: -1 } },
+      { ok: false, upstreamStatus: 503, body: { error: "kill refused by the control plane" } },
+      { ok: false, unreachable: true, error: "control plane timed out" },
+    ]) {
+      expect(killConfirmation(result).kind, JSON.stringify(result)).toBe("unconfirmed");
+    }
+  });
+
+  it("a degraded persistence is stated, never silently folded into confirmed", () => {
+    const degraded = killConfirmation({
+      ok: true,
+      upstreamStatus: 200,
+      body: { killed: true, epoch: 2, persistenceDegraded: true },
+    });
+    expect(degraded.kind).toBe("confirmed-degraded");
+    expect(degraded.text).toContain("DEGRADED");
   });
 });

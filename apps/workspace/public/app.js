@@ -12,14 +12,26 @@
   var STATUS_POLL_MS = 2000;
   var DEVICES_POLL_MS = 10000;
   var TICK_MS = 500;
+  var FETCH_TIMEOUT_MS = 4000;
 
   var CORE = null;
   var journal = null;
   var lastKillView = null;
   var pendingIds = [];
-  var windowFacts = {}; // id -> { agentId, tool } for journal wording after close
-  var inFlight = {}; // id -> true while a veto POST is out
-  var stopped = {}; // id -> true once the server confirmed vetoed
+  // Map/Set instead of plain {}: window ids arrive from OUTSIDE this page,
+  // and a plain object would let "__proto__"/"constructor"/"toString" keys
+  // collide with inherited members (post-merge audit #9)
+  var windowFacts = new Map(); // id -> { agentId, tool } for journal wording after close
+  var inFlight = new Set(); // ids with a veto POST out
+  var stopped = new Set(); // ids the server confirmed vetoed
+  // ORDERING guards (post-merge audit #2): polls are serial (the next one is
+  // scheduled only after the previous completes) AND generation-checked, so
+  // a late, stale answer can never repaint a newer state; a freshness TTL
+  // (watched from the tick) forces UNREACHABLE when nothing fresh arrives —
+  // a hung fetch or a resumed background tab cannot keep yesterday's ARMED.
+  var statusGen = 0;
+  var lastStatusAt = null;
+  var showingStale = false;
 
   function $(id) {
     return document.getElementById(id);
@@ -30,16 +42,24 @@
     if (el) el.textContent = value == null ? "" : String(value);
   }
 
-  /** GET an /api path; null on ANY failure — the caller renders fail closed. */
+  /** GET an /api path with a hard timeout; null on ANY failure — the caller
+      renders fail closed. Without the AbortController a hung request would
+      pin the serial poll loop (and the last painted state) forever. */
   function getJson(path) {
-    return fetch(path, { cache: "no-store" })
+    var ctl = new AbortController();
+    var timer = setTimeout(function () {
+      ctl.abort();
+    }, FETCH_TIMEOUT_MS);
+    return fetch(path, { cache: "no-store", signal: ctl.signal })
       .then(function (res) {
+        clearTimeout(timer);
         if (!res.ok) return null;
         return res.json().catch(function () {
           return null;
         });
       })
       .catch(function () {
+        clearTimeout(timer);
         return null;
       });
   }
@@ -96,13 +116,19 @@
   }
 
   function pollStatus() {
+    var gen = ++statusGen;
     return getJson("/api/status").then(function (reading) {
-      var view = CORE.classifyKillState(reading);
+      // a response that is no longer the newest ask paints NOTHING — a
+      // stale ARMED must not overwrite a fresher KILLED (audit #2)
+      if (gen !== statusGen) return;
+      var view = CORE.reduceKillView(lastKillView, CORE.classifyKillState(reading));
       var events = CORE.killStateTransitionEvents(lastKillView, view);
       for (var i = 0; i < events.length; i++) {
         note(Date.now(), events[i].kind, events[i].text, events[i].tone);
       }
       lastKillView = view;
+      lastStatusAt = Date.now();
+      showingStale = false;
       renderKillState(view);
       setText("sb-poll", CORE.formatClock(Date.now()) + " UTC");
     });
@@ -121,20 +147,20 @@
   }
 
   function onVetoClick(windowId) {
-    if (inFlight[windowId] || stopped[windowId]) return;
-    inFlight[windowId] = true;
+    if (inFlight.has(windowId) || stopped.has(windowId)) return;
+    inFlight.add(windowId);
     var btn = vetoButtonFor(windowId);
     if (btn) {
       btn.disabled = true;
       btn.textContent = "VETO …";
     }
     postJson("/api/veto/" + encodeURIComponent(windowId), {}).then(function (result) {
-      delete inFlight[windowId];
+      inFlight.delete(windowId);
       var current = vetoButtonFor(windowId) === null ? null : windowId;
       var action = CORE.vetoResultAction(windowId, current, result);
       var live = vetoButtonFor(windowId);
       if (action === "stopped") {
-        stopped[windowId] = true;
+        stopped.add(windowId);
         if (live) {
           live.disabled = true;
           live.textContent = "STOPPED";
@@ -208,10 +234,10 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "vetobtn";
-    if (stopped[w.id]) {
+    if (stopped.has(w.id)) {
       btn.disabled = true;
       btn.textContent = "STOPPED";
-    } else if (inFlight[w.id]) {
+    } else if (inFlight.has(w.id)) {
       btn.disabled = true;
       btn.textContent = "VETO …";
     } else {
@@ -275,20 +301,20 @@
     for (var i = 0; i < model.windows.length; i++) {
       var w = model.windows[i];
       nextIds.push(w.id);
-      windowFacts[w.id] = { agentId: w.agentId, tool: w.tool };
+      windowFacts.set(w.id, { agentId: w.agentId, tool: w.tool });
     }
     var diff = CORE.diffWindowIds(pendingIds, nextIds);
     pendingIds = nextIds;
     diff.appeared.forEach(function (id) {
-      var facts = windowFacts[id] || { agentId: "?", tool: "?" };
+      var facts = windowFacts.get(id) || { agentId: "?", tool: "?" };
       note(Date.now(), "window-open", "veto window " + id + " opened — " + facts.agentId + " · " + facts.tool, "warn");
     });
     diff.disappeared.forEach(function (id) {
-      delete stopped[id];
+      stopped.delete(id);
       getJson("/api/veto/" + encodeURIComponent(id)).then(function (answer) {
         var finalStatus = answer && typeof answer === "object" ? answer.status : null;
         note(Date.now(), "window-close", CORE.closedWindowText(id, finalStatus), CORE.closedWindowTone(finalStatus));
-        delete windowFacts[id];
+        windowFacts.delete(id);
       });
     });
   }
@@ -312,8 +338,18 @@
     });
   }
 
-  /** Re-label countdowns between polls; deadlines come from data attributes. */
+  /** Re-label countdowns between polls; deadlines come from data attributes.
+      ALSO the freshness watchdog: a hung poll or a tab resumed from the
+      BFCache must not keep showing the last painted state — past the TTL
+      the view is forced to STALE/UNREACHABLE until a fresh answer lands. */
   function tickCountdowns() {
+    if (!showingStale && CORE.isStatusStale(lastStatusAt, Date.now())) {
+      showingStale = true;
+      var stale = CORE.staleKillView(lastKillView);
+      note(Date.now(), "kill-state:stale", stale.detail, "warn");
+      lastKillView = stale;
+      renderKillState(stale);
+    }
     var cards = document.querySelectorAll(".vetocard");
     var now = Date.now();
     for (var i = 0; i < cards.length; i++) {
@@ -422,6 +458,10 @@
 
   function wireEstop() {
     var btn = $("estop");
+    // the button ships DISABLED in the HTML (audit #3): a page whose script
+    // never loaded must not show a working-looking STOP; it becomes active
+    // only here, once the handler is truly installed
+    btn.disabled = false;
     btn.addEventListener("click", function () {
       // the e-stop never asks twice; it is disabled only while its own
       // request is in flight, and pressing an already-killed system is a
@@ -430,19 +470,16 @@
       note(Date.now(), "kill", "E-STOP pressed — sending kill", "stop");
       postJson("/api/kill", { reason: "workspace console e-stop" }).then(function (result) {
         btn.disabled = false;
-        var ok = result && typeof result === "object" && result.ok === true;
-        if (ok) {
-          note(Date.now(), "kill", "kill engaged — control plane confirmed", "stop");
-        } else {
-          var why =
-            result && typeof result === "object" && typeof result.error === "string"
-              ? result.error
-              : result && typeof result === "object" && result.body && typeof result.body === "object" &&
-                  typeof result.body.error === "string"
-                ? result.body.error
-                : "no confirmation";
-          note(Date.now(), "kill", "kill NOT confirmed — " + why + " — check the control plane directly", "warn");
-        }
+        // "confirmed" is a SCHEMA, not any HTTP 200 (audit #4): killed:true
+        // with a usable epoch, and a degraded persistence stated as such —
+        // then the next status poll re-verifies against /status itself
+        var confirmation = CORE.killConfirmation(result);
+        note(
+          Date.now(),
+          "kill",
+          confirmation.text,
+          confirmation.kind === "unconfirmed" ? "warn" : "stop",
+        );
         pollStatus();
       });
     });
@@ -450,16 +487,61 @@
 
   /* ---------------- boot ---------------- */
 
-  import("./workspace-core.mjs").then(function (mod) {
-    CORE = mod;
-    journal = CORE.createJournal(250);
-    wireEstop();
-    pollStatus();
-    pollPending();
-    pollDevices();
-    setInterval(pollStatus, STATUS_POLL_MS);
-    setInterval(pollPending, STATUS_POLL_MS);
-    setInterval(pollDevices, DEVICES_POLL_MS);
-    setInterval(tickCountdowns, TICK_MS);
-  });
+  function bootFailure() {
+    // the module never loaded: nothing on this page is verified and nothing
+    // works — say so in the static fail-closed banner instead of leaving
+    // CONNECTING and a dead STOP button on screen (audit #3)
+    var banner = $("banner");
+    if (banner) banner.hidden = false;
+    setText(
+      "banner-text",
+      "console failed to load its logic — nothing on this page is verified and the buttons cannot work; treat the system as killed and reload",
+    );
+    setText("killstate", "BOOT ERROR");
+  }
+
+  function statusLoop() {
+    pollStatus().then(function () {
+      setTimeout(statusLoop, STATUS_POLL_MS);
+    });
+  }
+  function pendingLoop() {
+    pollPending().then(function () {
+      setTimeout(pendingLoop, STATUS_POLL_MS);
+    });
+  }
+  function devicesLoop() {
+    pollDevices().then(function () {
+      setTimeout(devicesLoop, DEVICES_POLL_MS);
+    });
+  }
+
+  import("./workspace-core.mjs")
+    .then(function (mod) {
+      CORE = mod;
+      journal = CORE.createJournal(250);
+      wireEstop();
+      statusLoop();
+      pendingLoop();
+      devicesLoop();
+      setInterval(tickCountdowns, TICK_MS);
+      // a page revived from the BFCache or a long-hidden tab re-verifies
+      // IMMEDIATELY: its painted state is history, not truth (audit #3)
+      window.addEventListener("pageshow", function (event) {
+        if (event.persisted) {
+          lastStatusAt = null;
+          pollStatus();
+          pollPending();
+        }
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") {
+          pollStatus();
+          pollPending();
+        }
+      });
+    })
+    .catch(function () {
+      bootFailure();
+    });
 })();

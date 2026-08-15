@@ -412,7 +412,8 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
       status: [200, '{"killed":false,"epoch":4,"killedAgents":["mcp-gateway"]}'],
     });
     const run = await runScript(stub.url);
-    expect(run.code).toBe(0);
+    // exit 3: a distinct code, so automation cannot read "fully restored"
+    expect(run.code).toBe(3);
     expect(run.output).toContain("scoped kills remain");
     expect(run.output).not.toContain("restored — one press");
   });
@@ -422,6 +423,7 @@ describe("two-go-demo.sh — the tested 2GO walkthrough step", () => {
       '{"killed":false,"epoch":1,"killedAgents":[],"persistenceDegraded":false}',
       '{"killed":false,"epoch":1,"killedAgents":[42]}',
       '{"killed":false,"epoch":1,"killedAgents":[""]}',
+      '{"killed":false,"epoch":1,"killedAgents":[" padded "]}',
     ]) {
       const stub = await stubPlane({
         go1: [201, `{"id":"${CANONICAL_ID}"}`],

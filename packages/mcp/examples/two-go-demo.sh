@@ -118,7 +118,10 @@ status_reading() {
         return;
       }
       const agents = s.killedAgents;
-      if (!Array.isArray(agents) || !agents.every((a) => typeof a === "string" && a.length > 0 && a.length <= 128)) {
+      // drift-pinned to @ownerswitchai/shared isValidAgentId: printable
+      // ASCII, 1-128, no leading/trailing whitespace
+      const AGENT_ID = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/;
+      if (!Array.isArray(agents) || !agents.every((a) => typeof a === "string" && a.length <= 128 && AGENT_ID.test(a))) {
         process.stdout.write("UNKNOWN");
         return;
       }
@@ -223,9 +226,12 @@ case "$(status_reading)" in
     echo "restored — one press to stop, two GOs to start."
     ;;
   SCOPED)
+    # exit 3, not 0: automation must not read "fully restored" out of a
+    # state that still denies scope-killed agents (review non-blocking)
     echo "    the GLOBAL restore landed, but scoped kills remain (killedAgents is not"
     echo "    empty) — those agents stay denied until their own scoped ceremony."
     echo "global restore complete — scoped kills remain."
+    exit 3
     ;;
   KILLED)
     fail "the restore did not take — /status confirms the system is still killed"

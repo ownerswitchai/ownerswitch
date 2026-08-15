@@ -20,19 +20,23 @@
     <div class="frame">
       <div class="topbar">
         <div class="brand">OwnerSwitch <small>Workspace</small></div>
-        <span class="killstate unreachable" id="killstate">CONNECTING</span>
+        <span class="killstate unreachable" id="killstate">NOT VERIFIED</span>
         <span class="epoch" id="epoch">epoch —</span>
         <div class="spacer"></div>
         <div class="estop">
           <span class="label">EMERGENCY<br>every session</span>
-          <button type="button" id="estop" aria-label="Emergency stop — kill every session">STOP</button>
+          <!-- ships DISABLED: a page whose script failed to load must not
+               show a working-looking STOP; app.js enables it only after the
+               click handler is truly installed -->
+          <button type="button" id="estop" disabled aria-label="Emergency stop — kill every session">STOP</button>
         </div>
       </div>
 
-      <!-- fail-closed strip: visible whenever the state is killed OR the
-           control plane cannot be proven live — never an optimistic ARMED -->
-      <div class="banner" id="banner" hidden>
-        <span id="banner-text"></span>
+      <!-- fail-closed strip: VISIBLE from the first paint — the page boots
+           into "nothing verified, treated as killed" and only a live status
+           reading may replace that; never an optimistic ARMED -->
+      <div class="banner" id="banner">
+        <span id="banner-text">console booting — nothing verified yet; treated as killed until a live status is proven</span>
       </div>
 
       <div class="cols">
